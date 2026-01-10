@@ -1,9 +1,6 @@
 # 使用 Python 3.9 slim 环境作为基础镜像
 FROM python:3.9-slim
 
-# 安装curl用于下载数据
-RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
-
 # 设置工作目录
 WORKDIR /app
 
