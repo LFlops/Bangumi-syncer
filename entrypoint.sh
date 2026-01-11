@@ -38,6 +38,7 @@ if [ ! -f "/app/config/email_notification.html" ]; then
     fi
 fi
 
-# 启动应用
+# 执行 Docker 传递进来的 CMD 命令 (比如 uvicorn ...)
+# "$@" 代表 Dockerfile 中的 CMD 参数
 echo "启动应用..."
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000
+exec "$@"
