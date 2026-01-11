@@ -40,5 +40,4 @@ fi
 
 # 启动应用
 echo "启动应用..."
-# 依然保留 uv run，严格遵守你的要求
-exec uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000

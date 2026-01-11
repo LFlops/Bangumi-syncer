@@ -1,4 +1,4 @@
-# Stage 1: Builder (保持不变)
+# Stage 1: Builder
 FROM python:3.9-slim-bookworm AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
@@ -23,9 +23,6 @@ FROM python:3.9-slim-bookworm
 # 1. 安全优化：创建非 Root 用户
 # --create-home (-m) 强制创建 /home/appuser 目录
 RUN groupadd -r appuser && useradd -r -g appuser --create-home appuser
-
-# 2. 复制 uv (因为你的脚本用了 uv run，所以必须保留)
-COPY --from=builder /bin/uv /usr/local/bin/uv
 
 # 3. 环境变量
 # 将 venv 加入 PATH，确保脚本能找到 uvicorn
