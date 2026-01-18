@@ -1,44 +1,74 @@
-name: Publish Docker image
+name: CI & Dev Build
 
 on:
   push:
     branches:
-      - main
-
-env:
-  DOCKERHUB_REPO: sanaemio/bangumi-syncer
+      - 'main'
+    tags-ignore:
+      - 'v*' # 忽略版本 Tag (交给 release.yml 处理)
+  pull_request:
 
 jobs:
-  push_to_registry:
-    name: Push Docker image to Docker Hub
+  dev_build:
     runs-on: ubuntu-latest
+    # 仅在 Secrets 存在时运行推送步骤, 必须配置了 Docker Hub 密码 (Fork 用户如果没有配 Secrets，这步自动跳过，不会报错)
+    if: ${{ secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != '' }}
     steps:
-      - name: Check out the repo
+      - name: Checkout
         uses: actions/checkout@v4
+
+      # =========================================================
+      # 1. 动态设置镜像名 (关键步骤)
+      # =========================================================
+      - name: Set up Docker Image Name
+        run: |
+          # 获取当前仓库名 (如 User/Repo)，并转换为全小写
+          REPO_NAME=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "DOCKER_IMAGE=${REPO_NAME}" >> $GITHUB_ENV
+          echo "Current Docker Image Target: ${REPO_NAME}"
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
+      # =========================================================
+      # 2. 生成标签 (自动处理 dev/feature 分支名)
+      # =========================================================
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKER_IMAGE }}
+          tags: |
+            type=ref,event=branch
+            # 如果是 PR 事件，生成 :pr-84, 用于测试 PR 镜像
+            type=ref,event=pr
+            # 为开发构建打上明确的 dev 标签，避免混淆
+            type=raw,value=dev-{{sha}},enable=${{ github.event_name == 'push' }}
+
+      # =========================================================
+      # 3. 推送镜像 (智能判断)
+      # 条件：只有在非 PR 事件且 Secrets 存在时才运行
+      # =========================================================
       - name: Login to DockerHub
+        # 仅当 Secrets 存在且非 PR 时运行
+        if: github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKERHUB_REPO }}
-
-      - name: Build and push Docker image
+      - name: Push to DockerHub
+        # 条件同上
+        if: github.event_name != 'pull_request' && secrets.DOCKERHUB_USERNAME != '' && secrets.DOCKERHUB_TOKEN != ''
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: |
-            linux/arm64
-            linux/amd64
-          file: ./Dockerfile
+          platforms: linux/amd64, linux/arm64
           push: true
-          tags: ${{ env.DOCKERHUB_REPO }}:test
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
