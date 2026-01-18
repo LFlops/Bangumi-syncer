@@ -1,5 +1,6 @@
-name: Publish Docker image
+name: Publish Release Image
 
+# 触发条件：只有打 v 开头的 Tag 时才运行 (比如 v1.0.0)
 on:
   push:
     tags:
@@ -9,16 +10,19 @@ env:
   DOCKERHUB_REPO: sanaemio/bangumi-syncer
 
 jobs:
-  push_to_registry:
-    name: Push Docker image to Docker Hub
+  release_build:
+    name: Build and Push Release
     runs-on: ubuntu-latest
     steps:
-      - name: Check out the repo
+      - name: Checkout
         uses: actions/checkout@v4
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
+
       - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
@@ -30,17 +34,23 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.DOCKERHUB_REPO }}
+          # 生产环境 Tag 策略：
+          # 1. v1.2.3 -> :1.2.3, :1.2, :1
+          # 2. 自动产生 :latest (因为 flavor 默认配置对 Tag 事件生效)
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
 
-      - name: Build and push Docker image
+      # 纯粹的构建和推送，不跑测试脚本
+      - name: Build and Push
         uses: docker/build-push-action@v5
         with:
           context: .
-          platforms: |
-            linux/arm64
-            linux/amd64
-          file: ./Dockerfile
+          # 正式版必须构建双架构
+          platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ${{ env.DOCKERHUB_REPO }}:latest
-            ${{ env.DOCKERHUB_REPO }}:${{ steps.meta.outputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
