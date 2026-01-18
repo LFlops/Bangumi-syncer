@@ -42,7 +42,6 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=semver,pattern={{major}}
 
-      # 纯粹的构建和推送，不跑测试脚本
       - name: Build and Push
         uses: docker/build-push-action@v5
         with:
