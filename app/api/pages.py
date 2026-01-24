@@ -96,3 +96,15 @@ async def logs_page(request: Request):
         return RedirectResponse(url="/login", status_code=302)
 
     return templates.TemplateResponse("logs.html", {"request": request, "user": user})
+
+
+@router.get("/trakt/config", response_class=HTMLResponse)
+async def trakt_config_page(request: Request):
+    """Trakt 配置页面"""
+    user = get_current_user_from_cookie(request)
+    if not user:
+        return RedirectResponse(url="/login", status_code=302)
+
+    return templates.TemplateResponse(
+        "trakt/config.html", {"request": request, "user": user}
+    )
