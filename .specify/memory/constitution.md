@@ -20,6 +20,9 @@
   - **主分支禁令**：严禁在主项目根目录直接修改代码。
   - **Feature 开发**：必须引导用户使用 `just new-feature <name>` 创建隔离环境，并在 `../<project>.worktrees/<name>` 中工作。
 - **环境隔离**：记住每个 Worktree 拥有独立的 `.venv`。
+- **忽略协议 (Ignorance Protocol)**：
+  - **读取**：必须优先读取项目根目录下的 `.claudignore` 文件。
+  - **执行**：凡是该文件中列出的路径或模式（如敏感配置、临时文件、特定构建产物），AI 必须在检索上下文和列出文件结构时**强制忽略**，防止上下文污染或敏感信息泄露。
 
 ### 2.2 规格驱动生命周期 (Spec-Driven Lifecycle)
 **绝不跳过文档直接写代码。** 必须严格遵循 `Spec -> Plan -> Tasks -> Code` 顺序：
@@ -55,11 +58,24 @@ AI Agent 必须**优先**使用 `Justfile` 封装的命令，禁止直接运行�
 
 ### 2.4 领域知识管理 (Domain Knowledge Management)
 **知识库位置**: 项目根目录下的 `context/` 文件夹。
-- **定义**: 该目录存放喂给 AI 的静态领域知识（Domain Knowledge）、业务规则速查表及架构决策记录。
-- **同步协议**:
-  1.  **遵从 (Obey)**: 任务开始前，必须检索 `context/` 下的已有文档，并严格遵守其中的业务约束。
-  2.  **修正 (Rectify)**: 若发现文档描述与实际代码逻辑不一致，**以代码为事实标准 (Code is Truth)**，必须立即修改文档以反映现状。
-  3.  **创建 (Create)**: 若在开发过程中发现缺失必要的领域概念描述或隐藏规则，必须在 `context/` 下主动创建新的 Markdown 文档进行记录。
+
+#### 边界与持久化 (Boundary & Persistence)
+- **Specs vs Context**: 
+  - `specs/` 是**瞬时**的，仅描述当前 Feature 的变更，随任务结束而归档。
+  - `context/` 是**持久**的，存放全生命周期的领域知识（如 Glossary, ADR, Business Rules）。
+- **禁止混淆**：严禁将长期有效的业务逻辑仅写在 `specs/` 中，必须沉淀至 `context/`。
+
+#### 同步协议 (Synchronization Protocol)
+1.  **遵从 (Obey)**: 任务开始前，必须检索 `context/` 下的已有文档。
+2.  **双重验证 (Double-Check Rectification)**: 
+    - 若发现文档与代码不一致，**切勿盲目修改文档**。
+    - **必须暂停**并进行反向验证：确认代码逻辑是否为 BUG。
+    - 仅在确认“代码正确但文档过时”时，才更新文档；否则应修复代码。
+3.  **创建 (Create)**: 发现缺失的领域概念时，主动创建 Markdown 记录。
+
+#### 原子性提交 (Atomic Commits)
+- **同生共死**：`context/` 文件夹下的变更被视为代码的一部分。
+- **操作要求**：在提交 Feature 代码时，必须检查是否有 `context/` 的更新。若有，**必须包含在同一个 Commit 中**，严禁将文档更新滞后处理。
 
 ## 3. 🛡️ 代码与质量规范
 
