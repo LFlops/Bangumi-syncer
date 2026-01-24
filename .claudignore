@@ -1,0 +1,57 @@
+# --- Dependencies & Locks ---
+# 锁定文件包含大量无关的依赖树信息，极大消耗 Token
+uv.lock
+poetry.lock
+Pipfile.lock
+package-lock.json
+
+# --- Binary & Assets (高优先级忽略) ---
+# 静态资源中的二进制文件
+static/logo.png
+static/css/fonts/
+*.woff
+*.woff2
+*.ttf
+*.ico
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.svg
+
+# --- Minified Vendor Libraries ---
+# 压缩过的第三方库代码，AI 不需要阅读这些
+static/js/bootstrap.bundle.min.js
+static/css/bootstrap.min.css
+*.min.js
+*.min.css
+*.map
+
+# --- Python Standard Ignores ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.tox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+
+# --- IDE & Git Metadata ---
+.idea/
+.vscode/
+.git/
+.gitattributes
+.git-blame-ignore-revs
+.gitignore
+.dockerignore
+
+# --- Documentation (可选，视情况而定) ---
+# 如果您主要在写代码，LICENSE 和变更日志可以忽略
+LICENSE
+CHANGELOG.md
