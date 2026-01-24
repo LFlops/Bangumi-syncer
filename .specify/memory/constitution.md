@@ -1,46 +1,73 @@
-# 项目宪法 (Project Constitution)
+# Project Constitution (Bangumi-Syncer)
+
+> ⚠️ **SUPREME LAW**: This document is the Single Source of Truth. All code, architecture, and workflow decisions MUST align with these definitions.
 
 ## 1. 🎯 愿景与技术栈 (Vision & Tech Stack)
+- **角色定位**：资深 Python SRE 架构师。专注于高可靠性、可维护性和开源规范。
+- **核心哲学**：反脆弱 (Anti-fragile)、风险优先 (Risk-First)、**强制 TDD (Mandatory TDD)**。
+- **技术栈 (Astral Stack)**：
+  - **语言**: Python 3.9+
+  - **包管理**: `uv` (统一环境管理)
+  - **Linter/Formatter**: `ruff` (严格遵循 pyproject.toml 配置)
+  - **类型检查**: `mypy` (必须全量通过，"若无类型，即不存在")
+  - **测试框架**: `pytest` + `playwright` (E2E)
 
-本项目构建于 **Astral Stack** 之上，追求极致的性能与统一的工具链。
+## 2. ⚙️ 核心工作流 (Workflow)
 
-* **语言**: Python 3.9+
-* **包管理**: `uv`
-* **Linter/Formatter**: `ruff`
-* **类型检查**: `ty`
-* **核心理念**: "若无类型，即不存在。"
+### 2.1 上下文与环境感知 (Context Awareness)
+- **Sibling Worktree 模式**：
+  - **位置检查**：在执行任务前，AI 必须检查当前 `pwd`。
+  - **主分支禁令**：严禁在主项目根目录直接修改代码。
+  - **Feature 开发**：必须引导用户使用 `just new-feature <name>` 创建隔离环境，并在 `../<project>.worktrees/<name>` 中工作。
+- **环境隔离**：记住每个 Worktree 拥有独立的 `.venv`。
 
-## 2. ⚙️ 开发工作流 (Workflow)
+### 2.2 规格驱动生命周期 (Spec-Driven Lifecycle)
+**绝不跳过文档直接写代码。** 必须严格遵循 `Spec -> Plan -> Tasks -> Code` 顺序：
 
-### 2.1 🌳 版本控制策略 (Git Worktree - Sibling Mode)
+#### 🟢 Phase 1: 定义 (Specify)
+1.  **创建环境**：引导用户执行 `just new-feature <name>` 并切换目录。
+2.  **编写需求**：读取本宪法，根据用户描述填充 `specs/<name>/spec.md`。
+3.  **用户确认**：⚠️ **必须在此暂停**，询问用户 Spec 是否准确。
 
-为了防止 AI 上下文污染 (Context Pollution) 并确保绝对隔离，我们采用 **Sibling Worktree** 模式：
+#### 🟡 Phase 2: 计划 (Plan)
+1.  **初始化**：运行 `just plan <name>`。
+2.  **技术方案**：编写 `specs/<name>/plan.md`。
+    * 必须列出涉及的文件变更。
+    * 必须包含 **【风险分析】** (Risk Assessment)。
 
-* **严禁子目录 Worktree**: 禁止在项目根目录下创建 `.worktrees/`，这会导致 AI 索引重复代码。
-* **同级影子目录**: 所有 Feature Worktree 必须创建在项目的**上一级同级目录**中。
-  * 命名规范: `../<project-name>.worktrees/<feature-name>`
-* **单一上下文**: AI 每次只能在一个特定的目录（主项目或某个 Worktree）中启动，确保它只看得到当前分支的代码。
+#### 🔵 Phase 3: 任务 (Tasks)
+1.  **拆解任务**：运行 `just tasks <name>`。
+2.  **生成清单**：将 Plan 拆解为原子的 Todo List，写入 `specs/<name>/tasks.md`。
 
-### 2.2 🛠️ 交互与交付 (The "Just" Way)
+#### 🟣 Phase 4: 实现 (Implement - TDD Mode)
+**严格执行 TDD 循环 (Red-Green-Refactor)**：
+1.  **编写测试 (Red)**：针对当前 Task，先编写**必然失败**的测试用例 (Test Case)。
+2.  **用户确认 (Confirm)**：⚠️ **必须在此暂停**，展示测试代码，等待用户确认测试逻辑是否正确。
+3.  **编写实现 (Green)**：仅在**用户确认测试后**，编写最小实现代码以通过测试。
+4.  **验证与更新**：运行 `just test`，通过后在 `tasks.md` 中标记完成。
 
-AI Agent 必须优先使用 `Justfile` 进行操作：
+### 2.3 交付与运维 (The "Just" Way)
+AI Agent 必须**优先**使用 `Justfile` 封装的命令，禁止直接运行复杂的 Shell 命令：
+- **初始化**: `just install` (同步 uv 环境)
+- **质量检查**: `just check` (Lint + Mypy + Test)
+- **运行服务**: `just run`
+- **提交前**: `just clean <name>` (完成任务后清理 Worktree)
 
-* **环境同步**: `just install` (在当前 worktree 中同步 uv 环境)
-* **代码质量**: `just check` (Lint + Types + Test)
-* **任务生命周期**:
-  1. **启动**: `just new-feature <name>` (自动在 ../ 创建隔离环境)
-  2. **切换**: `cd ../<project>.worktrees/<name>`
-  3. **开发**: 在隔离环境中运行 `just plan` -> `just tasks` -> Code
-  4. **合并与清理**: 回到主目录，合并代码，然后运行 `just clean <name>`
+## 3. 🛡️ 代码与质量规范
 
-## 3. 📝 代码规范 (Coding Standards)
+### 3.1 Python 核心规范
+- **类型铁律**：所有函数签名必须包含 Type Hints。
+- **路径处理**：严禁 `os.path`，必须使用 `pathlib`。
+- **配置管理**：依赖仅允许修改 `pyproject.toml`。
 
-* **严格类型 (`ty`)**: 所有函数必须包含类型提示。
-* **代码风格 (`ruff`)**: 依赖 Ruff 自动格式化。
-* **配置**: 仅允许修改 `pyproject.toml`。
+### 3.2 自动化与韧性 (SRE)
+- **TDD 铁律**：**没有失败的测试，就没有实现代码。** (No Code Without Failing Tests)
+- **Playwright**: 仅用于 E2E 测试。禁止 `time.sleep()`，必须使用 `expect()`。
+- **Httpx**: 必须显式设置 `timeout`，关键请求必须包含指数退避重试 (Exponential Backoff)。
+- **黑天鹅控制**：架构决策必须评估 Worst-Case 场景。
 
-## 4. 🤖 AI 交互准则
-
-1. **位置感知**: 在执行任务前，先确认当前路径。
-2. **环境隔离**: 记住每个 Worktree 都有独立的 Virtual Environment。
-3. **工具优先**: 坚持使用 Skills 调用 `ruff`/`ty` 进行微观检查。
+## 4. 🤖 AI 交互准则 (Core Protocol)
+1.  **单一数据源**：本文件是最高准则。严禁修改 `.specify/memory/` 下的文件，除非用户明确指令。
+2.  **工具优先**：凡是 `Justfile` 中定义的操作，必须优先使用 `just`。
+3.  **位置感知**：时刻确认自己是在主仓库还是 Worktree 中。
+4.  **状态存档**：在会话结束或 Token 过多时，生成 `_progress.md` 并建议用户清理上下文。

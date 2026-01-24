@@ -16,6 +16,11 @@ install:
 add package:
     uv add {{package}}
 
+# 启动开发服务器 (假设入口是 app/main.py 或 uvicorn)
+run:
+    @echo "▶️ Starting application..."
+    uv run uvicorn app.main:app --reload
+
 # === 2. Worktree Management (Sibling Isolation) ===
 
 # [Step 1] 创建完全隔离的新功能环境
@@ -29,11 +34,12 @@ new-feature name:
     git worktree add "{{worktree_root}}/{{name}}" -b feature/{{name}}
     
     # 2. 复制 spec 模板到新环境 (保持 spec-kit 结构)
+    # 注意：确保 .specify/templates 存在
     mkdir -p "{{worktree_root}}/{{name}}/specs/{{name}}"
     cp .specify/templates/spec.md "{{worktree_root}}/{{name}}/specs/{{name}}/spec.md"
     
     # 3. 初始化新环境的 uv (可选，也可以让用户进去后自己跑)
-    # cd "{{worktree_root}}/{{name}}" && uv sync
+    cd "{{worktree_root}}/{{name}}" && uv sync
     
     @echo ""
     @echo "✅ Isolated Environment Ready!"
@@ -63,6 +69,10 @@ types:
 test:
     uv run pytest
 
+# 运行 E2E 测试 (Playwright)
+test-e2e:
+    uv run pytest -m "not unit" 
+
 check: lint types test
 
 # === 4. Spec-Driven Flow ===
@@ -72,3 +82,14 @@ plan name:
 
 tasks name:
     cp .specify/templates/tasks.md specs/{{name}}/tasks.md
+
+# === 5. Ops & Docker (SRE Context) ===
+
+docker-build:
+    docker build -t {{project_name}}:latest .
+
+docker-up:
+    docker compose up -d
+
+docker-down:
+    docker compose down
