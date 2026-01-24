@@ -9,7 +9,7 @@
   - **语言**: Python 3.9+
   - **包管理**: `uv` (统一环境管理)
   - **Linter/Formatter**: `ruff` (严格遵循 pyproject.toml 配置)
-  - **类型检查**: `mypy` (必须全量通过，"若无类型，即不存在")
+  - **类型检查**: `ty` (必须全量通过，"若无类型，即不存在")
   - **测试框架**: `pytest` + `playwright` (E2E)
 
 ## 2. ⚙️ 核心工作流 (Workflow)
@@ -49,9 +49,17 @@
 ### 2.3 交付与运维 (The "Just" Way)
 AI Agent 必须**优先**使用 `Justfile` 封装的命令，禁止直接运行复杂的 Shell 命令：
 - **初始化**: `just install` (同步 uv 环境)
-- **质量检查**: `just check` (Lint + Mypy + Test)
+- **质量检查**: `just check` (Lint + ty + Test)
 - **运行服务**: `just run`
 - **提交前**: `just clean <name>` (完成任务后清理 Worktree)
+
+### 2.4 领域知识管理 (Domain Knowledge Management)
+**知识库位置**: 项目根目录下的 `context/` 文件夹。
+- **定义**: 该目录存放喂给 AI 的静态领域知识（Domain Knowledge）、业务规则速查表及架构决策记录。
+- **同步协议**:
+  1.  **遵从 (Obey)**: 任务开始前，必须检索 `context/` 下的已有文档，并严格遵守其中的业务约束。
+  2.  **修正 (Rectify)**: 若发现文档描述与实际代码逻辑不一致，**以代码为事实标准 (Code is Truth)**，必须立即修改文档以反映现状。
+  3.  **创建 (Create)**: 若在开发过程中发现缺失必要的领域概念描述或隐藏规则，必须在 `context/` 下主动创建新的 Markdown 文档进行记录。
 
 ## 3. 🛡️ 代码与质量规范
 
