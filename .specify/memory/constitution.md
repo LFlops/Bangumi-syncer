@@ -23,6 +23,8 @@
 - **忽略协议 (Ignorance Protocol)**：
   - **读取**：必须优先读取项目根目录下的 `.claudignore` 文件。
   - **执行**：凡是该文件中列出的路径或模式（如敏感配置、临时文件、特定构建产物），AI 必须在检索上下文和列出文件结构时**强制忽略**，防止上下文污染或敏感信息泄露。
+- **.gitignore**: 决定代码仓库的边界。原则：该文件变更必须经过人类 Review，严禁 AI 随意修改以“隐藏”文件。
+- **.claudignore**: 决定AI 认知的边界。原则：包含所有 .lock 文件、静态资源图片及大文本数据，以最大化 Token 效率（Signal-to-Noise Ratio）。
 
 ### 2.2 规格驱动生命周期 (Spec-Driven Lifecycle)
 **绝不跳过文档直接写代码。** 必须严格遵循 `Spec -> Plan -> Tasks -> Code` 顺序：
