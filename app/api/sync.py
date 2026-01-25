@@ -159,7 +159,7 @@ async def test_sync(
             elapsed_time = round(time.time() - start_time, 2)
 
             # 精简返回信息
-            response_data = result.dict()
+            response_data = result.model_dump()
             response_data["elapsed_time"] = f"{elapsed_time}秒"
             response_data["test_info"] = {
                 "title": test_item.title,
@@ -311,7 +311,7 @@ async def retry_sync_record(
             )
         # 如果重试仍然失败，保持原状态不变
 
-        return {"status": "success", "message": "重试完成", "data": result.dict()}
+        return {"status": "success", "message": "重试完成", "data": result.model_dump()}
 
     except HTTPException:
         raise
