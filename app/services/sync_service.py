@@ -202,12 +202,19 @@ class SyncService:
                 )
 
             # 查询bangumi番剧指定季度指定集数信息
-            bgm_se_id, bgm_ep_id = bgm.get_target_season_episode_id(
-                subject_id=subject_id,
-                target_season=item.season,
-                target_ep=item.episode,
-                is_season_subject_id=is_season_matched_id,
-            )
+            try:
+                bgm_se_id, bgm_ep_id = bgm.get_target_season_episode_id(
+                    subject_id=subject_id,
+                    target_season=item.season,
+                    target_ep=item.episode,
+                    is_season_subject_id=is_season_matched_id,
+                )
+            except ValueError as ve:
+                # 捕获认证错误（通知已在 BangumiApi 中发送）
+                if "认证失败" in str(ve) or "access_token" in str(ve):
+                    return SyncResponse(status="error", message=str(ve))
+                else:
+                    raise ve
 
             if not bgm_ep_id:
                 logger.error(
@@ -221,7 +228,15 @@ class SyncService:
             )
 
             # 标记为看过
-            mark_status = self._retry_mark_episode(bgm, bgm_se_id, bgm_ep_id)
+            try:
+                mark_status = self._retry_mark_episode(bgm, bgm_se_id, bgm_ep_id)
+            except ValueError as ve:
+                # 捕获认证错误（通知已在 BangumiApi 中发送）
+                if "认证失败" in str(ve) or "access_token" in str(ve):
+                    return SyncResponse(status="error", message=str(ve))
+                else:
+                    raise ve
+
             result_message = ""
 
             if mark_status == 0:
@@ -494,29 +509,38 @@ class SyncService:
                 )
 
                 if bangumi_data_result:
-                    bangumi_data_id, matched_title = bangumi_data_result
+                    bangumi_data_id, matched_title, date_matched = bangumi_data_result
                     logger.info(
-                        f"通过 bangumi-data 匹配到番剧 ID: {bangumi_data_id}, 匹配标题: {matched_title}"
+                        f"通过 bangumi-data 匹配到番剧 ID: {bangumi_data_id}, "
+                        f"匹配标题: {matched_title}, 日期匹配: {date_matched}"
                     )
 
-                    # 判断逻辑：如果bangumi-data匹配到的标题包含明确的季度信息，说明可能匹配到了正确的季度
+                    # 判断逻辑：优先使用日期匹配结果
                     if item.season > 1:
-                        # 检查匹配到的标题中是否包含季度信息
-                        title_has_season_info = self._check_season_info_in_title(
-                            matched_title, item.season
-                        )
-
-                        # 根据季度信息判断是否为特定季度ID
-                        if title_has_season_info:
-                            logger.debug(
-                                "匹配标题包含季度信息，bangumi-data可能匹配到了正确的季度，标记为特定季度ID"
-                            )
+                        if date_matched:
+                            # 通过日期匹配找到的，高可信度，直接标记为特定季度ID
+                            logger.debug("通过日期匹配找到番剧，标记为可信的季度ID")
                             is_season_matched_id = True
                         else:
                             logger.debug(
-                                "匹配标题不包含季度信息，bangumi-data返回的通常是系列ID，需要遍历续集"
+                                f"未通过日期匹配，检查标题 '{matched_title}' 是否包含第{item.season}季信息"
                             )
-                            is_season_matched_id = False
+                            # 未通过日期匹配，检查匹配到的标题中是否包含季度信息
+                            title_has_season_info = self._check_season_info_in_title(
+                                matched_title, item.season
+                            )
+
+                            # 根据季度信息判断是否为特定季度ID
+                            if title_has_season_info:
+                                logger.debug(
+                                    f"匹配标题包含第{item.season}季信息，标记为特定季度ID"
+                                )
+                                is_season_matched_id = True
+                            else:
+                                logger.debug(
+                                    f"匹配标题不包含季度信息，将从系列ID开始遍历续集查找第{item.season}季"
+                                )
+                                is_season_matched_id = False
                     else:
                         # 第一季总是返回True
                         is_season_matched_id = True
