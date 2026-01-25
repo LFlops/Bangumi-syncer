@@ -124,6 +124,12 @@ async def shutdown_event():
 
 
 if __name__ == "__main__":
+    # TODO 开发配置,合入前删除
+    import debugpy
+
+    # 允许远程连接并监听 5678 端口
+    # 0.0.0.0 表示监听所有网络接口，127.0.0.1 仅限本地
+    debugpy.listen(("0.0.0.0", 5678))
     # 配置Uvicorn日志
     uvicorn_logging_config = {
         "version": 1,
