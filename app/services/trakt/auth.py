@@ -29,6 +29,7 @@ class TraktAuthService:
         self.auth_url = "https://trakt.tv/oauth/authorize"
         self.token_url = "https://api.trakt.tv/oauth/token"
         self._oauth_states = {}
+        self.trakt_config = {}
 
     def _get_config(self) -> dict:
         """获取最新的 Trakt 配置"""
