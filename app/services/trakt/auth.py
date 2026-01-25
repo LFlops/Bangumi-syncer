@@ -25,21 +25,25 @@ class TraktAuthService:
     """Trakt OAuth2 认证服务"""
 
     def __init__(self):
-        self.trakt_config = config_manager.get_trakt_config()
         self.base_url = "https://api.trakt.tv"
         self.auth_url = "https://trakt.tv/oauth/authorize"
         self.token_url = "https://api.trakt.tv/oauth/token"
         self._oauth_states = {}
 
+    def _get_config(self) -> dict:
+        """获取最新的 Trakt 配置"""
+        return config_manager.get_trakt_config()
+
     def _validate_config(self) -> bool:
         """验证 Trakt 配置是否有效"""
-        if not self.trakt_config:
+        trakt_config = self._get_config()
+        if not trakt_config:
             logger.error("Trakt 配置未找到")
             return False
 
-        client_id = self.trakt_config.get("client_id", "").strip()
-        client_secret = self.trakt_config.get("client_secret", "").strip()
-        redirect_uri = self.trakt_config.get("redirect_uri", "").strip()
+        client_id = trakt_config.get("client_id", "").strip()
+        client_secret = trakt_config.get("client_secret", "").strip()
+        redirect_uri = trakt_config.get("redirect_uri", "").strip()
 
         if not client_id:
             logger.error("Trakt client_id 未配置")
@@ -72,10 +76,11 @@ class TraktAuthService:
         self._save_oauth_state(user_id, state)
 
         # 构建授权 URL
+        trakt_config = self._get_config()
         params = {
             "response_type": "code",
-            "client_id": self.trakt_config["client_id"],
-            "redirect_uri": self.trakt_config["redirect_uri"],
+            "client_id": trakt_config["client_id"],
+            "redirect_uri": trakt_config["redirect_uri"],
             "state": state,
         }
 
@@ -111,7 +116,7 @@ class TraktAuthService:
                 refresh_token=token_data.get("refresh_token"),
                 expires_at=self._calculate_expires_at(token_data.get("expires_in")),
                 enabled=True,
-                sync_interval=self.trakt_config.get(
+                sync_interval=self._get_config().get(
                     "default_sync_interval", "0 */6 * * *"
                 ),
                 last_sync_time=None,
@@ -234,11 +239,12 @@ class TraktAuthService:
             if not self._validate_config():
                 return None
 
+            trakt_config = self._get_config()
             data = {
                 "code": code,
-                "client_id": self.trakt_config["client_id"],
-                "client_secret": self.trakt_config["client_secret"],
-                "redirect_uri": self.trakt_config["redirect_uri"],
+                "client_id": trakt_config["client_id"],
+                "client_secret": trakt_config["client_secret"],
+                "redirect_uri": trakt_config["redirect_uri"],
                 "grant_type": "authorization_code",
             }
 
@@ -268,11 +274,12 @@ class TraktAuthService:
             if not self._validate_config():
                 return None
 
+            trakt_config = self._get_config()
             data = {
                 "refresh_token": refresh_token,
-                "client_id": self.trakt_config["client_id"],
-                "client_secret": self.trakt_config["client_secret"],
-                "redirect_uri": self.trakt_config["redirect_uri"],
+                "client_id": trakt_config["client_id"],
+                "client_secret": trakt_config["client_secret"],
+                "redirect_uri": trakt_config["redirect_uri"],
                 "grant_type": "refresh_token",
             }
 

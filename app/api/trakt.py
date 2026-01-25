@@ -7,9 +7,11 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
+from ..core.config import config_manager
 from ..core.database import database_manager
 from ..core.logging import logger
 from ..models.trakt import (
+    TraktApiConfigUpdateRequest,
     TraktAuthRequest,
     TraktAuthResponse,
     TraktCallbackRequest,
@@ -69,8 +71,8 @@ async def trakt_auth_callback(
         )
 
         if callback_response.success:
-            # 重定向到成功页面
-            return RedirectResponse(url="/trakt/config?status=success")
+            # 重定向到成功页面（不需要认证）
+            return RedirectResponse(url="/trakt/auth/success")
         else:
             # 重定向到失败页面
             return RedirectResponse(
@@ -91,6 +93,9 @@ async def get_trakt_config() -> TraktConfigResponse:
 
         config = trakt_auth_service.get_user_trakt_config(user_id)
 
+        # 从配置文件获取 API 配置
+        trakt_api_config = config_manager.get_trakt_config()
+
         if not config:
             return TraktConfigResponse(
                 user_id=user_id,
@@ -99,6 +104,9 @@ async def get_trakt_config() -> TraktConfigResponse:
                 last_sync_time=None,
                 is_connected=False,
                 token_expires_at=None,
+                client_id=trakt_api_config.get("client_id", ""),
+                client_secret=trakt_api_config.get("client_secret", ""),
+                redirect_uri=trakt_api_config.get("redirect_uri", "http://localhost:8000/api/trakt/auth/callback"),
             )
 
         # 检查令牌是否有效
@@ -111,6 +119,9 @@ async def get_trakt_config() -> TraktConfigResponse:
             last_sync_time=config.last_sync_time,
             is_connected=is_connected,
             token_expires_at=config.expires_at,
+            client_id=trakt_api_config.get("client_id", ""),
+            client_secret=trakt_api_config.get("client_secret", ""),
+            redirect_uri=trakt_api_config.get("redirect_uri", "http://localhost:8000/api/trakt/auth/callback"),
         )
 
     except Exception as e:
@@ -174,6 +185,41 @@ async def update_trakt_config(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"更新配置失败: {str(e)}",
+        )
+
+
+@router.put("/config/api", response_model=dict)
+async def update_trakt_api_config(
+    update_request: TraktApiConfigUpdateRequest,
+) -> dict:
+    """更新 Trakt API 配置"""
+    try:
+        # 获取当前配置
+        trakt_config = config_manager.get_trakt_config()
+
+        # 更新配置
+        if update_request.client_id is not None:
+            trakt_config["client_id"] = update_request.client_id
+            config_manager.set("trakt", "client_id", update_request.client_id)
+
+        if update_request.client_secret is not None:
+            trakt_config["client_secret"] = update_request.client_secret
+            config_manager.set("trakt", "client_secret", update_request.client_secret)
+
+        if update_request.redirect_uri is not None:
+            trakt_config["redirect_uri"] = update_request.redirect_uri
+            config_manager.set("trakt", "redirect_uri", update_request.redirect_uri)
+
+        # 保存配置
+        config_manager.save_config()
+
+        return {"success": True, "message": "API 配置保存成功"}
+
+    except Exception as e:
+        logger.error(f"更新 Trakt API 配置失败: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"更新 API 配置失败: {str(e)}",
         )
 
 

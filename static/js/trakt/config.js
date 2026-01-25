@@ -9,7 +9,11 @@ class TraktConfigPage {
         this.authWindow = null;
         this.authPollInterval = null;
 
+        // 存储实例到全局变量
+        window.traktConfigPage = this;
+
         this.init();
+        this.setupMessageListener();
     }
 
     /**
@@ -20,6 +24,32 @@ class TraktConfigPage {
         this.loadConfig();
         this.loadSyncStatus();
         this.loadSyncHistory();
+    }
+
+    /**
+     * 设置消息监听器
+     */
+    setupMessageListener() {
+        window.addEventListener('message', (event) => {
+            // 只接受来自同源的消息
+            if (event.origin !== window.location.origin) {
+                return;
+            }
+
+            if (event.data && event.data.type === 'trakt_auth_success') {
+                console.log('收到 Trakt 授权成功消息');
+                this.handleAuthSuccessFromChildWindow();
+            } else if (event.data && event.data.type === 'trakt_auth_error') {
+                console.log('收到 Trakt 授权错误消息:', event.data.message);
+                this.showAuthError(event.data.message || '授权失败');
+            } else if (event.data && event.data.type === 'trakt_auth_retry') {
+                console.log('收到重试授权消息');
+                this.showAuthStep(1);
+                setTimeout(() => {
+                    this.startAuthProcess();
+                }, 500);
+            }
+        });
     }
 
     /**
@@ -36,10 +66,16 @@ class TraktConfigPage {
             this.disconnectTrakt();
         });
 
-        // 保存配置表单
+        // 保存同步配置表单
         document.getElementById('sync-config-form').addEventListener('submit', (e) => {
             e.preventDefault();
             this.saveConfig();
+        });
+
+        // 保存 API 配置表单
+        document.getElementById('api-config-form').addEventListener('submit', (e) => {
+            e.preventDefault();
+            this.saveApiConfig();
         });
 
         // 手动同步按钮
@@ -83,6 +119,12 @@ class TraktConfigPage {
             this.showAuthStep(1);
             this.startAuthProcess();
         });
+
+        // 启用 API 配置表单的保存按钮
+        const apiSaveButton = document.querySelector('#api-config-form button[type="submit"]');
+        if (apiSaveButton) {
+            apiSaveButton.disabled = false;
+        }
     }
 
     /**
@@ -173,9 +215,18 @@ class TraktConfigPage {
         const connectionDetails = document.getElementById('connection-details');
         const authButton = document.getElementById('auth-button');
         const disconnectButton = document.getElementById('disconnect-button');
-        const saveButton = document.querySelector('#sync-config-form button[type="submit"]');
+        const syncSaveButton = document.querySelector('#sync-config-form button[type="submit"]');
+        const apiSaveButton = document.querySelector('#api-config-form button[type="submit"]');
         const syncEnabled = document.getElementById('sync-enabled');
         const syncInterval = document.getElementById('sync-interval');
+
+        // API 配置表单元素
+        const clientId = document.getElementById('client-id');
+        const clientSecret = document.getElementById('client-secret');
+        const redirectUri = document.getElementById('redirect-uri');
+
+        // API 配置表单应该始终可用
+        apiSaveButton.disabled = false;
 
         if (!config) {
             // 没有配置
@@ -186,7 +237,7 @@ class TraktConfigPage {
             connectionDetails.textContent = '请先完成 Trakt 授权';
             authButton.disabled = false;
             disconnectButton.disabled = true;
-            saveButton.disabled = true;
+            syncSaveButton.disabled = true;
             return;
         }
 
@@ -203,7 +254,7 @@ class TraktConfigPage {
             `;
             authButton.disabled = true;
             disconnectButton.disabled = false;
-            saveButton.disabled = false;
+            syncSaveButton.disabled = false;
         } else {
             connectionStatus.innerHTML = `
                 <i class="bi bi-exclamation-triangle-fill text-warning me-2"></i>
@@ -212,12 +263,17 @@ class TraktConfigPage {
             connectionDetails.textContent = 'Trakt 授权已过期或无效';
             authButton.disabled = false;
             disconnectButton.disabled = false;
-            saveButton.disabled = false;
+            syncSaveButton.disabled = false;
         }
 
-        // 更新表单
+        // 更新同步配置表单
         syncEnabled.checked = config.enabled;
         syncInterval.value = config.sync_interval || '0 */6 * * *';
+
+        // 更新 API 配置表单
+        if (clientId) clientId.value = config.client_id || '';
+        if (clientSecret) clientSecret.value = config.client_secret || '';
+        if (redirectUri) redirectUri.value = config.redirect_uri || 'http://localhost:8000/api/trakt/auth/callback';
     }
 
     /**
@@ -375,11 +431,48 @@ class TraktConfigPage {
             }
 
             const result = await response.json();
-            this.showNotification('配置保存成功', 'success');
+            this.showNotification('同步配置保存成功', 'success');
             this.updateConfigDisplay(result);
         } catch (error) {
             console.error('保存配置失败:', error);
             this.showNotification(`保存配置失败: ${error.message}`, 'danger');
+        }
+    }
+
+    /**
+     * 保存 API 配置
+     */
+    async saveApiConfig() {
+        const form = document.getElementById('api-config-form');
+        const formData = new FormData(form);
+
+        const apiConfig = {
+            client_id: formData.get('client_id') || '',
+            client_secret: formData.get('client_secret') || '',
+            redirect_uri: formData.get('redirect_uri') || 'http://localhost:8000/api/trakt/auth/callback'
+        };
+
+        try {
+            const response = await fetch('/api/trakt/config/api', {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(apiConfig)
+            });
+
+            if (!response.ok) {
+                const error = await response.json();
+                throw new Error(error.detail || `HTTP ${response.status}`);
+            }
+
+            await response.json();
+            this.showNotification('API 配置保存成功', 'success');
+            // 更新配置显示
+            this.loadConfig();
+        } catch (error) {
+            console.error('保存 API 配置失败:', error);
+            this.showNotification(`保存 API 配置失败: ${error.message}`, 'danger');
         }
     }
 
@@ -535,7 +628,7 @@ class TraktConfigPage {
     /**
      * 开始轮询授权状态
      */
-    startAuthPolling(state) {
+    startAuthPolling(_state) {
         // 清理现有轮询
         if (this.authPollInterval) {
             clearInterval(this.authPollInterval);
@@ -549,27 +642,32 @@ class TraktConfigPage {
 
             try {
                 // 检查授权窗口是否已关闭
+                // 如果窗口关闭，可能是用户手动关闭或授权成功后被关闭
+                // 不立即显示错误，继续轮询检查后端状态
                 if (this.authWindow && this.authWindow.closed) {
+                    // 窗口已关闭，但我们还不知道是否成功
+                    // 可以尝试检查后端状态，或者等待成功消息
+                    // 暂时继续轮询，如果超过最大轮询次数再显示错误
+                }
+
+                // 检查授权状态
+                const isAuthorized = await this.checkAuthStatus();
+                if (isAuthorized) {
                     clearInterval(this.authPollInterval);
-                    this.showAuthError('授权窗口已关闭');
+                    this.handleAuthSuccess();
                     return;
                 }
 
-                // 这里应该检查授权状态，但需要后端支持
-                // 暂时假设授权成功，刷新页面
-                if (pollCount >= 3) { // 模拟等待
+                // 如果超过最大轮询次数，停止轮询
+                if (pollCount >= maxPolls) {
                     clearInterval(this.authPollInterval);
-                    this.showAuthStep(3);
 
-                    // 关闭授权窗口
-                    if (this.authWindow && !this.authWindow.closed) {
-                        this.authWindow.close();
+                    // 检查窗口是否已关闭
+                    if (this.authWindow && this.authWindow.closed) {
+                        this.showAuthError('授权超时或窗口已关闭，请检查是否授权成功');
+                    } else {
+                        this.showAuthError('授权超时，请重试');
                     }
-
-                    // 刷新配置
-                    setTimeout(() => {
-                        this.loadConfig();
-                    }, 1000);
                 }
 
             } catch (error) {
@@ -579,7 +677,7 @@ class TraktConfigPage {
             }
         }, 5000); // 每5秒轮询一次
 
-        // 设置超时
+        // 设置超时（备用）
         setTimeout(() => {
             if (this.authPollInterval) {
                 clearInterval(this.authPollInterval);
@@ -619,6 +717,63 @@ class TraktConfigPage {
     }
 
     /**
+     * 处理来自子窗口的授权成功消息
+     */
+    handleAuthSuccessFromChildWindow() {
+        this.handleAuthSuccess();
+    }
+
+    /**
+     * 处理授权成功
+     */
+    handleAuthSuccess() {
+        // 清理轮询
+        if (this.authPollInterval) {
+            clearInterval(this.authPollInterval);
+            this.authPollInterval = null;
+        }
+
+        // 更新UI
+        this.showAuthStep(3);
+
+        // 关闭授权窗口（如果还开着）
+        if (this.authWindow && !this.authWindow.closed) {
+            this.authWindow.close();
+        }
+
+        // 刷新配置
+        setTimeout(() => {
+            this.loadConfig();
+        }, 1000);
+
+        // 隐藏模态框
+        setTimeout(() => {
+            const modal = bootstrap.Modal.getInstance(document.getElementById('authModal'));
+            if (modal) {
+                modal.hide();
+            }
+        }, 2000);
+    }
+
+    /**
+     * 检查授权状态
+     */
+    async checkAuthStatus() {
+        try {
+            const response = await fetch('/api/trakt/config');
+            if (!response.ok) {
+                return false;
+            }
+
+            const config = await response.json();
+            return config.is_connected === true;
+        } catch (error) {
+            console.error('检查授权状态失败:', error);
+            return false;
+        }
+    }
+
+    /**
      * 格式化日期时间
      */
     formatDate(timestamp) {
@@ -647,3 +802,18 @@ class TraktConfigPage {
 document.addEventListener('DOMContentLoaded', () => {
     new TraktConfigPage();
 });
+
+// 全局函数，供子窗口调用
+function handleTraktAuthSuccess() {
+    console.log('Trakt 授权成功回调');
+    // 重新加载配置
+    const page = window.traktConfigPage;
+    if (page && typeof page.loadConfig === 'function') {
+        page.loadConfig();
+        // 隐藏授权模态框
+        const modal = bootstrap.Modal.getInstance(document.getElementById('authModal'));
+        if (modal) {
+            modal.hide();
+        }
+    }
+}
