@@ -108,3 +108,23 @@ async def trakt_config_page(request: Request):
     return templates.TemplateResponse(
         "trakt/config.html", {"request": request, "user": user}
     )
+
+
+@router.get("/trakt/auth/success", response_class=HTMLResponse)
+async def trakt_auth_success_page(request: Request):
+    """Trakt 授权成功页面（不需要认证）"""
+    return templates.TemplateResponse(
+        "trakt/auth_success.html", {"request": request}
+    )
+
+
+@router.get("/trakt/auth", response_class=HTMLResponse)
+async def trakt_auth_error_page(request: Request):
+    """Trakt 授权错误页面（不需要认证）"""
+    status = request.query_params.get("status", "")
+    message = request.query_params.get("message", "")
+
+    return templates.TemplateResponse(
+        "trakt/auth_error.html",
+        {"request": request, "status": status, "message": message}
+    )

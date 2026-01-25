@@ -149,6 +149,9 @@ class TraktConfigResponse(BaseModel):
     last_sync_time: Optional[int] = Field(None, description="最后同步时间")
     is_connected: bool = Field(..., description="是否已连接 Trakt")
     token_expires_at: Optional[int] = Field(None, description="令牌过期时间")
+    client_id: str = Field("", description="Trakt Client ID")
+    client_secret: str = Field("", description="Trakt Client Secret")
+    redirect_uri: str = Field("", description="OAuth 回调 URL")
 
 
 class TraktConfigUpdateRequest(BaseModel):
@@ -156,6 +159,14 @@ class TraktConfigUpdateRequest(BaseModel):
 
     enabled: Optional[bool] = Field(None, description="是否启用")
     sync_interval: Optional[str] = Field(None, description="同步间隔")
+
+
+class TraktApiConfigUpdateRequest(BaseModel):
+    """Trakt API 配置更新请求模型"""
+
+    client_id: Optional[str] = Field(None, description="Trakt Client ID")
+    client_secret: Optional[str] = Field(None, description="Trakt Client Secret")
+    redirect_uri: Optional[str] = Field(None, description="OAuth 回调 URL")
 
 
 class TraktSyncStatusResponse(BaseModel):
