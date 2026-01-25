@@ -1,12 +1,12 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Trakt 授权成功 - Bangumi Syncer</title>
-    <link href="/static/css/bootstrap.min.css" rel="stylesheet">
-    <link href="/static/css/bootstrap-icons.css" rel="stylesheet">
-    <style>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Trakt 授权成功 - Bangumi Syncer</title>
+        <link href="/static/css/bootstrap.min.css" rel="stylesheet">
+        <link href="/static/css/bootstrap-icons.css" rel="stylesheet">
+        <style>
         body {
             background-color: #f8f9fa;
         }
@@ -27,25 +27,23 @@
         .btn-close-window {
             margin-top: 20px;
         }
-    </style>
-</head>
-<body>
-    <div class="success-container">
-        <div class="success-icon">
-            <i class="bi bi-check-circle-fill"></i>
+        </style>
+    </head>
+    <body>
+        <div class="success-container">
+            <div class="success-icon">
+                <i class="bi bi-check-circle-fill"></i>
+            </div>
+            <h2>授权成功！</h2>
+            <p class="text-muted">Trakt.tv 授权已完成。</p>
+            <p class="text-muted">现在可以关闭此窗口并返回配置页面。</p>
+            <div class="mt-4">
+                <button id="close-button" class="btn btn-primary btn-close-window">
+                    <i class="bi bi-x-circle me-2"></i>关闭窗口
+                </button>
+            </div>
         </div>
-        <h2>授权成功！</h2>
-        <p class="text-muted">Trakt.tv 授权已完成。</p>
-        <p class="text-muted">现在可以关闭此窗口并返回配置页面。</p>
-
-        <div class="mt-4">
-            <button id="close-button" class="btn btn-primary btn-close-window">
-                <i class="bi bi-x-circle me-2"></i>关闭窗口
-            </button>
-        </div>
-    </div>
-
-    <script>
+        <script>
         // 尝试通知父窗口授权成功
         try {
             if (window.opener && !window.opener.closed) {
@@ -79,6 +77,6 @@
                 }
             }
         }, 3000);
-    </script>
-</body>
+        </script>
+    </body>
 </html>
