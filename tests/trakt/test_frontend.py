@@ -1,6 +1,7 @@
 """
 Trakt 前端页面测试 (使用 Playwright)
 """
+
 from unittest.mock import Mock, patch
 
 import pytest
@@ -21,16 +22,20 @@ class TestTraktFrontendAPI:
 
     def test_trakt_config_page_requires_auth(self):
         """测试 Trakt 配置页面需要认证"""
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=None):
+        with patch("app.api.pages.get_current_user_from_cookie", return_value=None):
             client = TestClient(app)
             response = client.get("/trakt/config", follow_redirects=False)
             assert response.status_code == 302
             assert "/login" in response.headers["location"]
 
-    def test_trakt_config_page_authenticated(self, mock_database_manager, mock_config_manager):
+    def test_trakt_config_page_authenticated(
+        self, mock_database_manager, mock_config_manager
+    ):
         """测试认证用户访问 Trakt 配置页面"""
         mock_user = Mock(id="test_user", name="Test User")
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
             assert response.status_code == 200
@@ -46,7 +51,9 @@ class TestTraktFrontendPlaywright:
     """Trakt 前端 Playwright 浏览器测试类"""
 
     @pytest.mark.asyncio
-    async def test_trakt_config_page_loads(self, page, mock_database_manager, mock_config_manager):
+    async def test_trakt_config_page_loads(
+        self, page, mock_database_manager, mock_config_manager
+    ):
         """测试 Trakt 配置页面加载"""
         # 模拟认证用户
         mock_user = Mock(id="test_user", name="Test User")
@@ -60,7 +67,9 @@ class TestTraktFrontendPlaywright:
         # 使用 TestClient 而不是真实服务器（简化）
         # 在实际项目中，应该启动真实服务器进行测试
         # 这里使用模拟的方式
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(fastapi_app)
             response = client.get("/trakt/config")
             assert response.status_code == 200
@@ -75,22 +84,28 @@ class TestTraktFrontendPlaywright:
             assert "同步历史" in response.text
 
     @pytest.mark.asyncio
-    async def test_trakt_config_page_with_connection(self, page, mock_database_manager, mock_config_manager):
+    async def test_trakt_config_page_with_connection(
+        self, page, mock_database_manager, mock_config_manager
+    ):
         """测试已连接 Trakt 的配置页面"""
         mock_user = Mock(id="test_user", name="Test User")
 
         # 添加 Trakt 配置
-        mock_database_manager.save_trakt_config({
-            "user_id": "test_user",
-            "access_token": "valid_token",
-            "refresh_token": "refresh_token",
-            "expires_at": 1700000000 + 3600,
-            "enabled": True,
-            "sync_interval": "0 */6 * * *",
-            "last_sync_time": 1700000000 - 86400
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": "test_user",
+                "access_token": "valid_token",
+                "refresh_token": "refresh_token",
+                "expires_at": 1700000000 + 3600,
+                "enabled": True,
+                "sync_interval": "0 */6 * * *",
+                "last_sync_time": 1700000000 - 86400,
+            }
+        )
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -110,7 +125,9 @@ class TestTraktFrontendPlaywright:
         """测试授权模态框交互"""
         mock_user = Mock(id="test_user", name="Test User")
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -126,7 +143,9 @@ class TestTraktFrontendPlaywright:
         """测试配置表单元素"""
         mock_user = Mock(id="test_user", name="Test User")
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -143,16 +162,20 @@ class TestTraktFrontendPlaywright:
         mock_user = Mock(id="test_user", name="Test User")
 
         # 添加同步历史
-        mock_database_manager.add_trakt_sync_history({
-            "user_id": "test_user",
-            "trakt_item_id": "episode:123",
-            "media_type": "episode",
-            "watched_at": 1705336200,
-            "synced_at": 1705336200,
-            "task_id": "task_123"
-        })
+        mock_database_manager.add_trakt_sync_history(
+            {
+                "user_id": "test_user",
+                "trakt_item_id": "episode:123",
+                "media_type": "episode",
+                "watched_at": 1705336200,
+                "synced_at": 1705336200,
+                "task_id": "task_123",
+            }
+        )
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -169,7 +192,9 @@ class TestTraktFrontendPlaywright:
         """测试页面响应式设计"""
         mock_user = Mock(id="test_user", name="Test User")
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -184,8 +209,10 @@ class TestTraktFrontendPlaywright:
         mock_user = Mock(id="test_user", name="Test User")
 
         # 模拟 API 错误
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
-            with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
+            with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
                 mock_auth_service.get_user_trakt_config = Mock(return_value=None)
 
                 client = TestClient(app)
@@ -200,7 +227,9 @@ class TestTraktFrontendPlaywright:
         """测试静态资源加载"""
         mock_user = Mock(id="test_user", name="Test User")
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 
@@ -214,7 +243,9 @@ class TestTraktFrontendPlaywright:
         """测试页面 meta 标签"""
         mock_user = Mock(id="test_user", name="Test User")
 
-        with patch('app.api.pages.get_current_user_from_cookie', return_value=mock_user):
+        with patch(
+            "app.api.pages.get_current_user_from_cookie", return_value=mock_user
+        ):
             client = TestClient(app)
             response = client.get("/trakt/config")
 

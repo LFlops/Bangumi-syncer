@@ -1,8 +1,10 @@
 """
 Trakt API 接口测试
 """
+
 import time
 from unittest.mock import AsyncMock, Mock, patch
+from urllib.parse import unquote
 
 import pytest
 from fastapi import FastAPI
@@ -30,10 +32,10 @@ class TestTraktAPI:
         # 模拟认证服务
         mock_auth_response = TraktAuthResponse(
             auth_url="https://api.trakt.tv/oauth/authorize?client_id=test",
-            state="test_state"
+            state="test_state",
         )
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.init_oauth = AsyncMock(return_value=mock_auth_response)
 
             # 准备请求数据
@@ -45,13 +47,16 @@ class TestTraktAPI:
             # 验证
             assert response.status_code == 200
             data = response.json()
-            assert data["auth_url"] == "https://api.trakt.tv/oauth/authorize?client_id=test"
+            assert (
+                data["auth_url"]
+                == "https://api.trakt.tv/oauth/authorize?client_id=test"
+            )
             assert data["state"] == "test_state"
             mock_auth_service.init_oauth.assert_called_once_with("test_user")
 
     def test_init_trakt_auth_failure(self):
         """测试初始化 Trakt 授权失败"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.init_oauth = AsyncMock(return_value=None)
 
             request_data = {"user_id": "test_user"}
@@ -65,7 +70,7 @@ class TestTraktAPI:
 
     def test_init_trakt_auth_exception(self):
         """测试初始化 Trakt 授权时发生异常"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.init_oauth = AsyncMock(side_effect=Exception("测试异常"))
 
             request_data = {"user_id": "test_user"}
@@ -87,10 +92,10 @@ class TestTraktAPI:
             last_sync_time=int(time.time()) - 3600,
             access_token="valid_token",
             expires_at=int(time.time()) + 7200,
-            is_token_expired=Mock(return_value=False)
+            is_token_expired=Mock(return_value=False),
         )
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=mock_config)
 
             # 执行
@@ -108,7 +113,7 @@ class TestTraktAPI:
 
     def test_get_trakt_config_not_connected(self):
         """测试获取未连接的 Trakt 配置"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=None)
 
             # 执行
@@ -131,23 +136,20 @@ class TestTraktAPI:
             last_sync_time=int(time.time()) - 3600,
             access_token="valid_token",
             expires_at=int(time.time()) + 7200,
-            is_token_expired=Mock(return_value=False)
+            is_token_expired=Mock(return_value=False),
         )
 
         # 模拟数据库操作
         mock_db_success = True
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=mock_config)
 
-            with patch('app.api.trakt.database_manager') as mock_db:
+            with patch("app.api.trakt.database_manager") as mock_db:
                 mock_db.save_trakt_config = Mock(return_value=mock_db_success)
 
                 # 准备更新数据
-                update_data = {
-                    "enabled": False,
-                    "sync_interval": "0 */3 * * *"
-                }
+                update_data = {"enabled": False, "sync_interval": "0 */3 * * *"}
 
                 # 执行
                 response = self.client.put("/api/trakt/config", json=update_data)
@@ -166,7 +168,7 @@ class TestTraktAPI:
 
     def test_update_trakt_config_not_found(self):
         """测试更新不存在的 Trakt 配置"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=None)
 
             update_data = {"enabled": True}
@@ -188,13 +190,13 @@ class TestTraktAPI:
             last_sync_time=None,
             access_token="valid_token",
             expires_at=int(time.time()) + 7200,
-            is_token_expired=Mock(return_value=False)
+            is_token_expired=Mock(return_value=False),
         )
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=mock_config)
 
-            with patch('app.api.trakt.database_manager') as mock_db:
+            with patch("app.api.trakt.database_manager") as mock_db:
                 mock_db.save_trakt_config = Mock(return_value=False)
 
                 update_data = {"enabled": False}
@@ -214,7 +216,7 @@ class TestTraktAPI:
             last_sync_time=int(time.time()) - 3600,
             access_token="valid_token",
             expires_at=int(time.time()) + 7200,
-            is_token_expired=Mock(return_value=False)
+            is_token_expired=Mock(return_value=False),
         )
 
         # 模拟调度器状态
@@ -228,17 +230,17 @@ class TestTraktAPI:
                 {"status": "success"},
                 {"status": "success"},
                 {"status": "error"},
-                {"status": "success"}
+                {"status": "success"},
             ]
         }
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=mock_config)
 
-            with patch('app.api.trakt.trakt_scheduler') as mock_scheduler:
+            with patch("app.api.trakt.trakt_scheduler") as mock_scheduler:
                 mock_scheduler.get_user_job_status = Mock(return_value=mock_job_status)
 
-                with patch('app.api.trakt.database_manager') as mock_db:
+                with patch("app.api.trakt.database_manager") as mock_db:
                     mock_db.get_sync_records = Mock(return_value=mock_sync_stats)
 
                     # 执行
@@ -256,7 +258,7 @@ class TestTraktAPI:
 
     def test_get_trakt_sync_status_no_config(self):
         """测试获取 Trakt 同步状态（无配置）"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.get_user_trakt_config = Mock(return_value=None)
 
             # 执行
@@ -277,14 +279,13 @@ class TestTraktAPI:
         # 模拟同步服务
         mock_task_id = "trakt_sync_test_user_123456"
 
-        with patch('app.api.trakt.trakt_sync_service') as mock_sync_service:
-            mock_sync_service.start_user_sync_task = AsyncMock(return_value=mock_task_id)
+        with patch("app.api.trakt.trakt_sync_service") as mock_sync_service:
+            mock_sync_service.start_user_sync_task = AsyncMock(
+                return_value=mock_task_id
+            )
 
             # 准备请求数据
-            request_data = {
-                "user_id": "test_user",
-                "full_sync": True
-            }
+            request_data = {"user_id": "test_user", "full_sync": True}
 
             # 执行
             response = self.client.post("/api/trakt/sync/manual", json=request_data)
@@ -297,20 +298,18 @@ class TestTraktAPI:
             assert data["job_id"] == mock_task_id
 
             mock_sync_service.start_user_sync_task.assert_called_once_with(
-                user_id="test_user",
-                full_sync=True
+                user_id="test_user", full_sync=True
             )
 
     @pytest.mark.asyncio
     async def test_manual_trakt_sync_exception(self):
         """测试手动触发 Trakt 同步时发生异常"""
-        with patch('app.api.trakt.trakt_sync_service') as mock_sync_service:
-            mock_sync_service.start_user_sync_task = AsyncMock(side_effect=Exception("测试异常"))
+        with patch("app.api.trakt.trakt_sync_service") as mock_sync_service:
+            mock_sync_service.start_user_sync_task = AsyncMock(
+                side_effect=Exception("测试异常")
+            )
 
-            request_data = {
-                "user_id": "test_user",
-                "full_sync": False
-            }
+            request_data = {"user_id": "test_user", "full_sync": False}
 
             # 执行
             response = self.client.post("/api/trakt/sync/manual", json=request_data)
@@ -321,7 +320,7 @@ class TestTraktAPI:
 
     def test_disconnect_trakt_success(self):
         """测试断开 Trakt 连接成功"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.disconnect_trakt = Mock(return_value=True)
 
             # 执行
@@ -336,7 +335,7 @@ class TestTraktAPI:
 
     def test_disconnect_trakt_failure(self):
         """测试断开 Trakt 连接失败"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.disconnect_trakt = Mock(return_value=False)
 
             # 执行
@@ -348,7 +347,7 @@ class TestTraktAPI:
 
     def test_disconnect_trakt_exception(self):
         """测试断开 Trakt 连接时发生异常"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
             mock_auth_service.disconnect_trakt = Mock(side_effect=Exception("测试异常"))
 
             # 执行
@@ -363,11 +362,16 @@ class TestTraktAPI:
         # 模拟认证服务
         mock_callback_response = Mock(success=True, message="授权成功")
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
-            mock_auth_service.handle_callback = AsyncMock(return_value=mock_callback_response)
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
+            mock_auth_service.handle_callback = AsyncMock(
+                return_value=mock_callback_response
+            )
 
             # 执行回调请求
-            response = self.client.get("/api/trakt/auth/callback?code=test_code&state=test_state")
+            response = self.client.get(
+                "/api/trakt/auth/callback?code=test_code&state=test_state",
+                follow_redirects=False,
+            )
 
             # 验证
             assert response.status_code == 307  # 重定向
@@ -379,41 +383,58 @@ class TestTraktAPI:
         """测试 Trakt OAuth 回调失败"""
         mock_callback_response = Mock(success=False, message="授权失败")
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
-            mock_auth_service.handle_callback = AsyncMock(return_value=mock_callback_response)
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
+            mock_auth_service.handle_callback = AsyncMock(
+                return_value=mock_callback_response
+            )
 
             # 执行回调请求
-            response = self.client.get("/api/trakt/auth/callback?code=test_code&state=test_state")
+            response = self.client.get(
+                "/api/trakt/auth/callback?code=test_code&state=test_state",
+                follow_redirects=False,
+            )
 
             # 验证
             assert response.status_code == 307
             location = response.headers["location"]
             assert "/trakt/auth?status=error" in location
-            assert "message=授权失败" in location
+            unquoted_location = unquote(location)
+            assert "message=授权失败" in unquoted_location
 
     def test_trakt_auth_callback_exception(self):
         """测试 Trakt OAuth 回调时发生异常"""
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
-            mock_auth_service.handle_callback = AsyncMock(side_effect=Exception("回调异常"))
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
+            mock_auth_service.handle_callback = AsyncMock(
+                side_effect=Exception("回调异常")
+            )
 
             # 执行回调请求
-            response = self.client.get("/api/trakt/auth/callback?code=test_code&state=test_state")
+            response = self.client.get(
+                "/api/trakt/auth/callback?code=test_code&state=test_state",
+                follow_redirects=False,
+            )
 
             # 验证
             assert response.status_code == 307
             location = response.headers["location"]
             assert "/trakt/auth?status=error" in location
-            assert "message=回调异常" in location
+            unquoted_location = unquote(location)
+            assert "message=回调异常" in unquoted_location
 
     def test_trakt_auth_callback_no_state(self):
         """测试 Trakt OAuth 回调没有 state 参数"""
         mock_callback_response = Mock(success=True, message="授权成功")
 
-        with patch('app.api.trakt.trakt_auth_service') as mock_auth_service:
-            mock_auth_service.handle_callback = AsyncMock(return_value=mock_callback_response)
+        with patch("app.api.trakt.trakt_auth_service") as mock_auth_service:
+            mock_auth_service.handle_callback = AsyncMock(
+                return_value=mock_callback_response
+            )
 
             # 执行回调请求（无 state 参数）
-            response = self.client.get("/api/trakt/auth/callback?code=test_code")
+            response = self.client.get(
+                "/api/trakt/auth/callback?code=test_code",
+                follow_redirects=False,
+            )
 
             # 验证
             assert response.status_code == 307
