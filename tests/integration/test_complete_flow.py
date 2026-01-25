@@ -1,6 +1,7 @@
 """
 Trakt 完整流程集成测试
 """
+
 import asyncio
 import time
 from datetime import datetime, timedelta
@@ -8,9 +9,10 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from app.models.trakt import TraktConfig, TraktHistoryItem
+from app.models.trakt import TraktConfig
 from app.services.trakt.auth import TraktAuthService
 from app.services.trakt.client import TraktClient
+from app.services.trakt.models import TraktHistoryItem
 from app.services.trakt.scheduler import TraktScheduler
 from app.services.trakt.sync_service import TraktSyncService
 
@@ -19,7 +21,9 @@ class TestCompleteTraktFlow:
     """完整 Trakt 流程集成测试"""
 
     @pytest.mark.asyncio
-    async def test_complete_user_journey(self, mock_database_manager, mock_sync_service):
+    async def test_complete_user_journey(
+        self, mock_database_manager, mock_sync_service
+    ):
         """测试从授权到定期同步的完整流程"""
         # 1. 初始化服务
         auth_service = TraktAuthService()
@@ -27,12 +31,17 @@ class TestCompleteTraktFlow:
 
         user_id = "test_user"
 
-        # 2. 模拟 OAuth 授权
-        # 生成授权 URL
-        with patch('secrets.token_urlsafe', return_value="test_state_123"):
-            auth_url = await auth_service.init_oauth(user_id)
-            assert auth_url.startswith("https://api.trakt.tv/oauth/authorize")
-            assert "test_state_123" in auth_service._oauth_states
+        # TODO: 需要mock auth_service._validate_config 方法以绕过实际验证
+        with patch.object(
+            TraktAuthService, "_validate_config", AsyncMock(return_value=True)
+        ):
+            # 2. 模拟 OAuth 授权
+            # 生成授权 URL
+            with patch("secrets.token_urlsafe", return_value="test_state_123"):
+                auth_response = await auth_service.init_oauth(user_id)
+                assert auth_response is not None
+                assert auth_response.auth_url.startswith(auth_service.auth_url)
+                assert "test_state_123" in auth_service._oauth_states
 
         # 3. 模拟 OAuth 回调处理
         mock_trakt_response = {
@@ -40,10 +49,10 @@ class TestCompleteTraktFlow:
             "refresh_token": "test_refresh_token_101",
             "expires_in": 7200,
             "scope": "public",
-            "token_type": "bearer"
+            "token_type": "bearer",
         }
 
-        with patch('httpx.AsyncClient') as mock_client_class:
+        with patch("httpx.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_response = Mock()
             mock_response.status_code = 200
@@ -52,8 +61,13 @@ class TestCompleteTraktFlow:
             mock_client_class.return_value.__aenter__.return_value = mock_client
 
             # 处理回调
-            result = await auth_service.handle_callback("test_code", "test_state_123")
-            assert result is True
+            from app.models.trakt import TraktCallbackRequest
+
+            callback_request = TraktCallbackRequest(
+                code="test_code", state="test_state_123"
+            )
+            result = await auth_service.handle_callback(callback_request, "test_user")
+            assert result.success is True
 
             # 验证配置保存
             saved_config = mock_database_manager.get_trakt_config(user_id)
@@ -76,31 +90,34 @@ class TestCompleteTraktFlow:
             watched_at="2024-01-15T20:30:00.000Z",
             action="scrobble",
             type="episode",
-            episode={
-                "season": 1,
-                "number": 5,
-                "title": "Pilot",
-                "ids": {"trakt": 123}
-            },
+            episode={"season": 1, "number": 5, "title": "Pilot", "ids": {"trakt": 123}},
             show={
                 "title": "Example Show",
                 "original_title": "Example Show Original",
-                "ids": {"trakt": 456}
-            }
+                "ids": {"trakt": 456},
+            },
         )
 
         # 模拟客户端方法
-        trakt_client.get_all_watched_history = AsyncMock(return_value=[test_history_item])
+        trakt_client.get_all_watched_history = AsyncMock(
+            return_value=[test_history_item]
+        )
 
         # 6. 执行数据同步
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                   AsyncMock(return_value=trakt_client)):
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client",
+            AsyncMock(return_value=trakt_client),
+        ):
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
                 mock_auth_service.get_user_trakt_config.return_value = config
                 mock_auth_service.refresh_token = AsyncMock()
 
                 # 执行同步
-                sync_result = await sync_service.sync_user_trakt_data(user_id, full_sync=False)
+                sync_result = await sync_service.sync_user_trakt_data(
+                    user_id, full_sync=False
+                )
 
                 # 验证同步结果
                 assert sync_result.success is True
@@ -118,7 +135,9 @@ class TestCompleteTraktFlow:
         scheduler = TraktScheduler()
 
         # 模拟调度器启动
-        with patch('app.services.trakt.scheduler.AsyncIOScheduler') as mock_scheduler_class:
+        with patch(
+            "app.services.trakt.scheduler.AsyncIOScheduler"
+        ) as mock_scheduler_class:
             mock_scheduler = Mock()
             mock_scheduler.running = False
             mock_scheduler.start = Mock()
@@ -134,26 +153,27 @@ class TestCompleteTraktFlow:
         assert updated_config["enabled"] is True
         assert updated_config["sync_interval"] == "0 */2 * * *"
 
-        logger.info(f"完整用户旅程测试完成: 用户 {user_id}")
-
     @pytest.mark.asyncio
     async def test_error_recovery_scenario(self, mock_database_manager):
         """测试错误场景下的恢复能力"""
         # 1. 配置有效的 Trakt 连接
         user_id = "test_user"
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "valid_token",
-            "expires_at": int(time.time()) + 3600,
-            "enabled": True,
-            "last_sync_time": int(time.time()) - 86400
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "valid_token",
+                "expires_at": int(time.time()) + 3600,
+                "enabled": True,
+                "last_sync_time": int(time.time()) - 86400,
+            }
+        )
 
-        auth_service = TraktAuthService()
         sync_service = TraktSyncService()
 
         # 2. 模拟第一次同步时 Trakt API 暂时不可用
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client') as mock_create_client:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client"
+        ) as mock_create_client:
             # 第一次调用失败，第二次调用成功
             mock_client_failure = AsyncMock()
             mock_client_failure.get_all_watched_history = AsyncMock(
@@ -165,8 +185,12 @@ class TestCompleteTraktFlow:
 
             mock_create_client.side_effect = [mock_client_failure, mock_client_success]
 
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
-                config = TraktConfig.from_dict(mock_database_manager.get_trakt_config(user_id))
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
+                config = TraktConfig.from_dict(
+                    mock_database_manager.get_trakt_config(user_id)
+                )
                 mock_auth_service.get_user_trakt_config.return_value = config
                 mock_auth_service.refresh_token = AsyncMock()
 
@@ -183,7 +207,6 @@ class TestCompleteTraktFlow:
                 assert second_result.success is True
 
         # 3. 验证错误被记录但系统继续运行
-        logger.info("错误恢复测试完成: 第一次失败，第二次成功")
 
     @pytest.mark.asyncio
     async def test_concurrent_user_sync(self, mock_database_manager, mock_sync_service):
@@ -193,12 +216,14 @@ class TestCompleteTraktFlow:
         sync_service = TraktSyncService()
 
         for user_id in users:
-            mock_database_manager.save_trakt_config({
-                "user_id": user_id,
-                "access_token": f"token_{user_id}",
-                "expires_at": int(time.time()) + 3600,
-                "enabled": True
-            })
+            mock_database_manager.save_trakt_config(
+                {
+                    "user_id": user_id,
+                    "access_token": f"token_{user_id}",
+                    "expires_at": int(time.time()) + 3600,
+                    "enabled": True,
+                }
+            )
 
         # 模拟 Trakt 客户端
         mock_clients = {}
@@ -212,7 +237,7 @@ class TestCompleteTraktFlow:
                 action="scrobble",
                 type="episode",
                 episode={"season": 1, "number": int(user_id[-1])},
-                show={"title": f"Show for {user_id}"}
+                show={"title": f"Show for {user_id}"},
             )
             mock_client.get_all_watched_history = AsyncMock(return_value=[history_item])
             return mock_client
@@ -227,9 +252,13 @@ class TestCompleteTraktFlow:
                     return mock_clients[user_id]
             return None
 
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                   side_effect=create_client_side_effect):
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client",
+            side_effect=create_client_side_effect,
+        ):
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
                 # 配置认证服务
                 def get_config_side_effect(user_id):
                     config_dict = mock_database_manager.get_trakt_config(user_id)
@@ -237,7 +266,9 @@ class TestCompleteTraktFlow:
                         return TraktConfig.from_dict(config_dict)
                     return None
 
-                mock_auth_service.get_user_trakt_config.side_effect = get_config_side_effect
+                mock_auth_service.get_user_trakt_config.side_effect = (
+                    get_config_side_effect
+                )
                 mock_auth_service.refresh_token = AsyncMock()
 
                 # 并发执行同步任务
@@ -254,20 +285,22 @@ class TestCompleteTraktFlow:
                     if isinstance(result, Exception):
                         # 不应该有异常
                         raise result
-                    assert result.success is True, f"用户 {users[i]} 同步失败: {result.message}"
+                    assert result.success is True, (
+                        f"用户 {users[i]} 同步失败: {result.message}"
+                    )
                     assert result.synced_count == 1, f"用户 {users[i]} 应该同步1条记录"
 
                 # 验证每个用户的数据独立
                 for user_id in users:
-                    sync_history = mock_database_manager.get_trakt_sync_history(user_id, limit=10)
+                    sync_history = mock_database_manager.get_trakt_sync_history(
+                        user_id, limit=10
+                    )
                     assert sync_history["total"] == 1
                     record = sync_history["records"][0]
                     assert record["user_id"] == user_id
 
                 # 验证无数据混淆
                 # 每个用户的同步历史应该只包含自己的记录
-
-        logger.info(f"并发用户同步测试完成: {len(users)} 个用户同时同步")
 
     @pytest.mark.asyncio
     async def test_token_auto_refresh_flow(self, mock_database_manager):
@@ -277,13 +310,15 @@ class TestCompleteTraktFlow:
 
         # 1. 初始 token（已过期）
         expired_time = int(time.time()) - 3600
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "expired_token",
-            "refresh_token": "valid_refresh_token",
-            "expires_at": expired_time,
-            "enabled": True
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "expired_token",
+                "refresh_token": "valid_refresh_token",
+                "expires_at": expired_time,
+                "enabled": True,
+            }
+        )
 
         # 2. 模拟 token 刷新成功
         mock_refresh_response = {
@@ -291,10 +326,10 @@ class TestCompleteTraktFlow:
             "refresh_token": "new_refresh_token_456",
             "expires_in": 7200,
             "scope": "public",
-            "token_type": "bearer"
+            "token_type": "bearer",
         }
 
-        with patch('httpx.AsyncClient') as mock_client_class:
+        with patch("httpx.AsyncClient") as mock_client_class:
             mock_client = AsyncMock()
             mock_response = Mock()
             mock_response.status_code = 200
@@ -317,12 +352,16 @@ class TestCompleteTraktFlow:
         # 3. 使用新 token 进行同步
         sync_service = TraktSyncService()
 
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client') as mock_create_client:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client"
+        ) as mock_create_client:
             mock_client = AsyncMock()
             mock_client.get_all_watched_history = AsyncMock(return_value=[])
             mock_create_client.return_value = mock_client
 
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
                 config = TraktConfig.from_dict(updated_config)
                 mock_auth_service.get_user_trakt_config.return_value = config
 
@@ -333,23 +372,25 @@ class TestCompleteTraktFlow:
                 # 验证客户端使用新 token 创建
                 mock_create_client.assert_called_once_with("new_access_token_123")
 
-        logger.info("Token 自动刷新流程测试完成")
-
     @pytest.mark.asyncio
-    async def test_incremental_sync_logic(self, mock_database_manager, mock_sync_service):
+    async def test_incremental_sync_logic(
+        self, mock_database_manager, mock_sync_service
+    ):
         """测试增量同步逻辑"""
         user_id = "test_user"
         sync_service = TraktSyncService()
 
         # 1. 设置上次同步时间（3天前）
         three_days_ago = int(time.time()) - 3 * 86400
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "test_token",
-            "expires_at": int(time.time()) + 3600,
-            "enabled": True,
-            "last_sync_time": three_days_ago
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "test_token",
+                "expires_at": int(time.time()) + 3600,
+                "enabled": True,
+                "last_sync_time": three_days_ago,
+            }
+        )
 
         config = TraktConfig.from_dict(mock_database_manager.get_trakt_config(user_id))
 
@@ -363,7 +404,7 @@ class TestCompleteTraktFlow:
             action="scrobble",
             type="episode",
             episode={"season": 1, "number": 1},
-            show={"title": "Old Show"}
+            show={"title": "Old Show"},
         )
 
         new_item = TraktHistoryItem(
@@ -372,18 +413,17 @@ class TestCompleteTraktFlow:
             action="scrobble",
             type="episode",
             episode={"season": 1, "number": 2},
-            show={"title": "New Show"}
+            show={"title": "New Show"},
         )
 
         # 模拟客户端返回新旧数据
-        mock_client.get_all_watched_history = AsyncMock(return_value=[old_item, new_item])
+        mock_client.get_all_watched_history = AsyncMock(
+            return_value=[old_item, new_item]
+        )
 
         # 3. 执行增量同步（从3天前开始）
         result = await sync_service._sync_watched_history(
-            user_id=user_id,
-            client=mock_client,
-            config=config,
-            full_sync=False
+            user_id=user_id, client=mock_client, config=config, full_sync=False
         )
 
         # 4. 验证
@@ -406,10 +446,7 @@ class TestCompleteTraktFlow:
         mock_client.get_all_watched_history.return_value = [old_item, new_item]
 
         result = await sync_service._sync_watched_history(
-            user_id=user_id,
-            client=mock_client,
-            config=config,
-            full_sync=True
+            user_id=user_id, client=mock_client, config=config, full_sync=True
         )
 
         # 验证全量同步不包含开始日期
@@ -417,20 +454,20 @@ class TestCompleteTraktFlow:
         call_args = mock_client.get_all_watched_history.call_args[1]
         assert "start_date" not in call_args
 
-        logger.info("增量同步逻辑测试完成")
-
     @pytest.mark.asyncio
     async def test_scheduler_integration(self, mock_database_manager):
         """测试调度器集成"""
         # 准备用户配置
         user_id = "test_user"
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "test_token",
-            "expires_at": int(time.time()) + 3600,
-            "enabled": True,
-            "sync_interval": "*/5 * * * *"  # 每5分钟（测试用）
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "test_token",
+                "expires_at": int(time.time()) + 3600,
+                "enabled": True,
+                "sync_interval": "*/5 * * * *",  # 每5分钟（测试用）
+            }
+        )
 
         scheduler = TraktScheduler()
 
@@ -440,8 +477,10 @@ class TestCompleteTraktFlow:
         mock_async_scheduler.start = Mock()
         mock_async_scheduler.add_job = Mock()
 
-        with patch('app.services.trakt.scheduler.AsyncIOScheduler',
-                   return_value=mock_async_scheduler):
+        with patch(
+            "app.services.trakt.scheduler.AsyncIOScheduler",
+            return_value=mock_async_scheduler,
+        ):
             # 启动调度器
             result = scheduler.start()
             assert result is True
@@ -451,7 +490,7 @@ class TestCompleteTraktFlow:
             mock_async_scheduler.start.assert_called_once()
 
         # 模拟定时任务执行
-        with patch.object(scheduler, 'sync_user_data', AsyncMock()) as mock_sync_data:
+        with patch.object(scheduler, "sync_user_data", AsyncMock()) as mock_sync_data:
             # 模拟调度器触发任务
             await scheduler._sync_user_data_wrapper(user_id)
 
@@ -466,17 +505,3 @@ class TestCompleteTraktFlow:
         assert result is True
         mock_async_scheduler.shutdown.assert_called_once()
         assert scheduler.scheduler is None
-
-        logger.info("调度器集成测试完成")
-
-
-# 模拟日志记录
-class MockLogger:
-    def info(self, message):
-        print(f"[INFO] {message}")
-
-    def error(self, message):
-        print(f"[ERROR] {message}")
-
-
-logger = MockLogger()

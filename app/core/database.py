@@ -77,7 +77,7 @@ class DatabaseManager:
         self,
         user_name: str,
         title: str,
-        ori_title: str,
+        ori_title: Optional[str],
         season: int,
         episode: int,
         subject_id: Optional[str] = None,

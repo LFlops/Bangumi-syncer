@@ -3,7 +3,6 @@ Trakt 数据同步服务
 """
 
 import asyncio
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -47,7 +46,12 @@ class TraktSyncService:
         config = trakt_auth_service.get_user_trakt_config(user_id)
         if config is None:
             return TraktSyncResult(
-                success=False, message="Trakt 配置不存在", error_count=1
+                success=False,
+                message="Trakt 配置不存在",
+                error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
             )
 
         if not config.access_token:
@@ -55,10 +59,10 @@ class TraktSyncService:
                 success=False,
                 message="Trakt 未授权，请先完成 OAuth 授权",
                 error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
             )
-
-        # 此时 config 肯定不为 None
-        assert config is not None
 
         # 检查令牌是否过期
         if config.is_token_expired():
@@ -66,20 +70,47 @@ class TraktSyncService:
             success = await trakt_auth_service.refresh_token(user_id)
             if not success:
                 return TraktSyncResult(
-                    success=False, message="Trakt 令牌过期且刷新失败", error_count=1
+                    success=False,
+                    message="Trakt 令牌过期且刷新失败",
+                    error_count=1,
+                    synced_count=0,
+                    skipped_count=0,
+                    details={},
                 )
             # 刷新后重新获取配置
             config = trakt_auth_service.get_user_trakt_config(user_id)
 
         # 创建 Trakt 客户端
+        if config is None:
+            return TraktSyncResult(
+                success=False,
+                message="Trakt 配置不存在",
+                error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
+            )
+
         client = await TraktClientFactory.create_client(config.access_token)
         if not client:
             return TraktSyncResult(
-                success=False, message="创建 Trakt 客户端失败", error_count=1
+                success=False,
+                message="创建 Trakt 客户端失败",
+                error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
             )
 
         try:
-            stats = TraktSyncStats(start_time=time.time())
+            stats = TraktSyncStats(
+                total_items=0,
+                movies=0,
+                episodes=0,
+                start_time=time.time(),
+                end_time=None,
+                duration=None,
+            )
             synced_count = 0
             skipped_count = 0
             error_count = 0
@@ -96,28 +127,28 @@ class TraktSyncService:
                 error_count += history_result.error_count
                 details["history"] = history_result.details
 
-            if "ratings" in sync_types:
-                logger.info(f"开始同步用户 {user_id} 的 Trakt 评分")
-                ratings_result = await self._sync_ratings(
-                    user_id, client, config, full_sync
-                )
-                synced_count += ratings_result.synced_count
-                skipped_count += ratings_result.skipped_count
-                error_count += ratings_result.error_count
-                details["ratings"] = ratings_result.details
+            # if "ratings" in sync_types:
+            #     logger.info(f"开始同步用户 {user_id} 的 Trakt 评分")
+            #     ratings_result = await self._sync_ratings(
+            #         user_id, client, config, full_sync
+            #     )
+            #     synced_count += ratings_result.synced_count
+            #     skipped_count += ratings_result.skipped_count
+            #     error_count += ratings_result.error_count
+            #     details["ratings"] = ratings_result.details
 
-            if "collection" in sync_types:
-                logger.info(f"开始同步用户 {user_id} 的 Trakt 收藏")
-                collection_result = await self._sync_collection(
-                    user_id, client, config, full_sync
-                )
-                synced_count += collection_result.synced_count
-                skipped_count += collection_result.skipped_count
-                error_count += collection_result.error_count
-                details["collection"] = collection_result.details
+            # if "collection" in sync_types:
+            #     logger.info(f"开始同步用户 {user_id} 的 Trakt 收藏")
+            #     collection_result = await self._sync_collection(
+            #         user_id, client, config, full_sync
+            #     )
+            #     synced_count += collection_result.synced_count
+            #     skipped_count += collection_result.skipped_count
+            #     error_count += collection_result.error_count
+            #     details["collection"] = collection_result.details
 
             # 更新最后同步时间（只要没有错误就更新）
-            if error_count == 0:
+            if error_count == 0 and config is not None:
                 config.last_sync_time = int(time.time())
                 database_manager.save_trakt_config(config.to_dict())
 
@@ -141,7 +172,12 @@ class TraktSyncService:
         except Exception as e:
             logger.error(f"同步 Trakt 数据失败: {e}")
             return TraktSyncResult(
-                success=False, message=f"同步失败: {str(e)}", error_count=1
+                success=False,
+                message=f"同步失败: {str(e)}",
+                error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
             )
         finally:
             await client.close()
@@ -169,22 +205,23 @@ class TraktSyncService:
                     synced_count=0,
                     skipped_count=0,
                     error_count=0,
+                    details={},
                 )
 
             logger.info(f"获取到 {len(history_items)} 条观看历史记录")
 
-            # 过滤出剧集（只同步剧集，不同步电影）
-            episode_items = [
-                item
-                for item in history_items
-                if item.type == "episode" and item.episode and item.show
-            ]
-
+            # 过滤出剧集（只同步剧集，不同步电影）, 并检查数据完整性
+            episode_items = []
+            for item in history_items:
+                if item.type == "episode" and item.episode and item.show:
+                    episode_items.append(item)
+                else:
+                    logger.warning(f"跳过非剧集或数据不完整的记录: {item}")
+            skipped_count = len(history_items) - len(episode_items)
             logger.info(f"过滤后得到 {len(episode_items)} 条剧集记录")
 
             # 转换为 CustomItem 并同步
             synced_count = 0
-            skipped_count = 0
             error_count = 0
             details = []
 
@@ -241,7 +278,12 @@ class TraktSyncService:
         except Exception as e:
             logger.error(f"同步观看历史失败: {e}")
             return TraktSyncResult(
-                success=False, message=f"同步观看历史失败: {str(e)}", error_count=1
+                success=False,
+                message=f"同步观看历史失败: {str(e)}",
+                error_count=1,
+                synced_count=0,
+                skipped_count=0,
+                details={},
             )
 
     async def _sync_ratings(
@@ -256,6 +298,7 @@ class TraktSyncService:
             synced_count=0,
             skipped_count=0,
             error_count=0,
+            details={},
         )
 
     async def _sync_collection(
@@ -270,6 +313,7 @@ class TraktSyncService:
             synced_count=0,
             skipped_count=0,
             error_count=0,
+            details={},
         )
 
     def _should_sync_item(self, user_id: str, item: TraktHistoryItem) -> bool:
@@ -287,7 +331,7 @@ class TraktSyncService:
             for record in history_data["records"]:
                 if (
                     record.get("trakt_item_id") == item.trakt_item_id
-                    and record.get("watched_at") == item.watched_at
+                    and record.get("watched_at") == item.watched_timestamp
                 ):
                     return False
 
@@ -301,28 +345,19 @@ class TraktSyncService:
     ) -> None:
         """记录同步历史到数据库"""
         try:
-            # 直接使用 SQLite 插入记录
-            conn = sqlite3.connect(database_manager.db_path)
-            cursor = conn.cursor()
+            # 使用数据库管理器的保存方法
+            history_data = {
+                "user_id": user_id,
+                "trakt_item_id": item.trakt_item_id,
+                "media_type": item.type,
+                "watched_at": item.watched_timestamp,  # Use the timestamp property for consistency
+                "synced_at": int(time.time()),
+                "task_id": task_id,
+            }
 
-            cursor.execute(
-                """
-                INSERT INTO trakt_sync_history
-                (user_id, trakt_item_id, media_type, watched_at, synced_at, task_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """,
-                (
-                    user_id,
-                    item.trakt_item_id,
-                    item.type,
-                    item.watched_at,
-                    int(time.time()),
-                    task_id,
-                ),
-            )
-
-            conn.commit()
-            conn.close()
+            success = database_manager.save_trakt_sync_history(history_data)
+            if not success:
+                logger.error("保存同步历史失败")
 
         except Exception as e:
             logger.error(f"记录同步历史失败: {e}")
@@ -400,7 +435,12 @@ class TraktSyncService:
             except Exception as e:
                 logger.error(f"Trakt 同步任务 {task_id} 失败: {e}")
                 self._sync_results[task_id] = TraktSyncResult(
-                    success=False, message=f"任务执行失败: {str(e)}", error_count=1
+                    success=False,
+                    message=f"任务执行失败: {str(e)}",
+                    error_count=1,
+                    synced_count=0,
+                    skipped_count=0,
+                    details={},
                 )
             finally:
                 # 清理任务记录

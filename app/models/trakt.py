@@ -55,7 +55,7 @@ class TraktConfig(BaseModel):
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TraktConfig":
+    def from_dict(cls, data: dict) -> Optional["TraktConfig"]:
         """从字典创建实例，用于从数据库加载"""
         if data is None:
             return None
@@ -99,7 +99,7 @@ class TraktSyncHistory(BaseModel):
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "TraktSyncHistory":
+    def from_dict(cls, data: dict) -> Optional["TraktSyncHistory"]:
         """从字典创建实例，用于从数据库加载"""
         if data is None:
             return None

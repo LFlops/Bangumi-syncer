@@ -29,6 +29,7 @@ class TraktAuthService:
         self.base_url = "https://api.trakt.tv"
         self.auth_url = "https://trakt.tv/oauth/authorize"
         self.token_url = "https://api.trakt.tv/oauth/token"
+        self._oauth_states = {}
 
     def _validate_config(self) -> bool:
         """验证 Trakt 配置是否有效"""
@@ -56,6 +57,10 @@ class TraktAuthService:
 
     async def init_oauth(self, user_id: str) -> Optional[TraktAuthResponse]:
         """初始化 OAuth 授权流程，生成授权 URL"""
+        if not user_id or not user_id.strip():
+            logger.error("用户ID不能为空")
+            return None
+
         if not self._validate_config():
             return None
 
@@ -127,9 +132,7 @@ class TraktAuthService:
                 success=False, message=f"处理回调时发生错误: {str(e)}"
             )
 
-    async def handle_callback_legacy(
-        self, code: str, state: str, user_id: str
-    ) -> bool:
+    async def handle_callback_legacy(self, code: str, state: str, user_id: str) -> bool:
         """处理 OAuth 回调的z接口，用于兼容测试"""
         try:
             if not self._validate_config():
@@ -181,6 +184,9 @@ class TraktAuthService:
                 return False
 
             config = TraktConfig.from_dict(config_dict)
+            if not config:
+                logger.error(f"用户 {user_id} 的 Trakt 配置无效")
+                return False
 
             # 检查是否需要刷新
             if not config.refresh_if_needed():
@@ -324,7 +330,10 @@ class TraktAuthService:
             return False
 
         # 检查 state 是否过期（5分钟）
-        if time.time() - state_data["created_at"] > 300:
+        created_at = state_data["created_at"]
+        if not isinstance(created_at, (int, float)):
+            return False
+        if time.time() - created_at > 300:
             del self._oauth_states[key]
             return False
 
@@ -338,10 +347,14 @@ class TraktAuthService:
             return
 
         current_time = time.time()
-        expired_keys = [
-            key for key, state_data in self._oauth_states.items()
-            if current_time - state_data["created_at"] > max_age
-        ]
+        expired_keys = []
+        for key, state_data in self._oauth_states.items():
+            created_at = state_data["created_at"]
+            if (
+                isinstance(created_at, (int, float))
+                and current_time - created_at > max_age
+            ):
+                expired_keys.append(key)
 
         for key in expired_keys:
             del self._oauth_states[key]

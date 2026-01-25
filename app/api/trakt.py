@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
+from ..core.database import database_manager
 from ..core.logging import logger
 from ..models.trakt import (
     TraktAuthRequest,
@@ -145,7 +146,6 @@ async def update_trakt_config(
             config.sync_interval = update_request.sync_interval
 
         # 保存到数据库
-        from ..core.database import database_manager
 
         success = database_manager.save_trakt_config(config.to_dict())
 
@@ -208,9 +208,8 @@ async def get_trakt_sync_status() -> TraktSyncStatusResponse:
         is_running = False  # TODO: 需要实现任务运行状态跟踪
 
         # 从数据库获取同步统计信息
-        from ..core.database import database_manager
-
         # 查询该用户的 Trakt 同步记录
+        # TODO: 应该做分页查询,直到获取全量的记录进行统计
         sync_stats = database_manager.get_sync_records(
             limit=1000,  # 获取足够多的记录以统计
             user_name=user_id,  # 注意：user_name 字段可能需要映射

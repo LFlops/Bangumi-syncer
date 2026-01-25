@@ -96,6 +96,9 @@ class TraktScheduler:
 
             for config_dict in configs:
                 config = TraktConfig.from_dict(config_dict)
+                if not config or not config.user_id or not config.sync_interval:
+                    logger.warning(f"无效的 Trakt 配置，跳过: {config_dict}")
+                    continue
                 self.add_user_job(config.user_id, config.sync_interval)
 
         except Exception as e:
@@ -159,18 +162,19 @@ class TraktScheduler:
     def remove_user_job(self, user_id: str) -> bool:
         """移除用户的定时任务"""
         try:
-            if not self.scheduler:
-                return True
-
             job_id = self._user_jobs.get(user_id)
             if not job_id:
                 return True
 
             # 移除任务
-            self.scheduler.remove_job(job_id)
+            if self.scheduler:
+                self.scheduler.remove_job(job_id)
+                logger.info(f"移除用户 {user_id} 的定时任务成功")
+            else:
+                logger.warning(f"调度器未初始化，无法移除用户 {user_id} 的定时任务")
+
             del self._user_jobs[user_id]
 
-            logger.info(f"移除用户 {user_id} 的定时任务成功")
             return True
 
         except Exception as e:

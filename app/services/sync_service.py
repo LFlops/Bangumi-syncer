@@ -51,7 +51,7 @@ class SyncService:
         # 记录任务状态
         self._sync_tasks[task_id] = {
             "status": "pending",
-            "item": item.dict(),
+            "item": item.model_dump(),
             "source": source,
             "created_at": time.time(),
             "result": None,
@@ -78,7 +78,7 @@ class SyncService:
 
             # 更新任务结果
             self._sync_tasks[task_id]["status"] = "completed"
-            self._sync_tasks[task_id]["result"] = result.dict()
+            self._sync_tasks[task_id]["result"] = result.model_dump()
 
             return result
 
@@ -196,7 +196,10 @@ class SyncService:
             bgm = self._get_bangumi_api_for_user(item.user_name)
             if not bgm:
                 logger.error(f"无法为用户 {item.user_name} 创建bangumi API实例")
-                return SyncResponse(status="error", message="bangumi配置错误")
+                return SyncResponse(
+                    status="error",
+                    message="bangumi配置错误",
+                )
 
             # 查询bangumi番剧指定季度指定集数信息
             bgm_se_id, bgm_ep_id = bgm.get_target_season_episode_id(
@@ -306,7 +309,7 @@ class SyncService:
             database_manager.log_sync_record(
                 user_name=item.user_name,
                 title=item.title,
-                ori_title=item.ori_title,
+                ori_title=item.ori_title or "",
                 season=item.season,
                 episode=item.episode,
                 subject_id=bgm_se_id,
@@ -367,7 +370,10 @@ class SyncService:
                 logger.error(f"发送失败通知失败: {notify_error}")
             # ========== 修改结束 ==========
 
-            return SyncResponse(status="error", message=f"处理失败: {str(e)}")
+            return SyncResponse(
+                status="error",
+                message=f"处理失败: {str(e)}",
+            )
 
     def _check_user_permission(self, user_name: str) -> bool:
         """检查用户是否有权限同步"""
@@ -413,7 +419,7 @@ class SyncService:
 
         return True
 
-    def _is_title_blocked(self, title: str, ori_title: str = None) -> bool:
+    def _is_title_blocked(self, title: str, ori_title: Optional[str] = None) -> bool:
         """检查番剧标题是否包含屏蔽关键词"""
         # 获取屏蔽关键词配置
         blocked_keywords_str = config_manager.get(
@@ -482,8 +488,8 @@ class SyncService:
 
                 bangumi_data_result = bgm_data.find_bangumi_id(
                     title=item.title,
-                    ori_title=item.ori_title,
-                    release_date=release_date,
+                    ori_title=item.ori_title or "",
+                    release_date=release_date or "",
                     season=item.season,
                 )
 
@@ -532,7 +538,9 @@ class SyncService:
                 premiere_date = item.release_date[:10]
 
             bgm_data = bgm.bgm_search(
-                title=item.title, ori_title=item.ori_title, premiere_date=premiere_date
+                title=item.title,
+                ori_title=item.ori_title or "",
+                premiere_date=premiere_date or "",
             )
             if not bgm_data:
                 logger.error(
@@ -641,6 +649,8 @@ class SyncService:
                         f"标记剧集失败，已达到最大重试次数 {max_retries}: {str(e)}"
                     )
                     raise e
+        # This line should never be reached due to the loop logic
+        return 0  # pragma: no cover
 
     async def _retry_mark_episode_async(
         self, bgm_api: BangumiApi, subject_id: str, ep_id: str, max_retries: int = 3
@@ -671,6 +681,8 @@ class SyncService:
                         f"异步标记剧集失败，已达到最大重试次数 {max_retries}: {str(e)}"
                     )
                     raise e
+        # This line should never be reached due to the loop logic
+        return 0  # pragma: no cover
 
     def _get_bangumi_config_for_user(self, user_name: str) -> Optional[dict[str, str]]:
         """根据媒体服务器用户名获取对应的bangumi配置"""
@@ -761,7 +773,7 @@ class SyncService:
 
             # 更新任务结果
             self._sync_tasks[task_id]["status"] = "completed"
-            self._sync_tasks[task_id]["result"] = result.dict()
+            self._sync_tasks[task_id]["result"] = result.model_dump()
 
             return result
 
@@ -795,7 +807,10 @@ class SyncService:
             return self.sync_custom_item(custom_item, source="plex")
         except Exception as e:
             logger.error(f"Plex同步处理出错: {e}")
-            return SyncResponse(status="error", message=f"处理失败: {str(e)}")
+            return SyncResponse(
+                status="error",
+                message=f"处理失败: {str(e)}",
+            )
 
     async def sync_emby_item_async(self, emby_data: dict[str, Any]) -> str:
         """异步同步Emby项目，返回任务ID"""
@@ -831,7 +846,7 @@ class SyncService:
 
             # 更新任务结果
             self._sync_tasks[task_id]["status"] = "completed"
-            self._sync_tasks[task_id]["result"] = result.dict()
+            self._sync_tasks[task_id]["result"] = result.model_dump()
 
             return result
 
@@ -942,7 +957,7 @@ class SyncService:
 
             # 更新任务结果
             self._sync_tasks[task_id]["status"] = "completed"
-            self._sync_tasks[task_id]["result"] = result.dict()
+            self._sync_tasks[task_id]["result"] = result.model_dump()
 
             return result
 

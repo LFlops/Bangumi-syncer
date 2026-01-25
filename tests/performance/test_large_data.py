@@ -1,6 +1,7 @@
 """
 大数据量同步性能测试
 """
+
 import asyncio
 import sys
 import time
@@ -20,21 +21,23 @@ class TestLargeDatasetSync:
     @pytest.mark.performance
     async def test_large_dataset_sync(self, mock_database_manager, mock_sync_service):
         """测试同步大量观看历史记录"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("开始大数据量同步性能测试")
-        print("="*60)
+        print("=" * 60)
 
         user_id = "test_user"
         sync_service = TraktSyncService()
 
         # 1. 准备测试配置
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "test_token",
-            "expires_at": int(time.time()) + 3600,
-            "enabled": True,
-            "last_sync_time": None
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "test_token",
+                "expires_at": int(time.time()) + 3600,
+                "enabled": True,
+                "last_sync_time": None,
+            }
+        )
 
         # 2. 生成大量测试数据 (1000条记录)
         large_dataset = []
@@ -48,13 +51,13 @@ class TestLargeDatasetSync:
                     "season": (i // 10) + 1,
                     "number": (i % 10) + 1,
                     "title": f"Episode {i}",
-                    "ids": {"trakt": i}
+                    "ids": {"trakt": i},
                 },
                 show={
                     "title": f"Test Show {i // 100}",
                     "original_title": f"Test Show {i // 100} Original",
-                    "ids": {"trakt": i // 100}
-                }
+                    "ids": {"trakt": i // 100},
+                },
             )
             large_dataset.append(item)
 
@@ -66,26 +69,31 @@ class TestLargeDatasetSync:
 
         # 4. 记录开始时间和内存使用
         start_time = time.time()
-        if hasattr(sys, 'getallocatedblocks'):  # Python 3.4+
+        if hasattr(sys, "getallocatedblocks"):  # Python 3.4+
             start_memory = sys.getallocatedblocks()
         else:
             start_memory = None
 
         # 5. 执行同步
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                   AsyncMock(return_value=mock_client)):
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
-                config_dict = mock_database_manager.get_trakt_config(user_id)
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client",
+            AsyncMock(return_value=mock_client),
+        ):
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
                 config = Mock(
                     access_token="test_token",
                     last_sync_time=None,
-                    is_token_expired=Mock(return_value=False)
+                    is_token_expired=Mock(return_value=False),
                 )
                 mock_auth_service.get_user_trakt_config.return_value = config
                 mock_auth_service.refresh_token = AsyncMock()
 
                 # 执行同步
-                result = await sync_service.sync_user_trakt_data(user_id, full_sync=True)
+                result = await sync_service.sync_user_trakt_data(
+                    user_id, full_sync=True
+                )
 
                 # 记录结束时间
                 end_time = time.time()
@@ -108,7 +116,9 @@ class TestLargeDatasetSync:
         print(f"- 同步成功: {result.synced_count} 条")
         print(f"- 同步失败: {result.error_count} 条")
         print(f"- 总耗时: {elapsed_time:.2f} 秒")
-        print(f"- 平均每条记录耗时: {elapsed_time/len(large_dataset)*1000:.2f} 毫秒")
+        print(
+            f"- 平均每条记录耗时: {elapsed_time / len(large_dataset) * 1000:.2f} 毫秒"
+        )
 
         if memory_used is not None:
             print(f"- 内存使用增加: {memory_used} 个内存块")
@@ -129,23 +139,27 @@ class TestLargeDatasetSync:
 
     @pytest.mark.asyncio
     @pytest.mark.performance
-    async def test_concurrent_large_sync(self, mock_database_manager, mock_sync_service):
+    async def test_concurrent_large_sync(
+        self, mock_database_manager, mock_sync_service
+    ):
         """测试并发大数据量同步"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("开始并发大数据量同步性能测试")
-        print("="*60)
+        print("=" * 60)
 
         # 准备3个用户
         users = ["user1", "user2", "user3"]
         sync_service = TraktSyncService()
 
         for user_id in users:
-            mock_database_manager.save_trakt_config({
-                "user_id": user_id,
-                "access_token": f"token_{user_id}",
-                "expires_at": int(time.time()) + 3600,
-                "enabled": True
-            })
+            mock_database_manager.save_trakt_config(
+                {
+                    "user_id": user_id,
+                    "access_token": f"token_{user_id}",
+                    "expires_at": int(time.time()) + 3600,
+                    "enabled": True,
+                }
+            )
 
         # 生成测试数据（每个用户500条）
         def generate_user_data(user_id, count=500):
@@ -153,18 +167,19 @@ class TestLargeDatasetSync:
             for i in range(count):
                 item = TraktHistoryItem(
                     id=int(f"{ord(user_id[-1])}{i}"),  # 生成唯一ID
-                    watched_at=(datetime.now() - timedelta(days=i % 30)).isoformat() + "Z",
+                    watched_at=(datetime.now() - timedelta(days=i % 30)).isoformat()
+                    + "Z",
                     action="scrobble",
                     type="episode",
                     episode={
                         "season": (i // 10) + 1,
                         "number": (i % 10) + 1,
-                        "title": f"{user_id} Episode {i}"
+                        "title": f"{user_id} Episode {i}",
                     },
                     show={
                         "title": f"{user_id} Show {i // 100}",
-                        "original_title": f"{user_id} Show {i // 100} Original"
-                    }
+                        "original_title": f"{user_id} Show {i // 100} Original",
+                    },
                 )
                 data.append(item)
             return data
@@ -178,7 +193,9 @@ class TestLargeDatasetSync:
             for user_id in users:
                 if access_token == f"token_{user_id}":
                     mock_client = AsyncMock()
-                    mock_client.get_all_watched_history = AsyncMock(return_value=user_data[user_id])
+                    mock_client.get_all_watched_history = AsyncMock(
+                        return_value=user_data[user_id]
+                    )
                     return mock_client
             return None
 
@@ -186,20 +203,27 @@ class TestLargeDatasetSync:
         start_time = time.time()
 
         # 并发执行
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                   side_effect=create_client_side_effect):
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client",
+            side_effect=create_client_side_effect,
+        ):
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
+
                 def get_config_side_effect(user_id):
                     config_dict = mock_database_manager.get_trakt_config(user_id)
                     if config_dict:
                         return Mock(
                             access_token=f"token_{user_id}",
                             last_sync_time=None,
-                            is_token_expired=Mock(return_value=False)
+                            is_token_expired=Mock(return_value=False),
                         )
                     return None
 
-                mock_auth_service.get_user_trakt_config.side_effect = get_config_side_effect
+                mock_auth_service.get_user_trakt_config.side_effect = (
+                    get_config_side_effect
+                )
                 mock_auth_service.refresh_token = AsyncMock()
 
                 # 创建并发任务
@@ -226,8 +250,8 @@ class TestLargeDatasetSync:
         print(f"- 用户数: {len(users)}")
         print(f"- 总记录数: {total_records} 条")
         print(f"- 总耗时: {total_elapsed:.2f} 秒")
-        print(f"- 平均每个用户耗时: {total_elapsed/len(users):.2f} 秒")
-        print(f"- 平均每条记录耗时: {total_elapsed/total_records*1000:.2f} 毫秒")
+        print(f"- 平均每个用户耗时: {total_elapsed / len(users):.2f} 秒")
+        print(f"- 平均每条记录耗时: {total_elapsed / total_records * 1000:.2f} 毫秒")
 
         # 性能断言
         assert total_elapsed < 90, f"并发同步时间过长: {total_elapsed:.2f}秒 > 90秒"
@@ -239,14 +263,14 @@ class TestLargeDatasetSync:
     @pytest.mark.performance
     async def test_memory_efficiency(self, mock_database_manager):
         """测试内存使用效率"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("开始内存使用效率测试")
-        print("="*60)
+        print("=" * 60)
 
         # 这个测试主要观察内存使用模式
         # 我们可以模拟不同数据量的内存使用
 
-        if not hasattr(sys, 'getallocatedblocks'):
+        if not hasattr(sys, "getallocatedblocks"):
             print("⚠️  当前Python版本不支持内存块统计，跳过内存测试")
             return
 
@@ -261,12 +285,14 @@ class TestLargeDatasetSync:
             print(f"\n测试数据量: {size} 条记录")
 
             # 准备配置
-            mock_database_manager.save_trakt_config({
-                "user_id": user_id,
-                "access_token": "test_token",
-                "expires_at": int(time.time()) + 3600,
-                "enabled": True
-            })
+            mock_database_manager.save_trakt_config(
+                {
+                    "user_id": user_id,
+                    "access_token": "test_token",
+                    "expires_at": int(time.time()) + 3600,
+                    "enabled": True,
+                }
+            )
 
             # 生成测试数据
             test_data = []
@@ -277,7 +303,7 @@ class TestLargeDatasetSync:
                     action="scrobble",
                     type="episode",
                     episode={"season": 1, "number": i + 1},
-                    show={"title": f"Test Show {i // 100}"}
+                    show={"title": f"Test Show {i // 100}"},
                 )
                 test_data.append(item)
 
@@ -288,20 +314,28 @@ class TestLargeDatasetSync:
             # 记录开始内存
             start_memory = sys.getallocatedblocks()
 
-            with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                       AsyncMock(return_value=mock_client)):
-                with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+            with patch(
+                "app.services.trakt.sync_service.TraktClientFactory.create_client",
+                AsyncMock(return_value=mock_client),
+            ):
+                with patch(
+                    "app.services.trakt.sync_service.trakt_auth_service"
+                ) as mock_auth_service:
                     config = Mock(
                         access_token="test_token",
                         last_sync_time=None,
-                        is_token_expired=Mock(return_value=False)
+                        is_token_expired=Mock(return_value=False),
                     )
                     mock_auth_service.get_user_trakt_config.return_value = config
                     mock_auth_service.refresh_token = AsyncMock()
 
                     # 执行同步（但跳过实际同步服务调用以专注内存）
-                    with patch('app.services.trakt.sync_service.sync_service') as mock_sync_service:
-                        mock_sync_service.sync_custom_item_async = AsyncMock(return_value="dummy_task")
+                    with patch(
+                        "app.services.trakt.sync_service.sync_service"
+                    ) as mock_sync_service:
+                        mock_sync_service.sync_custom_item_async = AsyncMock(
+                            return_value="dummy_task"
+                        )
 
                         # 执行
                         await sync_service.sync_user_trakt_data(user_id, full_sync=True)
@@ -319,14 +353,15 @@ class TestLargeDatasetSync:
 
             # 强制垃圾回收
             import gc
+
             gc.collect()
 
         # 分析内存使用趋势
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print("内存使用趋势分析:")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"{'数据量':<10} {'内存块':<10} {'每记录块':<10}")
-        print(f"{'-'*30}")
+        print(f"{'-' * 30}")
 
         for size, memory, per_record in memory_results:
             print(f"{size:<10} {memory:<10} {per_record:.2f}")
@@ -336,7 +371,7 @@ class TestLargeDatasetSync:
             # 计算增长率
             growth_rates = []
             for i in range(1, len(memory_results)):
-                prev_size, prev_memory, _ = memory_results[i-1]
+                prev_size, prev_memory, _ = memory_results[i - 1]
                 curr_size, curr_memory, _ = memory_results[i]
 
                 size_growth = curr_size / prev_size
@@ -346,7 +381,7 @@ class TestLargeDatasetSync:
 
             print("\n内存增长率分析:")
             for i, rate in enumerate(growth_rates):
-                print(f"  {test_sizes[i]} -> {test_sizes[i+1]}: {rate:.2%}")
+                print(f"  {test_sizes[i]} -> {test_sizes[i + 1]}: {rate:.2%}")
 
             # 增长率应该 <= 1.2（允许20%的额外开销）
             for rate in growth_rates:
@@ -357,20 +392,22 @@ class TestLargeDatasetSync:
     @pytest.mark.asyncio
     async def test_error_handling_performance(self, mock_database_manager):
         """测试错误处理性能"""
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print("开始错误处理性能测试")
-        print("="*60)
+        print("=" * 60)
 
         user_id = "error_test_user"
         sync_service = TraktSyncService()
 
         # 准备配置
-        mock_database_manager.save_trakt_config({
-            "user_id": user_id,
-            "access_token": "test_token",
-            "expires_at": int(time.time()) + 3600,
-            "enabled": True
-        })
+        mock_database_manager.save_trakt_config(
+            {
+                "user_id": user_id,
+                "access_token": "test_token",
+                "expires_at": int(time.time()) + 3600,
+                "enabled": True,
+            }
+        )
 
         # 生成混合数据（包含一些错误数据）
         mixed_data = []
@@ -383,7 +420,7 @@ class TestLargeDatasetSync:
                     action="scrobble",
                     type="episode",
                     episode={},  # 空的 episode
-                    show=None    # 缺少 show
+                    show=None,  # 缺少 show
                 )
             else:
                 # 有效数据
@@ -393,11 +430,13 @@ class TestLargeDatasetSync:
                     action="scrobble",
                     type="episode",
                     episode={"season": 1, "number": i % 10 + 1},
-                    show={"title": f"Test Show {i // 10}"}
+                    show={"title": f"Test Show {i // 10}"},
                 )
             mixed_data.append(item)
 
-        print(f"测试数据: {len(mixed_data)} 条记录（包含 {len([d for d in mixed_data if not d.episode])} 条错误数据）")
+        print(
+            f"测试数据: {len(mixed_data)} 条记录（包含 {len([d for d in mixed_data if not d.episode])} 条错误数据）"
+        )
 
         # 模拟客户端
         mock_client = AsyncMock()
@@ -405,6 +444,7 @@ class TestLargeDatasetSync:
 
         # 模拟同步服务部分失败
         call_count = 0
+
         async def mock_sync_side_effect(*args, **kwargs):
             nonlocal call_count
             call_count += 1
@@ -414,22 +454,32 @@ class TestLargeDatasetSync:
 
         start_time = time.time()
 
-        with patch('app.services.trakt.sync_service.TraktClientFactory.create_client',
-                   AsyncMock(return_value=mock_client)):
-            with patch('app.services.trakt.sync_service.trakt_auth_service') as mock_auth_service:
+        with patch(
+            "app.services.trakt.sync_service.TraktClientFactory.create_client",
+            AsyncMock(return_value=mock_client),
+        ):
+            with patch(
+                "app.services.trakt.sync_service.trakt_auth_service"
+            ) as mock_auth_service:
                 config = Mock(
                     access_token="test_token",
                     last_sync_time=None,
-                    is_token_expired=Mock(return_value=False)
+                    is_token_expired=Mock(return_value=False),
                 )
                 mock_auth_service.get_user_trakt_config.return_value = config
                 mock_auth_service.refresh_token = AsyncMock()
 
-                with patch('app.services.trakt.sync_service.sync_service') as mock_sync_service:
-                    mock_sync_service.sync_custom_item_async = AsyncMock(side_effect=mock_sync_side_effect)
+                with patch(
+                    "app.services.trakt.sync_service.sync_service"
+                ) as mock_sync_service:
+                    mock_sync_service.sync_custom_item_async = AsyncMock(
+                        side_effect=mock_sync_side_effect
+                    )
 
                     # 执行同步
-                    result = await sync_service.sync_user_trakt_data(user_id, full_sync=True)
+                    result = await sync_service.sync_user_trakt_data(
+                        user_id, full_sync=True
+                    )
 
         end_time = time.time()
         elapsed_time = end_time - start_time
@@ -443,11 +493,19 @@ class TestLargeDatasetSync:
         print(f"- 总耗时: {elapsed_time:.2f} 秒")
 
         # 验证错误被正确处理
-        expected_skipped = len([d for d in mixed_data if not d.episode])  # 无效数据应该被跳过
-        expected_errors = (len(mixed_data) - expected_skipped) // 5  # 每5条有效数据有一条同步失败
+        expected_skipped = len(
+            [d for d in mixed_data if not d.episode]
+        )  # 无效数据应该被跳过
+        expected_errors = (
+            len(mixed_data) - expected_skipped
+        ) // 5  # 每5条有效数据有一条同步失败
 
-        assert result.skipped_count >= expected_skipped, f"应该跳过至少 {expected_skipped} 条无效数据"
-        assert result.error_count >= expected_errors, f"应该至少有 {expected_errors} 条同步错误"
+        assert result.skipped_count >= expected_skipped, (
+            f"应该跳过至少 {expected_skipped} 条无效数据"
+        )
+        assert result.error_count >= expected_errors, (
+            f"应该至少有 {expected_errors} 条同步错误"
+        )
 
         print("\n✅ 错误处理性能测试通过")
         print("   正确处理了无效数据和同步错误")

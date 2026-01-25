@@ -5,7 +5,7 @@ Trakt.tv API 异步客户端
 import asyncio
 import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urlencode
 
 import httpx
@@ -36,9 +36,9 @@ class TraktClient:
         }
 
         # 速率限制控制
-        self.rate_limit_remaining = 1000
-        self.rate_limit_reset = 0
-        self._request_queue = asyncio.Queue()
+        self.rate_limit_remaining: int = 1000
+        self.rate_limit_reset: int = 0
+        self._request_queue: asyncio.Queue = asyncio.Queue()
         self._semaphore = asyncio.Semaphore(5)  # 限制并发请求数
 
         # 重试配置
@@ -111,7 +111,11 @@ class TraktClient:
                     raise ValueError("认证失败")
                 elif response.status_code == 429:
                     # 速率限制，等待后重试
-                    retry_after = int(response.headers.get("Retry-After", 60))
+                    retry_after_str = response.headers.get("Retry-After", "60")
+                    try:
+                        retry_after = int(retry_after_str)
+                    except (ValueError, TypeError):
+                        retry_after = 60  # 默认值
                     logger.warning(f"达到速率限制，等待 {retry_after} 秒后重试")
                     await asyncio.sleep(retry_after)
                     continue
@@ -130,6 +134,8 @@ class TraktClient:
                     await asyncio.sleep(self.retry_delay * (2**attempt))
                     continue
                 return None
+            except ValueError:
+                raise
             except Exception as e:
                 logger.error(f"Trakt API 请求异常: {e}")
                 if attempt < self.max_retries - 1:
@@ -145,9 +151,9 @@ class TraktClient:
             remaining = headers.get("X-RateLimit-Remaining")
             reset = headers.get("X-RateLimit-Reset")
 
-            if remaining:
+            if remaining is not None:
                 self.rate_limit_remaining = int(remaining)
-            if reset:
+            if reset is not None:
                 self.rate_limit_reset = int(reset)
         except (ValueError, TypeError):
             pass
@@ -176,7 +182,7 @@ class TraktClient:
         """
         try:
             endpoint = "/sync/history"
-            params = {"limit": limit, "page": page}
+            params: dict[str, Union[str, int]] = {"limit": limit, "page": page}
 
             if start_date:
                 # Trakt 使用 YYYY-MM-DD 格式
@@ -210,12 +216,12 @@ class TraktClient:
             start_date: 开始日期，用于增量同步
             max_pages: 最大页数限制，防止无限循环
         """
-        all_items = []
+        all_items: list[TraktHistoryItem] = []
         page = 1
 
         while page <= max_pages:
             try:
-                items = await self.get_watched_history(
+                items: list[TraktHistoryItem] = await self.get_watched_history(
                     start_date=start_date,
                     limit=1000,  # 每页最大数量
                     page=page,
@@ -241,8 +247,8 @@ class TraktClient:
                 break
 
         # 去重：基于 trakt_item_id 和 watched_at
-        seen = set()
-        unique_items = []
+        seen: set[str] = set()
+        unique_items: list[TraktHistoryItem] = []
 
         for item in all_items:
             key = f"{item.trakt_item_id}:{item.watched_at}"
