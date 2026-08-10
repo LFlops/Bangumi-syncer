@@ -1,9 +1,9 @@
 # Phase 2.5: 窗口重叠去重
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 2（key_findings 存结构化覆盖列表）
+> 前置依赖：Phase 2.0.1（key_findings 存结构化 covered 列表）+ Phase 2.0.2（注入前比对位置）
 > 交付物：明细窗口与历史摘要重叠时，注入前识别重叠记录并标注，避免重复叙述
-> 执行时机：Phase 2.4 之后、Phase 3 之前（一个 phase 只做一件事）
+> 执行时机：Phase 2.3 之后、Phase 3 之前（一个 phase 只做一件事）
 
 ## 目标
 

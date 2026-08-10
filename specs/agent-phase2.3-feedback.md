@@ -1,7 +1,7 @@
 # Phase 2.3: 用户反馈交互
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 2（agent_working_memory 表 + MemoryRetriever 注入能力）
+> 前置依赖：Phase 2.0.1（表 + repository）+ Phase 2.0.2（MemoryRetriever 注入）
 > 交付物：用户对总结结果的反馈可写入记忆，并在后续执行注入为强约束
 > 执行时机：Phase 2.2 之后、Phase 3 之前（一个 phase 只做一件事）
 

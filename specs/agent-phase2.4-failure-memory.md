@@ -1,7 +1,7 @@
 # Phase 2.4: 失败路径记忆
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 2（agent_working_memory 表 + MemoryExtractor）
+> 前置依赖：Phase 2.0.1（表 + MemoryExtractor 签名已预留 error_message）
 > 交付物：任务执行失败也写入记忆，后续注入时 LLM 可识别历史异常模式
 > 执行时机：Phase 2.3 之后、Phase 3 之前（一个 phase 只做一件事）
 
