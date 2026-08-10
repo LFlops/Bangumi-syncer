@@ -24,8 +24,8 @@
 POST /api/summary/jobs/{name}/feedback {user_name, feedback}
     │
     ▼
-写入 agent_working_memory（task_type='summary'，summary 字段存反馈原文，
-key_findings=[{"type": "feedback", "user": "...", "feedback": "..."}]）
+写入 agent_working_memory（task_type='summary'，summary 字段存反馈原文含
+[用户反馈] 前缀，outcome='feedback'，covered 为空）
     │
     ▼
 下次 summary 执行：MemoryRetriever 读取时反馈条目格式化加 [用户反馈] 前缀
@@ -40,9 +40,8 @@ MemoryEntry(
     task_id="summary-{job_name}",
     run_id=str(uuid4()),
     summary="[用户反馈] 不要太啰嗦",       # 前缀约定：retriever 识别即加权
-    key_findings='[{"type": "feedback", "user": "alice", "feedback": "不要太啰嗦"}]',
-    decisions_taken="[]",
-    outcome="feedback",                     # 与 success/partial/failed 并列的新取值
+    covered=[],                             # 反馈条目无覆盖列表
+    outcome="feedback",                     # success | partial | feedback 之一
     tokens_used=0,
 )
 ```

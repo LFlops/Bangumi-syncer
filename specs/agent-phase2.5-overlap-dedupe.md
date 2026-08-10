@@ -1,7 +1,7 @@
 # Phase 2.5: 窗口重叠去重
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 2.0.1（key_findings 存结构化 covered 列表）+ Phase 2.0.2（注入前比对位置）
+> 前置依赖：Phase 2.0.1（covered 字段存结构化覆盖列表）+ Phase 2.0.2（注入前比对位置）
 > 交付物：明细窗口与历史摘要重叠时，注入前识别重叠记录并标注，避免重复叙述
 > 执行时机：Phase 2.3 之后、Phase 3 之前（一个 phase 只做一件事）
 
@@ -11,12 +11,12 @@
 
 ## 设计
 
-### 1. 数据基础（Phase 2 已存）
+### 1. 数据基础（Phase 2.0.1 已存）
 
-`agent_working_memory.key_findings` 中的 `covered` 列表（每次执行提取，规则从 records 生成）：
+`agent_working_memory.covered` 字段（每次执行提取，规则从 records 生成；Python 侧为 `list[CoveredItem]` Pydantic 模型，DB 中为其 `model_dump()` 序列化形态）：
 
 ```json
-{"covered": [{"title": "葬送的芙莉莲", "season": 1, "episode": 10}, ...]}
+[{"title": "葬送的芙莉莲", "season": 1, "episode": 10}, ...]
 ```
 
 ### 2. 重叠识别（注入前）
@@ -31,9 +31,10 @@ async def find_overlaps(
 ) -> list[dict]:
     """比对今日明细与最近一次记忆的 covered 列表，返回重叠记录。"""
     latest = await self._repo.get_latest(task_type="summary", task_id=task_id)
-    if not latest or not latest.key_findings.get("covered"):
+    if not latest or not latest.covered:
         return []
-    covered = {(c["title"], c.get("season"), c.get("episode")) for c in latest.key_findings["covered"]}
+    # latest.covered 为 list[CoveredItem]（Pydantic，见 2.0.1）
+    covered = {(c.title, c.season, c.episode) for c in latest.covered}
     return [
         r for r in records
         if (r.bgm_title, r.season, r.episode) in covered

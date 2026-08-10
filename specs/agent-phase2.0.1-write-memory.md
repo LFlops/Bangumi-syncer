@@ -8,12 +8,20 @@
 
 ## 目标
 
-记忆的**写入侧**：建表（含 FTS5 同步触发器）、repository 写入能力、MemoryExtractor（成功路径摘要生成、key_findings 提取、covered 覆盖列表）。读取与注入在 Phase 2.0.2。
+记忆的**写入侧**：建表（含 FTS5 同步触发器）、repository 写入能力、MemoryExtractor（成功路径摘要生成、covered 覆盖列表）。读取与注入在 Phase 2.0.2。
 
 ## MemoryEntry 模型
 
 ```python
-# app/services/memory/models.py（dataclass，与表字段对应）
+# app/services/memory/models.py
+
+from pydantic import BaseModel
+
+class CoveredItem(BaseModel):
+    """covered 条目：本次覆盖的一条记录（Pydantic：类型安全 + 序列化一站式）。"""
+    title: str
+    season: int | None = None      # 电影可为 None
+    episode: int | None = None
 
 @dataclass
 class MemoryEntry:
@@ -22,21 +30,20 @@ class MemoryEntry:
     task_id: str = ""
     run_id: str = ""
     summary: str = ""
-    key_findings: dict = field(default_factory=dict)   # {"covered": [...], "findings": [...]}
-    decisions_taken: list[str] = field(default_factory=list)
-    outcome: str = "success"                            # success | partial | feedback（无 failed：失败不写记忆）
+    covered: list[CoveredItem] = field(default_factory=list)
+    outcome: str = "success"                            # success | partial | feedback
     tokens_used: int = 0
-    error_message: str | None = None
     created_at: str = ""
 
     @classmethod
     def from_row(cls, row) -> "MemoryEntry":
-        """从 DB row 构造（key_findings/decisions_taken 做 json.loads 容错）。"""
+        """从 DB row 构造（covered 做 json.loads + model_validate 容错，失败兜底空列表）。"""
         ...
 ```
 
-- `key_findings` 在 Python 侧是 **dict**（存 `covered` + `findings`），入库时 `json.dumps`
-- `from_row` 解析时 `json.loads` 失败兜底为空 dict（防御脏数据）
+- **`covered` 用 Pydantic `CoveredItem`**（不是 dict + 注释）：类型安全（ty 检查字段）、序列化一站式（`model_dump`/`model_validate`）、与项目 app/models/ 的 Pydantic 惯例一致
+- 入库：`json.dumps([c.model_dump() for c in entry.covered])`；读取：`[CoveredItem.model_validate(x) for x in json.loads(raw or "[]")]`
+- 无 `decisions_taken`/`error_message`（无消费方，见总览"字段取舍"）
 
 ## 数据库（migration）
 
@@ -44,6 +51,7 @@ class MemoryEntry:
 
 - schema 见总览文档（`agent-phase2-memory.md` 数据库一节）
 - **触发器是必须的**：`agent_memory_fts` 是 external content 表，无触发器则 INSERT 后 FTS 不更新、`search_fts` 搜不到新记录（DELETE/UPDATE 同理）
+- **prune 默认 1000 条/任务**（FTS5 解耦检索性能与保留量，1000 条 ≈ 200KB 无压力，每日任务 ≈ 2.7 年历史）
 
 ## AgentMemoryRepository
 
@@ -52,8 +60,8 @@ class MemoryEntry:
 
 class AgentMemoryRepository:
     def insert(self, entry: MemoryEntry) -> int: ...
-    def prune(self, task_type: str, task_id: str, keep: int = 100) -> int:
-        """每 task 保留最近 keep 条，删除更早的。"""
+    def prune(self, task_type: str, task_id: str, keep: int = 1000) -> int:
+        """每 task 保留最近 keep 条，删除更早的（默认 1000）。"""
     def get_recent(self, task_type: str, task_id: str, limit: int = 5) -> list[MemoryEntry]:
         """按 task 取最近 N 条（created_at DESC）。"""
     def search_fts(self, query: str, task_type: str, limit: int = 5) -> list[MemoryEntry]:
@@ -68,7 +76,7 @@ class AgentMemoryRepository:
 ## MemoryExtractor
 
 ```python
-# app/services/memory/retriever.py
+# app/services/memory/extractor.py
 
 _SUMMARY_PROMPT = (
     "请用一句话总结以下追番总结的内容（不超过 50 字），保留关键信息："
@@ -86,25 +94,25 @@ class MemoryExtractor:
         task_id: str,
         run_id: str,
         llm_response: str,
-        records: list[dict],        # 本次覆盖的 sync records（covered 来源）
-        decisions: list[str],
+        records: list[SyncRecord],  # 本次覆盖的 sync records（covered 来源）
         outcome: str,
         tokens_used: int,
     ) -> None:
         summary = await self._summarize(llm_response)
-        key_findings = self._extract_key_findings(llm_response, records)
+        if not summary:
+            return  # 空响应（LLM 重试耗尽）不写记忆，避免无效条目
+        covered = self._extract_covered(records)
         await self._repo.insert(MemoryEntry(
             task_type=task_type,
             task_id=task_id,
             run_id=run_id,
             summary=summary,
-            key_findings=key_findings,
-            decisions_taken=decisions,
+            covered=covered,
             outcome=outcome,
             tokens_used=tokens_used,
         ))
-        # 清理旧记忆（每个 task 最多保留 100 条）
-        await self._repo.prune(task_type, task_id, keep=100)
+        # 清理旧记忆（每个 task 最多保留 1000 条）
+        await self._repo.prune(task_type, task_id, keep=1000)
 
     async def _summarize(self, llm_response: str) -> str:
         """一行摘要：LLM 内置模板生成；LLM 不可用/失败时规则截取兜底。"""
@@ -121,26 +129,25 @@ class MemoryExtractor:
             logger.warning("摘要 LLM 调用失败，使用规则截取", exc_info=True)
         return llm_response.strip()[:200]  # 规则兜底：截断
 
-    def _extract_key_findings(
-        self, llm_response: str, records: list[dict]
-    ) -> dict:
-        """key_findings = covered（结构化覆盖列表，规则提取）+ findings（发现项）。"""
-        covered = []
-        for r in records:
-            covered.append({
-                "title": r.get("bgm_title") or r.get("ori_title") or "",
-                "season": r.get("season"),
-                "episode": r.get("episode"),
-            })
-        return {"covered": covered, "findings": []}
+    def _extract_covered(self, records: list[SyncRecord]) -> list[CoveredItem]:
+        """covered：本次覆盖的记录列表（规则提取，非 LLM）。"""
+        return [
+            CoveredItem(
+                title=r.bgm_title or r.ori_title or "",
+                season=r.season,
+                episode=r.episode,
+            )
+            for r in records
+        ]
 ```
 
 ### 关键设计点（review 修复）
 
-- **签名含 `records`**：covered 从 records 规则提取（非 LLM），与 `_extract_key_findings(llm_response)` 的旧签名不同
-- **covered 的 season/episode 可为 None**（电影）：比对时（Phase 2.5）按 `(title, season, episode)` tuple 匹配，None 参与比对即可，无需特殊处理——提取时照实存
+- **签名含 `records`**：covered 从 records 规则提取（非 LLM）
+- **covered 的 season/episode 可为 None**（电影）：照实存，比对时（Phase 2.5）tuple 含 None 参与匹配即可
 - **`_summarize` 实现**：开发者内置模板（`_SUMMARY_PROMPT` 写死，不暴露配置）+ LLM 调用 + **规则截断兜底**（LLM 失败不抛异常）
-- **容错**：`execute_job` 调 `extract_and_store` 时整体 try/except 包裹（记忆写入失败不影响主流程的 `_dispatch_notification`）
+- **空响应不写记忆**：LLM 重试耗尽返回空响应时跳过（避免无效条目）
+- **容错**：`execute_job` 调 `extract_and_store` 时整体 try/except 包裹（记忆写入失败不影响主流程的 `_dispatch_notification`，见 2.0.2）
 - **成本说明**：每次成功执行多一次摘要 LLM 调用（小 prompt ~50 token），这是"摘要存"策略的固有成本；规则兜底保证 LLM 不可用时功能不中断
 
 ## 文件变更清单
@@ -149,47 +156,51 @@ class MemoryExtractor:
 |------|------|------|
 | 新增 | `app/services/memory/__init__.py` | 记忆模块包 |
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
-| 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/key_findings/covered/容错） |
+| 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/covered/空响应跳过） |
 | 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/get_latest） |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（表 + 索引 + FTS5 + 触发器） |
 
 > 总计：新增 4 个文件，修改 1 个文件
-> 失败路径不写记忆（异常模式识别是 Phase 3 日志分析 Agent 的独立功能）
 
 ## BDD 测试场景
 
 ### Scenario W1 成功路径写入
 - **Given** extract_and_store 传入 llm_response + records
 - **When** 执行
-- **Then** `agent_working_memory` 新增一条：`summary` 为摘要、`key_findings.covered` 含 records 的结构化列表、`outcome="success"`
+- **Then** `agent_working_memory` 新增一条：`summary` 为摘要、`covered` 含 records 的结构化列表、`outcome="success"`
 
 ### Scenario W2 摘要 LLM 失败规则兜底
 - **Given** `_summarize` 的 LLM 调用抛异常
 - **When** 执行
 - **Then** 不抛异常，summary 为规则截断（前 200 字符）
 
-### Scenario W3 FTS5 触发器同步
+### Scenario W3 空响应不写记忆
+- **Given** llm_response 为空（LLM 重试耗尽）
+- **When** extract_and_store
+- **Then** 不写入记忆（无无效条目）
+
+### Scenario W4 FTS5 触发器同步
 - **Given** insert 一条记忆
 - **When** `search_fts` 查询该记录的关键词
 - **Then** 能命中（触发器已同步 FTS 表）
 
-### Scenario W4 写入失败不影响调用方
+### Scenario W5 写入失败不影响调用方
 - **Given** extract_and_store 抛异常（如 DB 错误）
 - **When** execute_job 调用处（外层 try/except）
 - **Then** 调用方不中断，继续执行后续流程
 
-### Scenario W5 prune 保留上限
-- **Given** 同一 task 写入 105 条
-- **When** 每次 insert 后 prune(keep=100)
-- **Then** 表内仅保留最近 100 条
+### Scenario W6 prune 保留上限
+- **Given** 同一 task 写入 1005 条
+- **When** 每次 insert 后 prune(keep=1000)
+- **Then** 表内仅保留最近 1000 条
 
-### Scenario W6 covered 含 None 字段
+### Scenario W7 covered 含 None 字段
 - **Given** records 含电影（season/episode 为 None）
 - **When** 提取 covered
 - **Then** covered 条目照实存 None，不报错
 
 ## 验证方式
 
-1. 单元测试：W1-W6 全部通过
-2. 手动：触发一次 summary 成功执行，检查 `agent_working_memory` 表记录（summary/key_findings/outcome 正确）
+1. 单元测试：W1-W7 全部通过
+2. 手动：触发一次 summary 成功执行，检查 `agent_working_memory` 表记录（summary/covered/outcome 正确）
 3. 手动：`sqlite3` 验证 FTS 触发器（insert 后 `SELECT * FROM agent_memory_fts` 有对应行）

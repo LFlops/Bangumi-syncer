@@ -42,12 +42,10 @@ CREATE TABLE agent_working_memory (
     task_type TEXT NOT NULL,        -- 'summary', 'sync', 'diagnostic', 等
     task_id TEXT NOT NULL,          -- scheduler 名称, 如 'summary-daily'
     run_id TEXT NOT NULL UNIQUE,    -- UUID
-    summary TEXT NOT NULL,          -- 一行摘要（成功=LLM 生成，失败=规则）
-    key_findings TEXT,              -- JSON: {"covered": [...], "findings": [...]}
-    decisions_taken TEXT,           -- JSON: ["decision1", "decision2"]
-    outcome TEXT NOT NULL,          -- 'success', 'partial', 'failed', 'feedback'
+    summary TEXT NOT NULL,          -- 一行摘要（LLM 生成，失败兜底规则截断）
+    covered TEXT,                   -- JSON: [{"title","season","episode"}]（Phase 2.5 比对用）
+    outcome TEXT NOT NULL,          -- 'success', 'partial', 'feedback'
     tokens_used INTEGER,
-    error_message TEXT,
     created_at TEXT DEFAULT (datetime('now'))
 );
 
@@ -56,27 +54,31 @@ CREATE INDEX idx_memory_created ON agent_working_memory(created_at);
 
 -- FTS5 全文检索（external content 表）
 CREATE VIRTUAL TABLE agent_memory_fts USING fts5(
-    task_type, summary, key_findings, outcome,
+    task_type, summary, outcome,
     content='agent_working_memory',
     content_rowid='id'
 );
 
 -- 同步触发器（必须：external content 表不自动同步）
 CREATE TRIGGER agent_memory_ai AFTER INSERT ON agent_working_memory BEGIN
-    INSERT INTO agent_memory_fts(rowid, task_type, summary, key_findings, outcome)
-    VALUES (new.id, new.task_type, new.summary, new.key_findings, new.outcome);
+    INSERT INTO agent_memory_fts(rowid, task_type, summary, outcome)
+    VALUES (new.id, new.task_type, new.summary, new.outcome);
 END;
 CREATE TRIGGER agent_memory_ad AFTER DELETE ON agent_working_memory BEGIN
-    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, key_findings, outcome)
-    VALUES ('delete', old.id, old.task_type, old.summary, old.key_findings, old.outcome);
+    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, outcome)
+    VALUES ('delete', old.id, old.task_type, old.summary, old.outcome);
 END;
 CREATE TRIGGER agent_memory_au AFTER UPDATE ON agent_working_memory BEGIN
-    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, key_findings, outcome)
-    VALUES ('delete', old.id, old.task_type, old.summary, old.key_findings, old.outcome);
-    INSERT INTO agent_memory_fts(rowid, task_type, summary, key_findings, outcome)
-    VALUES (new.id, new.task_type, new.summary, new.key_findings, new.outcome);
+    INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, outcome)
+    VALUES ('delete', old.id, old.task_type, old.summary, old.outcome);
+    INSERT INTO agent_memory_fts(rowid, task_type, summary, outcome)
+    VALUES (new.id, new.task_type, new.summary, new.outcome);
 END;
 ```
+
+**字段取舍**：
+- `covered`：结构化覆盖列表（规则从 records 提取，零成本）——Phase 2.5 窗口重叠去重的比对数据（机器可精确比对）；`summary` 给 LLM 读（叙事，不可比对）、`outcome` 分类（状态枚举）——三者分工不同互不替代
+- 不设 `decisions_taken`：无消费方（Phase 3 用 agent_steps 记录决策，重复）；不设 `error_message`：失败不写记忆（异常识别是 Phase 3 日志分析 Agent 的独立功能）
 
 ## 记忆策略权衡
 
@@ -92,9 +94,16 @@ END;
 **Phase 2.0.1/2.0.2 选择 append-only 的理由**：记忆量小（每日 1 次执行），噪音与 token 浪费可忽略；实现最简，先验证"记忆价值假设"。不做滚动摘要（YAGNI）与语义检索（FTS5 关键词对 summary 场景够用）。
 
 **为演进留的扩展点（现在设计，不做实现）**：
-1. `MemoryEntry` 已有 `outcome/error_message/key_findings` 字段——失败记录、结构化发现天然可存，未来压缩/加权都能用
+1. `MemoryEntry` 已有 `outcome/covered` 字段——状态分类、结构化覆盖天然可存，未来压缩/加权都能用
 2. retriever 的 `_deduplicate_and_rank` 是策略集中点——未来加"反馈优先"、"旧记忆摘要化"只改这里
 3. 反馈加权先用 `[用户反馈]` 前缀约定（Phase 2.3），确认价值后再升为结构化 priority 字段
+
+### FTS5 必要性（多任务/长期运行场景）与 prune 权衡
+
+- **FTS5 不是当前规模的过度设计**：未来多任务（Phase 3 失败定位/诊断等 Agent 任务）都会写记忆，多任务 × 高频 × 长期运行 = 数万条。失败定位需快速检索"类似错误模式"——LIKE 全表扫描在数万条（~5MB 文本）退化到秒级，FTS5 倒排索引毫秒级
+- **关键洞察：FTS5 解耦"保留量"与"检索性能"**——倒排索引查询与总量基本无关。因此 prune 只需考虑存储与历史深度，不需要担心性能
+- **prune 默认 1000 条/任务**：每日任务 ≈ 2.7 年历史；存储 ~200KB/任务无压力；检索由 FTS5 保障
+- **职责分离**：`memory_limit` 管注入量（默认 5），`prune` 管增长上限（默认 1000）——互不干扰
 
 **演进路径**：append-only（2.0.1/2.0.2）→ 前缀优先（Phase 2.3 后）→ 滚动摘要（记忆膨胀时）。
 
@@ -129,19 +138,16 @@ END;
 
 > 注：失败路径不写记忆（无 outcome="failed" 条目）——异常模式识别是 Phase 3 日志分析 Agent 的独立功能，summary 链路保持内聚
 
-### key_findings 存结构化覆盖信息（Phase 2.5 的数据基础）
+### covered 存结构化覆盖信息（Phase 2.5 的数据基础）
 
-`extract_and_store` 时，`key_findings` 除发现项外，存入本次总结覆盖的记录列表（规则从 records 提取，非 LLM）：
+`extract_and_store` 时，`covered` 存入本次总结覆盖的记录列表（规则从 records 提取，非 LLM）：
 
 ```json
-// key_findings 示例
-{
-  "covered": [{"title": "葬送的芙莉莲", "season": 1, "episode": 10}, ...],
-  "findings": [...]
-}
+// covered 示例
+[{"title": "葬送的芙莉莲", "season": 1, "episode": 10}, ...]
 ```
 
-Phase 2.5 用 `covered` 列表按 `(title, season, episode)` 精确比对今日明细，实现窗口重叠去重。
+Phase 2.5 用 `covered` 列表按 `(title, season, episode)` 精确比对今日明细，实现窗口重叠去重。covered 的 season/episode 可为 None（电影），比对时 tuple 含 None 参与匹配即可。
 
 ### 摘要生成与评测
 

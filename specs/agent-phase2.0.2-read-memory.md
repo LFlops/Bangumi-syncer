@@ -124,7 +124,6 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
             run_id=str(uuid4()),
             llm_response=response.content,
             records=records,
-            decisions=[],
             outcome="success",
             tokens_used=response.usage.total_tokens if response.usage else 0,
         )
