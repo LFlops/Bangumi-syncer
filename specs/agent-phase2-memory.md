@@ -76,9 +76,49 @@ CREATE TRIGGER agent_memory_au AFTER UPDATE ON agent_working_memory BEGIN
 END;
 ```
 
+**归档表（prune 降级到冷存储，方案 B）**：
+
+```sql
+CREATE TABLE agent_working_memory_archive (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_type TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    run_id TEXT NOT NULL UNIQUE,      -- 归档保留，追溯/去重仍可用
+    summary TEXT NOT NULL,
+    covered TEXT,
+    outcome TEXT NOT NULL,
+    tokens_used INTEGER,
+    created_at TEXT,                  -- 保留原值（非重新默认）
+    archived_at TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, task_id);
+```
+
+- **prune 语义**：从"删除"变为"**降级到冷存储**"——超出 keep 的旧记录先 `INSERT INTO archive` 再 `DELETE` 主表（触发器同步删 FTS 索引，归档表无 FTS）；**`outcome=feedback` 条目跳过 prune（长期保留，见下）**
+- 主表（带 FTS）= 热记忆（recent/关键词注入）；归档表（无 FTS）= 冷记忆（Phase 3 失败定位等查全量历史走 `search_archive`，LIKE 检索）
+- 存储量级：主表 1000 条 ≈ 200KB/任务；归档表每年 ≈ 2MB——均无压力
+
+### 归档消费边界（summary 不接入归档 + FTS5 定位）
+
+- **summary 任务不接入归档记忆**：其消费需求是"近期上下文"（注入 memory_limit 条 + FTS 捞近期相关），1000 条热窗口（≈2.7 年）已覆盖全部实际需求；3 年前的记忆对今日总结价值趋近于零
+- **归档记忆的服务对象是 Phase 3 诊断**（追溯"很久以前的类似错误模式"）——追溯性需求与 summary 的近期性需求不同
+- **FTS5 vs LIKE 的 balance 原则**：按"频率 × 精度"分配索引——热记忆高频毫秒级（execute_job 每日注入热路径）→ FTS5；归档低频秒级（诊断触发时）→ LIKE。FTS5 服务热路径，不因归档存在而失去意义
+- **feedback 条目长期保留**：`outcome=feedback` 的用户偏好是长期有效强约束（"不要太啰嗦"3 年后依然生效），prune 跳过——执行摘要照常归档（近期价值）；注入时反馈优先（Phase 2.3：memory_limit 窗口内 feedback 优先，剩余给执行摘要）
+
 **字段取舍**：
 - `covered`：结构化覆盖列表（规则从 records 提取，零成本）——Phase 2.5 窗口重叠去重的比对数据（机器可精确比对）；`summary` 给 LLM 读（叙事，不可比对）、`outcome` 分类（状态枚举）——三者分工不同互不替代
 - 不设 `decisions_taken`：无消费方（Phase 3 用 agent_steps 记录决策，重复）；不设 `error_message`：失败不写记忆（异常识别是 Phase 3 日志分析 Agent 的独立功能）
+
+### 标识规范（task_id / run_id）
+
+| 标识 | 产生方 | 产生时机 | 消费方 |
+|---|---|---|---|
+| `task_id` | **调度层**——`{task_type}-{name}` 约定，从 section 名派生（summary 任务在 execute_job 中 `f"summary-{job_config.name}"`） | 每次执行开始时 | 写入（extract_and_store 接收）、读取过滤（retrieve/get_recent/search_fts/prune 按 task 分组） |
+| `run_id` | **调用方**——每次执行生成 `str(uuid4())`；MemoryExtractor 只接收不生成 | 每次执行开始时 | 写入（UNIQUE）、去重（_deduplicate_and_rank）、追溯 |
+
+- task_id : run_id = **1 : N**（一个任务多次执行）
+- 任何写记忆的调用方遵循同样约定：Phase 2.3 反馈生成自己的 run_id（outcome=feedback）、未来 Phase 3 agent 任务定义自己的 task_id
+- **归档保留两者**：追溯/去重不因归档中断
 
 ## 记忆策略权衡
 

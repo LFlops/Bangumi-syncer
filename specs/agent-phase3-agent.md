@@ -47,7 +47,7 @@ app/services/agent/
 │   ├── bangumi.py        # search_subject, get_episodes, set_watched
 │   ├── sync.py           # query_history, retry_failed, get_candidates
 │   ├── system.py         # check_health, get_errors, get_scheduler_status
-│   └── memory.py         # search_knowledge_base (查询已沉淀的知识)
+│   └── memory.py         # search_knowledge_base (查询已沉淀的知识) + search_archive (查冷记忆全量历史)
 ├── memory.py             # 记忆注入/提取 (Phase 2 已实现，Phase 3 扩展)
 └── models.py             # AgentRun, ToolCall, ToolResult, AgentTrace
 ```
@@ -123,6 +123,22 @@ tools.register(ToolDefinition(
     description="将本次诊断的解决方案沉淀到知识库，供未来复用",
     parameters={...},
     handler=knowledge_base_repo.insert,
+))
+
+# 冷记忆检索：Phase 2 归档表（agent_working_memory_archive），查全量历史
+# 场景：失败定位时检索"很久以前的类似错误模式"（热记忆 search_fts 只覆盖 prune 窗口）
+tools.register(ToolDefinition(
+    name="search_archive_memory",
+    description="检索归档的冷记忆（全量历史，超出热记忆 prune 窗口的记录）",
+    parameters={
+        "type": "object",
+        "properties": {
+            "task_type": {"type": "string", "description": "任务类型过滤，如 summary"},
+            "keywords": {"type": "string", "description": "关键词"},
+            "limit": {"type": "integer", "default": 50},
+        },
+    },
+    handler=memory_repo.search_archive,
 ))
 ```
 

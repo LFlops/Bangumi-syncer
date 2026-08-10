@@ -50,6 +50,10 @@ MemoryEntry(
 - 前缀方案零表结构改动，retriever 的 `_deduplicate_and_rank` 识别 `[用户反馈]` 前缀即可排到最前
 - 确认价值后（如反馈确实改变了行为）再升级为结构化字段（priority/importance）
 
+**feedback 条目长期保留**：
+- `outcome="feedback"` 条目**不被 prune 归档/删除**（用户偏好是长期有效强约束，"不要太啰嗦"3 年后依然生效）——prune 实现跳过 feedback（Phase 2.0.1 W9）
+- 注入时 feedback 优先：`memory_limit` 窗口内 feedback 条目排最前，剩余额度给执行摘要（`_deduplicate_and_rank` 的排序逻辑）
+
 ## API 设计
 
 ```python

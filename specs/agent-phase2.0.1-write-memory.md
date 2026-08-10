@@ -61,17 +61,24 @@ class MemoryEntry:
 class AgentMemoryRepository:
     def insert(self, entry: MemoryEntry) -> int: ...
     def prune(self, task_type: str, task_id: str, keep: int = 1000) -> int:
-        """每 task 保留最近 keep 条，删除更早的（默认 1000）。"""
+        """超出 keep 的旧记录：先 INSERT INTO archive，再 DELETE 主表
+        （触发器同步删 FTS 索引）。默认 1000 条/任务（热记忆窗口）。
+        跳过 outcome='feedback' 条目：用户偏好长期有效，不归档不删除。"""
     def get_recent(self, task_type: str, task_id: str, limit: int = 5) -> list[MemoryEntry]:
         """按 task 取最近 N 条（created_at DESC）。"""
     def search_fts(self, query: str, task_type: str, limit: int = 5) -> list[MemoryEntry]:
-        """FTS5 全文检索，按 task_type 过滤（JOIN 主表取全字段）。"""
+        """FTS5 全文检索（热记忆），按 task_type 过滤（JOIN 主表取全字段）。"""
+    def search_archive(
+        self, task_type: str | None, keywords: str, limit: int = 50
+    ) -> list[MemoryEntry]:
+        """冷记忆检索（LIKE，无 FTS）——Phase 3 失败定位等查全量历史用。"""
     def get_latest(self, task_type: str, task_id: str) -> MemoryEntry | None:
         """最近一条（Phase 2.5 使用）。"""
 ```
 
 - `search_fts` **必须带 task_type 过滤**（FTS5 查询条件或 JOIN 后过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
-- `prune` 在每次 insert 后调用，防表无限膨胀
+- `prune` 在每次 insert 后调用：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
+- `search_archive`：冷记忆无 FTS，LIKE 检索 + task_type 可选过滤——面向低频"查全量历史"场景（热路径仍走 FTS）
 
 ## MemoryExtractor
 
@@ -158,7 +165,7 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/covered/空响应跳过） |
 | 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/get_latest） |
-| 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（表 + 索引 + FTS5 + 触发器） |
+| 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器） |
 
 > 总计：新增 4 个文件，修改 1 个文件
 
@@ -189,10 +196,22 @@ class MemoryExtractor:
 - **When** execute_job 调用处（外层 try/except）
 - **Then** 调用方不中断，继续执行后续流程
 
-### Scenario W6 prune 保留上限
+### Scenario W6 prune 归档而非删除
 - **Given** 同一 task 写入 1005 条
 - **When** 每次 insert 后 prune(keep=1000)
-- **Then** 表内仅保留最近 1000 条
+- **Then** 主表仅保留最近 1000 条
+- **And** archive 表包含被归档的 5 条（含原 created_at/run_id）
+
+### Scenario W9 feedback 条目不被 prune
+- **Given** 主表含 1 条 `outcome="feedback"` 的旧条目（在 keep 窗口外）
+- **When** prune(keep=1000)
+- **Then** feedback 条目仍在主表（不归档不删除）
+- **And** archive 表不含该条目
+
+### Scenario W8 归档可检索
+- **Given** archive 表含某关键词记录
+- **When** `search_archive(task_type, keywords)`
+- **Then** 能命中（LIKE 检索冷记忆）
 
 ### Scenario W7 covered 含 None 字段
 - **Given** records 含电影（season/episode 为 None）
