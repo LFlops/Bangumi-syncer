@@ -1,9 +1,9 @@
 # Phase 2.1: 工具调用协议支持
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 1（ContentBlock 骨架 + 双 provider 结构）+ Phase 2（记忆，纯文本 chat 已就绪）
+> 前置依赖：Phase 1（双 provider 结构 + ContentBlock 骨架）——不需要 2.0.x（工具协议与记忆无关）
 > 交付物：内部模型支持 ToolUse/ToolResult block，Anthropic 与 OpenAI 双协议可无损表达工具调用
-> 执行时机：Phase 2 之后、Phase 2.2 之前（一个 phase 只做一件事）
+> 执行时机：Phase 2.0.2 之后、Phase 2.2 之前（一个 phase 只做一件事）
 
 ## 目标
 

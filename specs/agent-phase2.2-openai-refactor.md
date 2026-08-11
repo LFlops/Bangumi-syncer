@@ -1,7 +1,7 @@
 # Phase 2.2: OpenAI 兼容模式重构
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 1 + Phase 2 + Phase 2.1（工具拆并已就绪）
+> 前置依赖：Phase 1 + Phase 2.1（工具拆并已就绪）——不需要 2.0.x（openai 适配与记忆无关）
 > 交付物：`OpenAICompatProvider` 适配内部中立模型结构，支持 `thinking_level` → `reasoning_effort`
 > 执行时机：Phase 2.1 之后、Phase 3 之前（一个 phase 只做一件事）
 
