@@ -25,7 +25,7 @@ POST /api/summary/jobs/{name}/feedback {user_name, feedback}
     │
     ▼
 写入 agent_working_memory（task_type='summary'，summary 字段存反馈原文含
-[用户反馈] 前缀，outcome='feedback'，covered 为空）
+[用户反馈] 前缀，outcome='feedback'）
     │
     ▼
 下次 summary 执行：MemoryRetriever 读取时反馈条目格式化加 [用户反馈] 前缀
@@ -39,20 +39,35 @@ MemoryEntry(
     task_type="summary",
     task_id="summary-{job_name}",
     run_id=str(uuid4()),
-    summary="[用户反馈] 不要太啰嗦",       # 前缀约定：retriever 识别即加权
-    covered=[],                             # 反馈条目无覆盖列表
+    summary="[用户反馈] alice: 不要太啰嗦",  # 前缀 + 用户标识（user_name 缺省当前登录用户）
     outcome="feedback",                     # success | partial | feedback 之一
     tokens_used=0,
 )
 ```
 
+**用户标识走前缀约定，不新增列**（feedback 是任务级偏好）：
+- 当前消费方按 task_id 检索（get_feedback）——用户不影响（任务确定后该任务的所有反馈都该注入）
+- 未来按用户文本检索：FTS5 命中 summary 字段（`alice` 可搜）✓
+- 只有"按用户 SQL 精确过滤"才需加列——YAGNI，需求出现再升级（与 consumed_run_id 同 migration 模式）
+
 **为什么用前缀约定而非结构化 priority 字段**（权衡结论见 Phase 2 spec"记忆策略"）：
 - 前缀方案零表结构改动，retriever 的 `_deduplicate_and_rank` 识别 `[用户反馈]` 前缀即可排到最前
 - 确认价值后（如反馈确实改变了行为）再升级为结构化字段（priority/importance）
 
-**feedback 条目长期保留**：
-- `outcome="feedback"` 条目**不被 prune 归档/删除**（用户偏好是长期有效强约束，"不要太啰嗦"3 年后依然生效）——prune 实现跳过 feedback（Phase 2.0.1 W9）
-- 注入时 feedback 优先：`memory_limit` 窗口内 feedback 条目排最前，剩余额度给执行摘要（`_deduplicate_and_rank` 的排序逻辑）
+**feedback 条目长期保留 + 注入不占摘要额度**：
+- `outcome="feedback"` 条目**不被 prune 归档/删除**（用户偏好是长期有效强约束，"不要太啰嗦"3 年后依然生效）
+- 注入时 feedback **全量排最前，不占执行摘要额度**（总量 = feedback 数 + memory_limit）——反馈是强约束（用户明确表达），不该被执行摘要挤掉；feedback 数量天然少，token 成本可控
+
+### 对 2.0.1 / 2.0.2 的修改清单（feedback 是 2.3 的概念，统一在此引入）
+
+2.0.1/2.0.2 **不认识 feedback**（outcome 只有 success/partial，prune/get_recent 朴素实现）。本 phase 引入：
+
+| 修改 | 文件 | 内容 |
+|------|------|------|
+| 修改 | `app/services/memory/models.py` | outcome 取值扩展：`success \| partial \| feedback`（注释） |
+| 修改 | `app/core/database/agent_memory.py` | `get_recent` 排除 `outcome='feedback'`；新增 `get_feedback`（全量取反馈条目，无 limit）；`prune` 跳过 feedback（长期保留） |
+| 修改 | `app/services/memory/retriever.py` | `retrieve`/`_deduplicate_and_rank` 修改：feedback 全量优先、不占摘要额度（recent 路径分离 feedback 与摘要）；`_format_memory_context` 增加 `[用户反馈]` 前缀标记 |
+| 修改 | `app/services/summary/service.py` | `record_feedback()` 写入 MemoryEntry(outcome="feedback") |
 
 ## API 设计
 
@@ -104,8 +119,11 @@ MemoryEntry(
 | 修改 | `app/services/summary/service.py` | 新增 `record_feedback()`（或独立 feedback 服务方法） |
 | 修改 | `templates/`（inbox 通知列表） | watching_summary_* 通知条目加反馈按钮 + 弹窗 |
 | 修改 | `static/js/`（inbox 相关 JS） | 反馈弹窗交互 + POST 调用 |
+| 修改 | `app/services/memory/models.py` | outcome 取值扩展（feedback） |
+| 修改 | `app/core/database/agent_memory.py` | get_recent 排除 + get_feedback 新增 + prune 跳过（见"对 2.0.1/2.0.2 的修改清单"） |
+| 修改 | `app/services/memory/retriever.py` | retrieve 排序：feedback 全量优先、不占摘要额度（见"对 2.0.1/2.0.2 的修改清单"） |
 
-> 总计：修改 4 个文件（无新增）
+> 总计：修改 7 个文件（无新增；其中 3 个是对 2.0.1/2.0.2 已有文件的演进修改）
 
 ## BDD 测试场景
 
@@ -113,7 +131,7 @@ MemoryEntry(
 - **Given** 用户 alice 在 inbox 看到 summary 通知
 - **When** POST `/api/summary/jobs/daily/feedback` `{user_name: "alice", feedback: "不要太啰嗦"}`
 - **Then** 返回 success
-- **And** `agent_working_memory` 新增一条 `task_id="summary-daily"`、`summary` 含 `[用户反馈]` 前缀的记录
+- **And** `agent_working_memory` 新增一条 `task_id="summary-daily"`、`summary == "[用户反馈] alice: 不要太啰嗦"`（前缀 + 用户标识）的记录
 
 ### Scenario F2 反馈注入为强约束
 - **Given** 已有一条反馈记忆（`[用户反馈] 不要太啰嗦`）
