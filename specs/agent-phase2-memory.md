@@ -29,9 +29,11 @@
   2. 注入到 LLM prompt 的 "历史上下文" 部分
 
 每次定时任务执行后（2.0.1）：
-  1. MemoryExtractor.extract_and_store(result, records)
+  1. MemoryExtractor.extract_and_store(result)
      → 让 LLM 用一句话总结本次执行的关键发现（或规则兜底）
-     → 结构化写入 agent_working_memory（含 covered 覆盖列表）
+     → 结构化写入 agent_working_memory
+  2. mark_consumed(records, run_id)
+     → 在 sync_records 标记本次消费的剧集（窗口重叠去重的数据基础）
 ```
 
 ## 数据库（2.0.1 建表）
@@ -43,11 +45,15 @@ CREATE TABLE agent_working_memory (
     task_id TEXT NOT NULL,          -- scheduler 名称, 如 'summary-daily'
     run_id TEXT NOT NULL UNIQUE,    -- UUID
     summary TEXT NOT NULL,          -- 一行摘要（LLM 生成，失败兜底规则截断）
-    covered TEXT,                   -- JSON: [{"title","season","episode"}]（Phase 2.5 比对用）
     outcome TEXT NOT NULL,          -- 'success', 'partial', 'feedback'
     tokens_used INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
 );
+
+-- 剧集消费标记（sync_records 表新增列，migration ALTER TABLE）
+-- consumed_run_id: 最近一次消费该集的总结 run_id（NULL = 未被消费）
+-- 窗口重叠去重：查今日明细中 consumed_run_id IS NOT NULL 的记录，精确无窗口
+```
 
 CREATE INDEX idx_memory_task ON agent_working_memory(task_type, task_id);
 CREATE INDEX idx_memory_created ON agent_working_memory(created_at);
@@ -85,7 +91,6 @@ CREATE TABLE agent_working_memory_archive (
     task_id TEXT NOT NULL,
     run_id TEXT NOT NULL UNIQUE,      -- 归档保留，追溯/去重仍可用
     summary TEXT NOT NULL,
-    covered TEXT,
     outcome TEXT NOT NULL,
     tokens_used INTEGER,
     created_at TEXT,                  -- 保留原值（非重新默认）
@@ -106,7 +111,8 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - **feedback 条目长期保留**：`outcome=feedback` 的用户偏好是长期有效强约束（"不要太啰嗦"3 年后依然生效），prune 跳过——执行摘要照常归档（近期价值）；注入时反馈优先（Phase 2.3：memory_limit 窗口内 feedback 优先，剩余给执行摘要）
 
 **字段取舍**：
-- `covered`：结构化覆盖列表（规则从 records 提取，零成本）——Phase 2.5 窗口重叠去重的比对数据（机器可精确比对）；`summary` 给 LLM 读（叙事，不可比对）、`outcome` 分类（状态枚举）——三者分工不同互不替代
+- `summary` 给 LLM 读（叙事）、`outcome` 分类（状态枚举）、`tokens_used` 计费——职责单一
+- 不设 `covered`：窗口重叠去重改用**剧集消费标记**（sync_records 的 consumed_run_id，见"剧集消费标记"小节）——精确到集、无窗口近似、不依赖记忆保留窗口
 - 不设 `decisions_taken`：无消费方（Phase 3 用 agent_steps 记录决策，重复）；不设 `error_message`：失败不写记忆（异常识别是 Phase 3 日志分析 Agent 的独立功能）
 
 ### 标识规范（task_id / run_id）
@@ -119,6 +125,13 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - task_id : run_id = **1 : N**（一个任务多次执行）
 - 任何写记忆的调用方遵循同样约定：Phase 2.3 反馈生成自己的 run_id（outcome=feedback）、未来 Phase 3 agent 任务定义自己的 task_id
 - **归档保留两者**：追溯/去重不因归档中断
+
+### 多用户场景：task_id 是隔离单元，调用方决定粒度
+
+- **记忆按 task_id 隔离**（一个任务的记忆只被该任务读写）；**无 user 维度**——隔离粒度由调用方定义 task_id 决定
+- **summary 任务**：`user_name` 为空（多用户 job）= 记忆为**任务级混合**（注入含所有用户历史——可接受：总结本身是任务级产出，混合记忆同理）；多用户**隔离**需求 → 调用方约束：`user_name` 固定单用户或每用户一个 job；**不做**按用户分组注入/提取（复杂度高，YAGNI——真实需求出现时再加 user 维度）
+- **消费标记**：sync_records 记录级天然带 `user_name` ✓ 无需改
+- **feedback**：任务级偏好（多用户 job 下混合反馈注入所有用户，与混合总结一致）——用户标识走 summary 字段前缀约定（见 2.3），不新增列；可检索性：FTS5 全文命中 summary 字段，按用户 SQL 精确过滤（需列）是 YAGNI
 
 ## 记忆策略权衡
 
@@ -134,7 +147,7 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 **Phase 2.0.1/2.0.2 选择 append-only 的理由**：记忆量小（每日 1 次执行），噪音与 token 浪费可忽略；实现最简，先验证"记忆价值假设"。不做滚动摘要（YAGNI）与语义检索（FTS5 关键词对 summary 场景够用）。
 
 **为演进留的扩展点（现在设计，不做实现）**：
-1. `MemoryEntry` 已有 `outcome/covered` 字段——状态分类、结构化覆盖天然可存，未来压缩/加权都能用
+1. `MemoryEntry` 已有 `outcome` 字段——状态分类天然可存，未来压缩/加权都能用
 2. retriever 的 `_deduplicate_and_rank` 是策略集中点——未来加"反馈优先"、"旧记忆摘要化"只改这里
 3. 反馈加权先用 `[用户反馈]` 前缀约定（Phase 2.3），确认价值后再升为结构化 priority 字段
 
@@ -161,10 +174,12 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - **存取分离**：存什么与读什么是两个决策；"摘要存 + 最近 N 读 + 关键词补"是 token 成本最优解
 - 何时全量：记忆量极小（N≤3）时全量注入无妨（summary 字段本就精简）；回溯全文走 inbox 通知记录，无需记忆表存 full_text
 
-### 注入条数暴露为用户配置（memory_limit）
+### 记忆开关与注入条数（memory_enabled / memory_limit，每任务独立）
 
-- `[summary-{name}]` 新增 `memory_limit`（默认 5，**0 = 不注入记忆**），自部署用户可按模型上下文/token 预算/任务复杂度调整
-- `SummaryJobConfig` 增加 `memory_limit` 字段；前端 summary job 表单加输入框（见 2.0.2）
+- `[summary-{name}]` 新增 **`memory_enabled`**（默认 `false`，保守——存量行为不变）与 **`memory_limit`**（默认 5，仅 enabled=true 时生效）
+- **每任务独立配置，无全局继承**：三态继承（未配置=继承全局）对 INI 配置是语义负担（用户无法直观判断"全局 true 时某任务未配置是开是关"）；每任务显式声明，一眼可读；未来其他任务接入时在自己的配置段声明
+- **单一关闭途径**：`memory_enabled=false` 即关闭（不注入任何记忆，含 feedback）；`memory_limit` 只管条数（最小值 1），不用 0 表示关闭
+- `SummaryJobConfig` 增加两字段；前端 summary job 表单加开关 + 条数输入框（开关关时禁用，见 2.0.2）
 - 落地"Phase 2 在 [summary-{name}] 加可选字段"的预留
 
 ### 去重策略
@@ -174,20 +189,22 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 | 同记忆条目双路径命中（recent + keywords） | **去重**（`_deduplicate_and_rank` 按 run_id，2.0.2） |
 | 摘要间重复叙事（连续多次提同一番剧） | 靠 `memory_limit` 数量控制，不去重（append-only 固有噪音） |
 | 明细 vs 摘要交叉（今日明细与历史摘要同番剧） | **不去重**：明细是事实清单、摘要是历史叙事，用途不同不互斥；若观察实际冗余，在 `_format_memory_context` 加规则（策略集中点） |
-| **窗口重叠**（每日触发 + lookback_days=7：第 2 天明细 2-8 天与昨日总结 1-7 天重叠） | **2.0.1 存 covered 数据基础，精确去重见 Phase 2.5**：2.0.2 注入历史摘要让 LLM 看到重复（软去重） |
+| **窗口重叠**（每日触发 + lookback_days=7：第 2 天明细 2-8 天与昨日总结 1-7 天重叠） | **剧集消费标记**（2.0.1 标记 sync_records.consumed_run_id，2.0.2 find_overlaps 查标记 + overlap_note 标注）——精确到集、无窗口近似 |
 
 > 注：失败路径不写记忆（无 outcome="failed" 条目）——异常模式识别是 Phase 3 日志分析 Agent 的独立功能，summary 链路保持内聚
 
-### covered 存结构化覆盖信息（Phase 2.5 的数据基础）
+### 剧集消费标记（2.0.2 重叠去重的数据基础）
 
-`extract_and_store` 时，`covered` 存入本次总结覆盖的记录列表（规则从 records 提取，非 LLM）：
+窗口重叠去重从**剧集侧**建模：记录被哪次总结消费过，而非"总结覆盖了哪些记录"。
 
-```json
-// covered 示例
-[{"title": "葬送的芙莉莲", "season": 1, "episode": 10}, ...]
-```
-
-Phase 2.5 用 `covered` 列表按 `(title, season, episode)` 精确比对今日明细，实现窗口重叠去重。covered 的 season/episode 可为 None（电影），比对时 tuple 含 None 参与匹配即可。
+- **数据位置**：`sync_records` 新增 `consumed_run_id`（最近一次消费该集的总结 run_id，NULL = 未消费）+ `consumed_at`
+- **旧库迁移（幂等）**：`__ensure_sync_records_consumed`——启动时 `PRAGMA table_info` 检查列是否存在，缺失则 `ALTER TABLE ADD COLUMN`（项目既有 `__ensure_*` 模式，老用户升级自动补列）
+- **为什么加列而非新辅助表**：当前需求是单值标记（最近一次消费），加列无 join、生命周期一致（sync_records 清理时标记随之消失，无孤儿行）；辅助表的优势（消费历史/跨表复用）是 YAGNI
+- **写入（2.0.1）**：execute_job 成功路径，`mark_consumed(records, run_id)` 更新今日明细的消费标记（与 extract_and_store 同流程）
+- **读取（2.0.2）**：`find_overlaps` 查"今日明细中 `consumed_run_id IS NOT NULL`"——**精确到集，无窗口近似**（covered 方案的"最近 K 条并集"对超过窗口的旧集会漏标，消费标记无此问题）
+- **可追溯**：标记含 run_id → 直接取该次总结摘要（overlap_note 可带摘要内容）
+- **失败自洽**：总结失败不标记 → 下次重新总结；重复观看：标记更新为最新 run_id
+- **保留窗口**：随 sync_records 保留策略（记录是核心数据，通常长于记忆窗口）
 
 ### 摘要生成与评测
 
@@ -204,4 +221,6 @@ Phase 2.5 用 `covered` 列表按 `(title, season, episode)` 精确比对今日�
 
 ## 执行序列
 
-Phase 1 → 1.1 → **2.0.1 → 2.0.2** → 2.1 → 2.2 → 2.3 → 2.5 → Phase 3
+Phase 1 → 1.1 → **2.0.1 → 2.0.2** → 2.1 → 2.2 → 2.3 → Phase 3
+
+> 顺序说明：2.3（反馈）与 Phase 3 无依赖，排在 2.2 后是人为顺序——业务价值上 Phase 3 > 2.3，可按需调整（如 Phase 3 提前）。
