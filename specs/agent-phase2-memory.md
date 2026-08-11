@@ -45,6 +45,7 @@ CREATE TABLE agent_working_memory (
     task_id TEXT NOT NULL,          -- scheduler 名称, 如 'summary-daily'
     run_id TEXT NOT NULL UNIQUE,    -- UUID
     summary TEXT NOT NULL,          -- 一行摘要（LLM 生成，失败兜底规则截断）
+    full_text TEXT,                   -- 本次总结全文（回溯/诊断用；随 prune/归档同生命周期）
     outcome TEXT NOT NULL,          -- 'success', 'partial', 'feedback'
     tokens_used INTEGER,
     created_at TEXT DEFAULT (datetime('now'))
@@ -91,6 +92,7 @@ CREATE TABLE agent_working_memory_archive (
     task_id TEXT NOT NULL,
     run_id TEXT NOT NULL UNIQUE,      -- 归档保留，追溯/去重仍可用
     summary TEXT NOT NULL,
+    full_text TEXT,
     outcome TEXT NOT NULL,
     tokens_used INTEGER,
     created_at TEXT,                  -- 保留原值（非重新默认）
@@ -126,6 +128,20 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - 任何写记忆的调用方遵循同样约定：Phase 2.3 反馈生成自己的 run_id（outcome=feedback）、未来 Phase 3 agent 任务定义自己的 task_id
 - **归档保留两者**：追溯/去重不因归档中断
 
+### 记忆清理机制（上下文被污染时如何重置）
+
+| 方案 | 可恢复性 | 实现成本 | 责任方 |
+|---|---|---|---|
+| **C. 切换 task_id**（**首选**） | ✓✓ 零损失（旧 task_id 数据保留可切回） | **零**——summary 的 task_id = `summary-{name}`，job 改名/复制即新上下文 | 上游（用户/配置层）路由 |
+| **A. 显式 `clear_task`**（补充） | ✗ 不可恢复（二次确认） | 低——同一事务删主表 + 归档 + 消费标记 | memory 模块（API 层暴露） |
+| B. 软删除标志位 | ✓ 可恢复 | 中——deleted 列 + 全查询过滤 + 清理策略 | memory 模块 |
+| D. 业界其他 | 快照/版本化/自动遗忘/审计 | — | — |
+
+- **推荐 C 为主**：重置最自然的是**换隔离单元**（上游路由，符合"task_id 隔离/调用方决定粒度"），而非删隔离单元内数据；数据零损失、可回滚
+- **A 补充**：用户要"彻底清空"的快捷操作——`clear_task` 同一事务删主表 + 归档表 + 该 task 相关消费标记（**防悬挂引用**：否则 find_overlaps 标注"已消费于已删除的 run_id"）；API `POST /api/summary/jobs/{name}/clear-memory` + 前端按钮（二次确认）
+- **B 否决**：恢复需求已被 C 覆盖（旧数据在旧 task_id）；deleted 标志与归档语义重叠、表膨胀、查询复杂度
+- **职责划分**：task_id 路由归上游（配置层），清理能力归 memory 模块（clear_task）——互补不冲突
+
 ### 多用户场景：task_id 是隔离单元，调用方决定粒度
 
 - **记忆按 task_id 隔离**（一个任务的记忆只被该任务读写）；**无 user 维度**——隔离粒度由调用方定义 task_id 决定
@@ -158,6 +174,34 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - **prune 默认 1000 条/任务**：每日任务 ≈ 2.7 年历史；存储 ~200KB/任务无压力；检索由 FTS5 保障
 - **职责分离**：`memory_limit` 管注入量（默认 5），`prune` 管增长上限（默认 1000）——互不干扰
 
+### FTS5 与联合索引：互补而非替代
+
+| 索引 | 解决的问题 | 记忆检索路径 |
+|---|---|---|
+| **联合索引**（idx_memory_task：task_type+task_id+created_at） | **结构化查询**（按任务+时间过滤/排序） | `get_recent`——短期记忆注入路径（memory_limit 条） |
+| **FTS5**（倒排索引） | **全文检索**（按文本内容关键词匹配） | `search_fts`——中期记忆关键词检索（今日明细标题） |
+| LIKE（归档表） | 无索引（冷层低频） | `search_archive`——Phase 3 诊断全量历史 |
+
+- 不是二选一：`LIKE %kw%` 无法用联合索引（全表扫描），**内容检索必须 FTS5**；**结构化过滤必须联合索引**（get_recent 无法用 FTS5 表达"按 task + 时间排序取 N 条"）
+- **短期记忆 = 联合索引路径**（get_recent）；FTS5 是**中期记忆的检索手段**；归档 LIKE（冷层）
+
+### 短中长期记忆分层
+
+| 层 | 定义 | 当前实现 | 生命周期 |
+|---|---|---|---|
+| **短期**（工作记忆） | 当前执行的注入上下文 + 任务状态 | `memory_limit` 条注入（get_recent 联合索引路径）；AgentRun 上下文（Phase 3 内存态） | 单次执行/数天 |
+| **中期**（情景记忆） | 近期任务执行的摘要历史 | 热记忆主表 + FTS5 检索（prune 1000 ≈ 2.7 年） | 数周到数年 |
+| **长期**（语义/知识） | 跨任务的持久知识 | feedback（永久，不被 prune）+ 归档表 + knowledge_base（Phase 3 沉淀） | 永久 |
+
+**缺口标注**：三层无显式"记忆类别"标记——当前靠 task_type（任务维度）、outcome（feedback 标记）、独立表（knowledge_base）**隐含**分层。改进方向：knowledge_base 作为长期语义记忆的显式载体（Phase 3）；如需跨层统一检索再评估显式类别字段（YAGNI）。
+
+### 纯文本 vs RAG：gap 是词汇鸿沟
+
+- **FTS5 是词法匹配**——查询词与文档用词一致才命中。**词汇鸿沟（vocabulary gap）**：语义相同措辞不同则命中不了（"服务器挂了" vs "503 错误"；中文/日文/别名标题）
+- **RAG（embedding 向量检索）**把文本映射到语义空间按距离召回——跨越词汇鸿沟
+- **适合 RAG 的项目特征**：语义需求强（查询措辞 ≠ 文档措辞）、大规模非结构化文本（数万条+）、跨语言/同义词、有 embedding 能力、召回率优先（宁多召回让 LLM 过滤）
+- **当前判断**：summary 记忆检索（今日明细标题精确匹配、规模小）词汇鸿沟小，不需要 RAG；Phase 3 的可 RAG 候选（2GB 档案标题匹配、knowledge_base 错误模式）见 `agent-phase3-agent.md` 的"RAG 演进"小节
+
 **演进路径**：append-only（2.0.1/2.0.2）→ 前缀优先（Phase 2.3 后）→ 滚动摘要（记忆膨胀时）。
 
 ### append-only 与 `_summarize` 不矛盾（两个维度）
@@ -171,8 +215,9 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - **存储不是瓶颈**（一年几 MB），**注入才是瓶颈**：全量读时 token 成本线性膨胀 + 上下文窗口有限 + 信息冗余（注入 10 条全文 ≈ 5000 token，超过总结本身）
 - **摘要 = 注入粒度的最优解**：保留"发生了什么"语义，30 token/条可控
 - **关键词搜索 = 全量读取的选择性替代**：只注入最近 N 条时，FTS5 从全部历史按需捞相关记录
-- **存取分离**：存什么与读什么是两个决策；"摘要存 + 最近 N 读 + 关键词补"是 token 成本最优解
-- 何时全量：记忆量极小（N≤3）时全量注入无妨（summary 字段本就精简）；回溯全文走 inbox 通知记录，无需记忆表存 full_text
+- **存取分离（记忆表内两列）**：`summary` 存摘要（注入粒度最优，~30 token/条）；`full_text` 存本次总结全文（回溯/诊断用，Phase 3 看历史总结细节）——注：成功通知 `write_in_app=False` 不写站内信，全文项目内无 inbox 载体，故记忆表需 `full_text` 列
+- **成本账（为什么存摘要而非全文）**：LLM 摘要 1 次/执行（~100 token，且可命中 prompt 缓存见 2.0.1）+ 注入 5×30 = **~250 token/次** vs 存全文注入 5×300 = **~1500 token/次**——摘要是一次性成本被注入次数摊薄，长期更省；全文存 full_text 列仅供回溯不注入
+- 何时全量注入：记忆量极小（N≤3）时全文注入无妨（但 summary 字段本就精简，保持摘要注入）
 
 ### 记忆开关与注入条数（memory_enabled / memory_limit，每任务独立）
 

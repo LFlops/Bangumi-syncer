@@ -131,7 +131,8 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
                 task_type="summary",
                 task_id=task_id,
                 run_id=run_id,
-                llm_response=response.content,
+                messages=messages,             # 完整上下文：缓存前缀 + 摘要来源
+                response=response,             # 响应：summary 生成 + full_text 存储
                 outcome="success",
                 tokens_used=response.usage.total_tokens if response.usage else 0,
             )
@@ -200,6 +201,19 @@ if overlaps:
 
 - **默认标注而非过滤**：不删除明细（避免改变"过去 7 天完整总结"的语义）；LLM 自主决定简述/跳过，用户可在 system_prompt 中要求"重复也详细总结"覆盖此行为
 - **注入位置**：overlap_note 附加到 `## 历史执行上下文` 的 memory_context 内（与 2.0.2 的注入同一位置，不独立插入 system prompt）
+
+### 消费标记失败语义（判定规则定稿）
+
+消费标记的写入时机：execute_job 第 4 步（chat 成功 + 记忆写入成功后，同一 try 块）。各失败点的语义：
+
+| 失败点 | 消费标记 | 通知 | 下次行为 |
+|---|---|---|---|
+| **chat 失败**（LLM 调用异常） | 不写 | 不发 | **重新总结**（未消费） |
+| **extract/标记失败**（DB 异常，同 try 块） | 不写 | **照发**（try 外） | **重新总结**（可能重复通知，概率低可接受） |
+| **通知失败**（投递层，try 外） | **已写** | 失败 | **不重新总结**（已消费，inbox 失败通知含内容可查） |
+
+**判定规则**：消费成功 = **chat 成功 + 记忆写入成功**（第 4 步完成）。通知是投递层，独立于消费——通知失败**不回滚消费标记**（总结已生成；投递走通知重试/告警兜底；回滚方案否决——通知持续失败时每次执行重新生成浪费 token）。
+**memory_enabled=false 不标记消费**：一致性成立——关闭记忆 = 不注入 = 不需要重叠去重（find_overlaps 在注入 if 内，不会被调用）；关闭期间总结过的记录重新开启后视为未消费（可接受，关闭期间不追踪消费状态）。
 
 ## memory_enabled / memory_limit 配置（每任务独立，无继承）
 

@@ -21,8 +21,9 @@ class MemoryEntry:
     task_type: str = ""
     task_id: str = ""
     run_id: str = ""
-    summary: str = ""
-    outcome: str = "success"                            # success | partial（feedback 取值 Phase 2.3 引入）
+    summary: str = ""           # 一行摘要（注入粒度）
+    full_text: str = ""         # 本次总结全文（回溯/诊断用，随 prune/归档同生命周期）
+    outcome: str = "success"    # success | partial（feedback 取值 Phase 2.3 引入）
     tokens_used: int = 0
     created_at: str = ""
 
@@ -66,6 +67,15 @@ class AgentMemoryRepository:
         self, task_type: str | None, keywords: str, limit: int = 50
     ) -> list[MemoryEntry]:
         """冷记忆检索（LIKE，无 FTS）——Phase 3 失败定位等查全量历史用。"""
+    def clear_task(self, task_type: str, task_id: str) -> int:
+        """清空任务的记忆（显式重置，不可恢复——调用方需二次确认）：
+        同一事务删除主表 + 归档表 + 该 task 相关 sync_records 消费标记
+        （防悬挂引用：否则 find_overlaps 标注"已消费于已删除的 run_id"）。
+
+        首选重置方式是切换 task_id（job 改名 = 新上下文，数据可回滚），
+        clear_task 是"彻底清空"的快捷操作（见总览"记忆清理机制"）。
+        API/UI（POST /api/summary/jobs/{name}/clear-memory + 前端按钮）随 2.0.2
+        或独立小 phase 落地。"""
 
 - `search_fts` **必须带 task_type 过滤**（FTS5 查询条件或 JOIN 后过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
 - `prune` 在每次 insert 后调用：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
@@ -104,11 +114,12 @@ class MemoryExtractor:
         task_type: str,
         task_id: str,
         run_id: str,
-        llm_response: str,
+        messages: list[Message],    # 总结调用的完整对话上下文（缓存前缀 + 摘要来源）
+        response: ChatResponse,     # 总结响应（含全文 content）
         outcome: str,
         tokens_used: int,
     ) -> None:
-        summary = await self._summarize(llm_response)
+        summary = await self._summarize(messages, response)
         if not summary:
             return  # 空响应（LLM 重试耗尽）不写记忆，避免无效条目
         await self._repo.insert(MemoryEntry(
@@ -116,35 +127,48 @@ class MemoryExtractor:
             task_id=task_id,
             run_id=run_id,
             summary=summary,
+            full_text=response.content,   # 全文存 full_text（回溯用，不注入）
             outcome=outcome,
             tokens_used=tokens_used,
         ))
         # 清理旧记忆（每个 task 最多保留 1000 条）
         await self._repo.prune(task_type, task_id, keep=1000)
 
-    async def _summarize(self, llm_response: str) -> str:
-        """一行摘要：LLM 内置模板生成；LLM 不可用/失败时规则截取兜底。"""
-        if not llm_response:
+    async def _summarize(
+        self, messages: list[Message], response: ChatResponse
+    ) -> str:
+        """一行摘要：复用总结调用的完整对话上下文作前缀，命中 LLM prompt 缓存。
+
+        缓存利用：摘要调用紧跟总结调用（同一 execute_job 内，Anthropic 5 分钟
+        TTL / OpenAI 自动前缀缓存）——完整历史作前缀，输入 token 按缓存价格
+        （Anthropic 约 10%），且无截断信息损失。构造：
+        [总结调用的完整 messages + assistant 回复] + [user: "请用一句话总结"]。
+        """
+        if not response.content:
             return ""
         try:
-            resp = await self._llm.chat([
-                Message(role="system", content=_SUMMARY_PROMPT),
-                Message(role="user", content=llm_response[:2000]),
-            ])
+            summary_messages = list(messages)
+            summary_messages.append(Message(role="assistant", content=response.content))
+            summary_messages.append(Message(role="user", content=_SUMMARY_PROMPT))
+            resp = await self._llm.chat(summary_messages)
             if resp.content:
                 return resp.content.strip()[:200]
         except Exception:
             logger.warning("摘要 LLM 调用失败，使用规则截取", exc_info=True)
-        return llm_response.strip()[:200]  # 规则兜底：截断
+        return response.content.strip()[:200]  # 规则兜底：截断
+
+    # 注：Anthropic 侧 system 加 cache_control 标记（或依赖自动缓存）以显式
+    # 利用 prompt caching；OpenAI 侧自动前缀匹配无需额外配置
 ```
 
 ### 关键设计点（review 修复）
 
 - **无 covered**：窗口重叠去重改用剧集消费标记（`mark_consumed`，见 repository 与总览"剧集消费标记"）
-- **`_summarize` 实现**：开发者内置模板（`_SUMMARY_PROMPT` 写死，不暴露配置）+ LLM 调用 + **规则截断兜底**（LLM 失败不抛异常）
+- **`_summarize` 实现（缓存感知）**：复用总结调用完整上下文作前缀 → 命中 LLM prompt 缓存（成本 ~10%）；失败规则截断兜底；Anthropic system 加 cache_control
+- **`full_text` 列**：存总结全文（回溯/诊断用，不注入）——成功通知 `write_in_app=False` 不写站内信，全文项目内靠记忆表承载
 - **空响应不写记忆**：LLM 重试耗尽返回空响应时跳过（避免无效条目）
 - **容错**：`execute_job` 调 `extract_and_store` 时整体 try/except 包裹（记忆写入失败不影响主流程的 `_dispatch_notification`，见 2.0.2）
-- **成本说明**：每次成功执行多一次摘要 LLM 调用（小 prompt ~50 token），这是"摘要存"策略的固有成本；规则兜底保证 LLM 不可用时功能不中断
+- **成本说明**：摘要调用因缓存命中成本极低（完整历史 × 10% 输入价格）；规则兜底保证 LLM 不可用时功能不中断
 
 ## 文件变更清单
 
@@ -153,8 +177,8 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/__init__.py` | 记忆模块包 |
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
-| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive） |
-| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（SyncRecord 加字段后查询侧同步） |
+| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive/clear_task） |
+| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）+ `clear_consumed_by_task`（clear_task 联动）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（SyncRecord 加字段后查询侧同步） |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
 
 > 总计：新增 4 个文件，修改 2 个文件
@@ -162,7 +186,7 @@ class MemoryExtractor:
 ## BDD 测试场景
 
 ### Scenario W1 成功路径写入
-- **Given** extract_and_store 传入 llm_response
+- **Given** extract_and_store 传入 messages + response（完整上下文）
 - **When** 执行（随后 mark_consumed 标记今日明细）
 - **Then** `agent_working_memory` 新增一条：`summary` 为摘要、`outcome="success"`
 - **And** 今日明细的 sync_records 被标记 `consumed_run_id`（mark_consumed 同事务）
