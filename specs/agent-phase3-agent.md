@@ -1,7 +1,8 @@
 # Phase 3: Agent 化 — AI 能力对外溢出
 
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
-> 前置依赖：Phase 1（ContentBlock 类型）+ Phase 2（记忆模块）
+> 前置依赖：Phase 1（Message/ContentBlock + thinking_level）+ **Phase 2.0.1**（归档表/记忆 repo）+ **Phase 2.0.2**（注入机制，agent 场景可选）+ **Phase 2.1**（tool_use/tool_result 协议）+ **Phase 2.2**（openai 拆并）
+> 说明：agent 循环依赖 2.1 的工具协议支持；记忆工具依赖 2.0.1 归档表（search_archive）；2.2 确保 openai 侧可承载工具消息。2.3（反馈）与 Phase 3 无依赖，可并行/任意顺序
 > 交付物：Agent 循环 + 工具调用 + 日志分析 + 知识沉淀（Hermes 模式）
 
 ## 目标
@@ -48,7 +49,7 @@ app/services/agent/
 │   ├── sync.py           # query_history, retry_failed, get_candidates
 │   ├── system.py         # check_health, get_errors, get_scheduler_status
 │   └── memory.py         # search_knowledge_base (查询已沉淀的知识) + search_archive (查冷记忆全量历史)
-├── memory.py             # 记忆注入/提取 (Phase 2 已实现，Phase 3 扩展)
+├── memory.py             # 记忆注入/提取 (Phase 2.0.2 已实现，Phase 3 扩展)
 └── models.py             # AgentRun, ToolCall, ToolResult, AgentTrace
 ```
 
@@ -140,6 +141,12 @@ tools.register(ToolDefinition(
     },
     handler=memory_repo.search_archive,
 ))
+
+# 扩展点（Phase 3 实现时确认）：agent 任务（诊断等）执行摘要写记忆——
+# 复用 Phase 2.0.1 的 MemoryExtractor.extract_and_store，task_type 自定义
+# （如 'diagnostic'），task_id 遵循 {task_type}-{name} 约定，run_id 由 agent 执行时生成。
+# 这样未来的诊断任务也能引用之前诊断的记忆（任务级摘要，区别于 agent_runs 的执行追踪）。
+
 ```
 
 ## 预算控制
@@ -254,7 +261,7 @@ Agent 执行采用通用 API，不绑定具体场景：
 | 新增 | `app/services/agent/tools/bangumi.py` | Bangumi API 工具 |
 | 新增 | `app/services/agent/tools/sync.py` | 同步管理工具 |
 | 新增 | `app/services/agent/tools/system.py` | 系统诊断工具 |
-| 新增 | `app/services/agent/tools/memory.py` | 知识库搜索工具 |
+| 新增 | `app/services/agent/tools/memory.py` | search_knowledge_base + search_archive_memory（冷记忆全量历史） |
 | **数据层** | | |
 | 新增 | `app/core/database/agent_runs.py` | Agent 追踪数据 |
 | 新增 | `app/core/database/knowledge_base.py` | 知识库 CRUD |
@@ -262,10 +269,14 @@ Agent 执行采用通用 API，不绑定具体场景：
 | **API + UI** | | |
 | 新增 | `app/api/agent.py` | Agent 通用执行/查询/知识沉淀 API |
 | 修改 | `app/main.py` | 注册 agent router |
-| **前端（Phase 3 暂不实现）** | | |
-| — | `templates/` | 后续在 dashboard/logs 页面增加 AI 分析入口 |
+| **前端（日志页入口，Agent 核心跑通后补）** | | |
+| — | `templates/logs.html` + `static/js/` | "AI 分析"按钮（触发 /api/agent/run + 追踪展示） |
 
-> 总计：新增 ~14 个文件，修改 ~3 个文件（前端后续补）
+> 总计：新增 ~14 个文件，修改 ~3 个文件（前端日志页按钮后续补）
+
+## BDD 测试场景（占位）
+
+Phase 3 的 BDD 场景（agent 循环、预算、追踪、工具调用链、日志分析流程、知识沉淀）在 **Phase 3 细节对齐时补充**——分层测试方法论（单元/集成/黄金场景/E2E + LLM-as-judge）见最初 8 问的测试规划，届时落到本文档。
 
 ## 验证方式
 
