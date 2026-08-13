@@ -62,12 +62,13 @@
 ### D5. clear_task 消费标记的 run_id→task_id 定位
 
 - **问题**：`consumed_run_id` 只存 run_id、不存 task_id；run_id→task_id 映射只存在于 `agent_working_memory` 与 `agent_working_memory_archive`。
-  `clear_consumed_by_task` 必须先取该 task 的 run_id 集合再删消费标记，且需覆盖归档表、顺序敏感。
-- **推荐**：
-  - `clear_task` 事务内顺序：① `SELECT run_id FROM agent_working_memory WHERE task_type=? AND task_id=?` 与归档表同条件，求并集；② 删主表；③ 删归档表；④ `DELETE FROM sync_records WHERE consumed_run_id IN (run_ids)`。
+  清消费标记必须先取该 task 的 run_id 集合，且需覆盖归档表、顺序敏感。
+- **推荐**（已定稿）：
+  - 消费标记清理折叠进 `AgentMemoryRepository.clear_task`（单一 `_run_write` 原子事务），**而非**独立 `SyncRecordsRepository.clear_consumed_by_task`（避免跨 repo 各 commit 破坏原子性；消费标记是记忆域数据，见 2.0.1）。
+  - 顺序：① 收集 run_id（主表 + 归档表 UNION，必须在删表前取）；② 删主表；③ 删归档表；④ `DELETE FROM sync_records WHERE consumed_run_id IN (run_ids)`。
   - 归档表 run_id 也参与（归档过的 run_id 可能仍被消费标记引用）。
   - `rename_task` 无需动消费标记（consumed_run_id 只关联 run_id，改名不改变 run_id）——维持现状。
-- **待改**：2.0.3 `clear_task`/`clear_consumed_by_task` 说明 + C3 场景补充「含归档 run_id 的消费标记也被清理」。
+- **待改**：2.0.3 `clear_task` 说明 + 文件清单（删 `sync_records.py` 行）+ C3/C12 场景。
 
 ### D6. API 透传漏了 `app/models/summary.py`
 
@@ -154,7 +155,7 @@
 | D2 | 引入 SummaryRecord dataclass（_query_records 返回 list[SummaryRecord]） | ✅ 已定稿 |
 | D3 | 显式声明 service 拆解（_query_records/_build_messages/llm_client/_dispatch_notification） | ✅ 已定稿 |
 | D4 | 历史上下文拼进现有 system（不新增第二条 system） | ✅ 已定稿 |
-| D5 | clear_task 先取 run_id 再删消费标记（含归档） | 待定稿 |
+| D5 | clear_task 折叠进 memory repo 单一事务（run_id 收集先于删表，含归档） | ✅ 已定稿 |
 | D6 | 补 app/models/summary.py 三模型 | ✅ 已定稿 |
 | D7 | 承认非原子，统一"顺序保证" | 待定稿 |
 | D8 | _format_memory_context 归 MemoryRetriever | 待定稿 |

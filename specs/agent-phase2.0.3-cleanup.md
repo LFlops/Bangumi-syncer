@@ -45,18 +45,72 @@ class MemoryService:
 
     def clear_task(self, task_type: str, task_id: str) -> int:
         """显式清空（不可恢复，调用方二次确认）：
-        同一事务删除主表 + 归档表 + 该 task 相关 sync_records 消费标记
+        委托 AgentMemoryRepository.clear_task 在同一事务内按序完成：
+        ① 收集该 task 的 run_id 集合（主表 + 归档表，必须在删表前取）；
+        ② 删主表；③ 删归档表；④ 清 sync_records 中 consumed_run_id ∈ run_ids 的消费标记
         （防悬挂引用：否则 find_overlaps 标注"已消费于已删除的 run_id"）。
 
         **含 feedback 条目**（彻底清空语义）——用户要重置就全清（偏好也重来）；
         想保留偏好用"复制新 job"（旧 job 完整保留）。"""
-        ...
+        return self._memory.clear_task(task_type, task_id)
 ```
 
 - **层次**：业务层（summary service / API 层）只调 MemoryService；AgentMemoryRepository / SyncRecordsRepository 是纯 SQL 层
 - **实例化**：`MemoryService(database_manager.memory, database_manager.sync_records)`——两个 repo 经 facade 公开属性注入（见 2.0.1 文件清单中 `__init__.py` 的 `memory`/`sync_records` 公开属性）
 - 消费标记（sync_records 表）经 MemoryService 统一入口（mark_consumed / clear_task 联动）——业务层不直接碰 sync_records
 - `extract_and_store` / `retrieve` 的调用也统一收口到 MemoryService（替代 2.0.1/2.0.2 文档中业务层直接构造 extractor/retriever 的方式——实现时以 MemoryService 为入口，extractor/retriever 作为其内部组件）
+
+### AgentMemoryRepository.clear_task（run_id 定位 + 原子事务）
+
+消费标记（`consumed_run_id`）只存 run_id、不存 task_id；run_id→task_id 映射只存在于记忆主表与归档表。因此清空必须**先收集 run_id 再删表**（顺序敏感），且消费标记的 DELETE 必须与记忆删除**在同一事务**内（否则跨 repo 各 commit 破坏原子性——记忆删了、消费标记漏删，重跑时 run_id 映射已丢）。故折叠进 memory repo 的单一 `_run_write`：
+
+```python
+# app/core/database/agent_memory.py
+
+def clear_task(self, task_type: str, task_id: str) -> int:
+    """同一事务清空该 task 的记忆 + 消费标记。
+
+    顺序敏感：① 先收集 run_id（主表 + 归档表 UNION）——必须在删表前取，
+    否则 run_id→task_id 映射丢失；② 删主表；③ 删归档表；
+    ④ 删 sync_records 中 consumed_run_id ∈ run_ids（消费标记是记忆域数据，
+    见 2.0.1「剧集消费标记」，故在同一事务内由 memory repo 直连清理）。
+    """
+    def _write(conn):
+        main_ids = [
+            r[0] for r in conn.execute(
+                "SELECT run_id FROM agent_working_memory WHERE task_type=? AND task_id=?",
+                (task_type, task_id),
+            )
+        ]
+        arch_ids = [
+            r[0] for r in conn.execute(
+                "SELECT run_id FROM agent_working_memory_archive WHERE task_type=? AND task_id=?",
+                (task_type, task_id),
+            )
+        ]
+        run_ids = set(main_ids) | set(arch_ids)
+
+        n1 = conn.execute(
+            "DELETE FROM agent_working_memory WHERE task_type=? AND task_id=?",
+            (task_type, task_id),
+        ).rowcount
+        n2 = conn.execute(
+            "DELETE FROM agent_working_memory_archive WHERE task_type=? AND task_id=?",
+            (task_type, task_id),
+        ).rowcount
+
+        n3 = 0
+        if run_ids:
+            placeholders = ",".join("?" * len(run_ids))
+            n3 = conn.execute(
+                f"DELETE FROM sync_records WHERE consumed_run_id IN ({placeholders})",
+                tuple(run_ids),
+            ).rowcount
+
+        return n1 + n2 + n3
+
+    return self._run_write(_write, error_msg="清空任务记忆失败")
+```
 
 ## API 与前端
 
@@ -84,13 +138,12 @@ class MemoryService:
 | 操作 | 文件 | 说明 |
 |------|------|------|
 | 新增 | `app/services/memory/service.py` | MemoryService（rename_task/clear_task + 统一入口） |
-| 修改 | `app/core/database/agent_memory.py` | repository 纯 SQL（rename 的 UPDATE、clear 的 DELETE） |
-| 修改 | `app/core/database/sync_records.py` | `clear_consumed_by_task`（clear_task 联动） |
+| 修改 | `app/core/database/agent_memory.py` | repository 纯 SQL（rename 的 UPDATE；clear_task 的 run_id 收集 + 主表/归档/sync_records 三处 DELETE 同一事务） |
 | 修改 | `app/api/summary_jobs.py` | `POST /api/summary/jobs/{name}/clear-memory`；改名流程联动 rename_task |
 | 修改 | `app/services/summary/service.py` | 调用收口 MemoryService（改名联动） |
 | 修改 | `templates/config.html` + `static/js/` | "清空记忆"按钮（二次确认） |
 
-> 总计：新增 1 个文件，修改 5 个文件
+> 总计：新增 1 个文件，修改 4 个文件（`sync_records.py` 无需改动：消费标记清理折叠进 `agent_memory.clear_task` 的同一事务）
 
 ## BDD 测试场景
 
@@ -106,10 +159,11 @@ class MemoryService:
 - **Then** 旧 task_id 记忆删除（主表 + 归档 + 消费标记联动）
 - **And** 新 task_id 从零开始
 
-### Scenario C3 clear_task 消费标记联动
-- **Given** task 有记忆 + sync_records 含该 task 的消费标记
+### Scenario C3 clear_task 消费标记联动（含归档 run_id）
+- **Given** task 有主表记忆（run_id=u1,u2）+ 归档记忆（run_id=u3）
+- **And** sync_records 中 consumed_run_id 分别为 u1/u2/u3（含归档 run_id 的消费标记）
 - **When** `clear_task`
-- **Then** 主表 + 归档 + 消费标记同一事务删除
+- **Then** 主表 + 归档 + 三处消费标记（u1/u2/u3）同一事务删除
 - **And** 无悬挂引用（find_overlaps 不再标注"已消费于已删除的 run_id"）
 
 ### Scenario C4 clear-memory API 二次确认
@@ -154,6 +208,11 @@ class MemoryService:
 - **Given** task 已无记忆
 - **When** 再次 `clear_task`
 - **Then** 不报错，影响行数 0
+
+### Scenario C12 run_id 收集先于删表（顺序保证）
+- **Given** task 有记忆 + 消费标记
+- **When** `clear_task` 内部先收集 run_id（主表 + 归档）再删表
+- **Then** 消费标记被正确清除（不会因先删表导致 run_id→task_id 映射丢失而漏删）
 
 ## Summary 层利用（改名联动 / 清空入口）
 
