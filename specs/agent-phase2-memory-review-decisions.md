@@ -102,8 +102,8 @@
 ### D9. `outcome="partial"` 无写入路径
 
 - **问题**：`MemoryEntry.outcome` 注释 `success | partial`，但 2.0.1/2.0.2 永远写 `"success"`，失败不写。
-- **推荐**：**本阶段只保留 `success`**，注释改为 `success（partial/feedback 后续 phase 引入）`；或直接定义 partial=「本次总结生成了但非完整（如部分记录失败）」并给出触发条件。**默认：本阶段只写 success，删除 partial 的歧义**。
-- **待改**：2.0.1 `MemoryEntry.outcome` 注释。
+- **推荐**（已定稿）：**删除 `partial`**（无写入路径，不留注释）；`outcome` 本阶段仅 `success`，`feedback` 由 Phase 2.3 引入（有明确写入路径）。
+- **待改**：2.0.1 `MemoryEntry.outcome` 注释改为「本阶段仅 success；feedback 取值 Phase 2.3 引入」。
 
 ### D10. `consumed_at` 字段补全
 
@@ -162,12 +162,12 @@
 | D5 | clear_task 折叠进 memory repo 单一事务（run_id 收集先于删表，含归档） | ✅ 已定稿 |
 | D6 | 补 app/models/summary.py 三模型 | ✅ 已定稿 |
 | D7 | insert + 消费标记同一事务（prune 独立 best-effort） | ✅ 已定稿 |
-| D8 | _format_memory_context 归 MemoryRetriever | 待定稿 |
-| D9 | 本阶段只写 outcome=success | 待定稿 |
+| D8 | _format_memory_context 归 MemoryRetriever | ✅ 已定稿 |
+| D9 | 删除 partial，仅 success | ✅ 已定稿 |
 | D10 | 补 consumed_at 注释 | 待定稿 |
-| D11 | find_overlaps 改 sync | 待定稿 |
-| D12 | get_records_in_date_range SELECT 写清 + 补 BDD | 待定稿 |
-| D13 | prune 粒度统一"每 (task_type,task_id) 1000" | 待定稿 |
+| D11 | find_overlaps 改 sync | ✅ 已定稿 |
+| D12 | get_records_in_date_range SELECT 写清 + 补 BDD | ✅ 已定稿 |
+| D13 | prune 粒度统一"每 (task_type,task_id) 1000" | ✅ 已定稿 |
 | D14 | tokens_used 语义注释 | 待定稿 |
 | D15 | search_fts task_type 过滤写死 | 待定稿 |
 | D16 | find_overlaps 不下沉 SQL | 待定稿 |

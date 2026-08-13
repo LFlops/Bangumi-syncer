@@ -23,7 +23,7 @@ class MemoryEntry:
     run_id: str = ""
     summary: str = ""           # 一行摘要（注入粒度）
     full_text: str = ""         # 本次总结全文（回溯/诊断用，随 prune/归档同生命周期）
-    outcome: str = "success"    # success | partial（feedback 取值 Phase 2.3 引入）
+    outcome: str = "success"    # 本阶段仅 success；feedback 取值 Phase 2.3 引入
     tokens_used: int = 0
     created_at: str = ""
 
@@ -180,7 +180,7 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
 | 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（store_and_mark/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
-| 修改 | `app/core/database/sync_records.py` | summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（供 dict→`SummaryRecord` 转换填充，见 2.0.2）；消费标记的写（store_and_mark）与清（clear_task）都折叠进 `agent_memory.py` 的同一事务，sync_records repo 不单独设 mark_consumed |
+| 修改 | `app/core/database/sync_records.py` | summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（`consumed_at` 不读回——find_overlaps 只依赖 consumed_run_id，供 dict→`SummaryRecord` 转换填充，见 2.0.2）；消费标记的写（store_and_mark）与清（clear_task）都折叠进 `agent_memory.py` 的同一事务，sync_records repo 不单独设 mark_consumed |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
 | 修改 | `app/core/database/__init__.py` | `DatabaseManager` 新增公开属性 `self.memory = AgentMemoryRepository(self._connection)`（对齐既有 `self.llm_usage` 公开属性先例）；新增公开别名 `self.sync_records = self._sync`（一行别名，不改动既有 sync 转发方法） |
 
@@ -216,7 +216,7 @@ class MemoryExtractor:
 
 ### Scenario W6 prune 归档而非删除
 - **Given** 同一 task 写入 1005 条
-- **When** 每次 insert 后 prune(keep=1000)
+- **When** 每次 store_and_mark 后 prune(keep=1000)
 - **Then** 主表仅保留最近 1000 条
 - **And** archive 表包含被归档的 5 条（含原 created_at/run_id）
 
@@ -237,8 +237,13 @@ class MemoryExtractor:
 - **Then** 两列被 ALTER TABLE 补上
 - **And** 再次执行幂等（列已存在，跳过）
 
+### Scenario W11 查询返回 consumed_run_id
+- **Given** sync_records 有记录含 consumed_run_id 标记
+- **When** `get_records_in_date_range`（summary 的 `_query_records` 底层）查询
+- **Then** 返回 dict 含 `consumed_run_id` 键（供 dict→SummaryRecord 转换填充；不返回 `consumed_at`）
+
 ## 验证方式
 
-1. 单元测试：W1-W10 全部通过
+1. 单元测试：W1-W11 全部通过
 2. 手动：触发一次 summary 成功执行，检查 `agent_working_memory` 表记录（summary/outcome 正确）与 sync_records 的 consumed_run_id 标记
 3. 手动：`sqlite3` 验证 FTS 触发器（insert 后 `SELECT * FROM agent_memory_fts` 有对应行）

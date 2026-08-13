@@ -102,7 +102,7 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 
 - **prune 语义**：从"删除"变为"**降级到冷存储**"——超出 keep 的旧记录先 `INSERT INTO archive` 再 `DELETE` 主表（触发器同步删 FTS 索引，归档表无 FTS）；**`outcome=feedback` 条目跳过 prune（长期保留，见下）**
 - 主表（带 FTS）= 热记忆（recent/关键词注入）；归档表（无 FTS）= 冷记忆（Phase 3 失败定位等查全量历史走 `search_archive`，LIKE 检索）
-- 存储量级：主表 1000 条 ≈ 200KB/任务；归档表每年 ≈ 2MB——均无压力
+- 存储量级：每 (task_type, task_id) 主表 1000 条 ≈ 200KB/任务；归档表每年 ≈ 2MB——均无压力
 
 ### 归档消费边界（summary 不接入归档 + FTS5 定位）
 
@@ -234,7 +234,7 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 |---|---|
 | 同记忆条目双路径命中（recent + keywords） | **去重**（`_deduplicate_and_rank` 按 run_id，2.0.2） |
 | 摘要间重复叙事（连续多次提同一番剧） | 靠 `memory_limit` 数量控制，不去重（append-only 固有噪音） |
-| 明细 vs 摘要交叉（今日明细与历史摘要同番剧） | **不去重**：明细是事实清单、摘要是历史叙事，用途不同不互斥；若观察实际冗余，在 `_format_memory_context` 加规则（策略集中点） |
+| 明细 vs 摘要交叉（今日明细与历史摘要同番剧） | **不去重**：明细是事实清单、摘要是历史叙事，用途不同不互斥；若观察实际冗余，在 `format_memory_context` 加规则（策略集中点） |
 | **窗口重叠**（每日触发 + lookback_days=7：第 2 天明细 2-8 天与昨日总结 1-7 天重叠） | **剧集消费标记**（2.0.1 标记 sync_records.consumed_run_id，2.0.2 find_overlaps 查标记 + overlap_note 标注）——精确到集、无窗口近似 |
 
 > 注：失败路径不写记忆（无 outcome="failed" 条目）——异常模式识别是 Phase 3 日志分析 Agent 的独立功能，summary 链路保持内聚

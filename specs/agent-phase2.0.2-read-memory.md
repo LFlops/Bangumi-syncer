@@ -8,7 +8,7 @@
 
 ## 目标
 
-记忆的**读取侧**：MemoryRetriever（最近 N 条 + FTS5 关键词检索 + 去重排序）、`_format_memory_context` 注入格式化、`execute_job` 注入历史上下文、`memory_limit` 用户配置（含前端表单）、**窗口重叠去重**（剧集消费标记比对 + overlap_note 标注，原 Phase 2.5 并入本 phase——读取侧过滤逻辑）。
+记忆的**读取侧**：MemoryRetriever（最近 N 条 + FTS5 关键词检索 + 去重排序）、`format_memory_context` 注入格式化、`execute_job` 注入历史上下文、`memory_limit` 用户配置（含前端表单）、**窗口重叠去重**（剧集消费标记比对 + overlap_note 标注，原 Phase 2.5 并入本 phase——读取侧过滤逻辑）。
 
 ## 前置重构（本 phase 内完成，execute_job 依赖）
 
@@ -94,10 +94,11 @@ class MemoryRetriever:
 - **keywords 空字符串过滤**：`[job_config.user_filter or ""]` 在 user_filter 为空时产生 `""` 元素——`filter` 掉避免 FTS5 查空串
 - **去重**：`_deduplicate_and_rank` 按 run_id，recent 路径优先（双路径命中时只注入一次）
 
-## _format_memory_context 格式（归属：MemoryRetriever，记忆读取统一）
+## format_memory_context 格式（MemoryRetriever 方法，记忆读取统一）
 
 ```python
-def _format_memory_context(entries: list[MemoryEntry]) -> str:
+# MemoryRetriever 的方法（记忆读取统一放 retriever，execute_job 经 memory_retriever 调用）
+def format_memory_context(self, entries: list[MemoryEntry]) -> str:
     """MemoryEntry 列表 → 注入文本。"""
     return "\n".join(f"- {e.summary}" for e in entries)
 ```
@@ -127,7 +128,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
             limit=job_config.memory_limit,   # 用户可配置
             keywords=keywords,
         )
-        memory_context = self._format_memory_context(past_memories)
+        memory_context = memory_retriever.format_memory_context(past_memories)
     else:
         memory_context = ""
 
@@ -177,7 +178,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
 ### 重叠识别（注入前，基于剧集消费标记；归属：MemoryRetriever）
 
 ```python
-async def find_overlaps(
+def find_overlaps(
     self,
     records: list[SummaryRecord],
 ) -> list[SummaryRecord]:
@@ -202,7 +203,7 @@ async def find_overlaps(
 
 ```python
 # execute_job 中，注入历史上下文时（memory_context 构建后）：
-overlaps = await retriever.find_overlaps(records)
+overlaps = retriever.find_overlaps(records)
 if overlaps:
     overlap_note = (
         "以下记录已在上次总结中覆盖，可简述或跳过，不必重复展开：\n"
@@ -352,7 +353,7 @@ class SummaryRecord:
 
 | 操作 | 文件 | 说明 |
 |------|------|------|
-| 新增 | `app/services/memory/retriever.py` | MemoryRetriever（retrieve/_deduplicate_and_rank/find_overlaps）+ `_format_memory_context`（记忆读取统一放 retriever） |
+| 新增 | `app/services/memory/retriever.py` | MemoryRetriever（retrieve/_deduplicate_and_rank/find_overlaps/format_memory_context）——记忆读取统一放 retriever |
 | 修改 | `app/models/summary.py` | `SummaryJobCreate`/`SummaryJobUpdate`/`SummaryJobResponse` 增加 `memory_enabled`/`memory_limit` 字段（API CRUD 透传用） |
 | 修改 | `app/services/summary/service.py` | 前置重构（`_query_records`/`_build_messages`/`self.llm_client`/`_dispatch_notification`）+ `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入） |
 | 修改 | `app/services/summary/models.py` | `SummaryJobConfig` 增加 `memory_enabled`/`memory_limit`；新增 `SummaryRecord` dataclass |
