@@ -8,7 +8,7 @@
 
 ## 目标
 
-记忆的**写入侧**：建表（含 FTS5 同步触发器）、repository 写入能力、MemoryExtractor（成功路径摘要生成）、剧集消费标记（mark_consumed）。读取与注入在 Phase 2.0.2。
+记忆的**写入侧**：建表（含 FTS5 同步触发器）、repository 写入能力、MemoryExtractor（成功路径摘要生成）、剧集消费标记（store_and_mark）。读取与注入在 Phase 2.0.2。
 
 ## MemoryEntry 模型
 
@@ -50,14 +50,22 @@ class MemoryEntry:
 # app/core/database/agent_memory.py（继承 BaseRepository）
 
 class AgentMemoryRepository:
-    def insert(self, entry: MemoryEntry) -> int: ...
-    def prune(self, task_type: str, task_id: str, keep: int = 1000) -> int:
-        """超出 keep 的旧记录：先 INSERT INTO archive，再 DELETE 主表
-        （触发器同步删 FTS 索引）。默认 1000 条/任务（热记忆窗口）。
-        （Phase 2.3 引入 feedback 条目后，此处增加跳过逻辑）
+    def store_and_mark(self, entry: MemoryEntry, record_ids: list[int]) -> int:
+        """同一事务：INSERT 记忆（entry）+ UPDATE sync_records 消费标记
+        （consumed_run_id=entry.run_id, consumed_at=now WHERE id IN record_ids）。
 
-        事务性：归档 INSERT 与主表 DELETE 在**同一事务**内（_run_write 提供），
-        防止"删了未归档"丢数据——任一步失败整体回滚。"""
+        run 的原子单元——"记忆记录 + 记录消费"要么全成功要么全回滚，
+        消除"记忆已写但标记未写"的中间态（见 2.0.2 失败语义表）。
+        消费标记是记忆域数据（见总览「剧集消费标记」），故在同一事务内直连
+        sync_records 表执行。"""
+    def prune(self, task_type: str, task_id: str, keep: int = 1000) -> int:
+        """独立 best-effort 事务：超出 keep 的旧记录先 INSERT INTO archive，
+        再 DELETE 主表（触发器同步删 FTS 索引）。默认 1000 条/任务。
+
+        与 store_and_mark **不同事务**：prune 是维护性操作，失败只导致表不清理
+        （下次 run 重试），不应回滚一次已成功且已消耗 LLM token 的总结 run。
+        事务性：归档 INSERT 与主表 DELETE 在同一事务内（_run_write 提供）。
+        （Phase 2.3 引入 feedback 条目后，此处增加跳过逻辑）"""
     def get_recent(self, task_type: str, task_id: str, limit: int = 5) -> list[MemoryEntry]:
         """按 task 取最近 N 条记忆（created_at DESC，朴素实现——
         Phase 2.3 引入 feedback 后此处增加排除逻辑）。"""
@@ -70,19 +78,15 @@ class AgentMemoryRepository:
 
 
 - `search_fts` **必须带 task_type 过滤**（FTS5 查询条件或 JOIN 后过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
-- `prune` 在每次 insert 后调用：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
+- `prune` 在每次 store_and_mark 后调用（**独立 best-effort 事务**，非同一事务）：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
 - `search_archive`：冷记忆无 FTS，LIKE 检索 + task_type 可选过滤——面向低频"查全量历史"场景（热路径仍走 FTS）
 
-### SyncRecordsRepository.mark_consumed（剧集消费标记，归属 sync_records 表）
+### 消费标记写入（折叠进 store_and_mark，不单独设 mark_consumed）
 
-```python
-# app/core/database/sync_records.py（操作 sync_records 表，表归对应 repo 管）
-
-def mark_consumed(self, record_ids: list[int], run_id: str) -> int:
-    """标记今日明细记录已被本次总结消费：
-    UPDATE sync_records SET consumed_run_id=?, consumed_at=now WHERE id IN (...)。
-    与 extract_and_store 同流程（记忆写成功才标记）。"""
-```
+消费标记（`consumed_run_id`/`consumed_at`）的写入**不单独设 `SyncRecordsRepository.mark_consumed`**，
+而是折叠进 `AgentMemoryRepository.store_and_mark` 的同一事务（INSERT 记忆 + UPDATE sync_records 原子完成）。
+理由与 2.0.3 的 `clear_task` 折叠一致：消费标记是记忆域数据（见总览「剧集消费标记」），
+其写/清都归 memory 域，避免跨 repo 各 commit 破坏"任务执行"的原子性。
 
 
 ## MemoryExtractor
@@ -110,20 +114,25 @@ class MemoryExtractor:
         response: ChatResponse,     # 总结响应（含全文 content）
         outcome: str,
         tokens_used: int,
+        record_ids: list[int],      # 今日明细记录 id（store_and_mark 标记消费用）
     ) -> None:
         summary = await self._summarize(messages, response)
         if not summary:
             return  # 空响应（LLM 重试耗尽）不写记忆，避免无效条目
-        await self._repo.insert(MemoryEntry(
-            task_type=task_type,
-            task_id=task_id,
-            run_id=run_id,
-            summary=summary,
-            full_text=response.content,   # 全文存 full_text（回溯用，不注入）
-            outcome=outcome,
-            tokens_used=tokens_used,
-        ))
-        # 清理旧记忆（每个 task 最多保留 1000 条）
+        # 原子单元：INSERT 记忆 + 标记消费（同一事务，见 store_and_mark）
+        await self._repo.store_and_mark(
+            MemoryEntry(
+                task_type=task_type,
+                task_id=task_id,
+                run_id=run_id,
+                summary=summary,
+                full_text=response.content,   # 全文存 full_text（回溯用，不注入）
+                outcome=outcome,
+                tokens_used=tokens_used,
+            ),
+            record_ids=record_ids,
+        )
+        # 清理旧记忆（独立 best-effort 事务，失败不回滚上面的 run）
         await self._repo.prune(task_type, task_id, keep=1000)
 
     async def _summarize(
@@ -155,7 +164,8 @@ class MemoryExtractor:
 
 ### 关键设计点（review 修复）
 
-- **无 covered**：窗口重叠去重改用剧集消费标记（`mark_consumed`，见 repository 与总览"剧集消费标记"）
+- **无 covered**：窗口重叠去重改用剧集消费标记（`store_and_mark` 写入、`find_overlaps` 读取，见 repository 与总览"剧集消费标记"）
+- **insert + 消费标记同一事务（原子单元）**：`store_and_mark` 把"INSERT 记忆 + UPDATE sync_records 消费标记"折叠成一个 `_run_write`，消除"记忆已写但标记未写"的中间态；`prune` 独立 best-effort（维护性，失败不回滚已成功的 run）
 - **`_summarize` 实现（缓存感知）**：复用总结调用完整上下文作前缀 → 命中 LLM prompt 缓存（成本 ~10%）；失败规则截断兜底；Anthropic system 加 cache_control
 - **`full_text` 列**：存总结全文（回溯/诊断用，不注入）——成功通知 `write_in_app=False` 不写站内信，全文项目内靠记忆表承载
 - **空响应不写记忆**：LLM 重试耗尽返回空响应时跳过（避免无效条目）
@@ -169,8 +179,8 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/__init__.py` | 记忆模块包 |
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
-| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
-| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（供 dict→`SummaryRecord` 转换填充，见 2.0.2）——消费标记清理见 Phase 2.0.3 的 `agent_memory.clear_task`（同一事务内直连 sync_records 删除） |
+| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（store_and_mark/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
+| 修改 | `app/core/database/sync_records.py` | summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（供 dict→`SummaryRecord` 转换填充，见 2.0.2）；消费标记的写（store_and_mark）与清（clear_task）都折叠进 `agent_memory.py` 的同一事务，sync_records repo 不单独设 mark_consumed |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
 | 修改 | `app/core/database/__init__.py` | `DatabaseManager` 新增公开属性 `self.memory = AgentMemoryRepository(self._connection)`（对齐既有 `self.llm_usage` 公开属性先例）；新增公开别名 `self.sync_records = self._sync`（一行别名，不改动既有 sync 转发方法） |
 
@@ -178,11 +188,11 @@ class MemoryExtractor:
 
 ## BDD 测试场景
 
-### Scenario W1 成功路径写入
-- **Given** extract_and_store 传入 messages + response（完整上下文）
-- **When** 执行（随后 mark_consumed 标记今日明细）
+### Scenario W1 成功路径写入（insert + 消费标记同一事务）
+- **Given** extract_and_store 传入 messages + response + record_ids（完整上下文）
+- **When** 执行
 - **Then** `agent_working_memory` 新增一条：`summary` 为摘要、`outcome="success"`
-- **And** 今日明细的 sync_records 被标记 `consumed_run_id`（mark_consumed 同事务）
+- **And** 今日明细的 sync_records 被标记 `consumed_run_id`（store_and_mark 同一事务，与记忆 INSERT 原子）
 
 ### Scenario W2 摘要 LLM 失败规则兜底
 - **Given** `_summarize` 的 LLM 调用抛异常

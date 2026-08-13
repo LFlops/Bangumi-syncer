@@ -31,7 +31,8 @@ class MemoryService:
     """记忆服务层：统一包装记忆操作，业务层只调此入口。
 
     2.0.1/2.0.2 的底层能力（extract_and_store / retrieve）与 2.0.3 的
-    清理能力（rename_task / clear_task / mark_consumed）统一经此暴露。
+    清理能力（rename_task / clear_task）统一经此暴露。
+    （mark_consumed 已折叠进 extract_and_store → store_and_mark，非独立入口）
     """
 
     def __init__(self, memory_repo: AgentMemoryRepository, sync_records_repo=None):
@@ -57,7 +58,7 @@ class MemoryService:
 
 - **层次**：业务层（summary service / API 层）只调 MemoryService；AgentMemoryRepository / SyncRecordsRepository 是纯 SQL 层
 - **实例化**：`MemoryService(database_manager.memory, database_manager.sync_records)`——两个 repo 经 facade 公开属性注入（见 2.0.1 文件清单中 `__init__.py` 的 `memory`/`sync_records` 公开属性）
-- 消费标记（sync_records 表）经 MemoryService 统一入口（mark_consumed / clear_task 联动）——业务层不直接碰 sync_records
+- 消费标记（sync_records 表）的写（store_and_mark，经 extract_and_store）与清（clear_task）都经 MemoryService 收口——业务层不直接碰 sync_records；`mark_consumed` 不作为独立方法（折叠进 `store_and_mark` 的同一事务，见 2.0.1）
 - `extract_and_store` / `retrieve` 的调用也统一收口到 MemoryService（替代 2.0.1/2.0.2 文档中业务层直接构造 extractor/retriever 的方式——实现时以 MemoryService 为入口，extractor/retriever 作为其内部组件）
 
 ### AgentMemoryRepository.clear_task（run_id 定位 + 原子事务）

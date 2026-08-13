@@ -153,11 +153,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
                 response=response,             # 响应：summary 生成 + full_text 存储
                 outcome="success",
                 tokens_used=response.usage.total_tokens if response.usage else 0,
-            )
-            # mark_consumed：标记今日明细已被本次总结消费（与记忆写入同流程）
-            # 归属 SyncRecordsRepository（操作 sync_records 表）
-            await database_manager.sync_records.mark_consumed(
-                record_ids=[r.id for r in records], run_id=run_id
+                record_ids=[r.id for r in records],   # store_and_mark 同一事务标记消费
             )
         except Exception:
             logger.exception("Failed to store memory")
@@ -187,7 +183,7 @@ async def find_overlaps(
 ) -> list[SummaryRecord]:
     """返回今日明细中已被消费的记录（consumed_run_id IS NOT NULL）。
 
-    数据基础：2.0.1 的 mark_consumed 在每次总结成功后标记 sync_records。
+    数据基础：2.0.1 的 store_and_mark 在每次总结成功后标记 sync_records。
     精确到集、无窗口近似——无论多早被消费都能命中（covered 方案的
     "最近 K 条并集"对超过窗口的旧集会漏标）。
     """
@@ -223,15 +219,16 @@ if overlaps:
 
 ### 消费标记失败语义（判定规则定稿）
 
-消费标记的写入时机：execute_job 第 4 步（chat 成功 + 记忆写入成功后，同一 try 块）。各失败点的语义：
+消费标记的写入时机：execute_job 第 4 步（chat 成功后，`store_and_mark` 同一事务内写记忆 + 标记消费，同一 try 块）。各失败点的语义：
 
 | 失败点 | 消费标记 | 通知 | 下次行为 |
 |---|---|---|---|
 | **chat 失败**（LLM 调用异常） | 不写 | 不发 | **重新总结**（未消费） |
-| **extract/标记失败**（DB 异常，同 try 块） | 不写 | **照发**（try 外） | **重新总结**（可能重复通知，概率低可接受） |
+| **store_and_mark 失败**（DB 异常，同 try 块） | 不写（记忆+标记原子回滚） | **照发**（try 外） | **重新总结**（可能重复通知，概率低可接受） |
 | **通知失败**（投递层，try 外） | **已写** | 失败 | **不重新总结**（已消费，inbox 失败通知含内容可查） |
 
-**判定规则**：消费成功 = **chat 成功 + 记忆写入成功**（第 4 步完成）。通知是投递层，独立于消费——通知失败**不回滚消费标记**（总结已生成；投递走通知重试/告警兜底；回滚方案否决——通知持续失败时每次执行重新生成浪费 token）。
+**判定规则**：消费成功 = **chat 成功 + store_and_mark 成功**（第 4 步完成）。通知是投递层，独立于消费——通知失败**不回滚消费标记**（总结已生成；投递走通知重试/告警兜底；回滚方案否决——通知持续失败时每次执行重新生成浪费 token）。
+**原子性**：记忆 INSERT 与消费标记 UPDATE 是 `store_and_mark` 的同一事务（见 2.0.1）——不存在"记忆已写但标记未写"的中间态，失败时两者一起回滚。
 **memory_enabled=false 不标记消费**：一致性成立——关闭记忆 = 不注入 = 不需要重叠去重（find_overlaps 在注入 if 内，不会被调用）；关闭期间总结过的记录重新开启后视为未消费（可接受，关闭期间不追踪消费状态）。
 
 ## memory_enabled / memory_limit 配置（每任务独立，无继承）

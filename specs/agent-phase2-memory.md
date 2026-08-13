@@ -29,11 +29,10 @@
   2. 注入到 LLM prompt 的 "历史上下文" 部分
 
 每次定时任务执行后（2.0.1）：
-  1. MemoryExtractor.extract_and_store(result)
+  1. MemoryExtractor.extract_and_store(result, record_ids)
      → 让 LLM 用一句话总结本次执行的关键发现（或规则兜底）
-     → 结构化写入 agent_working_memory
-  2. mark_consumed(records, run_id)
-     → 在 sync_records 标记本次消费的剧集（窗口重叠去重的数据基础）
+     → store_and_mark 同一事务：结构化写入 agent_working_memory + 标记消费
+     → prune 独立 best-effort 归档旧记忆
 ```
 
 ## 数据库（2.0.1 建表）
@@ -247,7 +246,7 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - **数据位置**：`sync_records` 新增 `consumed_run_id`（最近一次消费该集的总结 run_id，NULL = 未消费）+ `consumed_at`
 - **旧库迁移（幂等）**：`__ensure_sync_records_consumed`——启动时 `PRAGMA table_info` 检查列是否存在，缺失则 `ALTER TABLE ADD COLUMN`（项目既有 `__ensure_*` 模式，老用户升级自动补列）
 - **为什么加列而非新辅助表**：当前需求是单值标记（最近一次消费），加列无 join、生命周期一致（sync_records 清理时标记随之消失，无孤儿行）；辅助表的优势（消费历史/跨表复用）是 YAGNI
-- **写入（2.0.1）**：execute_job 成功路径，`mark_consumed(records, run_id)` 更新今日明细的消费标记（与 extract_and_store 同流程）
+- **写入（2.0.1）**：execute_job 成功路径，`store_and_mark(entry, record_ids)` 同一事务内更新今日明细的消费标记（记忆 INSERT + 标记消费原子，见 2.0.1；`prune` 独立 best-effort）
 - **读取（2.0.2）**：`find_overlaps` 查"今日明细中 `consumed_run_id IS NOT NULL`"——**精确到集，无窗口近似**（covered 方案的"最近 K 条并集"对超过窗口的旧集会漏标，消费标记无此问题）
 - **可追溯**：标记含 run_id → 直接取该次总结摘要（overlap_note 可带摘要内容）
 - **失败自洽**：总结失败不标记 → 下次重新总结；重复观看：标记更新为最新 run_id

@@ -81,12 +81,16 @@
 
 ## P1 · 语义统一（不改会引入 bug 或误解）
 
-### D7. "同事务/同流程/同一事务"三词混用
+### D7. 记忆写入 + 消费标记应同一事务（原子）
 
-- **问题**：总览写"同流程"，2.0.1 W1 写"mark_consumed 同事务"，2.0.3 写"同一事务"。但 `extract_and_store`（insert+prune）与 `mark_consumed` 是两次独立 `_run_write`，非原子。
-- **推荐**：**承认非原子**，统一表述为「顺序保证：记忆写成功后才 `mark_consumed`；两者非同一事务」。
-  记忆写成但标记失败 → 下次重新总结（可接受，已在 2.0.2 失败语义表体现）。若要求原子，需合并为单一 `_run_write`（**不推荐**，收益低）。
-- **待改**：2.0.1 W1、总览"剧集消费标记"、2.0.2 失败语义表措辞。
+- **问题**：原 spec 把 `extract_and_store`（insert+prune）与 `mark_consumed` 拆成两次独立 `_run_write`，
+  产生"记忆已写但标记未写"的中间态，被迫写容忍逻辑，反而更复杂。
+- **推荐**（已定稿）：**折叠成单一事务**——
+  - `store_and_mark(entry, record_ids)`：INSERT 记忆 + UPDATE sync_records 消费标记，同一 `_run_write`（run 的原子单元）。
+  - `prune`：**独立 best-effort 事务**（维护性；失败不回滚已成功且已消耗 LLM token 的 run）。
+  - 消费标记写/清都折叠进 memory repo（对称于 D5 的 clear_task），不设独立 `SyncRecordsRepository.mark_consumed`。
+  - `_summarize`（async LLM）在事务外，先 summarize 再 `store_and_mark`。
+- **待改**：2.0.1 `extract_and_store`/`store_and_mark`/W1/文件清单；2.0.2 `execute_job` 第 4 步 + 失败语义表；2.0.3 MemoryService 说明。
 
 ### D8. `_format_memory_context` 归属与调用方式
 
@@ -157,7 +161,7 @@
 | D4 | 历史上下文拼进现有 system（不新增第二条 system） | ✅ 已定稿 |
 | D5 | clear_task 折叠进 memory repo 单一事务（run_id 收集先于删表，含归档） | ✅ 已定稿 |
 | D6 | 补 app/models/summary.py 三模型 | ✅ 已定稿 |
-| D7 | 承认非原子，统一"顺序保证" | 待定稿 |
+| D7 | insert + 消费标记同一事务（prune 独立 best-effort） | ✅ 已定稿 |
 | D8 | _format_memory_context 归 MemoryRetriever | 待定稿 |
 | D9 | 本阶段只写 outcome=success | 待定稿 |
 | D10 | 补 consumed_at 注释 | 待定稿 |
