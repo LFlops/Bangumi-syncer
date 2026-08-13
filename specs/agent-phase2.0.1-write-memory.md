@@ -170,7 +170,7 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
 | 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
-| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（SyncRecord 加字段后查询侧同步）——`clear_consumed_by_task` 见 Phase 2.0.3 |
+| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（供 dict→`SummaryRecord` 转换填充，见 2.0.2）——`clear_consumed_by_task` 见 Phase 2.0.3 |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
 | 修改 | `app/core/database/__init__.py` | `DatabaseManager` 新增公开属性 `self.memory = AgentMemoryRepository(self._connection)`（对齐既有 `self.llm_usage` 公开属性先例）；新增公开别名 `self.sync_records = self._sync`（一行别名，不改动既有 sync 转发方法） |
 

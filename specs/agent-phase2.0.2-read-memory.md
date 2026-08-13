@@ -164,8 +164,8 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
 ```python
 async def find_overlaps(
     self,
-    records: list[SyncRecord],
-) -> list[SyncRecord]:
+    records: list[SummaryRecord],
+) -> list[SummaryRecord]:
     """返回今日明细中已被消费的记录（consumed_run_id IS NOT NULL）。
 
     数据基础：2.0.1 的 mark_consumed 在每次总结成功后标记 sync_records。
@@ -174,7 +174,7 @@ async def find_overlaps(
     """
     return [
         r for r in records
-        if r.consumed_run_id is not None       # SyncRecord 增加 consumed_run_id 字段
+        if r.consumed_run_id is not None       # SummaryRecord.consumed_run_id 字段
     ]
 ```
 
@@ -226,7 +226,27 @@ memory_limit = 5         # 注入记忆条数（最小值 1，仅 enabled=true �
 
 **为什么每任务独立（不用全局 + 覆盖）**：三态继承（未配置=继承全局）对 INI 配置是语义负担——用户无法直观判断"全局 true 时某任务未配置是开是关"。每任务显式声明，一眼可读；未来其他任务（feiniu 等）接入时在自己的配置段声明，语义同样清晰。
 
-- `app/services/summary/models.py`：`SummaryJobConfig` 增加 `memory_enabled: bool = False`、`memory_limit: int = 5`（from_config_dict 解析，非法值回落默认）
+`SummaryRecord`（`app/services/summary/models.py`，summary 链路内部观影记录载体，`_query_records` 返回类型；与 `SummaryJobConfig` 同为 `@dataclass`）：
+
+```python
+@dataclass
+class SummaryRecord:
+    id: int
+    timestamp: str
+    user_name: str
+    title: str
+    bgm_title: str
+    season: int
+    episode: int
+    media_type: str
+    source: str
+    status: str
+    consumed_run_id: str | None = None   # 消费标记（NULL=未消费；D12 补 SELECT 后填充）
+```
+
+> 为什么 `@dataclass` 而非 `BaseModel`：summary 链路内部载体，数据来自自有 SQL 查询（可信）、不跨 I/O 边界、不需校验/序列化；与 `SummaryJobConfig`/`MemoryEntry` 风格一致。共享方法 `get_records_in_date_range` 保持返回 `list[dict]` 不变，由 `_query_records` 内部做一行 dict→`SummaryRecord` 转换（避免波及 14 处测试断言）。
+
+- `app/services/summary/models.py`：`SummaryJobConfig` 增加 `memory_enabled: bool = False`、`memory_limit: int = 5`（from_config_dict 解析，非法值回落默认）；新增 `SummaryRecord` dataclass（见上）
 - `app/models/summary.py`：`SummaryJobCreate`（`memory_enabled: bool = False`、`memory_limit: int = 5`）、`SummaryJobUpdate`（`memory_enabled: Optional[bool] = None`、`memory_limit: Optional[int] = None`）、`SummaryJobResponse`（`memory_enabled: bool`、`memory_limit: int`）；`from_config_dict` 解析 `memory_enabled` 用与 `enabled` 相同的布尔容错、`memory_limit` 用 `_int(..., 5)` 回落
 - `app/core/config.py`：`_SUMMARY_FIELDS` 增加 `"memory_enabled"`、`"memory_limit"`
 - **前端**：summary job 表单（`templates/config.html` 的 summary 卡片 + JS `renderSummaryJobs`/保存逻辑）加"记忆"开关（switch）+ "记忆条数"输入框——**开关关闭时条数输入框禁用**；表单标注"记忆按任务隔离，多用户场景建议每用户一个任务"
@@ -317,10 +337,9 @@ memory_limit = 5         # 注入记忆条数（最小值 1，仅 enabled=true �
 | 操作 | 文件 | 说明 |
 |------|------|------|
 | 新增 | `app/services/memory/retriever.py` | MemoryRetriever（retrieve/_deduplicate_and_rank/find_overlaps）+ `_format_memory_context`（记忆读取统一放 retriever） |
-| 修改 | `app/models/sync.py` | `SyncRecord` 增加 `consumed_run_id` 字段（查询今日明细时返回） |
 | 修改 | `app/models/summary.py` | `SummaryJobCreate`/`SummaryJobUpdate`/`SummaryJobResponse` 增加 `memory_enabled`/`memory_limit` 字段（API CRUD 透传用） |
-| 修改 | `app/services/summary/service.py` | `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入） |
-| 修改 | `app/services/summary/models.py` | `SummaryJobConfig` 增加 `memory_enabled`/`memory_limit` |
+| 修改 | `app/services/summary/service.py` | `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入）；`_query_records` 返回 `list[SummaryRecord]` |
+| 修改 | `app/services/summary/models.py` | `SummaryJobConfig` 增加 `memory_enabled`/`memory_limit`；新增 `SummaryRecord` dataclass |
 | 修改 | `app/core/config.py` | `_SUMMARY_FIELDS` 增加 `memory_enabled`/`memory_limit` |
 | 修改 | `app/api/summary_jobs.py` | summary job CRUD 透传 memory_enabled/memory_limit |
 | 修改 | `templates/config.html` + `static/js/`（summary 相关） | 表单"记忆"开关 + "记忆条数"输入框（开关关时禁用） |

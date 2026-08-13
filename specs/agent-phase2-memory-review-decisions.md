@@ -22,17 +22,18 @@
 - **否决**：不做 facade 转发方法（需新增 ~7 个 `*_memory`/`mark_consumed` 转发方法，且要改 MemoryRetriever/MemoryService 构造签名，代价大于收益）。
 - **待改**：2.0.1 文件变更清单补一行 `app/core/database/__init__.py`（新增 `memory` + `sync_records` 公开属性）；2.0.3 `MemoryService` 实例化处注明传 `database_manager.memory` / `database_manager.sync_records`。
 
-### D2. summary 链路用 dict 还是 SyncRecord
+### D2. summary 链路用 dict 还是类型化对象
 
 - **问题**：`_query_records` 返回 `list[dict]`，但 `keywords`/`record_ids`/`find_overlaps` 用属性访问且类型标注 `SyncRecord`；
   `SyncRecord`（`app/models/sync.py`）又缺 `bgm_title`/`consumed_run_id` 字段。
-- **推荐**：**保持 dict**（改动最小，当前 `_format_records` 就是 dict 访问）。
-  - `find_overlaps(records: list[dict]) -> list[dict]`，判断 `r["consumed_run_id"] is not None`；
-  - `keywords += [r["bgm_title"] for r in records if r.get("bgm_title")][:5]`；
-  - `record_ids = [r["id"] for r in records]`；
-  - `overlap_note` 里 `r["bgm_title"]`/`r["season"]`/`r["episode"]`/`r["consumed_run_id"]`。
-  - **不改 `app/models/sync.py` 的 `SyncRecord`**（它只服务于其它 API，与 summary 查询无关）；删掉 2.0.2 文件清单里"修改 `app/models/sync.py`"这一条。
-- **待改**：2.0.2 `execute_job`/`find_overlaps`/文件变更清单。
+- **推荐**：**引入 `SummaryRecord` dataclass**（`app/services/summary/models.py`，与 `SummaryJobConfig` 同文件、同为 `@dataclass`），`_query_records` 返回 `list[SummaryRecord]`：
+  - 字段：`id/timestamp/user_name/title/bgm_title/season/episode/media_type/source/status/consumed_run_id(str|None=None)`。
+  - `find_overlaps(records: list[SummaryRecord]) -> list[SummaryRecord]`，`r.consumed_run_id` 属性访问；`keywords`/`record_ids`/`overlap_note` 同样属性访问。
+  - `_format_records`（D3 重构）由 `r.get(...)` 改为 `r.xxx` 属性访问。
+  - **共享方法 `get_records_in_date_range` 保持返回 `list[dict]` 不变**，由 `_query_records` 内部做一行 dict→`SummaryRecord` 转换（避免波及 14 处测试断言）。
+  - **不改 `app/models/sync.py` 的 `SyncRecord`**（它是 API 模型、半死代码，与 summary 内部载体不匹配）；删掉 2.0.2 文件清单里"修改 `app/models/sync.py`"这一条。
+- **为何 `@dataclass` 而非 `BaseModel`**：summary 内部数据载体，数据来自自有 SQL（可信）、不跨 I/O 边界、不需校验/序列化；与 `SummaryJobConfig`/`MemoryEntry` 风格一致。
+- **待改**：2.0.2 `find_overlaps` 类型标注、`_format_records`（D3）、文件变更清单（删 `app/models/sync.py`、`summary/models.py` 补 `SummaryRecord`）。
 
 ### D3. execute_job 的 service 拆解要显式声明
 
@@ -147,7 +148,7 @@
 | 编号 | 决议 | 状态 |
 |---|---|---|
 | D1 | facade 新增公开 repo 属性（memory + sync_records 别名） | ✅ 已定稿 |
-| D2 | summary 链路保持 dict | 待定稿 |
+| D2 | 引入 SummaryRecord dataclass（_query_records 返回 list[SummaryRecord]） | ✅ 已定稿 |
 | D3 | 显式声明 service 拆解 | 待定稿 |
 | D4 | 历史上下文拼进现有 system | 待定稿 |
 | D5 | clear_task 先取 run_id 再删消费标记（含归档） | 待定稿 |
