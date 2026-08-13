@@ -67,15 +67,7 @@ class AgentMemoryRepository:
         self, task_type: str | None, keywords: str, limit: int = 50
     ) -> list[MemoryEntry]:
         """冷记忆检索（LIKE，无 FTS）——Phase 3 失败定位等查全量历史用。"""
-    def clear_task(self, task_type: str, task_id: str) -> int:
-        """清空任务的记忆（显式重置，不可恢复——调用方需二次确认）：
-        同一事务删除主表 + 归档表 + 该 task 相关 sync_records 消费标记
-        （防悬挂引用：否则 find_overlaps 标注"已消费于已删除的 run_id"）。
 
-        首选重置方式是切换 task_id（job 改名 = 新上下文，数据可回滚），
-        clear_task 是"彻底清空"的快捷操作（见总览"记忆清理机制"）。
-        API/UI（POST /api/summary/jobs/{name}/clear-memory + 前端按钮）随 2.0.2
-        或独立小 phase 落地。"""
 
 - `search_fts` **必须带 task_type 过滤**（FTS5 查询条件或 JOIN 后过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
 - `prune` 在每次 insert 后调用：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
@@ -177,8 +169,8 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/__init__.py` | 记忆模块包 |
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
-| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive/clear_task） |
-| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）+ `clear_consumed_by_task`（clear_task 联动）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（SyncRecord 加字段后查询侧同步） |
+| 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（insert/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
+| 修改 | `app/core/database/sync_records.py` | SyncRecordsRepository 增加 `mark_consumed`（消费标记）；summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（SyncRecord 加字段后查询侧同步）——`clear_consumed_by_task` 见 Phase 2.0.3 |
 | 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
 
 > 总计：新增 4 个文件，修改 2 个文件

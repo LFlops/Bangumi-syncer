@@ -128,19 +128,21 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 - 任何写记忆的调用方遵循同样约定：Phase 2.3 反馈生成自己的 run_id（outcome=feedback）、未来 Phase 3 agent 任务定义自己的 task_id
 - **归档保留两者**：追溯/去重不因归档中断
 
-### 记忆清理机制（上下文被污染时如何重置）
+### 记忆清理机制（上下文被污染时如何重置；实施见 Phase 2.0.3）
 
 | 方案 | 可恢复性 | 实现成本 | 责任方 |
 |---|---|---|---|
-| **C. 切换 task_id**（**首选**） | ✓✓ 零损失（旧 task_id 数据保留可切回） | **零**——summary 的 task_id = `summary-{name}`，job 改名/复制即新上下文 | 上游（用户/配置层）路由 |
-| **A. 显式 `clear_task`**（补充） | ✗ 不可恢复（二次确认） | 低——同一事务删主表 + 归档 + 消费标记 | memory 模块（API 层暴露） |
+| **改名迁移记忆**（rename_task） | ✓ 记忆跟随任务（改名不丢） | 低——同一事务 UPDATE 主表 + 归档表的 task_id | memory 模块 + 改名流程联动 |
+| **重置：显式 `clear_task`** | ✗ 不可恢复（二次确认） | 低——同一事务删主表 + 归档 + 消费标记 | memory 模块（API 层暴露） |
+| **重置：复制为新 job** | ✓✓ 旧 job 记忆保留可回滚 | 零——配置系统已支持 | 上游（用户/配置层） |
 | B. 软删除标志位 | ✓ 可恢复 | 中——deleted 列 + 全查询过滤 + 清理策略 | memory 模块 |
 | D. 业界其他 | 快照/版本化/自动遗忘/审计 | — | — |
 
-- **推荐 C 为主**：重置最自然的是**换隔离单元**（上游路由，符合"task_id 隔离/调用方决定粒度"），而非删隔离单元内数据；数据零损失、可回滚
-- **A 补充**：用户要"彻底清空"的快捷操作——`clear_task` 同一事务删主表 + 归档表 + 该 task 相关消费标记（**防悬挂引用**：否则 find_overlaps 标注"已消费于已删除的 run_id"）；API `POST /api/summary/jobs/{name}/clear-memory` + 前端按钮（二次确认）
-- **B 否决**：恢复需求已被 C 覆盖（旧数据在旧 task_id）；deleted 标志与归档语义重叠、表膨胀、查询复杂度
-- **职责划分**：task_id 路由归上游（配置层），清理能力归 memory 模块（clear_task）——互补不冲突
+- **改名 ≠ 重置（语义修正）**：用户只改显示名时记忆跟随（`rename_task` 迁移）——`summary-{name}` 的 task_id 改名时 UPDATE 记忆表的 task_id；**消费标记天然无需迁移**（consumed_run_id 只关联 run_id，不依赖 task_id）；改名流程联动：`save_summary_config(old_name)` + `rename_notification_type` 已有先例，增加 `rename_task` 调用
+- **重置 = 显式操作**：`clear_task`（彻底清空，二次确认——同一事务删主表 + 归档表 + 该 task 相关消费标记，防悬挂引用）或**复制为新 job**（保留旧 job 记忆，新 job 从零开始，可回滚）
+- **映射表方案否决**：task_id 从"由 name 派生"变"查映射表"（每个读写多一跳），为"改名不丢记忆"付出的代价远大于 rename_task 的一次性 UPDATE
+- **B 否决**：deleted 标志与归档语义重叠、表膨胀、查询复杂度
+- **职责划分**：改名迁移归 memory 模块（rename_task），配置层改名流程联动；清理能力归 memory 模块（clear_task）；复制新 job 归配置层——互补不冲突
 
 ### 多用户场景：task_id 是隔离单元，调用方决定粒度
 
@@ -266,6 +268,6 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 
 ## 执行序列
 
-Phase 1 → 1.1 → **2.0.1 → 2.0.2** → 2.1 → 2.2 → 2.3 → Phase 3
+Phase 1 → 1.1 → **2.0.1 → 2.0.2 → 2.0.3** → 2.1 → 2.2 → 2.3 → Phase 3
 
 > 顺序说明：2.3（反馈）与 Phase 3 无依赖，排在 2.2 后是人为顺序——业务价值上 Phase 3 > 2.3，可按需调整（如 Phase 3 提前）。
