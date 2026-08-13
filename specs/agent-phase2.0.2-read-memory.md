@@ -96,7 +96,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     records = await self._query_records(job_config)
 
     # === 2. 注入记忆 ===
-    # repo 从 database_manager 获取（项目惯例，不新增构造函数参数）
+    # repo 经 facade 公开属性 database_manager.memory 获取（见 2.0.1 文件清单中 __init__.py 的公开属性）
     memory_retriever = MemoryRetriever(database_manager.memory)
     if job_config.memory_enabled:                        # 开关短路，不调 retrieve
         # 关键词 = user_filter + 今日明细标题提取（规则提取，并集）
@@ -227,6 +227,7 @@ memory_limit = 5         # 注入记忆条数（最小值 1，仅 enabled=true �
 **为什么每任务独立（不用全局 + 覆盖）**：三态继承（未配置=继承全局）对 INI 配置是语义负担——用户无法直观判断"全局 true 时某任务未配置是开是关"。每任务显式声明，一眼可读；未来其他任务（feiniu 等）接入时在自己的配置段声明，语义同样清晰。
 
 - `app/services/summary/models.py`：`SummaryJobConfig` 增加 `memory_enabled: bool = False`、`memory_limit: int = 5`（from_config_dict 解析，非法值回落默认）
+- `app/models/summary.py`：`SummaryJobCreate`（`memory_enabled: bool = False`、`memory_limit: int = 5`）、`SummaryJobUpdate`（`memory_enabled: Optional[bool] = None`、`memory_limit: Optional[int] = None`）、`SummaryJobResponse`（`memory_enabled: bool`、`memory_limit: int`）；`from_config_dict` 解析 `memory_enabled` 用与 `enabled` 相同的布尔容错、`memory_limit` 用 `_int(..., 5)` 回落
 - `app/core/config.py`：`_SUMMARY_FIELDS` 增加 `"memory_enabled"`、`"memory_limit"`
 - **前端**：summary job 表单（`templates/config.html` 的 summary 卡片 + JS `renderSummaryJobs`/保存逻辑）加"记忆"开关（switch）+ "记忆条数"输入框——**开关关闭时条数输入框禁用**；表单标注"记忆按任务隔离，多用户场景建议每用户一个任务"
 
@@ -317,14 +318,14 @@ memory_limit = 5         # 注入记忆条数（最小值 1，仅 enabled=true �
 |------|------|------|
 | 新增 | `app/services/memory/retriever.py` | MemoryRetriever（retrieve/_deduplicate_and_rank/find_overlaps）+ `_format_memory_context`（记忆读取统一放 retriever） |
 | 修改 | `app/models/sync.py` | `SyncRecord` 增加 `consumed_run_id` 字段（查询今日明细时返回） |
+| 修改 | `app/models/summary.py` | `SummaryJobCreate`/`SummaryJobUpdate`/`SummaryJobResponse` 增加 `memory_enabled`/`memory_limit` 字段（API CRUD 透传用） |
 | 修改 | `app/services/summary/service.py` | `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入） |
-| 修改 | `app/services/summary/scheduler.py` | 传递 memory_repo（或共享实例） |
 | 修改 | `app/services/summary/models.py` | `SummaryJobConfig` 增加 `memory_enabled`/`memory_limit` |
 | 修改 | `app/core/config.py` | `_SUMMARY_FIELDS` 增加 `memory_enabled`/`memory_limit` |
 | 修改 | `app/api/summary_jobs.py` | summary job CRUD 透传 memory_enabled/memory_limit |
 | 修改 | `templates/config.html` + `static/js/`（summary 相关） | 表单"记忆"开关 + "记忆条数"输入框（开关关时禁用） |
 
-> 总计：新增 1 个文件，修改 6 个文件
+> 总计：新增 1 个文件，修改 6 个文件（`scheduler.py` 无需改动：service 经 `database_manager.memory` 直接访问，不走 scheduler 传递）
 
 ## 验证方式
 
