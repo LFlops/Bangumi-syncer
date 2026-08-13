@@ -10,6 +10,25 @@
 
 记忆的**读取侧**：MemoryRetriever（最近 N 条 + FTS5 关键词检索 + 去重排序）、`_format_memory_context` 注入格式化、`execute_job` 注入历史上下文、`memory_limit` 用户配置（含前端表单）、**窗口重叠去重**（剧集消费标记比对 + overlap_note 标注，原 Phase 2.5 并入本 phase——读取侧过滤逻辑）。
 
+## 前置重构（本 phase 内完成，execute_job 依赖）
+
+当前 `SummaryService` 是单体 `generate_summary`（日期计算 + 查询 + 格式化 + 构建消息 + 调 LLM 全在一个方法里）+ 薄 `execute_job` + `_send_success_notification`/`_send_failure_notification`/`_format_records`。而本 phase 的 `execute_job` 需要拿到「查询结果 records」和「构建好的 messages」两个中间值来做记忆注入与重叠标注，因此先做一次**不改变对外行为**的拆解：
+
+| 新成员 | 签名 | 来源（从 generate_summary 抽出） |
+|---|---|---|
+| `_query_records` | `(job_config) -> tuple[list[SummaryRecord], str, str]`（同步） | 日期范围计算 + `database_manager.get_records_in_date_range(...)` + dict→`SummaryRecord` 转换；返回值含 `(records, date_from, date_to)` |
+| `_build_messages` | `(records, system_prompt) -> list[Message]`（同步） | `_format_records` 格式化 + 拼 system/user 两条消息 |
+| `self.llm_client` | 实例属性 | `__init__` 中 `self.llm_client = get_llm_client()`（替代每次 `get_llm_client()`） |
+| `_dispatch_notification` | `(job_config, response, records, date_from, date_to) -> None` | 现有 `execute_job` 的「空内容→失败通知 / 正常→成功通知」分支，内部复用 `_send_success_notification`/`_send_failure_notification` |
+
+要点：
+- **`_query_records`/`_build_messages` 是同步方法**（DB 查询与字符串拼接无 await；`execute_job`/`generate_summary` 保持 async，仅在 `chat` 处 await）。因此 2.0.2 `execute_job` 片段里 `records = await self._query_records(...)` 的 `await` 去掉，改为 `records, date_from, date_to = self._query_records(...)`。
+- **日期范围共享**：`date_from/date_to` 原来在 `generate_summary` 内计算、既用于查询又塞进 result；拆解后由 `_query_records` 返回，`_dispatch_notification` 复用（避免两处重复计算日期）。
+- **`generate_summary` 改为薄封装**（复用 `_query_records` + `_build_messages` + `self.llm_client`，继续返回 dict），供 `test_summary_job`（`app/api/summary_jobs.py`）使用——**test 端点签名与返回不变**（预览不含记忆，符合预期）。
+- **`_dispatch_notification` 保持现有失败语义**：`chat` 返回空内容（`not response.content and not response.model`）→ `_send_failure_notification`（summary_llm_failed）；否则 `_send_success_notification`。记忆提取（步骤 4）在 try/except 内、`_dispatch_notification`（步骤 5）在 try 外，维持 2.0.2 失败语义表。
+- `_format_records` 由 `r.get(...)` 改为 `r.xxx`（`SummaryRecord` 属性访问，见 D2）。
+- `memory_retriever`/`memory_extractor` 作为 service 成员在 `__init__` 构造（与 `self.llm_client` 并列）：`self.memory_retriever = MemoryRetriever(database_manager.memory)`、`self.memory_extractor = MemoryExtractor(database_manager.memory)`；2.0.2 片段里 `memory_extractor` 裸名改为 `self.memory_extractor`。
+
 ## MemoryRetriever
 
 ```python
@@ -93,7 +112,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     task_id = f"summary-{job_config.name}"
 
     # === 1. 查询明细（先于注入：keywords 需要 records）===
-    records = await self._query_records(job_config)
+    records, date_from, date_to = self._query_records(job_config)
 
     # === 2. 注入记忆 ===
     # repo 经 facade 公开属性 database_manager.memory 获取（见 2.0.1 文件清单中 __init__.py 的公开属性）
@@ -112,14 +131,13 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     else:
         memory_context = ""
 
-    messages = self._build_messages(records, job_config.system_prompt)
-
-    # === 3. 注入历史上下文到 system prompt ===
+    # === 3. 注入历史上下文：拼进 system prompt（而非新增第二条 system message）===
+    # 多 system message 对 OpenAI 兼容端点不安全（Anthropic 会 \n\n 合并、OpenAI 原样转发可能 400），
+    # 故把 memory_context 拼进现有 system prompt 内容。
+    system_prompt = job_config.system_prompt
     if memory_context:
-        messages.insert(0, Message(
-            role="system",
-            content=f"## 历史执行上下文\n{memory_context}"
-        ))
+        system_prompt = f"## 历史执行上下文\n{memory_context}\n\n{system_prompt}"
+    messages = self._build_messages(records, system_prompt)
 
     response = await self.llm_client.chat(messages)
 
@@ -127,7 +145,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     if job_config.memory_enabled:
         run_id = str(uuid4())          # 单次执行的唯一标识（记忆写入与消费标记共用）
         try:
-            await memory_extractor.extract_and_store(
+            await self.memory_extractor.extract_and_store(
                 task_type="summary",
                 task_id=task_id,
                 run_id=run_id,
@@ -145,7 +163,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
             logger.exception("Failed to store memory")
 
     # === 5. 原有逻辑 ===
-    await self._dispatch_notification(response)
+    self._dispatch_notification(job_config, response, records, date_from, date_to)
 ```
 
 ### 关键设计点（review 修复）
@@ -154,6 +172,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
 - **`memory_enabled` 开关短路（读写一致）**：`false` 时跳过 retrieve **且跳过 extract_and_store**（不注入也不写入）——用户显式关闭该任务的记忆功能：不积累数据、不产生摘要 LLM 调用成本；feedback 强约束也随之失效；**memory_limit 只管条数（最小值 1），不用 0 表示关闭（单一关闭途径）**
 - **提取记忆 try/except 包裹**：`_summarize` 的 LLM 调用等失败不影响 `_dispatch_notification`
 - **`tokens_used` 空值防护**：`response.usage` 可能为 None（LLM 重试耗尽返回空响应）——但此时 `response.content` 也为空，提取出的摘要为空字符串，可接受（空响应不写记忆，避免无效条目）
+- **历史上下文拼进 system prompt（不新增第二条 system）**：多 system message 对 OpenAI 兼容端点不安全（Anthropic 在 provider 内 `\n\n` 合并、OpenAI 原样转发多 system 可能 400）；故在 `execute_job` 里把 `memory_context` 拼进现有 system prompt 内容，而非 `messages.insert(0, Message(role="system", ...))`。与 Phase 2.2 无关（改在 summary service，不碰 `openai_compat.py`）
 
 ## 窗口重叠去重（原 Phase 2.5 并入）
 
@@ -200,7 +219,7 @@ if overlaps:
 ```
 
 - **默认标注而非过滤**：不删除明细（避免改变"过去 7 天完整总结"的语义）；LLM 自主决定简述/跳过，用户可在 system_prompt 中要求"重复也详细总结"覆盖此行为
-- **注入位置**：overlap_note 附加到 `## 历史执行上下文` 的 memory_context 内（与 2.0.2 的注入同一位置，不独立插入 system prompt）
+- **注入位置与顺序**：overlap_note 附加到 `memory_context` 内（与历史上下文同一位置，不独立插入 system prompt）；**必须在步骤 3 的 `_build_messages` 之前**追加（因为 system_prompt 已含 memory_context，之后无法再改）
 
 ### 消费标记失败语义（判定规则定稿）
 
@@ -338,7 +357,7 @@ class SummaryRecord:
 |------|------|------|
 | 新增 | `app/services/memory/retriever.py` | MemoryRetriever（retrieve/_deduplicate_and_rank/find_overlaps）+ `_format_memory_context`（记忆读取统一放 retriever） |
 | 修改 | `app/models/summary.py` | `SummaryJobCreate`/`SummaryJobUpdate`/`SummaryJobResponse` 增加 `memory_enabled`/`memory_limit` 字段（API CRUD 透传用） |
-| 修改 | `app/services/summary/service.py` | `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入）；`_query_records` 返回 `list[SummaryRecord]` |
+| 修改 | `app/services/summary/service.py` | 前置重构（`_query_records`/`_build_messages`/`self.llm_client`/`_dispatch_notification`）+ `execute_job()` 注入记忆（顺序修正、memory_enabled 短路、提取容错、overlap_note 并入） |
 | 修改 | `app/services/summary/models.py` | `SummaryJobConfig` 增加 `memory_enabled`/`memory_limit`；新增 `SummaryRecord` dataclass |
 | 修改 | `app/core/config.py` | `_SUMMARY_FIELDS` 增加 `memory_enabled`/`memory_limit` |
 | 修改 | `app/api/summary_jobs.py` | summary job CRUD 透传 memory_enabled/memory_limit |

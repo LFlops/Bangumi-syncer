@@ -39,22 +39,25 @@
 
 - **问题**：2.0.2 `execute_job` 用 `self._query_records`/`self._build_messages`/`self.llm_client`/`self._dispatch_notification`，
   这些在当前 `SummaryService` 里都不存在（当前是单体 `generate_summary` + `get_llm_client()` + `_send_*_notification`）。
-- **推荐**：在 2.0.2 开头新增一节「**前置重构（本 phase 内完成）**」，明确把 `generate_summary` 拆成：
-  - `_query_records(job_config) -> list[dict]`
-  - `_build_messages(records, system_prompt) -> list[Message]`（含既有 system + user）
-  - `self.llm_client`（构造时 `get_llm_client()` 存入）
-  - `_dispatch_notification(response, ...)`（承载现有 `_send_success_notification`/`_send_failure_notification`）
-  - 同步调整 `test_summary_job`（`app/api/summary_jobs.py` 调 `generate_summary`）为走新拆解或保留 `generate_summary` 作薄封装。
-- **待改**：2.0.2 新增"前置重构"小节 + 文件清单补 `service.py` 重构说明；`app/api/summary_jobs.py` 的 test 端点。
+- **推荐**：在 2.0.2 开头新增「**前置重构（本 phase 内完成）**」小节，明确把 `generate_summary` 拆成（不改变对外行为）：
+  - `_query_records(job_config) -> tuple[list[SummaryRecord], str, str]`（同步；返回 `records, date_from, date_to`）
+  - `_build_messages(records, system_prompt) -> list[Message]`（同步；含既有 system + user）
+  - `self.llm_client`（`__init__` 中 `get_llm_client()` 存入）
+  - `_dispatch_notification(job_config, response, records, date_from, date_to) -> None`（同步；承载现有 `_send_success_notification`/`_send_failure_notification`，保持空内容→失败通知语义）
+  - `self.memory_retriever`/`self.memory_extractor`（`__init__` 构造，与 `llm_client` 并列）
+  - `generate_summary` 改为薄封装供 `test_summary_job`（`app/api/summary_jobs.py`）复用，test 端点签名/返回不变。
+- **同步修正**：2.0.2 片段里 `records = await self._query_records(...)` 去 `await` 改 tuple 解构；`await self._dispatch_notification(...)` 去 `await`；`memory_extractor` 裸名改 `self.memory_extractor`。
+- **待改**：2.0.2 新增“前置重构”小节（已写）+ 文件清单 `service.py` 行补重构说明。
 
 ### D4. 历史上下文注入不能产生第二条 system
 
 - **问题**：`messages.insert(0, Message(role="system", content="## 历史执行上下文..."))` 与 `_build_messages` 已有的 system 形成两条 system；
-  OpenAI provider 直接把多条 `role=system` 塞进 messages，多 system 会报错。
-- **推荐**：**拼进现有 system 内容**，不新增 system message：
-  - `_build_messages` 产出后，把 `memory_context` 前置/后置到 system prompt 字符串（如 `system_prompt = f"## 历史执行上下文\n{memory_context}\n\n{system_prompt}"`）。
-  - `overlap_note` 同理拼进 `memory_context`（本就在 `## 历史执行上下文` 内，保持），不独立插 system。
-- **待改**：2.0.2 `execute_job` 第 3 步 + `overlap_note` 注入方式。
+  OpenAI provider 直接把多条 `role=system` 塞进 messages，多 system 对兼容端点不安全（Anthropic 在 provider 内 `\n\n` 合并、OpenAI 原样转发可能 400）。
+- **推荐**：**拼进现有 system prompt 内容**，不新增 system message：
+  - `execute_job` 第 3 步：`system_prompt = job_config.system_prompt`；若 `memory_context` 非空则 `system_prompt = f"## 历史执行上下文\n{memory_context}\n\n{system_prompt}"`，再 `_build_messages(records, system_prompt)`。
+  - `overlap_note` 同理拼进 `memory_context`（在 `_build_messages` 之前），不独立插 system。
+- **与 Phase 2.2 的关系**：**不涉及**——改在 summary service（2.0.2 先于 2.2，且语义上 memory_context 就是 system prompt 的一部分）；2.2 的 `openai_compat.py` 不动（不加多 system 合并防御，避免 YAGNI）。
+- **待改**：2.0.2 `execute_job` 第 3 步 + `overlap_note` 注入顺序。
 
 ### D5. clear_task 消费标记的 run_id→task_id 定位
 
@@ -149,8 +152,8 @@
 |---|---|---|
 | D1 | facade 新增公开 repo 属性（memory + sync_records 别名） | ✅ 已定稿 |
 | D2 | 引入 SummaryRecord dataclass（_query_records 返回 list[SummaryRecord]） | ✅ 已定稿 |
-| D3 | 显式声明 service 拆解 | 待定稿 |
-| D4 | 历史上下文拼进现有 system | 待定稿 |
+| D3 | 显式声明 service 拆解（_query_records/_build_messages/llm_client/_dispatch_notification） | ✅ 已定稿 |
+| D4 | 历史上下文拼进现有 system（不新增第二条 system） | ✅ 已定稿 |
 | D5 | clear_task 先取 run_id 再删消费标记（含归档） | 待定稿 |
 | D6 | 补 app/models/summary.py 三模型 | ✅ 已定稿 |
 | D7 | 承认非原子，统一"顺序保证" | 待定稿 |
