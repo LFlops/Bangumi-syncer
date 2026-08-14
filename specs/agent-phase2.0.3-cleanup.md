@@ -63,7 +63,7 @@ class MemoryService:
 
 ### AgentMemoryRepository.clear_task（run_id 定位 + 原子事务）
 
-消费标记（`consumed_run_id`）只存 run_id、不存 task_id；run_id→task_id 映射只存在于记忆主表与归档表。因此清空必须**先收集 run_id 再删表**（顺序敏感），且消费标记的 DELETE 必须与记忆删除**在同一事务**内（否则跨 repo 各 commit 破坏原子性——记忆删了、消费标记漏删，重跑时 run_id 映射已丢）。故折叠进 memory repo 的单一 `_run_write`：
+消费标记（`consumed_run_id`）只存 run_id、不存 task_id；run_id→task_id 映射只存在于记忆主表与归档表。因此清空必须**先收集 run_id 再删表**（顺序敏感），且消费标记的清空（UPDATE SET NULL）必须与记忆删除**在同一事务**内（否则跨 repo 各 commit 破坏原子性——记忆删了、消费标记漏清，重跑时 run_id 映射已丢）。故折叠进 memory repo 的单一 `_run_write`：
 
 ```python
 # app/core/database/agent_memory.py
@@ -73,7 +73,7 @@ def clear_task(self, task_type: str, task_id: str) -> int:
 
     顺序敏感：① 先收集 run_id（主表 + 归档表 UNION）——必须在删表前取，
     否则 run_id→task_id 映射丢失；② 删主表；③ 删归档表；
-    ④ 删 sync_records 中 consumed_run_id ∈ run_ids（消费标记是记忆域数据，
+    ④ 清 sync_records 中 consumed_run_id ∈ run_ids 的消费标记（SET consumed_run_id=NULL；消费标记是记忆域数据，
     见 2.0.1「剧集消费标记」，故在同一事务内由 memory repo 直连清理）。
     """
     def _write(conn):
@@ -104,7 +104,7 @@ def clear_task(self, task_type: str, task_id: str) -> int:
         if run_ids:
             placeholders = ",".join("?" * len(run_ids))
             n3 = conn.execute(
-                f"DELETE FROM sync_records WHERE consumed_run_id IN ({placeholders})",
+                f"UPDATE sync_records SET consumed_run_id = NULL WHERE consumed_run_id IN ({placeholders})",
                 tuple(run_ids),
             ).rowcount
 
@@ -157,14 +157,14 @@ def clear_task(self, task_type: str, task_id: str) -> int:
 ### Scenario C2 改名 + 重置（不迁移 + 清空）
 - **Given** 改名流程选择"重置"
 - **When** 改名 + `clear_task`（旧 task_id）
-- **Then** 旧 task_id 记忆删除（主表 + 归档 + 消费标记联动）
+- **Then** 旧 task_id 记忆删除（主表 + 归档），消费标记清空（consumed_run_id=NULL，联动）
 - **And** 新 task_id 从零开始
 
 ### Scenario C3 clear_task 消费标记联动（含归档 run_id）
 - **Given** task 有主表记忆（run_id=u1,u2）+ 归档记忆（run_id=u3）
 - **And** sync_records 中 consumed_run_id 分别为 u1/u2/u3（含归档 run_id 的消费标记）
 - **When** `clear_task`
-- **Then** 主表 + 归档 + 三处消费标记（u1/u2/u3）同一事务删除
+- **Then** 主表 + 归档删除，三处消费标记（u1/u2/u3）同一事务清空（consumed_run_id = NULL）
 - **And** 无悬挂引用（find_overlaps 不再标注"已消费于已删除的 run_id"）
 
 ### Scenario C4 clear-memory API 二次确认
@@ -265,4 +265,4 @@ Summary 业务层通过 MemoryService 利用清理能力：
 1. **Memory 单元测试**：C1-C11 全部通过（repository/service 层，无网络依赖）
 2. **Summary 集成测试**：S1-S5 全部通过（API 层 + service 层）
 3. **E2E**：C5、S6 在本地/CI 验证
-4. 手动：改名 job → 检查记忆表 task_id 迁移 + 通知类型迁移；清空记忆 → 检查主表/归档/消费标记联动删除（含 feedback）
+4. 手动：改名 job → 检查记忆表 task_id 迁移 + 通知类型迁移；清空记忆 → 检查主表/归档删除、消费标记清空（consumed_run_id=NULL，含 feedback）

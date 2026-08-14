@@ -36,6 +36,8 @@ def test_from_config_dict_defaults_empty():
     assert cfg.user_name == ""
     assert cfg.system_prompt == SummaryJobConfig.system_prompt
     assert cfg.max_records == -1
+    assert cfg.memory_enabled is False  # 默认关闭（保守：存量行为不变）
+    assert cfg.memory_limit == 5
 
 
 def test_from_config_dict_defaults_minimal():
@@ -71,6 +73,38 @@ def test_enabled_already_bool():
     assert cfg_true.enabled is True
     cfg_false = SummaryJobConfig.from_config_dict({"name": "t", "enabled": False})
     assert cfg_false.enabled is False
+
+
+# ── memory_enabled / memory_limit（R6 配置透传）──────────────────────────
+
+
+def test_memory_config_parsed():
+    """R6：[summary-xxx] memory_enabled=true、memory_limit=3 → 透传。"""
+    cfg = SummaryJobConfig.from_config_dict(
+        {"name": "daily", "memory_enabled": "true", "memory_limit": "3"}
+    )
+    assert cfg.memory_enabled is True
+    assert cfg.memory_limit == 3
+
+
+def test_memory_enabled_bool_variants():
+    for value in ("true", "True", "TRUE", "1", True):
+        cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_enabled": value})
+        assert cfg.memory_enabled is True, f"memory_enabled={value!r} should be True"
+    for value in ("false", "False", "FALSE", "0", False):
+        cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_enabled": value})
+        assert cfg.memory_enabled is False, f"memory_enabled={value!r} should be False"
+
+
+def test_memory_limit_min_one():
+    """memory_limit 最小值 1（0/负值回落，不用 0 表示关闭）。"""
+    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "0"})
+    assert cfg.memory_limit == 1
+
+
+def test_memory_limit_invalid_falls_back():
+    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "abc"})
+    assert cfg.memory_limit == 5
 
 
 # ── int coercion ──────────────────────────────────────────────────────

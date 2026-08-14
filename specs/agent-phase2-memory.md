@@ -132,13 +132,13 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 | 方案 | 可恢复性 | 实现成本 | 责任方 |
 |---|---|---|---|
 | **改名迁移记忆**（rename_task） | ✓ 记忆跟随任务（改名不丢） | 低——同一事务 UPDATE 主表 + 归档表的 task_id | memory 模块 + 改名流程联动 |
-| **重置：显式 `clear_task`** | ✗ 不可恢复（二次确认） | 低——同一事务删主表 + 归档 + 消费标记 | memory 模块（API 层暴露） |
+| **重置：显式 `clear_task`** | ✗ 不可恢复（二次确认） | 低——同一事务删主表 + 归档 + 清消费标记（SET consumed_run_id=NULL） | memory 模块（API 层暴露） |
 | **重置：复制为新 job** | ✓✓ 旧 job 记忆保留可回滚 | 零——配置系统已支持 | 上游（用户/配置层） |
 | B. 软删除标志位 | ✓ 可恢复 | 中——deleted 列 + 全查询过滤 + 清理策略 | memory 模块 |
 | D. 业界其他 | 快照/版本化/自动遗忘/审计 | — | — |
 
 - **改名 ≠ 重置（语义修正）**：用户只改显示名时记忆跟随（`rename_task` 迁移）——`summary-{name}` 的 task_id 改名时 UPDATE 记忆表的 task_id；**消费标记天然无需迁移**（consumed_run_id 只关联 run_id，不依赖 task_id）；改名流程联动：`save_summary_config(old_name)` + `rename_notification_type` 已有先例，增加 `rename_task` 调用
-- **重置 = 显式操作**：`clear_task`（彻底清空，二次确认——同一事务删主表 + 归档表 + 该 task 相关消费标记，防悬挂引用）或**复制为新 job**（保留旧 job 记忆，新 job 从零开始，可回滚）
+- **重置 = 显式操作**：`clear_task`（彻底清空，二次确认——同一事务删主表 + 归档表 + 清该 task 相关消费标记（SET consumed_run_id=NULL），防悬挂引用）或**复制为新 job**（保留旧 job 记忆，新 job 从零开始，可回滚）
 - **映射表方案否决**：task_id 从"由 name 派生"变"查映射表"（每个读写多一跳），为"改名不丢记忆"付出的代价远大于 rename_task 的一次性 UPDATE
 - **B 否决**：deleted 标志与归档语义重叠、表膨胀、查询复杂度
 - **职责划分**：改名迁移归 memory 模块（rename_task），配置层改名流程联动；清理能力归 memory 模块（clear_task）；复制新 job 归配置层——互补不冲突
@@ -243,7 +243,7 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 
 窗口重叠去重从**剧集侧**建模：记录被哪次总结消费过，而非"总结覆盖了哪些记录"。
 
-- **数据位置**：`sync_records` 新增 `consumed_run_id`（最近一次消费该集的总结 run_id，NULL = 未消费）+ `consumed_at`
+- **数据位置**：`sync_records` 新增 `consumed_run_id`（最近一次消费该集的总结 run_id，NULL = 未消费）
 - **旧库迁移（幂等）**：`__ensure_sync_records_consumed`——启动时 `PRAGMA table_info` 检查列是否存在，缺失则 `ALTER TABLE ADD COLUMN`（项目既有 `__ensure_*` 模式，老用户升级自动补列）
 - **为什么加列而非新辅助表**：当前需求是单值标记（最近一次消费），加列无 join、生命周期一致（sync_records 清理时标记随之消失，无孤儿行）；辅助表的优势（消费历史/跨表复用）是 YAGNI
 - **写入（2.0.1）**：execute_job 成功路径，`store_and_mark(entry, record_ids)` 同一事务内更新今日明细的消费标记（记忆 INSERT + 标记消费原子，见 2.0.1；`prune` 独立 best-effort）

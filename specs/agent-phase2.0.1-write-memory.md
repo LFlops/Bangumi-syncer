@@ -24,7 +24,7 @@ class MemoryEntry:
     summary: str = ""           # 一行摘要（注入粒度）
     full_text: str = ""         # 本次总结全文（回溯/诊断用，随 prune/归档同生命周期）
     outcome: str = "success"    # 本阶段仅 success；feedback 取值 Phase 2.3 引入
-    tokens_used: int = 0
+    tokens_used: int = 0        # 总结调用的 token（response.usage.total_tokens；摘要调用成本不单独计）
     created_at: str = ""
 
     @classmethod
@@ -42,7 +42,7 @@ class MemoryEntry:
 - schema 见总览文档（`agent-phase2-memory.md` 数据库一节）
 - **触发器是必须的**：`agent_memory_fts` 是 external content 表，无触发器则 INSERT 后 FTS 不更新、`search_fts` 搜不到新记录（DELETE/UPDATE 同理）
 - **prune 默认 1000 条/任务**（FTS5 解耦检索性能与保留量，1000 条 ≈ 200KB 无压力，每日任务 ≈ 2.7 年历史）
-- **消费标记迁移（幂等）**：`__ensure_sync_records_consumed`——`PRAGMA table_info(sync_records)` 检查 `consumed_run_id`/`consumed_at` 列，缺失则 `ALTER TABLE ADD COLUMN`（老库自动补列，不加约束无风险；不建辅助表——单值标记加列无 join、生命周期一致，辅助表优势是 YAGNI）
+- **消费标记迁移（幂等）**：`__ensure_sync_records_consumed`——`PRAGMA table_info(sync_records)` 检查 `consumed_run_id` 列，缺失则 `ALTER TABLE ADD COLUMN`（老库自动补列，不加约束无风险；不建辅助表——单值标记加列无 join、生命周期一致，辅助表优势是 YAGNI）
 
 ## AgentMemoryRepository
 
@@ -52,7 +52,7 @@ class MemoryEntry:
 class AgentMemoryRepository:
     def store_and_mark(self, entry: MemoryEntry, record_ids: list[int]) -> int:
         """同一事务：INSERT 记忆（entry）+ UPDATE sync_records 消费标记
-        （consumed_run_id=entry.run_id, consumed_at=now WHERE id IN record_ids）。
+        （consumed_run_id=entry.run_id WHERE id IN record_ids）。
 
         run 的原子单元——"记忆记录 + 记录消费"要么全成功要么全回滚，
         消除"记忆已写但标记未写"的中间态（见 2.0.2 失败语义表）。
@@ -70,20 +70,24 @@ class AgentMemoryRepository:
         """按 task 取最近 N 条记忆（created_at DESC，朴素实现——
         Phase 2.3 引入 feedback 后此处增加排除逻辑）。"""
     def search_fts(self, query: str, task_type: str, limit: int = 5) -> list[MemoryEntry]:
-        """FTS5 全文检索（热记忆），按 task_type 过滤（JOIN 主表取全字段）。"""
+        """FTS5 全文检索（热记忆），按 task_type 过滤。
+
+        实现：JOIN agent_memory_fts（external content 表）→ agent_working_memory
+        （ON fts.rowid = main.id）取全字段，WHERE agent_working_memory.task_type = ?
+        （行数少，JOIN 后过滤即可，不必在 FTS5 查询条件里过滤）。"""
     def search_archive(
         self, task_type: str | None, keywords: str, limit: int = 50
     ) -> list[MemoryEntry]:
         """冷记忆检索（LIKE，无 FTS）——Phase 3 失败定位等查全量历史用。"""
 
 
-- `search_fts` **必须带 task_type 过滤**（FTS5 查询条件或 JOIN 后过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
+- `search_fts` **必须带 task_type 过滤**——用 JOIN 主表后 `WHERE agent_working_memory.task_type = ?`（而非 FTS5 查询条件内过滤），避免跨任务命中（summary 任务搜到 sync/diagnostic 的记忆）
 - `prune` 在每次 store_and_mark 后调用（**独立 best-effort 事务**，非同一事务）：**降级到冷存储而非删除**（归档表见总览），主表保持有界、历史可追溯
 - `search_archive`：冷记忆无 FTS，LIKE 检索 + task_type 可选过滤——面向低频"查全量历史"场景（热路径仍走 FTS）
 
 ### 消费标记写入（折叠进 store_and_mark，不单独设 mark_consumed）
 
-消费标记（`consumed_run_id`/`consumed_at`）的写入**不单独设 `SyncRecordsRepository.mark_consumed`**，
+消费标记（`consumed_run_id`）的写入**不单独设 `SyncRecordsRepository.mark_consumed`**，
 而是折叠进 `AgentMemoryRepository.store_and_mark` 的同一事务（INSERT 记忆 + UPDATE sync_records 原子完成）。
 理由与 2.0.3 的 `clear_task` 折叠一致：消费标记是记忆域数据（见总览「剧集消费标记」），
 其写/清都归 memory 域，避免跨 repo 各 commit 破坏"任务执行"的原子性。
@@ -180,8 +184,8 @@ class MemoryExtractor:
 | 新增 | `app/services/memory/models.py` | MemoryEntry dataclass |
 | 新增 | `app/services/memory/extractor.py` | MemoryExtractor（_summarize/空响应跳过） |
 | 新增 | `app/core/database/agent_memory.py` | AgentMemoryRepository（store_and_mark/prune/get_recent/search_fts/search_archive）——清理方法（rename/clear）见 Phase 2.0.3 |
-| 修改 | `app/core/database/sync_records.py` | summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（`consumed_at` 不读回——find_overlaps 只依赖 consumed_run_id，供 dict→`SummaryRecord` 转换填充，见 2.0.2）；消费标记的写（store_and_mark）与清（clear_task）都折叠进 `agent_memory.py` 的同一事务，sync_records repo 不单独设 mark_consumed |
-| 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id/consumed_at 幂等补列） |
+| 修改 | `app/core/database/sync_records.py` | summary `_query_records` 底层查询方法 SELECT 需带 `consumed_run_id`（供 dict→`SummaryRecord` 转换填充，见 2.0.2）；消费标记的写（store_and_mark）与清（clear_task）都折叠进 `agent_memory.py` 的同一事务，sync_records repo 不单独设 mark_consumed |
+| 修改 | `app/core/database/connection.py` | `__ensure_agent_memory()` migration（主表 + 归档表 + 索引 + FTS5 + 触发器）；`__ensure_sync_records_consumed`（consumed_run_id 幂等补列） |
 | 修改 | `app/core/database/__init__.py` | `DatabaseManager` 新增公开属性 `self.memory = AgentMemoryRepository(self._connection)`（对齐既有 `self.llm_usage` 公开属性先例）；新增公开别名 `self.sync_records = self._sync`（一行别名，不改动既有 sync 转发方法） |
 
 > 总计：新增 4 个文件，修改 3 个文件
@@ -232,15 +236,15 @@ class MemoryExtractor:
 - **And** archive 表不含该条目
 
 ### Scenario W10 老库补列幂等（migration）
-- **Given** 已有 sync_records 表（无 consumed_run_id/consumed_at 列，模拟老用户）
+- **Given** 已有 sync_records 表（无 consumed_run_id 列，模拟老用户）
 - **When** 启动 `__ensure_sync_records_consumed`
-- **Then** 两列被 ALTER TABLE 补上
+- **Then** consumed_run_id 列被 ALTER TABLE 补上
 - **And** 再次执行幂等（列已存在，跳过）
 
 ### Scenario W11 查询返回 consumed_run_id
 - **Given** sync_records 有记录含 consumed_run_id 标记
 - **When** `get_records_in_date_range`（summary 的 `_query_records` 底层）查询
-- **Then** 返回 dict 含 `consumed_run_id` 键（供 dict→SummaryRecord 转换填充；不返回 `consumed_at`）
+- **Then** 返回 dict 含 `consumed_run_id` 键（供 dict→SummaryRecord 转换填充）
 
 ## 验证方式
 

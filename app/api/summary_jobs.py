@@ -7,16 +7,22 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Depends, HTTPException
 
 from ..core.config import config_manager
+from ..core.database import database_manager
 from ..models.summary import (
+    ClearMemoryRequest,
     SummaryJobCreate,
     SummaryJobResponse,
     SummaryJobTestResponse,
     SummaryJobUpdate,
 )
+from ..services.memory.service import MemoryService
 from ..services.summary import SummaryJobConfig, summary_scheduler, summary_service
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/summary/jobs", tags=["summary_jobs"])
+
+# 记忆清理入口（改名联动 / clear-memory 端点）
+memory_service = MemoryService(database_manager.memory, database_manager.sync_records)
 
 
 def _validate_job_name(name: str, old_name: str = "") -> None:
@@ -64,6 +70,10 @@ async def update_summary_job(
             old_type = f"watching_summary_{decoded}"
             new_type = f"watching_summary_{updates['name']}"
             config_manager.rename_notification_type(old_type, new_type)
+            # 记忆跟随任务（与 rename_notification_type 同流程）
+            memory_service.rename_task(
+                "summary", f"summary-{decoded}", f"summary-{updates['name']}"
+            )
     config_manager.save_summary_config(updates, old_name=decoded)
     config_manager.reload_config()
     await summary_scheduler.apply_config_after_save()
@@ -132,3 +142,26 @@ async def trigger_summary_job(name: str, _=Depends(get_current_user_flexible)):
     job_config = SummaryJobConfig.from_config_dict(target)
     await summary_service.execute_job(job_config)
     return {"status": "success", "message": f"任务 '{job_config.name}' 已触发"}
+
+
+@router.post("/{name:path}/clear-memory")
+async def clear_summary_job_memory(
+    name: str,
+    body: ClearMemoryRequest,
+    _=Depends(get_current_user_flexible),
+):
+    """清空任务记忆（不可恢复，二次确认）。
+
+    同一事务删除主表 + 归档表 + 清相关消费标记（含 feedback 条目）。
+    想保留偏好重新开始 → 复制为新 job（旧 job 记忆完整保留）。
+    """
+    decoded = unquote(name)
+    _find_config(decoded)  # 任务不存在 404
+    if not body.confirm:
+        raise HTTPException(422, "必须携带 confirm=true 确认清空")
+    deleted = memory_service.clear_task("summary", f"summary-{decoded}")
+    return {
+        "status": "success",
+        "message": "任务记忆已清空",
+        "deleted_records": deleted,
+    }

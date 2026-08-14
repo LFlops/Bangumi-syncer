@@ -1,0 +1,493 @@
+"""AgentMemoryRepository 测试（Phase 2.0.1 写入侧）。
+
+覆盖 BDD 场景 W1/W4/W6/W8/W9/W10/W11。
+"""
+
+import sqlite3
+from unittest.mock import patch
+
+import pytest
+
+from app.services.memory.models import MemoryEntry
+
+MAIN_COLS = "id, task_type, task_id, run_id, summary, full_text, outcome, tokens_used, created_at"
+
+
+def _make_db(temp_dir, name="memory.db"):
+    """创建一个指向临时文件的 DatabaseManager 并返回。"""
+    db_path = temp_dir / name
+    with patch("app.core.database.logger"):
+        from app.core.database import DatabaseManager
+
+        db = DatabaseManager(str(db_path))
+    return db
+
+
+def _entry(run_id: str, summary: str = "昨日看了芙莉莲", **overrides) -> MemoryEntry:
+    defaults = {
+        "task_type": "summary",
+        "task_id": "summary-daily",
+        "run_id": run_id,
+        "summary": summary,
+        "full_text": f"{summary}（全文）",
+        "outcome": "success",
+        "tokens_used": 120,
+    }
+    defaults.update(overrides)
+    return MemoryEntry(**defaults)
+
+
+def _log_record(db, *, title="葬送的芙莉莲", episode=10, bgm_title="葬送的芙莉莲"):
+    return db.log_sync_record(
+        user_name="dad",
+        title=title,
+        ori_title=None,
+        season=1,
+        episode=episode,
+        subject_id="1",
+        status="success",
+        source="plex",
+        media_type="episode",
+        bgm_title=bgm_title,
+    )
+
+
+def _main_rows(db) -> list[tuple]:
+    conn = db._get_connection()
+    return conn.execute(
+        f"SELECT {MAIN_COLS} FROM agent_working_memory ORDER BY id"
+    ).fetchall()
+
+
+def _archive_rows(db) -> list[tuple]:
+    conn = db._get_connection()
+    return conn.execute(
+        f"SELECT {MAIN_COLS} FROM agent_working_memory_archive ORDER BY id"
+    ).fetchall()
+
+
+# ── 表结构（W4 数据基础）───────────────────────────────────────────────
+
+
+class TestSchema:
+    def test_memory_tables_and_fts_created(self, temp_dir, reset_singletons):
+        _ = _make_db(temp_dir)
+
+        with sqlite3.connect(str(temp_dir / "memory.db")) as raw:
+            names = {
+                r[0]
+                for r in raw.execute(
+                    "SELECT name FROM sqlite_master WHERE type IN ('table','virtual table')"
+                )
+            }
+            assert "agent_working_memory" in names
+            assert "agent_working_memory_archive" in names
+            assert "agent_memory_fts" in names
+
+            triggers = {
+                r[0]
+                for r in raw.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert {"agent_memory_ai", "agent_memory_ad", "agent_memory_au"} <= triggers
+
+    def test_memory_table_has_expected_columns(self, temp_dir, reset_singletons):
+        _ = _make_db(temp_dir)
+
+        with sqlite3.connect(str(temp_dir / "memory.db")) as raw:
+            rows = raw.execute("PRAGMA table_info(agent_working_memory)").fetchall()
+            cols = [r[1] for r in rows]
+            assert "task_type" in cols
+            assert "task_id" in cols
+            assert "run_id" in cols
+            assert "summary" in cols
+            assert "full_text" in cols
+            assert "outcome" in cols
+            assert "tokens_used" in cols
+            assert "created_at" in cols
+            # run_id 唯一索引（UNIQUE 列约束 → sqlite 自动索引，列名经 index_info 查）
+            indexes = raw.execute("PRAGMA index_list(agent_working_memory)").fetchall()
+            unique_cols: set[str] = set()
+            for idx in indexes:
+                if idx[2] == 1:  # unique=1
+                    cols = raw.execute(f"PRAGMA index_info({idx[1]})").fetchall()
+                    unique_cols.update(c[2] for c in cols)
+            assert "run_id" in unique_cols
+
+    def test_facade_exposes_memory_and_sync_records(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        from app.core.database.agent_memory import AgentMemoryRepository
+        from app.core.database.sync_records import SyncRecordsRepository
+
+        assert isinstance(db.memory, AgentMemoryRepository)
+        assert isinstance(db.sync_records, SyncRecordsRepository)
+
+
+# ── W1 成功路径写入 ─────────────────────────────────────────────────────
+
+
+class TestStoreAndMark:
+    def test_inserts_memory_and_marks_consumed_in_same_transaction(
+        self, temp_dir, reset_singletons
+    ):
+        """W1：store_and_mark 写入记忆 + 标记消费（同一事务原子完成）。"""
+        db = _make_db(temp_dir)
+        r1 = _log_record(db, episode=10)
+        r2 = _log_record(db, title="鬼灭之刃", episode=5, bgm_title="鬼灭之刃")
+
+        db.memory.store_and_mark(_entry("run-1"), [r1, r2])
+
+        rows = _main_rows(db)
+        assert len(rows) == 1
+        assert rows[0][3] == "run-1"  # run_id
+        assert rows[0][4] == "昨日看了芙莉莲"  # summary
+
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        by_id = {r["id"]: r for r in recs}
+        assert by_id[r1]["consumed_run_id"] == "run-1"
+        assert by_id[r2]["consumed_run_id"] == "run-1"
+
+    def test_no_record_ids_skips_marking(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-2"), [])
+
+        assert len(_main_rows(db)) == 1
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        assert all(r["consumed_run_id"] is None for r in recs)
+
+    def test_duplicate_run_id_raises(self, temp_dir, reset_singletons):
+        """run_id UNIQUE：重复 run_id 抛异常（调用方 try/except 捕获）。"""
+        import sqlite3
+
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-x"), [])
+
+        with pytest.raises(sqlite3.IntegrityError):
+            db.memory.store_and_mark(_entry("run-x"), [])
+
+
+# ── W4 FTS5 触发器同步 ──────────────────────────────────────────────────
+
+
+class TestFtsSearch:
+    def test_search_fts_finds_newly_inserted_row(self, temp_dir, reset_singletons):
+        """W4：插入后触发器同步 FTS，search_fts 命中。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(
+            _entry("run-1", summary="昨日看了葬送的芙莉莲 S1E10"), []
+        )
+
+        hits = db.memory.search_fts("芙莉莲", task_type="summary")
+        assert len(hits) == 1
+        assert hits[0].run_id == "run-1"
+        assert hits[0].summary == "昨日看了葬送的芙莉莲 S1E10"
+
+    def test_search_fts_filters_by_task_type(self, temp_dir, reset_singletons):
+        """跨任务不命中：其他 task_type 的记忆不进 summary 检索结果。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(
+            _entry(
+                "run-a",
+                summary="server 挂了 503",
+                task_type="diagnostic",
+                task_id="diag-x",
+            ),
+            [],
+        )
+        db.memory.store_and_mark(
+            _entry(
+                "run-b",
+                summary="server 挂了 503",
+                task_type="summary",
+                task_id="summary-daily",
+            ),
+            [],
+        )
+
+        hits = db.memory.search_fts("503", task_type="summary")
+        assert [h.run_id for h in hits] == ["run-b"]
+
+    def test_search_fts_multiple_keywords_and(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-1", summary="芙莉莲 S1E10 鬼灭之刃"), [])
+        db.memory.store_and_mark(_entry("run-2", summary="只看了芙莉莲"), [])
+
+        hits = db.memory.search_fts("芙莉莲 鬼灭之刃", task_type="summary")
+        assert [h.run_id for h in hits] == ["run-1"]
+
+    def test_search_fts_returns_empty_for_no_match(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-1", summary="芙莉莲"), [])
+        assert db.memory.search_fts("不存在的关键词", task_type="summary") == []
+
+
+# ── W6 prune 归档 / W9 feedback 保留 ────────────────────────────────────
+
+
+class TestPrune:
+    def test_prune_archives_old_records(self, temp_dir, reset_singletons):
+        """W6：超出 keep 的旧记录先入归档再删主表（降级而非删除）。"""
+        db = _make_db(temp_dir)
+        for i in range(1005):
+            db.memory.store_and_mark(_entry(f"run-{i}", summary=f"第{i}次总结"), [])
+
+        db.memory.prune("summary", "summary-daily", keep=1000)
+
+        assert len(_main_rows(db)) == 1000
+        archive = _archive_rows(db)
+        assert len(archive) == 5
+        # 归档保留原 created_at/run_id
+        assert {r[3] for r in archive} == {f"run-{i}" for i in range(5)}
+        assert all(r[8] for r in archive)  # created_at 非空
+
+    def test_prune_keeps_feedback_outside_window(self, temp_dir, reset_singletons):
+        """W9：outcome=feedback 的旧条目跳过 prune（长期保留）。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(
+            _entry("run-fb", summary="用户反馈：不要太啰嗦", outcome="feedback"), []
+        )
+        for i in range(1005):
+            db.memory.store_and_mark(_entry(f"run-{i}", summary=f"第{i}次总结"), [])
+
+        db.memory.prune("summary", "summary-daily", keep=1000)
+
+        rows = _main_rows(db)
+        assert any(r[3] == "run-fb" for r in rows)
+        assert all(r[3] != "run-fb" for r in _archive_rows(db))
+
+    def test_prune_scoped_to_task(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-a", task_id="summary-daily"), [])
+        db.memory.store_and_mark(_entry("run-b", task_id="summary-weekly"), [])
+
+        db.memory.prune("summary", "summary-daily", keep=0)
+
+        rows = _main_rows(db)
+        assert [r[3] for r in rows] == ["run-b"]
+
+
+# ── W8 归档可检索 ───────────────────────────────────────────────────────
+
+
+class TestSearchArchive:
+    def test_search_archive_finds_keyword(self, temp_dir, reset_singletons):
+        """W8：LIKE 检索冷记忆。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-1", summary="归档前的一次总结"), [])
+        db.memory.prune("summary", "summary-daily", keep=0)
+
+        hits = db.memory.search_archive("summary", "归档前")
+        assert len(hits) == 1
+        assert hits[0].run_id == "run-1"
+
+    def test_search_archive_task_type_filter(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(
+            _entry(
+                "run-a",
+                summary="共享关键词内容",
+                task_type="summary",
+                task_id="summary-daily",
+            ),
+            [],
+        )
+        db.memory.store_and_mark(
+            _entry(
+                "run-b",
+                summary="共享关键词内容",
+                task_type="diagnostic",
+                task_id="diag-x",
+            ),
+            [],
+        )
+        db.memory.prune("summary", "summary-daily", keep=0)
+        db.memory.prune("diagnostic", "diag-x", keep=0)
+
+        hits = db.memory.search_archive("summary", "共享关键词")
+        assert [h.run_id for h in hits] == ["run-a"]
+
+
+# ── W10 老库补列幂等 ────────────────────────────────────────────────────
+
+
+class TestMigration:
+    def test_consumed_run_id_added_and_idempotent(self, temp_dir, reset_singletons):
+        """W10：启动时幂等补列 consumed_run_id。"""
+        db = _make_db(temp_dir)
+
+        with sqlite3.connect(str(temp_dir / "memory.db")) as raw:
+            cols = [r[1] for r in raw.execute("PRAGMA table_info(sync_records)")]
+            assert "consumed_run_id" in cols
+
+        # 再次执行迁移方法幂等（列已存在，跳过）
+        conn = db._get_connection()
+        db._connection._ensure_sync_records_consumed(conn.cursor())
+        with sqlite3.connect(str(temp_dir / "memory.db")) as raw:
+            cols = [r[1] for r in raw.execute("PRAGMA table_info(sync_records)")]
+            assert "consumed_run_id" in cols
+
+    def test_consumed_run_id_added_to_legacy_db(self, temp_dir, reset_singletons):
+        """老库（无 consumed_run_id 列）启动时自动补列。"""
+        legacy = temp_dir / "legacy.db"
+        raw = sqlite3.connect(str(legacy))
+        raw.execute(
+            "CREATE TABLE sync_records ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,"
+            "user_name TEXT NOT NULL, title TEXT NOT NULL, season INTEGER NOT NULL,"
+            "episode INTEGER NOT NULL, status TEXT NOT NULL, source TEXT NOT NULL)"
+        )
+        raw.commit()
+        raw.close()
+
+        _make_db(temp_dir, name="legacy.db")
+
+        with sqlite3.connect(str(legacy)) as raw:
+            cols = [r[1] for r in raw.execute("PRAGMA table_info(sync_records)")]
+            assert "consumed_run_id" in cols
+
+
+# ── W11 查询返回 consumed_run_id ────────────────────────────────────────
+
+
+class TestQueryConsumed:
+    def test_get_records_in_date_range_includes_consumed_run_id(
+        self, temp_dir, reset_singletons
+    ):
+        """W11：summary 底层查询返回 consumed_run_id 键。"""
+        db = _make_db(temp_dir)
+        r1 = _log_record(db)
+        db.memory.store_and_mark(_entry("run-1"), [r1])
+
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        assert recs and "consumed_run_id" in recs[0]
+        assert recs[0]["consumed_run_id"] == "run-1"
+
+
+# ── 2.0.3 清理与重置：rename_task / clear_task（C1-C12）──────────────────
+
+
+class TestRenameTask:
+    def test_rename_migrates_main_and_archive(self, temp_dir, reset_singletons):
+        """C1：改名迁移主表 + 归档表的 task_id。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-1", task_id="summary-daily"), [])
+        db.memory.store_and_mark(_entry("run-2", task_id="summary-daily"), [])
+        db.memory.prune("summary", "summary-daily", keep=1)  # run-1 入归档，run-2 保留
+
+        n = db.memory.rename_task("summary", "summary-daily", "summary-daily2")
+
+        assert n == 2
+        main = [r[3] for r in _main_rows(db)]
+        archive = [r[3] for r in _archive_rows(db)]
+        assert set(main) == {"run-2"}
+        assert archive == ["run-1"]
+        assert all(r[2] == "summary-daily2" for r in _main_rows(db))
+        assert all(r[2] == "summary-daily2" for r in _archive_rows(db))
+
+    def test_rename_nonexistent_task_idempotent(self, temp_dir, reset_singletons):
+        """C6：改不存在的 task_id → 无操作，不报错。"""
+        db = _make_db(temp_dir)
+        n = db.memory.rename_task("summary", "summary-nonexist", "summary-new")
+        assert n == 0
+
+    def test_rename_keeps_consumed_marks(self, temp_dir, reset_singletons):
+        """C7：消费标记只关联 run_id，改名不破坏。"""
+        db = _make_db(temp_dir)
+        r1 = _log_record(db)
+        db.memory.store_and_mark(_entry("run-1", task_id="summary-daily"), [r1])
+        db.memory.rename_task("summary", "summary-daily", "summary-daily2")
+
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        assert recs[0]["consumed_run_id"] == "run-1"
+
+    def test_rename_scoped_to_task_type_and_task(self, temp_dir, reset_singletons):
+        """rename 只影响目标 (task_type, task_id)。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-a", task_id="summary-daily"), [])
+        db.memory.store_and_mark(
+            _entry("run-b", task_type="diagnostic", task_id="diag-x"), []
+        )
+
+        db.memory.rename_task("summary", "summary-daily", "summary-daily2")
+
+        rows = _main_rows(db)
+        by_run = {r[3]: r[2] for r in rows}
+        assert by_run["run-a"] == "summary-daily2"
+        assert by_run["run-b"] == "diag-x"
+
+
+class TestClearTask:
+    def _seed(self, db):
+        """两条主表记忆 + 一条归档记忆 + 三条消费标记。"""
+        r1 = _log_record(db, episode=1)
+        r2 = _log_record(db, episode=2)
+        r3 = _log_record(db, episode=3)
+        db.memory.store_and_mark(_entry("u1", task_id="summary-daily"), [r1])
+        db.memory.store_and_mark(_entry("u2", task_id="summary-daily"), [r2])
+        db.memory.store_and_mark(_entry("u3", task_id="summary-daily"), [r3])
+        db.memory.prune("summary", "summary-daily", keep=1)  # u1/u2 入归档
+        return [r1, r2, r3]
+
+    def test_clear_task_removes_memory_and_marks(self, temp_dir, reset_singletons):
+        """C3：同一事务清主表 + 归档 + 消费标记（含归档 run_id）。"""
+        db = _make_db(temp_dir)
+        r1, r2, r3 = self._seed(db)
+
+        n = db.memory.clear_task("summary", "summary-daily")
+
+        # u3 主表 + u1/u2 归档 = 3 删除 + 3 消费标记清空
+        assert n == 6
+        assert _main_rows(db) == []
+        assert _archive_rows(db) == []
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        assert all(r["consumed_run_id"] is None for r in recs)
+
+    def test_clear_task_isolation(self, temp_dir, reset_singletons):
+        """C9：清 A 不影响 B。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("u1", task_id="summary-daily"), [])
+        db.memory.store_and_mark(_entry("v1", task_id="summary-weekly"), [])
+
+        db.memory.clear_task("summary", "summary-daily")
+
+        rows = _main_rows(db)
+        assert [r[3] for r in rows] == ["v1"]
+
+    def test_clear_task_includes_feedback(self, temp_dir, reset_singletons):
+        """C10：彻底清空语义——feedback 条目一并删除。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(
+            _entry("u-fb", task_id="summary-daily", outcome="feedback"), []
+        )
+        db.memory.store_and_mark(_entry("u1", task_id="summary-daily"), [])
+
+        db.memory.clear_task("summary", "summary-daily")
+
+        assert _main_rows(db) == []
+
+    def test_clear_task_idempotent(self, temp_dir, reset_singletons):
+        """C11：再次清空不报错，影响行数 0。"""
+        db = _make_db(temp_dir)
+        db.memory.clear_task("summary", "summary-daily")
+        assert db.memory.clear_task("summary", "summary-daily") == 0
+
+    def test_clear_task_then_retrieve_empty(self, temp_dir, reset_singletons):
+        """C8：清空后 retrieve 返回空（新上下文从零开始）。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("u1", task_id="summary-daily"), [])
+        db.memory.clear_task("summary", "summary-daily")
+
+        assert db.memory.get_recent("summary", "summary-daily") == []
+
+    def test_run_ids_collected_before_delete(self, temp_dir, reset_singletons):
+        """C12：run_id 收集先于删表——消费标记不因映射丢失而漏清。"""
+        db = _make_db(temp_dir)
+        r1, r2, r3 = self._seed(db)
+        # 与 C3 相同验证，此处显式断言 u1/u2/u3 三个标记（含归档 run_id）全清
+        db.memory.clear_task("summary", "summary-daily")
+
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        marked = [r for r in recs if r["consumed_run_id"] is not None]
+        assert marked == []

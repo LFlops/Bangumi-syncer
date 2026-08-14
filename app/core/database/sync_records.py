@@ -468,7 +468,8 @@ class SyncRecordsRepository(BaseRepository):
             limit_clause = "LIMIT ?" if limit > 0 else ""
             query = f"""
                 SELECT id, timestamp, user_name, title, ori_title, season, episode,
-                       subject_id, episode_id, status, message, source, media_type, bgm_title
+                       subject_id, episode_id, status, message, source, media_type, bgm_title,
+                       consumed_run_id
                 FROM sync_records
                 {where}
                 ORDER BY timestamp DESC
@@ -493,6 +494,7 @@ class SyncRecordsRepository(BaseRepository):
                     "source": row[11],
                     "media_type": row[12] or "episode",
                     "bgm_title": row[13] or "",
+                    "consumed_run_id": row[14],
                 }
                 for row in cursor.fetchall()
             ]

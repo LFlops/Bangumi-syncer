@@ -1207,3 +1207,158 @@ class TestLLMUsageStatsResponse:
         assert model.by_model[0]["model"] == "gpt-4o-mini"
         assert len(model.by_job) == 1
         assert len(model.daily) == 1
+
+
+# ========== 记忆清理与改名联动（Phase 2.0.3，S1/S3/S5） ==========
+
+
+def _make_summary_app():
+    """构建只挂 summary_jobs router 的测试 app（mock 认证）。"""
+    from fastapi import FastAPI
+
+    from app.api.deps import get_current_user_flexible
+    from app.api.summary_jobs import router
+
+    app = FastAPI()
+    app.include_router(router)
+
+    async def mock_auth(request=None, credentials=None):
+        return {"username": "testuser"}
+
+    app.dependency_overrides[get_current_user_flexible] = mock_auth
+    return app
+
+
+class TestClearMemoryApi:
+    @pytest.mark.asyncio
+    async def test_requires_confirm(self):
+        """C4/S3：无 confirm → 422，不删除。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                response = await client.post(
+                    "/api/summary/jobs/daily/clear-memory", json={}
+                )
+                assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_clear_memory_success(self):
+        """S3：confirm=true → success + deleted_records，委托 MemoryService。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_memory.clear_task.return_value = 42
+                response = await client.post(
+                    "/api/summary/jobs/daily/clear-memory", json={"confirm": True}
+                )
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                assert data["deleted_records"] == 42
+                mock_memory.clear_task.assert_called_once_with(
+                    "summary", "summary-daily"
+                )
+
+    @pytest.mark.asyncio
+    async def test_job_not_found_404(self):
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                mock_cm.get_summary_configs.return_value = []
+                response = await client.post(
+                    "/api/summary/jobs/nonexist/clear-memory", json={"confirm": True}
+                )
+                assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_clear_failure_returns_error(self):
+        """S5：清空失败返回错误响应（不影响任务配置）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_memory.clear_task.side_effect = RuntimeError("db down")
+                response = await client.post(
+                    "/api/summary/jobs/daily/clear-memory", json={"confirm": True}
+                )
+                assert response.status_code == 500
+
+
+class TestRenameMemoryLinkage:
+    @pytest.mark.asyncio
+    async def test_rename_migrates_memory(self):
+        """S1：改名 PUT → MemoryService.rename_task 联动（记忆跟随）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_sched,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_sched.apply_config_after_save = AsyncMock()
+                response = await client.put(
+                    "/api/summary/jobs/daily",
+                    json={"name": "daily2"},
+                )
+                assert response.status_code == 200
+                mock_memory.rename_task.assert_called_once_with(
+                    "summary", "summary-daily", "summary-daily2"
+                )
+
+    @pytest.mark.asyncio
+    async def test_rename_same_name_no_migration(self):
+        """改名与原名相同 → 不触发记忆迁移。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_sched,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_sched.apply_config_after_save = AsyncMock()
+                await client.put(
+                    "/api/summary/jobs/daily",
+                    json={"cron": "0 8 * * *"},
+                )
+                mock_memory.rename_task.assert_not_called()

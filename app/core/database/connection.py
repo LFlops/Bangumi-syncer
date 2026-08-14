@@ -48,6 +48,8 @@ class DatabaseConnection:
         self._match_fields_migrated = False
         self._pending_sync_sync_record_id_migrated = False
         self._pending_candidates_sync_record_id_migrated = False
+        self._sync_records_consumed_migrated = False
+        self._agent_memory_migrated = False
         self._init_database()
 
     def close(self) -> None:
@@ -202,6 +204,102 @@ class DatabaseConnection:
         self._pending_candidates_sync_record_id_migrated = True
         logger.info("pending_candidates 已迁移：增加 sync_record_id 列")
 
+    def _ensure_sync_records_consumed(self, cursor) -> None:
+        """旧库迁移：为 sync_records 增加 consumed_run_id（剧集消费标记，NULL = 未消费）。"""
+        if self._sync_records_consumed_migrated:
+            return
+        cursor.execute("PRAGMA table_info(sync_records)")
+        cols = [row[1] for row in cursor.fetchall()]
+        if "consumed_run_id" in cols:
+            self._sync_records_consumed_migrated = True
+            return
+        cursor.execute("ALTER TABLE sync_records ADD COLUMN consumed_run_id TEXT")
+        self._sync_records_consumed_migrated = True
+        logger.info("sync_records 已迁移：增加 consumed_run_id 列")
+
+    def _ensure_agent_memory(self, cursor) -> None:
+        """Agent 工作记忆 schema：主表 + 归档表 + 索引 + FTS5 + 同步触发器。
+
+        FTS5 是 external content 表，触发器必须存在（否则 INSERT 后 FTS 不更新）。
+        tokenizer 优先 trigram（中文子串匹配）；老 SQLite（< 3.34）不支持时降级
+        默认 unicode61（整段 CJK 为一个 token，仅精确标题可命中）。
+        """
+        if self._agent_memory_migrated:
+            return
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_working_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                run_id TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL,
+                full_text TEXT,
+                outcome TEXT NOT NULL,
+                tokens_used INTEGER,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_working_memory_archive (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                run_id TEXT NOT NULL UNIQUE,
+                summary TEXT NOT NULL,
+                full_text TEXT,
+                outcome TEXT NOT NULL,
+                tokens_used INTEGER,
+                created_at TEXT,
+                archived_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_task "
+            "ON agent_working_memory(task_type, task_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_created "
+            "ON agent_working_memory(created_at)"
+        )
+        try:
+            cursor.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5("
+                "task_type, summary, outcome, "
+                "content='agent_working_memory', content_rowid='id', "
+                "tokenize='trigram')"
+            )
+        except sqlite3.OperationalError:
+            # SQLite < 3.34：trigram 不可用，降级默认分词器
+            cursor.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5("
+                "task_type, summary, outcome, "
+                "content='agent_working_memory', content_rowid='id')"
+            )
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_memory_ai
+            AFTER INSERT ON agent_working_memory BEGIN
+                INSERT INTO agent_memory_fts(rowid, task_type, summary, outcome)
+                VALUES (new.id, new.task_type, new.summary, new.outcome);
+            END
+        """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_memory_ad
+            AFTER DELETE ON agent_working_memory BEGIN
+                INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, outcome)
+                VALUES ('delete', old.id, old.task_type, old.summary, old.outcome);
+            END
+        """)
+        cursor.execute("""
+            CREATE TRIGGER IF NOT EXISTS agent_memory_au
+            AFTER UPDATE ON agent_working_memory BEGIN
+                INSERT INTO agent_memory_fts(agent_memory_fts, rowid, task_type, summary, outcome)
+                VALUES ('delete', old.id, old.task_type, old.summary, old.outcome);
+                INSERT INTO agent_memory_fts(rowid, task_type, summary, outcome)
+                VALUES (new.id, new.task_type, new.summary, new.outcome);
+            END
+        """)
+        self._agent_memory_migrated = True
+
     def _init_database(self) -> None:
         """初始化数据库"""
         conn = self._get_connection()
@@ -234,6 +332,7 @@ class DatabaseConnection:
         self._ensure_sync_records_media_type(cursor)
         self._ensure_sync_records_bgm_title(cursor)
         self._ensure_sync_records_match_fields(cursor)
+        self._ensure_sync_records_consumed(cursor)
 
         # 创建 Trakt 配置表
         cursor.execute("""
@@ -394,6 +493,9 @@ class DatabaseConnection:
             "CREATE INDEX IF NOT EXISTS idx_pending_candidates_sync_record_id "
             "ON pending_candidates(sync_record_id)"
         )
+
+        # Agent 工作记忆（热表 + 归档冷表 + FTS5 + 同步触发器）
+        self._ensure_agent_memory(cursor)
 
         conn.commit()
         logger.info(f"数据库初始化完成: {self.db_path}")

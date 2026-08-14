@@ -1,0 +1,175 @@
+"""MemoryExtractor 测试（Phase 2.0.1 摘要生成）。
+
+覆盖 BDD 场景 W1/W2/W3/W5。
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.services.llm.models import ChatResponse, Message, Usage
+from app.services.memory.extractor import MemoryExtractor
+from app.services.memory.models import MemoryEntry
+
+
+def _response(content: str = "本次总结全文内容") -> ChatResponse:
+    return ChatResponse(
+        content=content,
+        model="test-model",
+        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+
+def _messages() -> list[Message]:
+    return [
+        Message(role="system", content="system prompt"),
+        Message(role="user", content="records..."),
+    ]
+
+
+def _make_extractor(
+    repo=None, llm=None
+) -> tuple[MemoryExtractor, MagicMock, MagicMock]:
+    repo = repo or MagicMock()
+    llm = llm or MagicMock()
+    llm.chat = AsyncMock(return_value=ChatResponse(content="一句话摘要", model="m"))
+    extractor = MemoryExtractor(repo, llm_client=llm)
+    return extractor, repo, llm
+
+
+# ── W1 成功路径写入 ─────────────────────────────────────────────────────
+
+
+class TestExtractAndStore:
+    @pytest.mark.asyncio
+    async def test_writes_summary_and_prunes(self):
+        """extract_and_store 用 LLM 摘要写入记忆并 prune。"""
+        extractor, repo, llm = _make_extractor()
+        response = _response("本次总结全文")
+
+        await extractor.extract_and_store(
+            task_type="summary",
+            task_id="summary-daily",
+            run_id="run-1",
+            messages=_messages(),
+            response=response,
+            outcome="success",
+            tokens_used=150,
+            record_ids=[1, 2],
+        )
+
+        # LLM 收到完整上下文（system+user）+ assistant 回复 + 摘要指令（缓存前缀复用）
+        args = llm.chat.await_args.args[0]
+        assert len(args) == 4
+        assert args[2].role == "assistant"
+        assert args[2].content == "本次总结全文"
+        assert args[3].role == "user"
+
+        repo.store_and_mark.assert_called_once()
+        entry: MemoryEntry = repo.store_and_mark.call_args.args[0]
+        assert entry.task_type == "summary"
+        assert entry.task_id == "summary-daily"
+        assert entry.run_id == "run-1"
+        assert entry.summary == "一句话摘要"
+        assert entry.full_text == "本次总结全文"
+        assert entry.outcome == "success"
+        assert entry.tokens_used == 150
+        assert repo.store_and_mark.call_args.kwargs["record_ids"] == [1, 2]
+
+        repo.prune.assert_called_once_with("summary", "summary-daily", keep=1000)
+
+    @pytest.mark.asyncio
+    async def test_summary_truncated_to_200_chars(self):
+        long_text = "长" * 500
+        extractor, repo, llm = _make_extractor()
+        llm.chat = AsyncMock(return_value=ChatResponse(content=long_text, model="m"))
+
+        await extractor.extract_and_store(
+            task_type="summary",
+            task_id="summary-daily",
+            run_id="run-1",
+            messages=_messages(),
+            response=_response(),
+            outcome="success",
+            tokens_used=0,
+            record_ids=[],
+        )
+        entry = repo.store_and_mark.call_args.args[0]
+        assert len(entry.summary) == 200
+
+
+# ── W2 摘要 LLM 失败规则兜底 ────────────────────────────────────────────
+
+
+class TestSummarizeFallback:
+    @pytest.mark.asyncio
+    async def test_llm_exception_falls_back_to_truncated_content(self):
+        """W2：_summarize LLM 抛异常 → 不抛，规则截断兜底。"""
+        extractor, repo, llm = _make_extractor()
+        llm.chat = AsyncMock(side_effect=RuntimeError("llm down"))
+        response = _response("规则截断的全文内容" * 30)
+
+        summary = await extractor._summarize(_messages(), response)
+
+        assert summary == ("规则截断的全文内容" * 30)[:200]
+
+    @pytest.mark.asyncio
+    async def test_empty_llm_summary_falls_back_to_truncated_content(self):
+        """摘要 LLM 返回空内容 → 规则截断兜底。"""
+        extractor, repo, llm = _make_extractor()
+        llm.chat = AsyncMock(return_value=ChatResponse(content="", model="m"))
+        response = _response("兜底全文" * 100)
+
+        summary = await extractor._summarize(_messages(), response)
+
+        assert summary == ("兜底全文" * 100)[:200]
+
+
+# ── W3 空响应不写记忆 ───────────────────────────────────────────────────
+
+
+class TestEmptyResponse:
+    @pytest.mark.asyncio
+    async def test_empty_response_skips_write(self):
+        """W3：LLM 重试耗尽返回空响应 → 不写记忆。"""
+        extractor, repo, llm = _make_extractor()
+        empty = ChatResponse(content="", model="", usage=None, latency=5)
+
+        await extractor.extract_and_store(
+            task_type="summary",
+            task_id="summary-daily",
+            run_id="run-1",
+            messages=_messages(),
+            response=empty,
+            outcome="success",
+            tokens_used=0,
+            record_ids=[],
+        )
+
+        repo.store_and_mark.assert_not_called()
+        repo.prune.assert_not_called()
+        llm.chat.assert_not_awaited()  # 空响应不触发摘要调用
+
+
+# ── W5 写入失败不影响调用方 ─────────────────────────────────────────────
+
+
+class TestFailurePropagation:
+    @pytest.mark.asyncio
+    async def test_repo_failure_propagates_to_caller(self):
+        """W5：DB 写入异常向上传播（execute_job 外层 try/except 处理）。"""
+        repo = MagicMock()
+        repo.store_and_mark.side_effect = RuntimeError("db down")
+        extractor, _, _ = _make_extractor(repo=repo)
+
+        with pytest.raises(RuntimeError):
+            await extractor.extract_and_store(
+                task_type="summary",
+                task_id="summary-daily",
+                run_id="run-1",
+                messages=_messages(),
+                response=_response(),
+                outcome="success",
+                tokens_used=0,
+                record_ids=[],
+            )

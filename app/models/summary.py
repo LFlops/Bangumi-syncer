@@ -54,6 +54,8 @@ class SummaryJobCreate(BaseModel):
     system_prompt: str = ""
     max_records: int = -1  # -1 表示不限制
     enabled: bool = True
+    memory_enabled: bool = False  # 记忆开关（默认关闭）
+    memory_limit: int = 5  # 注入记忆条数
 
 
 class SummaryJobUpdate(BaseModel):
@@ -66,6 +68,8 @@ class SummaryJobUpdate(BaseModel):
     system_prompt: Optional[str] = None
     max_records: Optional[int] = None
     enabled: Optional[bool] = None
+    memory_enabled: Optional[bool] = None
+    memory_limit: Optional[int] = None
 
 
 class SummaryJobResponse(BaseModel):
@@ -78,6 +82,8 @@ class SummaryJobResponse(BaseModel):
     system_prompt: str
     max_records: int
     enabled: bool
+    memory_enabled: bool = False
+    memory_limit: int = 5
     # 只读的 notification_type，供前端展示
     notification_type: str = ""
 
@@ -91,6 +97,12 @@ class SummaryJobResponse(BaseModel):
                 return default
             return int(v)
 
+        def _memory_limit() -> int:
+            try:
+                return max(1, _int("memory_limit", 5))
+            except ValueError:
+                return 5
+
         name = str(data.get("name", ""))
         user_name = str(data.get("user_name", "") or "")
         notif_type = f"watching_summary_{name}"
@@ -98,6 +110,10 @@ class SummaryJobResponse(BaseModel):
         enabled = data.get("enabled", True)
         if not isinstance(enabled, bool):
             enabled = str(enabled).lower() in ("true", "1")
+
+        memory_enabled = data.get("memory_enabled", False)
+        if not isinstance(memory_enabled, bool):
+            memory_enabled = str(memory_enabled).lower() in ("true", "1")
 
         return cls(
             name=str(data.get("name", "")),
@@ -107,8 +123,16 @@ class SummaryJobResponse(BaseModel):
             system_prompt=str(data.get("system_prompt", "")),
             max_records=_int("max_records", -1),
             enabled=enabled,
+            memory_enabled=memory_enabled,
+            memory_limit=_memory_limit(),
             notification_type=notif_type,
         )
+
+
+class ClearMemoryRequest(BaseModel):
+    """POST /api/summary/jobs/{name}/clear-memory 请求（二次确认）"""
+
+    confirm: bool = False
 
 
 class SummaryJobTestResponse(BaseModel):

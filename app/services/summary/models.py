@@ -1,5 +1,7 @@
 """Summary job 配置数据类。"""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 
@@ -20,10 +22,19 @@ class SummaryJobConfig:
         "5. 限制在 300 字以内"
     )
     max_records: int = -1  # -1 表示不限制
+    memory_enabled: bool = False  # 记忆开关（默认关闭，每任务显式声明）
+    memory_limit: int = 5  # 注入记忆条数（最小值 1，仅 enabled=true 时生效）
 
     @classmethod
-    def from_config_dict(cls, data: dict) -> "SummaryJobConfig":
+    def from_config_dict(cls, data: dict) -> SummaryJobConfig:
         """从 config_manager.get_summary_configs() 字典创建实例。"""
+
+        def _memory_limit() -> int:
+            try:
+                return max(1, int(data.get("memory_limit", 5)))
+            except (TypeError, ValueError):
+                return 5
+
         return cls(
             name=str(data.get("name", "")),
             enabled=data.get("enabled", True)
@@ -34,4 +45,25 @@ class SummaryJobConfig:
             user_name=str(data.get("user_name", "")),
             system_prompt=str(data.get("system_prompt", cls.system_prompt)),
             max_records=int(data.get("max_records", -1)),
+            memory_enabled=data.get("memory_enabled", False)
+            if isinstance(data.get("memory_enabled"), bool)
+            else str(data.get("memory_enabled", "false")).lower() in ("true", "1"),
+            memory_limit=_memory_limit(),
         )
+
+
+@dataclass
+class SummaryRecord:
+    """summary 链路内部观影记录载体（_query_records 返回类型）。"""
+
+    id: int
+    timestamp: str
+    user_name: str
+    title: str
+    bgm_title: str
+    season: int
+    episode: int
+    media_type: str
+    source: str
+    status: str
+    consumed_run_id: str | None = None  # 消费标记（NULL=未消费）

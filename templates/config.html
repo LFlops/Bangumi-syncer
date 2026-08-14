@@ -1937,6 +1937,10 @@
     document.getElementById('summary-job-lookback').value = '1'
     document.getElementById('summary-job-user').value = ''
     document.getElementById('summary-job-max-records').value = '-1'
+    document.getElementById('summary-job-memory-enabled').checked = false
+    document.getElementById('summary-job-memory-limit').value = '5'
+    document.getElementById('summary-job-memory-limit').disabled = true
+    document.getElementById('summary-job-clear-memory-btn').disabled = true
     document.getElementById('summary-job-prompt').value =
       '你是一个轻松有趣的追番助手。用户会给你一段指定时间范围内的观影记录，请你用亲切自然的中文生成追番总结。\n\n' +
       '规则：\n' +
@@ -1947,6 +1951,36 @@
       '5. 限制在 300 字以内'
     if (window.refreshAllCronPreviews) window.refreshAllCronPreviews()
     showModal('summaryJobModal')
+  }
+
+  function toggleSummaryMemoryInput() {
+    var enabled = document.getElementById('summary-job-memory-enabled').checked
+    document.getElementById('summary-job-memory-limit').disabled = !enabled
+  }
+
+  async function clearSummaryMemory() {
+    var name = document.getElementById('summary-job-name').value
+    if (!name) return
+    if (!window.confirm('确定清空任务「' + name + '」的全部记忆吗？此操作不可恢复。')) {
+      return
+    }
+    try {
+      var d = await apiFetch(
+        '/api/summary/jobs/' + encodeURIComponent(name) + '/clear-memory',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ confirm: true }),
+        },
+      )
+      if (d.status === 'success') {
+        showAlert('任务记忆已清空（' + d.deleted_records + ' 条）', 'success')
+      } else {
+        showAlert('清空失败: ' + (d.message || d.detail || '未知错误'), 'danger')
+      }
+    } catch (e) {
+      showAlert('清空失败: ' + e.message, 'danger')
+    }
   }
 
   async function editSummaryJob(name) {
@@ -1966,6 +2000,12 @@
       document.getElementById('summary-job-lookback').value = job.lookback_days
       document.getElementById('summary-job-user').value = job.user_name || ''
       document.getElementById('summary-job-max-records').value = job.max_records
+      document.getElementById('summary-job-memory-enabled').checked =
+        !!job.memory_enabled
+      document.getElementById('summary-job-memory-limit').value =
+        job.memory_limit || 5
+      toggleSummaryMemoryInput()
+      document.getElementById('summary-job-clear-memory-btn').disabled = false
       document.getElementById('summary-job-prompt').value =
         job.system_prompt || ''
       if (window.refreshAllCronPreviews) window.refreshAllCronPreviews()
@@ -1987,6 +2027,11 @@
         parseInt(document.getElementById('summary-job-lookback').value) || 1,
       user_name: document.getElementById('summary-job-user').value,
       max_records: isNaN(mrVal) ? -1 : mrVal,
+      memory_enabled: document.getElementById('summary-job-memory-enabled')
+        .checked,
+      memory_limit: parseInt(
+        document.getElementById('summary-job-memory-limit').value,
+      ) || 5,
       system_prompt: document.getElementById('summary-job-prompt').value,
     }
     // 前端校验：名称不能含逗号，不能与已有任务重名
@@ -2214,6 +2259,38 @@
                                    min="-1"
                                    max="10000" />
                             <small class="text-muted">-1 表示不限制条数</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">记忆</label>
+                            <div class="form-check form-switch mt-1">
+                                <input class="form-check-input"
+                                       type="checkbox"
+                                       id="summary-job-memory-enabled"
+                                       onchange="toggleSummaryMemoryInput()" />
+                                <label class="form-check-label" for="summary-job-memory-enabled">启用历史记忆</label>
+                            </div>
+                            <small class="text-muted">记忆按任务隔离，多用户场景建议每用户一个任务</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">记忆条数</label>
+                            <input type="number"
+                                   class="form-control"
+                                   id="summary-job-memory-limit"
+                                   value="5"
+                                   min="1"
+                                   max="50"
+                                   disabled />
+                            <small class="text-muted">注入最近 N 条执行摘要</small>
+                        </div>
+                        <div class="col-md-4 d-flex align-items-end">
+                            <button type="button"
+                                    class="btn btn-sm btn-outline-danger w-100"
+                                    id="summary-job-clear-memory-btn"
+                                    onclick="clearSummaryMemory()"
+                                    disabled>
+                                <i class="bi bi-trash me-1"></i>清空记忆
+                            </button>
+                            <small class="text-muted ms-2">不可恢复，清空后从零开始</small>
                         </div>
                         <div class="col-12">
                             <label class="form-label">

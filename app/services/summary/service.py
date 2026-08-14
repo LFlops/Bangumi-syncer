@@ -3,67 +3,147 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from uuid import uuid4
 
 from app.core.database import database_manager
 from app.core.logging import logger
 
 from ..llm import Message, get_llm_client
+from ..memory.service import MemoryService
 from ..notification_service import notification_service
-from .models import SummaryJobConfig
+from .models import SummaryJobConfig, SummaryRecord
 
 # 内部常量 —— 用户可自定义的 prompt 结构，不暴露到 config.ini
 _USER_PROMPT_TEMPLATE = (
     "{date_from} 至 {date_to} 观影记录（共 {record_count} 条）：\n\n{records}"
 )
 
+_MEMORY_SECTION = "## 历史执行上下文"
+_OVERLAP_NOTE = "以下记录已在上次总结中覆盖，可简述或跳过，不必重复展开：\n"
+
 
 class SummaryService:
     """生成 AI 驱动的追番观影总结。"""
 
-    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
-        """查询数据库，格式化记录，调用 LLM。
+    def __init__(self):
+        # 记忆统一入口（extractor/retriever 是其内部组件，业务层不直接碰 repository）
+        self.memory = MemoryService(
+            database_manager.memory, database_manager.sync_records
+        )
 
-        返回字典，包含以下键：summary_text、model、usage、record_count、
-        date_from、date_to。
-        """
-        # 1. 计算日期范围
+    @property
+    def llm_client(self):
+        """每次取模块级单例——LLM 配置保存会 reset_llm_client()，缓存实例会失效。"""
+        return get_llm_client()
+
+    # ------------------------------------------------------------------
+    # 查询与构建（Phase 2.0.2 拆解，execute_job / generate_summary 共用）
+    # ------------------------------------------------------------------
+
+    def _query_records(
+        self, job_config: SummaryJobConfig
+    ) -> tuple[list[SummaryRecord], str, str]:
+        """计算日期范围并查询记录，返回 (records, date_from, date_to)。"""
         now = datetime.now()
         date_from = (now - timedelta(days=job_config.lookback_days)).strftime(
             "%Y-%m-%d"
         )
         date_to = now.strftime("%Y-%m-%d")
 
-        # 2. 查询记录
         records = database_manager.get_records_in_date_range(
             date_from=date_from,
             date_to=date_to,
             limit=job_config.max_records,
             user_name=job_config.user_name.strip() or None,
         )
-        record_count = len(records)
+        converted = [
+            SummaryRecord(
+                id=r["id"],
+                timestamp=r["timestamp"],
+                user_name=r["user_name"],
+                title=r["title"],
+                bgm_title=r.get("bgm_title") or "",
+                season=r["season"],
+                episode=r["episode"],
+                media_type=r.get("media_type") or "episode",
+                source=r["source"],
+                status=r["status"],
+                consumed_run_id=r.get("consumed_run_id"),
+            )
+            for r in records
+        ]
+        return converted, date_from, date_to
 
-        # 3. 格式化记录为文本
+    def _build_messages(
+        self,
+        records: list[SummaryRecord],
+        system_prompt: str,
+        date_from: str,
+        date_to: str,
+    ) -> list[Message]:
+        """格式化记录并构建 system + user 两条消息。"""
         records_text = self._format_records(records)
-
-        # 4. 构建消息
-        system_prompt = job_config.system_prompt.strip()
-        if not system_prompt:
-            system_prompt = SummaryJobConfig.system_prompt
-
         user_content = _USER_PROMPT_TEMPLATE.format(
             date_from=date_from,
             date_to=date_to,
             records=records_text,
-            record_count=record_count,
+            record_count=len(records),
         )
-        messages = [
+        return [
             Message(role="system", content=system_prompt),
             Message(role="user", content=user_content),
         ]
 
-        # 5. 调用 LLM
-        client = get_llm_client()
-        response = await client.chat(
+    def _build_memory_context(
+        self, job_config: SummaryJobConfig, task_id: str, records: list[SummaryRecord]
+    ) -> str:
+        """检索历史记忆并格式化为注入文本（含重叠标注）。"""
+        # 关键词 = 今日明细标题提取（规则提取，bgm_title 去重取前 5）
+        keywords: list[str] = []
+        seen: set[str] = set()
+        for r in records:
+            t = r.bgm_title
+            if t and t not in seen:
+                seen.add(t)
+                keywords.append(t)
+            if len(keywords) >= 5:
+                break
+        past_memories = self.memory.retrieve(
+            task_type="summary",
+            task_id=task_id,
+            limit=job_config.memory_limit,
+            keywords=keywords,
+        )
+        context = self.memory.format_memory_context(past_memories)
+
+        # 窗口重叠标注：今日明细中已被消费的记录提示简述/跳过
+        overlaps = self.memory.find_overlaps(records)
+        if overlaps:
+            lines = "\n".join(
+                f"- {r.bgm_title} S{r.season}E{r.episode}"
+                f"（已消费于总结 {r.consumed_run_id[:8]}）"
+                for r in overlaps[:20]
+            )
+            context = f"{context}\n{_OVERLAP_NOTE}{lines}"
+        return context
+
+    # ------------------------------------------------------------------
+    # 对外入口
+    # ------------------------------------------------------------------
+
+    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
+        """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
+
+        返回字典，包含以下键：summary_text、model、usage、record_count、
+        date_from、date_to。
+        """
+        records, date_from, date_to = self._query_records(job_config)
+        system_prompt = job_config.system_prompt.strip()
+        if not system_prompt:
+            system_prompt = SummaryJobConfig.system_prompt
+        messages = self._build_messages(records, system_prompt, date_from, date_to)
+
+        response = await self.llm_client.chat(
             messages,
             job_name=job_config.name,
         )
@@ -73,38 +153,61 @@ class SummaryService:
             "model": response.model,
             "usage": response.usage,
             "latency_ms": response.latency,
-            "record_count": record_count,
+            "record_count": len(records),
             "date_from": date_from,
             "date_to": date_to,
         }
 
     async def execute_job(self, job_config: SummaryJobConfig) -> None:
-        """完整执行：生成摘要，然后通过通知器发送。"""
+        """完整执行：查询 → 注入记忆 → 调 LLM → 提取记忆 → 发送通知。"""
         try:
-            result = await self.generate_summary(job_config)
+            task_id = f"summary-{job_config.name}"
+            records, date_from, date_to = self._query_records(job_config)
 
-            # LLM 失败时用明确提示替换空摘要
-            summary_text = result["summary_text"]
-            if not summary_text and not result.get("model"):
-                summary_text = (
-                    "AI 追番总结生成失败：LLM 返回空内容（所有重试已耗尽）。\n"
-                    "请检查 LLM 配置中的 api_base、api_key 是否正确，"
-                    "以及网络连通性。"
+            # 注入历史上下文（memory_enabled 开关短路，不调 retrieve）
+            memory_context = ""
+            if job_config.memory_enabled:
+                memory_context = self._build_memory_context(
+                    job_config, task_id, records
                 )
-                logger.error(
-                    f"Summary job '{job_config.name}' LLM 返回空内容，发送失败提示通知"
-                )
-                self._send_failure_notification(
-                    job_config,
-                    summary_text,
-                    inbox_type="summary_llm_failed",
-                    inbox_title=f"追番总结失败：{job_config.name}",
-                    inbox_body="LLM 返回空内容，请检查 API 地址和密钥",
-                )
-                return
 
-            # 正常发送成功通知
-            self._send_success_notification(job_config, result)
+            # 历史上下文拼进 system prompt（多 system message 对 OpenAI 兼容端点不安全）
+            system_prompt = job_config.system_prompt.strip()
+            if not system_prompt:
+                system_prompt = SummaryJobConfig.system_prompt
+            if memory_context:
+                system_prompt = (
+                    f"{_MEMORY_SECTION}\n{memory_context}\n\n{system_prompt}"
+                )
+            messages = self._build_messages(records, system_prompt, date_from, date_to)
+
+            response = await self.llm_client.chat(
+                messages,
+                job_name=job_config.name,
+            )
+
+            # 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）
+            if job_config.memory_enabled:
+                run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
+                try:
+                    await self.memory.extract_and_store(
+                        task_type="summary",
+                        task_id=task_id,
+                        run_id=run_id,
+                        messages=messages,  # 完整上下文：缓存前缀 + 摘要来源
+                        response=response,  # 响应：summary 生成 + full_text 存储
+                        outcome="success",
+                        tokens_used=response.usage.total_tokens
+                        if response.usage
+                        else 0,
+                        record_ids=[r.id for r in records],  # 同一事务标记消费
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to store memory: {e}")
+
+            self._dispatch_notification(
+                job_config, response, records, date_from, date_to
+            )
         except Exception as e:
             logger.error(f"Summary job '{job_config.name}' failed: {e}")
             summary_text = (
@@ -118,6 +221,44 @@ class SummaryService:
                 inbox_title=f"追番总结异常：{job_config.name}",
                 inbox_body="执行异常，请检查任务配置",
             )
+
+    def _dispatch_notification(
+        self,
+        job_config: SummaryJobConfig,
+        response,
+        records: list[SummaryRecord],
+        date_from: str,
+        date_to: str,
+    ) -> None:
+        """空内容→失败通知 / 正常→成功通知（保持既有失败语义）。"""
+        if not response.content and not response.model:
+            summary_text = (
+                "AI 追番总结生成失败：LLM 返回空内容（所有重试已耗尽）。\n"
+                "请检查 LLM 配置中的 api_base、api_key 是否正确，"
+                "以及网络连通性。"
+            )
+            logger.error(
+                f"Summary job '{job_config.name}' LLM 返回空内容，发送失败提示通知"
+            )
+            self._send_failure_notification(
+                job_config,
+                summary_text,
+                inbox_type="summary_llm_failed",
+                inbox_title=f"追番总结失败：{job_config.name}",
+                inbox_body="LLM 返回空内容，请检查 API 地址和密钥",
+            )
+            return
+
+        result = {
+            "summary_text": response.content,
+            "model": response.model,
+            "usage": response.usage,
+            "latency_ms": response.latency,
+            "record_count": len(records),
+            "date_from": date_from,
+            "date_to": date_to,
+        }
+        self._send_success_notification(job_config, result)
 
     def _send_success_notification(
         self, job_config: SummaryJobConfig, result: dict
@@ -177,25 +318,22 @@ class SummaryService:
             tokens_used=0,
         )
 
-    def _format_records(self, records: list[dict]) -> str:
+    def _format_records(self, records: list[SummaryRecord]) -> str:
         """将同步记录格式化为紧凑的文本表格。"""
         if not records:
             return "（无记录）"
         lines = []
         for r in records:
-            ts = str(r.get("timestamp", ""))[:16]
-            user = r.get("user_name", "")
-            title = r.get("title", "")
-            bgm = r.get("bgm_title", "")
+            ts = str(r.timestamp)[:16]
+            user = r.user_name
+            title = r.title
+            bgm = r.bgm_title
             display_title = f"{title}（{bgm}）" if bgm and bgm != title else title
-            media = r.get("media_type", "episode")
-            if media == "movie":
+            if r.media_type == "movie":
                 ep_label = "剧场版"
             else:
-                ep_label = f"S{r.get('season', 0)}E{r.get('episode', 0)}"
-            source = r.get("source", "")
-            status = r.get("status", "")
-            line = f"[{ts}] {user} | {display_title} | {ep_label} | {source} | {status}"
+                ep_label = f"S{r.season}E{r.episode}"
+            line = f"[{ts}] {user} | {display_title} | {ep_label} | {r.source} | {r.status}"
             lines.append(line)
         return "\n".join(lines)
 

@@ -65,7 +65,7 @@
   清消费标记必须先取该 task 的 run_id 集合，且需覆盖归档表、顺序敏感。
 - **推荐**（已定稿）：
   - 消费标记清理折叠进 `AgentMemoryRepository.clear_task`（单一 `_run_write` 原子事务），**而非**独立 `SyncRecordsRepository.clear_consumed_by_task`（避免跨 repo 各 commit 破坏原子性；消费标记是记忆域数据，见 2.0.1）。
-  - 顺序：① 收集 run_id（主表 + 归档表 UNION，必须在删表前取）；② 删主表；③ 删归档表；④ `DELETE FROM sync_records WHERE consumed_run_id IN (run_ids)`。
+  - 顺序：① 收集 run_id（主表 + 归档表 UNION，必须在删表前取）；② 删主表；③ 删归档表；④ `UPDATE sync_records SET consumed_run_id = NULL WHERE consumed_run_id IN (run_ids)`（清标记，不删记录）。
   - 归档表 run_id 也参与（归档过的 run_id 可能仍被消费标记引用）。
   - `rename_task` 无需动消费标记（consumed_run_id 只关联 run_id，改名不改变 run_id）——维持现状。
 - **待改**：2.0.3 `clear_task` 说明 + 文件清单（删 `sync_records.py` 行）+ C3/C12 场景。
@@ -105,11 +105,11 @@
 - **推荐**（已定稿）：**删除 `partial`**（无写入路径，不留注释）；`outcome` 本阶段仅 `success`，`feedback` 由 Phase 2.3 引入（有明确写入路径）。
 - **待改**：2.0.1 `MemoryEntry.outcome` 注释改为「本阶段仅 success；feedback 取值 Phase 2.3 引入」。
 
-### D10. `consumed_at` 字段补全
+### D10. 删除 `consumed_at`（无读者，YAGNI）
 
-- **问题**：总览 SQL 只注释 `consumed_run_id`，但 `mark_consumed`/`__ensure_sync_records_consumed` 用到 `consumed_at`。
-- **推荐**：总览 schema 补 `consumed_at` 注释；2.0.1 `mark_consumed` 的 SELECT 清单确认 `consumed_at` 是否要读回（`find_overlaps` 只依赖 `consumed_run_id`，`consumed_at` 可不读回）。
-- **待改**：总览"数据库"一节、2.0.1 migration 小节。
+- **问题**：`consumed_at` 被 `store_and_mark` 写入、migration 补列，但没有任何读取方（`find_overlaps` 只看 `consumed_run_id IS NOT NULL`）；且"何时消费"可由 `consumed_run_id` join 记忆表 `created_at` 推导（归档表也有 created_at）。
+- **推荐**（已定稿）：**删除 `consumed_at`**，只留 `consumed_run_id`——migration 少一列、`store_and_mark` 少写一个字段。
+- **待改**：总览"剧集消费标记"、2.0.1 migration/store_and_mark/W10/W11、connection.py 文件清单。
 
 ### D11. `find_overlaps` 去掉 async
 
@@ -119,8 +119,8 @@
 
 ### D12. `get_records_in_date_range` 的 SELECT 改动写清楚
 
-- **问题**："SELECT 需带 consumed_run_id" 只被顺带提一句，无 BDD 场景，也没说 `consumed_at` 是否 SELECT。
-- **推荐**：明确 `get_records_in_date_range` 增加 `consumed_run_id`（`consumed_at` 不读回）；补一条 BDD「查询返回 dict 含 consumed_run_id 键」。
+- **问题**："SELECT 需带 consumed_run_id" 只被顺带提一句，无 BDD 场景。
+- **推荐**：明确 `get_records_in_date_range` 增加 `consumed_run_id`；补一条 BDD「查询返回 dict 含 consumed_run_id 键」。
 - **待改**：2.0.1 文件清单、2.0.2 新增/补 BDD。
 
 ### D13. prune 粒度表述统一
@@ -144,7 +144,7 @@
 - **推荐**：external content 表 + JOIN 主表后 `WHERE agent_working_memory.task_type = ?`（行数少，够用）。
 - **待改**：2.0.1 `search_fts` 注释。
 
-### D16. `find_overlaps` 是否下沉 SQL（不强制）
+### D16. `find_overlaps` 是否下沉 SQL（已定稿：不做）
 
 - **推荐**：维持现状（在已加载 `records` 上 Python 过滤，零额外查询）。**不做**，避免过度设计。
 - **待改**：无。
@@ -164,10 +164,10 @@
 | D7 | insert + 消费标记同一事务（prune 独立 best-effort） | ✅ 已定稿 |
 | D8 | _format_memory_context 归 MemoryRetriever | ✅ 已定稿 |
 | D9 | 删除 partial，仅 success | ✅ 已定稿 |
-| D10 | 补 consumed_at 注释 | 待定稿 |
+| D10 | 删除 consumed_at（无读者） | ✅ 已定稿 |
 | D11 | find_overlaps 改 sync | ✅ 已定稿 |
 | D12 | get_records_in_date_range SELECT 写清 + 补 BDD | ✅ 已定稿 |
 | D13 | prune 粒度统一"每 (task_type,task_id) 1000" | ✅ 已定稿 |
-| D14 | tokens_used 语义注释 | 待定稿 |
-| D15 | search_fts task_type 过滤写死 | 待定稿 |
-| D16 | find_overlaps 不下沉 SQL | 待定稿 |
+| D14 | tokens_used 语义注释 | ✅ 已定稿 |
+| D15 | search_fts task_type 过滤写死 | ✅ 已定稿 |
+| D16 | find_overlaps 不下沉 SQL | ✅ 已定稿 |
