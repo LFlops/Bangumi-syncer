@@ -185,3 +185,6 @@ sync_records.db-shm
 
 # Claude Code
 .claude/
+
+# Pi Agent
+.pi
