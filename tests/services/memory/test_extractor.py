@@ -3,7 +3,7 @@
 覆盖 BDD 场景 W1/W2/W3/W5。
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -99,6 +99,25 @@ class TestExtractAndStore:
 
 
 # ── W2 摘要 LLM 失败规则兜底 ────────────────────────────────────────────
+
+
+class TestLazyLlmClient:
+    @pytest.mark.asyncio
+    async def test_no_injected_client_uses_global_singleton_per_call(self):
+        """未注入 llm_client 时，_summarize 每次现取 get_llm_client()（reset 后不滞留旧实例）。"""
+        mock_llm = MagicMock()
+        mock_llm.chat = AsyncMock(
+            return_value=ChatResponse(content="一句话", model="m")
+        )
+        extractor = MemoryExtractor(MagicMock(), llm_client=None)
+
+        with patch(
+            "app.services.memory.extractor.get_llm_client", return_value=mock_llm
+        ):
+            summary = await extractor._summarize(_messages(), _response())
+
+        assert summary == "一句话"
+        mock_llm.chat.assert_awaited_once()
 
 
 class TestSummarizeFallback:

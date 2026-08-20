@@ -208,13 +208,26 @@ class TestFtsSearch:
         hits = db.memory.search_fts("503", task_type="summary")
         assert [h.run_id for h in hits] == ["run-b"]
 
-    def test_search_fts_multiple_keywords_and(self, temp_dir, reset_singletons):
+    def test_search_fts_multiple_keywords_or(self, temp_dir, reset_singletons):
+        """多关键词 OR：任一标题命中即相关（今日看的任一番剧都捞回）。"""
         db = _make_db(temp_dir)
         db.memory.store_and_mark(_entry("run-1", summary="芙莉莲 S1E10 鬼灭之刃"), [])
         db.memory.store_and_mark(_entry("run-2", summary="只看了芙莉莲"), [])
 
         hits = db.memory.search_fts("芙莉莲 鬼灭之刃", task_type="summary")
-        assert [h.run_id for h in hits] == ["run-1"]
+        # OR 语义：run-2 虽只含一词，仍是"与今日任一标题相关"的记忆
+        assert {h.run_id for h in hits} == {"run-1", "run-2"}
+
+    def test_search_fts_each_keyword_hits_independently(
+        self, temp_dir, reset_singletons
+    ):
+        """多关键词 OR 的核心场景：两条记忆各命中一个标题，均被捞回（AND 会 0 命中）。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-a", summary="只看了芙莉莲"), [])
+        db.memory.store_and_mark(_entry("run-b", summary="只看了鬼灭之刃"), [])
+
+        hits = db.memory.search_fts("芙莉莲 鬼灭之刃", task_type="summary")
+        assert {h.run_id for h in hits} == {"run-a", "run-b"}
 
     def test_search_fts_returns_empty_for_no_match(self, temp_dir, reset_singletons):
         db = _make_db(temp_dir)

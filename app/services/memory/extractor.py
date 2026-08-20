@@ -20,8 +20,9 @@ _SUMMARY_MAX_LEN = 200
 class MemoryExtractor:
     def __init__(self, repo: AgentMemoryRepository, llm_client=None):
         self._repo = repo
-        # 无 import 环（memory → llm.client → core.config，反向无依赖），可顶层 import
-        self._llm = llm_client or get_llm_client()
+        # 测试可注入；None 时 _summarize 内现取全局单例（LLM 配置保存会
+        # reset_llm_client()，缓存实例会滞留旧 api_base/key）
+        self._llm = llm_client
 
     async def extract_and_store(
         self,
@@ -66,7 +67,8 @@ class MemoryExtractor:
             summary_messages = list(messages)
             summary_messages.append(Message(role="assistant", content=response.content))
             summary_messages.append(Message(role="user", content=_SUMMARY_PROMPT))
-            resp = await self._llm.chat(summary_messages)
+            llm = self._llm or get_llm_client()
+            resp = await llm.chat(summary_messages)
             if resp.content:
                 return resp.content.strip()[:_SUMMARY_MAX_LEN]
         except Exception as e:

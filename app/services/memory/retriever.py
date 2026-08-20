@@ -46,16 +46,14 @@ class MemoryRetriever:
                     )
                 )
 
-        # 3. 去重（按 run_id，防双路径命中）；不按 limit 收束（keywords 额度独立）
-        return self._deduplicate_and_rank(entries, limit)
+        # 3. 去重（按 run_id，防双路径命中）；keywords 命中不占额度不收束
+        return self._deduplicate_and_rank(entries)
 
-    def _deduplicate_and_rank(
-        self, entries: list[MemoryEntry], limit: int
-    ) -> list[MemoryEntry]:
+    def _deduplicate_and_rank(self, entries: list[MemoryEntry]) -> list[MemoryEntry]:
         """按 run_id 去重，保留顺序（recent 在前、keywords 命中随后）。
 
         recent 条数已在 get_recent(limit) 源头受限；keywords 命中不占额度
-        全部保留，故此处无需收束（Phase 2.3 的 feedback 优先排序也在此扩展）。
+        全部保留（Phase 2.3 的 feedback 优先排序也在此扩展）。
         """
         seen: set[str] = set()
         ranked: list[MemoryEntry] = []
