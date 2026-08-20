@@ -274,6 +274,8 @@ class TestGetRecordsInDateRange:
             "media_type",
             "bgm_title",
             "consumed_run_id",
+            "run_id",
+            "batch_id",
         }
         assert set(r.keys()) == expected_keys
         assert r["user_name"] == "u"
