@@ -589,7 +589,6 @@ class ConfigManager:
     def get_llm_config(self) -> dict[str, Any]:
         """获取 LLM 全局配置（含默认值）。"""
         # 延迟 import 避免循环依赖：llm 包初始化会 import config_manager
-        from app.services.llm.constants import PROVIDER_OPENAI_COMPAT
 
         defaults: dict[str, Any] = {
             "provider": "openai_compat",

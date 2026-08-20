@@ -12,7 +12,6 @@ import time
 from app.core.config import config_manager
 from app.core.logging import logger
 
-from .constants import PROVIDER_ANTHROPIC_COMPAT, PROVIDER_OPENAI_COMPAT
 from .models import ChatResponse, Message
 from .providers.anthropic import AnthropicProvider
 from .providers.base import BaseProvider

@@ -53,7 +53,9 @@ class TestRetrieve:
 
         retriever.retrieve("summary", "summary-daily", keywords=["芙莉莲"])
 
-        repo.search_fts.assert_called_once_with(["芙莉莲"], task_type="summary", limit=5)
+        repo.search_fts.assert_called_once_with(
+            ["芙莉莲"], task_type="summary", limit=5
+        )
 
     def test_multi_word_keyword_passed_as_single_phrase(self):
         """#4 修复：带空格的标题作为整体短语传递（不被空白切碎）。"""

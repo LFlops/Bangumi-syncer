@@ -7,8 +7,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.services.llm.constants import PROVIDER_OPENAI_COMPAT
-
 from .base_repository import BaseRepository
 
 

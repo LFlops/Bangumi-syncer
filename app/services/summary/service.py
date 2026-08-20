@@ -224,9 +224,7 @@ class SummaryService:
                     messages=messages,  # 完整上下文：缓存前缀 + 摘要来源
                     response=response,  # 响应：summary 生成 + full_text 存储
                     outcome="success",
-                    tokens_used=response.usage.total_tokens
-                    if response.usage
-                    else 0,
+                    tokens_used=response.usage.total_tokens if response.usage else 0,
                     record_ids=[r.id for r in records],  # 同一事务标记消费
                 )
             except Exception as e:

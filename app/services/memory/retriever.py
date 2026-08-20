@@ -41,9 +41,7 @@ class MemoryRetriever:
             clean = [k for k in keywords if k and k.strip()]  # 过滤空字符串
             if clean:
                 entries.extend(
-                    self._repo.search_fts(
-                        clean, task_type=task_type, limit=limit
-                    )
+                    self._repo.search_fts(clean, task_type=task_type, limit=limit)
                 )
 
         # 3. 去重（按 run_id，防双路径命中）；keywords 命中不占额度不收束

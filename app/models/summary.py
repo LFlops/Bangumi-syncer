@@ -6,8 +6,6 @@ from typing import Optional
 
 from pydantic import BaseModel
 
-from app.services.llm.constants import PROVIDER_OPENAI_COMPAT
-
 
 class LLMConfigResponse(BaseModel):
     """GET /llm 响应"""

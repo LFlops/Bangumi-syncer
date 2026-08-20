@@ -16,7 +16,6 @@ from ..models.summary import (
     LLMUsageStatsResponse,
 )
 from ..services.llm import Message, get_llm_client, reset_llm_client
-from ..services.llm.constants import PROVIDER_OPENAI_COMPAT
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])

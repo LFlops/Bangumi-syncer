@@ -229,6 +229,16 @@ class TestFtsSearch:
         hits = db.memory.search_fts(["芙莉莲", "鬼灭之刃"], task_type="summary")
         assert {h.run_id for h in hits} == {"run-a", "run-b"}
 
+    def test_search_fts_multi_word_title_phrase_match(self, temp_dir, reset_singletons):
+        """#4：带空格标题按短语整体匹配——不把 'Spy x Family' 拆成 Spy/Family 独立 OR
+        （精确性：只命中含完整短语的记忆，而非'含任一单词'的记忆）。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-a", summary="Spy x Family 剧场版"), [])
+        db.memory.store_and_mark(_entry("run-b", summary="Family Guy 新季开播"), [])
+
+        hits = db.memory.search_fts(["Spy x Family"], task_type="summary")
+        assert [h.run_id for h in hits] == ["run-a"]
+
     def test_search_fts_returns_empty_for_no_match(self, temp_dir, reset_singletons):
         db = _make_db(temp_dir)
         db.memory.store_and_mark(_entry("run-1", summary="芙莉莲"), [])
