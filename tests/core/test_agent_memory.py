@@ -178,7 +178,7 @@ class TestFtsSearch:
             _entry("run-1", summary="昨日看了葬送的芙莉莲 S1E10"), []
         )
 
-        hits = db.memory.search_fts("芙莉莲", task_type="summary")
+        hits = db.memory.search_fts(["芙莉莲"], task_type="summary")
         assert len(hits) == 1
         assert hits[0].run_id == "run-1"
         assert hits[0].summary == "昨日看了葬送的芙莉莲 S1E10"
@@ -205,7 +205,7 @@ class TestFtsSearch:
             [],
         )
 
-        hits = db.memory.search_fts("503", task_type="summary")
+        hits = db.memory.search_fts(["503"], task_type="summary")
         assert [h.run_id for h in hits] == ["run-b"]
 
     def test_search_fts_multiple_keywords_or(self, temp_dir, reset_singletons):
@@ -214,7 +214,7 @@ class TestFtsSearch:
         db.memory.store_and_mark(_entry("run-1", summary="芙莉莲 S1E10 鬼灭之刃"), [])
         db.memory.store_and_mark(_entry("run-2", summary="只看了芙莉莲"), [])
 
-        hits = db.memory.search_fts("芙莉莲 鬼灭之刃", task_type="summary")
+        hits = db.memory.search_fts(["芙莉莲", "鬼灭之刃"], task_type="summary")
         # OR 语义：run-2 虽只含一词，仍是"与今日任一标题相关"的记忆
         assert {h.run_id for h in hits} == {"run-1", "run-2"}
 
@@ -226,13 +226,23 @@ class TestFtsSearch:
         db.memory.store_and_mark(_entry("run-a", summary="只看了芙莉莲"), [])
         db.memory.store_and_mark(_entry("run-b", summary="只看了鬼灭之刃"), [])
 
-        hits = db.memory.search_fts("芙莉莲 鬼灭之刃", task_type="summary")
+        hits = db.memory.search_fts(["芙莉莲", "鬼灭之刃"], task_type="summary")
         assert {h.run_id for h in hits} == {"run-a", "run-b"}
+
+    def test_search_fts_multi_word_title_phrase_match(self, temp_dir, reset_singletons):
+        """#4：带空格标题按短语整体匹配——不把 'Spy x Family' 拆成 Spy/Family 独立 OR
+        （精确性：只命中含完整短语的记忆，而非'含任一单词'的记忆）。"""
+        db = _make_db(temp_dir)
+        db.memory.store_and_mark(_entry("run-a", summary="Spy x Family 剧场版"), [])
+        db.memory.store_and_mark(_entry("run-b", summary="Family Guy 新季开播"), [])
+
+        hits = db.memory.search_fts(["Spy x Family"], task_type="summary")
+        assert [h.run_id for h in hits] == ["run-a"]
 
     def test_search_fts_returns_empty_for_no_match(self, temp_dir, reset_singletons):
         db = _make_db(temp_dir)
         db.memory.store_and_mark(_entry("run-1", summary="芙莉莲"), [])
-        assert db.memory.search_fts("不存在的关键词", task_type="summary") == []
+        assert db.memory.search_fts(["不存在的关键词"], task_type="summary") == []
 
 
 # ── W6 prune 归档 / W9 feedback 保留 ────────────────────────────────────

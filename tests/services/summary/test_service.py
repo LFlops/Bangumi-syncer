@@ -511,6 +511,57 @@ class TestExecuteJob:
         assert any("failing_job" in m and "LLM down" in m for m in error_msgs)
 
     @pytest.mark.asyncio
+    async def test_chat_exception_no_notification(self):
+        """spec 失败语义：chat 异常 → 不写标记、不发通知（下次调度重新总结）。"""
+        svc = self._make_svc()
+        config = _make_config(name="chat_fail_job")
+        mock_client = MagicMock()
+        mock_client.chat = AsyncMock(side_effect=RuntimeError("API down"))
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=mock_client,
+            ),
+            patch("app.services.summary.service.notification_service") as mock_ns,
+            patch("app.services.summary.service.logger") as mock_logger,
+        ):
+            await svc.execute_job(config)
+
+        mock_ns.notify.assert_not_called()
+        error_msgs = [c[0][0] for c in mock_logger.error.call_args_list if c[0]]
+        assert any("chat_fail_job" in m and "API down" in m for m in error_msgs)
+
+    @pytest.mark.asyncio
+    async def test_notification_failure_no_second_notification(self):
+        """spec 失败语义：通知失败 → 已写消费标记，不二次通知（只尝试一次）。"""
+        svc = self._make_svc()
+        config = _make_config(name="notify_fail_job")
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            self._patch_llm(_mock_chat_response())[0],
+            patch("app.services.summary.service.notification_service") as mock_ns,
+            patch("app.services.summary.service.logger") as mock_logger,
+        ):
+            mock_ns.notify.side_effect = RuntimeError("notify down")
+            await svc.execute_job(config)
+
+        # 只尝试一次通知（失败后不落入通用 summary_job_failed 二次通知）
+        mock_ns.notify.assert_called_once()
+        error_msgs = [c[0][0] for c in mock_logger.error.call_args_list if c[0]]
+        assert any("notify_fail_job" in m and "notify down" in m for m in error_msgs)
+
+    @pytest.mark.asyncio
     async def test_empty_llm_content_sends_llm_failed_notification(self):
         """LLM 返回空内容时，发送 summary_llm_failed 通知并写入收件箱。"""
         svc = self._make_svc()

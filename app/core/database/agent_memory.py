@@ -204,25 +204,27 @@ class AgentMemoryRepository(BaseRepository):
         return self._run_read(_read, error_msg="获取最近任务记忆失败", default=[])
 
     def search_fts(
-        self, query: str, task_type: str, limit: int = 5
+        self, terms: list[str], task_type: str, limit: int = 5
     ) -> list[MemoryEntry]:
         """FTS5 全文检索（热记忆），按 task_type 过滤。
 
         多关键词 OR 连接（任一命中即相关——关键词是今日明细标题，目的
-        是捞回与任一标题相关的历史记忆）；中文子串匹配依赖 trigram
-        tokenizer（SQLite >= 3.34）；查询词短语引号包裹避免特殊字符破坏
-        MATCH 语法；短词（<3 字符，trigram 无法命中）过滤。
+        是捞回与任一标题相关的历史记忆）；**每个关键词作为一个整体短语**
+        （保留多词标题如 "Spy x Family" 的完整匹配，不再按空白二次切分）；
+        中文子串匹配依赖 trigram tokenizer（SQLite >= 3.34）；查询词短语
+        引号包裹避免特殊字符破坏 MATCH 语法；短词（<3 字符，trigram
+        无法命中）过滤。
         """
 
         def _read(conn):
-            terms = [
-                '"' + t.replace('"', '""') + '"'
-                for t in query.split()
+            phrases = [
+                '"' + t.strip().replace('"', '""') + '"'
+                for t in terms
                 if len(t.strip()) >= 3
             ]
-            if not terms:
+            if not phrases:
                 return []
-            match = " OR ".join(terms)
+            match = " OR ".join(phrases)
             cursor = conn.execute(
                 """
                 SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,

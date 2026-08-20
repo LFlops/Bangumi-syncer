@@ -982,6 +982,7 @@ class TestDeleteSummaryJob:
         with (
             patch("app.api.summary_jobs.config_manager") as mock_cm,
             patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            patch("app.api.summary_jobs.memory_service") as mock_memory,
         ):
             mock_scheduler.apply_config_after_save = AsyncMock()
 
@@ -993,6 +994,10 @@ class TestDeleteSummaryJob:
                 data = response.json()
                 assert data["status"] == "success"
                 mock_cm.delete_summary_config.assert_called_once_with("Dad Summary")
+                # 记忆清理联动：避免孤儿记忆 + 悬挂 consumed_run_id
+                mock_memory.clear_task.assert_called_once_with(
+                    "summary", "summary-Dad Summary"
+                )
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
 

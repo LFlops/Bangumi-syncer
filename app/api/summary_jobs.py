@@ -84,6 +84,9 @@ async def update_summary_job(
 async def delete_summary_job(name: str, _=Depends(get_current_user_flexible)):
     decoded = unquote(name)
     config_manager.delete_summary_config(decoded)
+    # 清理该任务记忆（主表 + 归档 + 消费标记，同一事务）：
+    # 避免孤儿记忆行与悬挂 consumed_run_id（重名重建 job 时产生虚假 overlap）。
+    memory_service.clear_task("summary", f"summary-{decoded}")
     config_manager.reload_config()
     await summary_scheduler.apply_config_after_save()
     return {"status": "success", "message": "摘要任务已删除"}
