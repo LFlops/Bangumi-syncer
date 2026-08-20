@@ -25,7 +25,7 @@
 - **`_query_records`/`_build_messages` 是同步方法**（DB 查询与字符串拼接无 await；`execute_job`/`generate_summary` 保持 async，仅在 `chat` 处 await）。因此 2.0.2 `execute_job` 片段里 `records = await self._query_records(...)` 的 `await` 去掉，改为 `records, date_from, date_to = self._query_records(...)`。
 - **日期范围共享**：`date_from/date_to` 原来在 `generate_summary` 内计算、既用于查询又塞进 result；拆解后由 `_query_records` 返回，`_dispatch_notification` 复用（避免两处重复计算日期）。
 - **`generate_summary` 改为薄封装**（复用 `_query_records` + `_build_messages` + `self.llm_client`，继续返回 dict），供 `test_summary_job`（`app/api/summary_jobs.py`）使用——**test 端点签名与返回不变**（预览不含记忆，符合预期）。
-- **`_dispatch_notification` 保持现有失败语义**：`chat` 返回空内容（`not response.content and not response.model`）→ `_send_failure_notification`（summary_llm_failed）；否则 `_send_success_notification`。记忆提取（步骤 4）在 try/except 内、`_dispatch_notification`（步骤 5）在 try 外，维持 2.0.2 失败语义表。
+- **`_dispatch_notification` 保持空内容→失败 / 正常→成功的分支语义**：`chat` 返回空内容（`not response.content and not response.model`）→ `_send_failure_notification`（summary_llm_failed）；否则 `_send_success_notification`。异常时的错误出口由 execute_job **单一 try/except + stage 追踪**统一收口（`_send_stage_failure_notification`，按阶段区分文案）——任何阶段失败都通知，唯一例外是投递层失败不二次通知；错误处理定稿见下方「消费标记失败语义」与 `hy-review20260817.md` #1。
 - `_format_records` 由 `r.get(...)` 改为 `r.xxx`（`SummaryRecord` 属性访问，见 D2）。
 - `memory_retriever`/`memory_extractor` 作为 service 成员在 `__init__` 构造（与 `self.llm_client` 并列）：`self.memory_retriever = MemoryRetriever(database_manager.memory)`、`self.memory_extractor = MemoryExtractor(database_manager.memory)`；2.0.2 片段里 `memory_extractor` 裸名改为 `self.memory_extractor`。
 
@@ -143,23 +143,22 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     response = await self.llm_client.chat(messages)
 
     # === 4. 提取记忆（Phase 2.0.1；读写同开关：memory_enabled=false 时不注入也不写入）===
+    # 不做局部 try/except 吞掉：store 阶段失败由 execute_job 单一 try 捕获，
+    # 发送 summary_job_failed（记忆写入阶段文案），消费标记随事务回滚、下次重新总结。
     if job_config.memory_enabled:
         run_id = str(uuid4())          # 单次执行的唯一标识（记忆写入与消费标记共用）
-        try:
-            await self.memory_extractor.extract_and_store(
-                task_type="summary",
-                task_id=task_id,
-                run_id=run_id,
-                messages=messages,             # 完整上下文：缓存前缀 + 摘要来源
-                response=response,             # 响应：summary 生成 + full_text 存储
-                outcome="success",
-                tokens_used=response.usage.total_tokens if response.usage else 0,
-                record_ids=[r.id for r in records],   # store_and_mark 同一事务标记消费
-            )
-        except Exception:
-            logger.exception("Failed to store memory")
+        await self.memory_extractor.extract_and_store(
+            task_type="summary",
+            task_id=task_id,
+            run_id=run_id,
+            messages=messages,             # 完整上下文：缓存前缀 + 摘要来源
+            response=response,             # 响应：summary 生成 + full_text 存储
+            outcome="success",
+            tokens_used=response.usage.total_tokens if response.usage else 0,
+            record_ids=[r.id for r in records],   # store_and_mark 同一事务标记消费
+        )
 
-    # === 5. 原有逻辑 ===
+    # === 5. 通知（投递层；失败不二次通知，见失败语义表）===
     self._dispatch_notification(job_config, response, records, date_from, date_to)
 ```
 
@@ -167,7 +166,7 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
 
 - **顺序修正**：`_query_records` 提到 retrieve 之前（keywords 依赖 records，原示例有 NameError）
 - **`memory_enabled` 开关短路（读写一致）**：`false` 时跳过 retrieve **且跳过 extract_and_store**（不注入也不写入）——用户显式关闭该任务的记忆功能：不积累数据、不产生摘要 LLM 调用成本；feedback 强约束也随之失效；**memory_limit 只管条数（最小值 1），不用 0 表示关闭（单一关闭途径）**
-- **提取记忆 try/except 包裹**：`_summarize` 的 LLM 调用等失败不影响 `_dispatch_notification`
+- **store 阶段失败不静默**：`_summarize` 的 LLM 调用等失败由 execute_job 统一捕获并发送 `summary_job_failed` 失败通知（记忆写入阶段文案）；消费标记随事务回滚、下次重新总结（不再局部吞掉后照发成功通知）
 - **`tokens_used` 空值防护**：`response.usage` 可能为 None（LLM 重试耗尽返回空响应）——但此时 `response.content` 也为空，提取出的摘要为空字符串，可接受（空响应不写记忆，避免无效条目）
 - **历史上下文拼进 system prompt（不新增第二条 system）**：多 system message 对 OpenAI 兼容端点不安全（Anthropic 在 provider 内 `\n\n` 合并、OpenAI 原样转发多 system 可能 400）；故在 `execute_job` 里把 `memory_context` 拼进现有 system prompt 内容，而非 `messages.insert(0, Message(role="system", ...))`。与 Phase 2.2 无关（改在 summary service，不碰 `openai_compat.py`）
 
@@ -220,15 +219,18 @@ if overlaps:
 
 ### 消费标记失败语义（判定规则定稿）
 
-消费标记的写入时机：execute_job 第 4 步（chat 成功后，`store_and_mark` 同一事务内写记忆 + 标记消费，同一 try 块）。各失败点的语义：
+消费标记的写入时机：execute_job 第 4 步（chat 成功后，`store_and_mark` 同一事务内写记忆 + 标记消费，位于 execute_job 单一 try 内，随流程推进以 `stage` 标记当前阶段）。各失败点的语义：
 
 | 失败点 | 消费标记 | 通知 | 下次行为 |
 |---|---|---|---|
-| **chat 失败**（LLM 调用异常） | 不写 | 不发 | **重新总结**（未消费） |
-| **store_and_mark 失败**（DB 异常，同 try 块） | 不写（记忆+标记原子回滚） | **照发**（try 外） | **重新总结**（可能重复通知，概率低可接受） |
-| **通知失败**（投递层，try 外） | **已写** | 失败 | **不重新总结**（已消费，inbox 失败通知含内容可查） |
+| **query 失败**（查询明细/构建消息） | 不写 | 发 `summary_job_failed`（「执行异常（查询/构建阶段）· 请检查任务配置」） | **重新总结**（未消费） |
+| **chat 失败**（LLM 调用异常） | 不写 | 发 `summary_llm_failed`（「LLM 调用失败（LLM 调用阶段）· 请检查 API 地址和密钥」） | **重新总结**（未消费） |
+| **store_and_mark 失败**（DB 异常） | 不写（记忆+标记原子回滚） | 发 `summary_job_failed`（「任务异常（记忆写入阶段）· 记忆写入失败，下次将重新总结」）——**非成功通知** | **重新总结**（未消费） |
+| **通知失败**（投递层） | **已写** | **不二次通知**（唯一例外，仅日志，投递层重试/告警兜底） | **不重新总结**（已消费，inbox 失败通知含内容可查） |
 
-**判定规则**：消费成功 = **chat 成功 + store_and_mark 成功**（第 4 步完成）。通知是投递层，独立于消费——通知失败**不回滚消费标记**（总结已生成；投递走通知重试/告警兜底；回滚方案否决——通知持续失败时每次执行重新生成浪费 token）。
+> 通知列按 **2026-08-20 产品决策**定稿（见 `hy-review20260817.md` #1）：总结过程**任何阶段失败都发通知、按阶段区分文案**，不做静默吞掉。失败仍**不写记忆**（无 `outcome='failed'` 条目），异常模式识别是 Phase 3 日志分析 Agent 的独立功能。
+
+**判定规则**：消费成功 = **chat 成功 + store_and_mark 成功**（第 4 步完成）。通知是投递层，独立于消费——通知失败**不回滚消费标记**（总结已生成；投递走通知重试/告警兜底；回滚方案否决——通知持续失败时每次执行重新生成浪费 token）。此前的『chat 失败静默 return / store 失败照发成功通知』已被产品决策推翻，见 `hy-review20260817.md` #1。
 **原子性**：记忆 INSERT 与消费标记 UPDATE 是 `store_and_mark` 的同一事务（见 2.0.1）——不存在"记忆已写但标记未写"的中间态，失败时两者一起回滚。
 **memory_enabled=false 不标记消费**：一致性成立——关闭记忆 = 不注入 = 不需要重叠去重（find_overlaps 在注入 if 内，不会被调用）；关闭期间总结过的记录重新开启后视为未消费（可接受，关闭期间不追踪消费状态）。
 
@@ -317,10 +319,11 @@ class SummaryRecord:
 - **Then** `memory_enabled is True`、`memory_limit == 3`
 - **And** 未配置时 `memory_enabled is False`（默认关闭）、`memory_limit == 5`
 
-### Scenario R7 提取记忆失败不影响通知（集成）
+### Scenario R7 store 阶段失败发失败通知（集成）
 - **Given** extract_and_store 抛异常
 - **When** execute_job
-- **Then** `_dispatch_notification` 正常执行，异常仅记录日志
+- **Then** 捕获异常并发送 `summary_job_failed` 失败通知（记忆写入阶段文案），不抛给调度器
+- **And** 消费标记未写（store_and_mark 原子回滚），下次重新总结
 
 ### Scenario D1 无重叠不注入提示
 - **Given** 今日明细全部 `consumed_run_id IS NULL`（未消费）

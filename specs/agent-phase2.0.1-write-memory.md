@@ -173,7 +173,7 @@ class MemoryExtractor:
 - **`_summarize` 实现（缓存感知）**：复用总结调用完整上下文作前缀 → 命中 LLM prompt 缓存（成本 ~10%）；失败规则截断兜底；Anthropic system 加 cache_control
 - **`full_text` 列**：存总结全文（回溯/诊断用，不注入）——成功通知 `write_in_app=False` 不写站内信，全文项目内靠记忆表承载
 - **空响应不写记忆**：LLM 重试耗尽返回空响应时跳过（避免无效条目）
-- **容错**：`execute_job` 调 `extract_and_store` 时整体 try/except 包裹（记忆写入失败不影响主流程的 `_dispatch_notification`，见 2.0.2）
+- **容错**：store 阶段失败不静默——`extract_and_store` 失败后由 execute_job 统一错误出口发送 `summary_job_failed` 失败通知（记忆写入阶段文案），不再照发成功通知；消费标记原子回滚、下次重新总结（错误处理定稿见 2.0.2 失败语义表 / `hy-review20260817.md` #1）
 - **成本说明**：摘要调用因缓存命中成本极低（完整历史 × 10% 输入价格）；规则兜底保证 LLM 不可用时功能不中断
 
 ## 文件变更清单
@@ -215,8 +215,8 @@ class MemoryExtractor:
 
 ### Scenario W5 写入失败不影响调用方
 - **Given** extract_and_store 抛异常（如 DB 错误）
-- **When** execute_job 调用处（外层 try/except）
-- **Then** 调用方不中断，继续执行后续流程
+- **When** execute_job 调用处（单一 try/except + stage 追踪）
+- **Then** 调用方不中断（execute_job 捕获后发送 `summary_job_failed` 失败通知，不抛给调度器）
 
 ### Scenario W6 prune 归档而非删除
 - **Given** 同一 task 写入 1005 条
