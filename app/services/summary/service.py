@@ -21,6 +21,33 @@ _USER_PROMPT_TEMPLATE = (
 _MEMORY_SECTION = "## 历史执行上下文"
 _OVERLAP_NOTE = "以下记录已在上次总结中覆盖，可简述或跳过，不必重复展开：\n"
 
+# 执行阶段（execute_job 出错时用于定位失败环节；任何阶段失败都会通知，文案按阶段区分）
+_STAGE_QUERY = "query"  # 查询明细 + 注入记忆 + 构建消息
+_STAGE_CHAT = "chat"  # LLM 调用
+_STAGE_STORE = "store"  # 记忆写入（含消费标记）
+_STAGE_NOTIFY = "notify"  # 通知投递
+
+_STAGE_FAILURE_META = {
+    _STAGE_QUERY: {
+        "inbox_type": "summary_job_failed",
+        "inbox_title": "追番总结异常：{name}",
+        "inbox_body": "执行异常，请检查任务配置（Cron 表达式、回溯天数等）是否正确",
+        "summary_prefix": "追番总结任务执行异常（查询/构建阶段）",
+    },
+    _STAGE_CHAT: {
+        "inbox_type": "summary_llm_failed",
+        "inbox_title": "追番总结失败：{name}",
+        "inbox_body": "LLM 调用失败，请检查 API 地址和密钥",
+        "summary_prefix": "AI 追番总结生成失败（LLM 调用阶段）",
+    },
+    _STAGE_STORE: {
+        "inbox_type": "summary_job_failed",
+        "inbox_title": "追番总结异常：{name}",
+        "inbox_body": "记忆写入失败，本次执行未记录，下一次将重新总结",
+        "summary_prefix": "追番总结任务异常（记忆写入阶段）",
+    },
+}
+
 
 class SummaryService:
     """生成 AI 驱动的追番观影总结。"""
@@ -161,15 +188,15 @@ class SummaryService:
     async def execute_job(self, job_config: SummaryJobConfig) -> None:
         """完整执行：查询 → 注入记忆 → 调 LLM → 提取记忆 → 发送通知。
 
-        失败语义（对齐 spec 2.0.2 失败语义表）：
-        - 查询/构建阶段失败：发 summary_job_failed 并终止（配置问题需告知用户）；
-        - chat 失败：不写标记、不发通知（下次调度重新总结）；
-        - 记忆提取失败：仅记日志，不影响通知（best-effort）；
-        - 通知失败：不二次通知（消费标记已写，投递走通知重试/告警兜底）。
+        错误处理策略：**总结过程任何阶段出错都向用户发送失败通知**，
+        不静默吞掉——只是按失败阶段（_STAGE_*）区分通知类型与文案，
+        方便用户定位问题环节。唯一例外：通知投递本身失败（stage=notify）
+        时不再二次通知——投递层问题走通知重试/告警兜底，重发可能重复失败。
         """
         task_id = f"summary-{job_config.name}"
-        # === 1-3. 查询明细 + 注入记忆 + 构建消息 ===
+        stage = _STAGE_QUERY
         try:
+            # 1. 查询明细 + 注入记忆 + 构建消息
             records, date_from, date_to = self._query_records(job_config)
 
             # 注入历史上下文（memory_enabled 开关短路，不调 retrieve）
@@ -188,35 +215,18 @@ class SummaryService:
                     f"{_MEMORY_SECTION}\n{memory_context}\n\n{system_prompt}"
                 )
             messages = self._build_messages(records, system_prompt, date_from, date_to)
-        except Exception as e:
-            logger.error(f"Summary job '{job_config.name}' failed: {e}")
-            summary_text = (
-                f"追番总结任务执行异常：{e}\n"
-                "请检查任务配置（Cron 表达式、回溯天数等）是否正确。"
-            )
-            self._send_failure_notification(
-                job_config,
-                summary_text,
-                inbox_type="summary_job_failed",
-                inbox_title=f"追番总结异常：{job_config.name}",
-                inbox_body="执行异常，请检查任务配置",
-            )
-            return
 
-        # === chat：失败不写标记、不发通知（重新总结）===
-        try:
+            # 2. 调 LLM 生成总结
+            stage = _STAGE_CHAT
             response = await self.llm_client.chat(
                 messages,
                 job_name=job_config.name,
             )
-        except Exception as e:
-            logger.error(f"LLM chat failed for '{job_config.name}': {e}")
-            return
 
-        # === 4. 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）===
-        if job_config.memory_enabled:
-            run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
-            try:
+            # 3. 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）
+            if job_config.memory_enabled:
+                stage = _STAGE_STORE
+                run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
                 await self.memory.extract_and_store(
                     task_type="summary",
                     task_id=task_id,
@@ -227,16 +237,35 @@ class SummaryService:
                     tokens_used=response.usage.total_tokens if response.usage else 0,
                     record_ids=[r.id for r in records],  # 同一事务标记消费
                 )
-            except Exception as e:
-                logger.error(f"Failed to store memory: {e}")
 
-        # === 5. 通知：失败不二次通知（消费标记已写，投递走通知重试/告警兜底）===
-        try:
+            # 4. 通知
+            stage = _STAGE_NOTIFY
             self._dispatch_notification(
                 job_config, response, records, date_from, date_to
             )
         except Exception as e:
-            logger.error(f"Notification failed for '{job_config.name}': {e}")
+            if stage == _STAGE_NOTIFY:
+                # 通知投递失败：总结/记忆已成功，消费标记已写，不二次通知
+                # （投递层问题走通知重试/告警兜底）。
+                logger.error(f"Notification failed for '{job_config.name}': {e}")
+                return
+            logger.error(
+                f"Summary job '{job_config.name}' failed at stage={stage}: {e}"
+            )
+            self._send_stage_failure_notification(job_config, stage, e)
+
+    def _send_stage_failure_notification(
+        self, job_config: SummaryJobConfig, stage: str, error: Exception
+    ) -> None:
+        """按失败阶段发送差异化失败通知（统一错误出口，便于用户定位环节）。"""
+        meta = _STAGE_FAILURE_META[stage]
+        self._send_failure_notification(
+            job_config,
+            f"{meta['summary_prefix']}：{error}",
+            inbox_type=meta["inbox_type"],
+            inbox_title=meta["inbox_title"].format(name=job_config.name),
+            inbox_body=meta["inbox_body"],
+        )
 
     def _dispatch_notification(
         self,

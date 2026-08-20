@@ -511,8 +511,8 @@ class TestExecuteJob:
         assert any("failing_job" in m and "LLM down" in m for m in error_msgs)
 
     @pytest.mark.asyncio
-    async def test_chat_exception_no_notification(self):
-        """spec 失败语义：chat 异常 → 不写标记、不发通知（下次调度重新总结）。"""
+    async def test_chat_exception_sends_llm_failed_notification(self):
+        """chat 异常：按统一策略也要通知，且文案标注入阶段（summary_llm_failed）。"""
         svc = self._make_svc()
         config = _make_config(name="chat_fail_job")
         mock_client = MagicMock()
@@ -533,9 +533,53 @@ class TestExecuteJob:
         ):
             await svc.execute_job(config)
 
-        mock_ns.notify.assert_not_called()
+        # 统一策略：出错就通知，但类型/文案按阶段区分（chat → summary_llm_failed）
+        mock_ns.notify.assert_called_once()
+        call_args = mock_ns.notify.call_args
+        assert call_args.args[0] == "watching_summary_chat_fail_job"
+        kwargs = call_args.kwargs
+        assert kwargs["in_app_type"] == "summary_llm_failed"
+        assert "chat_fail_job" in kwargs["in_app_title"]
+        assert "LLM 调用阶段" in kwargs["summary_text"]
+        assert "API down" in kwargs["summary_text"]
+        assert "LLM 调用失败" in kwargs["in_app_body"]
+
+        # 日志记录失败阶段，便于排查
         error_msgs = [c[0][0] for c in mock_logger.error.call_args_list if c[0]]
-        assert any("chat_fail_job" in m and "API down" in m for m in error_msgs)
+        assert any("chat_fail_job" in m and "stage=chat" in m for m in error_msgs)
+
+    @pytest.mark.asyncio
+    async def test_store_failure_sends_failed_notification(self, temp_dir):
+        """记忆写入失败：统一策略下也通知（summary_job_failed），文案标注记忆写入阶段。"""
+        svc, _ = self._svc_with_real_memory(temp_dir, job_name="store_fail_job")
+        config = _make_config(name="store_fail_job", memory_enabled=True)
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            self._patch_llm(_mock_chat_response())[0],
+            patch("app.services.summary.service.notification_service") as mock_ns,
+            patch("app.services.summary.service.logger") as mock_logger,
+        ):
+            svc.memory.extract_and_store = AsyncMock(
+                side_effect=RuntimeError("db locked")
+            )
+            await svc.execute_job(config)
+
+        mock_ns.notify.assert_called_once()
+        call_args = mock_ns.notify.call_args
+        assert call_args.args[0] == "watching_summary_store_fail_job"
+        kwargs = call_args.kwargs
+        assert kwargs["in_app_type"] == "summary_job_failed"
+        assert "记忆写入阶段" in kwargs["summary_text"]
+        assert "db locked" in kwargs["summary_text"]
+        assert "记忆写入失败" in kwargs["in_app_body"]
+
+        error_msgs = [c[0][0] for c in mock_logger.error.call_args_list if c[0]]
+        assert any("store_fail_job" in m and "stage=store" in m for m in error_msgs)
 
     @pytest.mark.asyncio
     async def test_notification_failure_no_second_notification(self):
