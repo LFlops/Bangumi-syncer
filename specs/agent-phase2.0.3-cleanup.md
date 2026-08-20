@@ -35,9 +35,10 @@ class MemoryService:
     （mark_consumed 已折叠进 extract_and_store → store_and_mark，非独立入口）
     """
 
-    def __init__(self, memory_repo: AgentMemoryRepository, sync_records_repo=None):
+    def __init__(self, memory_repo: AgentMemoryRepository):
+        # 消费标记（sync_records 表）经共享 connection 在 store_and_mark / clear_task
+        # 事务内穿透式访问，不注入 sync repo（见 hy-review20260817 #7）
         self._memory = memory_repo
-        self._sync = sync_records_repo  # 消费标记联动
 
     def rename_task(self, task_type: str, old_task_id: str, new_task_id: str) -> int:
         """改名迁移：同一事务 UPDATE 主表 + 归档表的 task_id（记忆跟随任务）。
@@ -57,7 +58,7 @@ class MemoryService:
 ```
 
 - **层次**：业务层（summary service / API 层）只调 MemoryService；AgentMemoryRepository / SyncRecordsRepository 是纯 SQL 层
-- **实例化**：`MemoryService(database_manager.memory, database_manager.sync_records)`——两个 repo 经 facade 公开属性注入（见 2.0.1 文件清单中 `__init__.py` 的 `memory`/`sync_records` 公开属性）
+- **实例化**：`MemoryService(database_manager.memory)`——记忆 repo 经 facade 公开属性注入；`sync_records` 的消费标记读写（store_and_mark / clear_task）走共享 connection 穿透式访问，不注入 repo（见 hy-review20260817 #7）
 - 消费标记（sync_records 表）的写（store_and_mark，经 extract_and_store）与清（clear_task）都经 MemoryService 收口——业务层不直接碰 sync_records；`mark_consumed` 不作为独立方法（折叠进 `store_and_mark` 的同一事务，见 2.0.1）
 - `extract_and_store` / `retrieve` 的调用也统一收口到 MemoryService（替代 2.0.1/2.0.2 文档中业务层直接构造 extractor/retriever 的方式——实现时以 MemoryService 为入口，extractor/retriever 作为其内部组件）
 

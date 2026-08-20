@@ -123,6 +123,21 @@ class TestSchema:
         assert isinstance(db.memory, AgentMemoryRepository)
         assert isinstance(db.sync_records, SyncRecordsRepository)
 
+    def test_sync_records_consumed_run_id_index_created(
+        self, temp_dir, reset_singletons
+    ):
+        """#8：consumed_run_id 建有索引（clear_task 清消费标记免全表扫）。"""
+        _ = _make_db(temp_dir)
+
+        with sqlite3.connect(str(temp_dir / "memory.db")) as raw:
+            indexes = {
+                r[0]
+                for r in raw.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index'"
+                )
+            }
+            assert "idx_sync_records_consumed_run_id" in indexes
+
 
 # ── W1 成功路径写入 ─────────────────────────────────────────────────────
 

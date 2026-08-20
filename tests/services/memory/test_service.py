@@ -24,7 +24,7 @@ def _make_db(temp_dir, name="svc.db"):
 
 
 def _make_service(db) -> MemoryService:
-    return MemoryService(db.memory, db.sync_records)
+    return MemoryService(db.memory)
 
 
 class TestRenameTask:

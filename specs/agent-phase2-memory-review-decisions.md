@@ -16,8 +16,9 @@
 - **推荐**：**facade 新增公开 repo 属性**（对齐既有 `self.llm_usage` 公开属性先例），不动既有转发方法：
   - `DatabaseManager` 新增 `self.memory = AgentMemoryRepository(self._connection)`（公开属性，等价 `llm_usage` 的暴露方式）。
   - 新增公开别名 `self.sync_records = self._sync`（一行别名，避免改动既有 ~20 个 sync 转发方法；也可选择把 `_sync` 直接改名为 `sync_records`）。
-  - `MemoryRetriever(repo)` / `MemoryService(memory_repo, sync_records_repo)` 的**构造签名不变**，业务层直接传
-    `database_manager.memory` / `database_manager.sync_records`。
+  - `MemoryRetriever(repo)` / `MemoryService(memory_repo)` 的**构造签名**（`sync_records_repo`
+    形参在 hy-review20260817 #7 中删除——消费标记经共享 connection 穿透式访问，不注入 repo），
+    业务层直接传 `database_manager.memory`。
   - 2.0.2 `execute_job` 里 `database_manager.memory`、`database_manager.sync_records.mark_consumed(...)` **原样成立，无需改代码**。
 - **否决**：不做 facade 转发方法（需新增 ~7 个 `*_memory`/`mark_consumed` 转发方法，且要改 MemoryRetriever/MemoryService 构造签名，代价大于收益）。
 - **待改**：2.0.1 文件变更清单补一行 `app/core/database/__init__.py`（新增 `memory` + `sync_records` 公开属性）；2.0.3 `MemoryService` 实例化处注明传 `database_manager.memory` / `database_manager.sync_records`。

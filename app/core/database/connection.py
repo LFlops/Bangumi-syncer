@@ -643,6 +643,13 @@ class DatabaseConnection:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_sync_records_status ON sync_records(status)"
         )
+        # consumed_run_id 反查索引：加速 clear_task 清消费标记
+        # （UPDATE ... WHERE consumed_run_id IN (...) 否则全表扫；
+        # find_overlaps 走 Python 已加载集合无需索引，见 hy-review20260817 #8）
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_records_consumed_run_id "
+            "ON sync_records(consumed_run_id)"
+        )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_trakt_sync_history_user_id ON trakt_sync_history(user_id)"
         )

@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from app.core.database.agent_memory import AgentMemoryRepository
-from app.core.database.sync_records import SyncRecordsRepository
 from app.services.llm.models import ChatResponse
 
 from .extractor import MemoryExtractor
@@ -25,13 +24,10 @@ class MemoryService:
     （mark_consumed 已折叠进 extract_and_store → store_and_mark，非独立入口）
     """
 
-    def __init__(
-        self,
-        memory_repo: AgentMemoryRepository,
-        sync_records_repo: SyncRecordsRepository | None = None,
-    ):
+    def __init__(self, memory_repo: AgentMemoryRepository):
+        # 消费标记（sync_records 表）的写/清经共享 connection 在 store_and_mark /
+        # clear_task 事务内穿透式访问，不注入 sync repo（见 hy-review20260817 #7）。
         self._memory = memory_repo
-        self._sync = sync_records_repo  # 消费标记联动
         self._extractor = MemoryExtractor(memory_repo)
         self._retriever = MemoryRetriever(memory_repo)
 

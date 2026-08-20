@@ -260,10 +260,10 @@ CREATE INDEX idx_memory_archive_task ON agent_working_memory_archive(task_type, 
 ### 关键词来源（查询词来自当前任务侧）
 
 - **摘要无需"生成关键词"**：FTS5 是全文索引，查询词直接匹配摘要全文
-- 查询词由调用方（summary service，2.0.2）提供：今日 sync records 提取番剧标题（`bgm_title/ori_title` 去重取前 N）+ user_filter 并集
+- 查询词由调用方（summary service，2.0.2）提供：仅取今日 sync records 的 `bgm_title`（去重取前 5）——`user_filter` 是 feiniu 专属字段、summary 域不存在（见 hy-review20260817 #3），不参与关键词构造
 - **生产者是规则（纯代码），不是 LLM**：`bgm_title` 是同步匹配后的规范化标题（结构化字段），一行代码提取，零 LLM 参与、零 function call
 - 未来若需从自由文本提取（如 Phase 2.3 反馈"最近看的番都很好看"→ 偏好关键词）：走普通 `llm_client.chat()` 单次补全，**不是 function call**（function call 是 Phase 3 模型主动调工具的机制）
-- 现有 `keywords=[job_config.user_filter]` 升级为并集
+- summary 关键词无 user_filter 并集：仅今日明细 `bgm_title`（去重前 5）
 
 ## 执行序列
 

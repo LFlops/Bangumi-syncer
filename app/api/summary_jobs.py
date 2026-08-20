@@ -22,7 +22,7 @@ from .deps import get_current_user_flexible
 router = APIRouter(prefix="/api/summary/jobs", tags=["summary_jobs"])
 
 # 记忆清理入口（改名联动 / clear-memory 端点）
-memory_service = MemoryService(database_manager.memory, database_manager.sync_records)
+memory_service = MemoryService(database_manager.memory)
 
 
 def _validate_job_name(name: str, old_name: str = "") -> None:

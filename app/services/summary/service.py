@@ -54,9 +54,7 @@ class SummaryService:
 
     def __init__(self):
         # 记忆统一入口（extractor/retriever 是其内部组件，业务层不直接碰 repository）
-        self.memory = MemoryService(
-            database_manager.memory, database_manager.sync_records
-        )
+        self.memory = MemoryService(database_manager.memory)
 
     @property
     def llm_client(self):
@@ -144,6 +142,7 @@ class SummaryService:
         context = self.memory.format_memory_context(past_memories)
 
         # 窗口重叠标注：今日明细中已被消费的记录提示简述/跳过
+        # （context 为空时直接以标注开头，避免前导空行，见 hy-review20260817 #9）
         overlaps = self.memory.find_overlaps(records)
         if overlaps:
             lines = "\n".join(
@@ -151,7 +150,8 @@ class SummaryService:
                 f"（已消费于总结 {r.consumed_run_id[:8]}）"
                 for r in overlaps[:20]
             )
-            context = f"{context}\n{_OVERLAP_NOTE}{lines}"
+            note = f"{_OVERLAP_NOTE}{lines}"
+            context = f"{context}\n{note}" if context else note
         return context
 
     # ------------------------------------------------------------------

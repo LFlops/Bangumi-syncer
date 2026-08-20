@@ -91,7 +91,7 @@ class MemoryRetriever:
 ### 关键设计点（review 修复）
 
 - **`search_fts` 带 task_type 过滤**：跨任务命中会污染上下文（summary 任务注入 sync/diagnostic 的记忆）
-- **keywords 空字符串过滤**：`[job_config.user_filter or ""]` 在 user_filter 为空时产生 `""` 元素——`filter` 掉避免 FTS5 查空串
+- **keywords 空字符串过滤**：`retrieve` 对 keywords 列表 `filter` 掉空串（hy-review20260817 #3：`user_filter` 是 feiniu 专属字段、summary 域不存在——summary 关键词仅取今日明细 `bgm_title`，已过滤空标题；此处为防御性过滤避免 FTS5 查空串）
 - **去重**：`_deduplicate_and_rank` 按 run_id，recent 路径优先（双路径命中时只注入一次）
 
 ## format_memory_context 格式（MemoryRetriever 方法，记忆读取统一）
@@ -119,9 +119,9 @@ async def execute_job(self, job_config: SummaryJobConfig) -> None:
     # repo 经 facade 公开属性 database_manager.memory 获取（见 2.0.1 文件清单中 __init__.py 的公开属性）
     memory_retriever = MemoryRetriever(database_manager.memory)
     if job_config.memory_enabled:                        # 开关短路，不调 retrieve
-        # 关键词 = user_filter + 今日明细标题提取（规则提取，并集）
-        keywords = [job_config.user_filter or ""]
-        keywords += [r.bgm_title for r in records if r.bgm_title][:5]
+        # 关键词 = 今日明细标题提取（规则提取，bgm_title 去重取前 5；
+        # user_filter 是 feiniu 专属字段、summary 域不存在，不参与关键词构造，见 hy-review20260817 #3）
+        keywords = [r.bgm_title for r in records if r.bgm_title][:5]
         past_memories = memory_retriever.retrieve(
             task_type="summary",
             task_id=task_id,
@@ -309,7 +309,7 @@ class SummaryRecord:
 - **Then** 注入最近 3 条历史摘要
 
 ### Scenario R5 空关键词过滤
-- **Given** keywords 含空字符串（user_filter 为空）
+- **Given** keywords 含空字符串（如直接传入的边界输入）
 - **When** retrieve
 - **Then** 不抛异常，FTS5 用非空关键词查询
 

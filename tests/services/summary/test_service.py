@@ -663,7 +663,7 @@ class TestExecuteJob:
         """构造绑定了临时 DB 记忆 repo 的 SummaryService（真实 MemoryService）。"""
         db = _temp_db(temp_dir)
         svc = SummaryService()
-        svc.memory = MemoryService(db.memory, db.sync_records)
+        svc.memory = MemoryService(db.memory)
         # 真实检索链路 + 可断言的 extract（不真正调 LLM 摘要）
         svc.memory.extract_and_store = AsyncMock()
         return svc, db
@@ -936,3 +936,38 @@ class TestExecuteJob:
 
         kwargs = mock_memory.retrieve.call_args.kwargs
         assert kwargs["keywords"] == ["葬送的芙莉莲"]  # 空 bgm_title 已过滤
+
+    @pytest.mark.asyncio
+    async def test_overlap_note_with_empty_context_no_leading_blank_line(
+        self, temp_dir
+    ):
+        """#9：无历史记忆仅有重叠标注时，system prompt 不产生前导空行。"""
+        svc, _ = self._svc_with_real_memory(temp_dir)
+        records = [
+            _summary_record(id=1, consumed_run_id="run-abc12345"),
+            _summary_record(id=2, consumed_run_id=None),
+        ]
+        config = _make_config(memory_enabled=True)
+        _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(records, "2026-07-14", "2026-07-15"),
+            ),
+            _llm_patch,
+            patch("app.services.summary.service.notification_service"),
+            patch.object(svc, "memory") as mock_memory,
+        ):
+            mock_memory.retrieve.return_value = []  # 无历史记忆
+            mock_memory.format_memory_context.return_value = ""  # context 为空
+            mock_memory.find_overlaps.return_value = records[
+                :1
+            ]  # 仅已消费记录（真实实现会过滤 None）
+            await svc.execute_job(config)
+
+        system_prompt = mock_client.chat.call_args.args[0][0].content
+        # 标注直接作为「## 历史执行上下文」的开头，无前导空行
+        assert "## 历史执行上下文\n以下记录已在上次总结中覆盖" in system_prompt
+        assert "## 历史执行上下文\n\n" not in system_prompt
