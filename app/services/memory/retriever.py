@@ -42,7 +42,7 @@ class MemoryRetriever:
             if clean:
                 entries.extend(
                     self._repo.search_fts(
-                        " ".join(clean), task_type=task_type, limit=limit
+                        clean, task_type=task_type, limit=limit
                     )
                 )
 

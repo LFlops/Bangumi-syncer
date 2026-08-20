@@ -159,9 +159,17 @@ class SummaryService:
         }
 
     async def execute_job(self, job_config: SummaryJobConfig) -> None:
-        """完整执行：查询 → 注入记忆 → 调 LLM → 提取记忆 → 发送通知。"""
+        """完整执行：查询 → 注入记忆 → 调 LLM → 提取记忆 → 发送通知。
+
+        失败语义（对齐 spec 2.0.2 失败语义表）：
+        - 查询/构建阶段失败：发 summary_job_failed 并终止（配置问题需告知用户）；
+        - chat 失败：不写标记、不发通知（下次调度重新总结）；
+        - 记忆提取失败：仅记日志，不影响通知（best-effort）；
+        - 通知失败：不二次通知（消费标记已写，投递走通知重试/告警兜底）。
+        """
+        task_id = f"summary-{job_config.name}"
+        # === 1-3. 查询明细 + 注入记忆 + 构建消息 ===
         try:
-            task_id = f"summary-{job_config.name}"
             records, date_from, date_to = self._query_records(job_config)
 
             # 注入历史上下文（memory_enabled 开关短路，不调 retrieve）
@@ -180,34 +188,6 @@ class SummaryService:
                     f"{_MEMORY_SECTION}\n{memory_context}\n\n{system_prompt}"
                 )
             messages = self._build_messages(records, system_prompt, date_from, date_to)
-
-            response = await self.llm_client.chat(
-                messages,
-                job_name=job_config.name,
-            )
-
-            # 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）
-            if job_config.memory_enabled:
-                run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
-                try:
-                    await self.memory.extract_and_store(
-                        task_type="summary",
-                        task_id=task_id,
-                        run_id=run_id,
-                        messages=messages,  # 完整上下文：缓存前缀 + 摘要来源
-                        response=response,  # 响应：summary 生成 + full_text 存储
-                        outcome="success",
-                        tokens_used=response.usage.total_tokens
-                        if response.usage
-                        else 0,
-                        record_ids=[r.id for r in records],  # 同一事务标记消费
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to store memory: {e}")
-
-            self._dispatch_notification(
-                job_config, response, records, date_from, date_to
-            )
         except Exception as e:
             logger.error(f"Summary job '{job_config.name}' failed: {e}")
             summary_text = (
@@ -221,6 +201,44 @@ class SummaryService:
                 inbox_title=f"追番总结异常：{job_config.name}",
                 inbox_body="执行异常，请检查任务配置",
             )
+            return
+
+        # === chat：失败不写标记、不发通知（重新总结）===
+        try:
+            response = await self.llm_client.chat(
+                messages,
+                job_name=job_config.name,
+            )
+        except Exception as e:
+            logger.error(f"LLM chat failed for '{job_config.name}': {e}")
+            return
+
+        # === 4. 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）===
+        if job_config.memory_enabled:
+            run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
+            try:
+                await self.memory.extract_and_store(
+                    task_type="summary",
+                    task_id=task_id,
+                    run_id=run_id,
+                    messages=messages,  # 完整上下文：缓存前缀 + 摘要来源
+                    response=response,  # 响应：summary 生成 + full_text 存储
+                    outcome="success",
+                    tokens_used=response.usage.total_tokens
+                    if response.usage
+                    else 0,
+                    record_ids=[r.id for r in records],  # 同一事务标记消费
+                )
+            except Exception as e:
+                logger.error(f"Failed to store memory: {e}")
+
+        # === 5. 通知：失败不二次通知（消费标记已写，投递走通知重试/告警兜底）===
+        try:
+            self._dispatch_notification(
+                job_config, response, records, date_from, date_to
+            )
+        except Exception as e:
+            logger.error(f"Notification failed for '{job_config.name}': {e}")
 
     def _dispatch_notification(
         self,

@@ -53,7 +53,19 @@ class TestRetrieve:
 
         retriever.retrieve("summary", "summary-daily", keywords=["芙莉莲"])
 
-        repo.search_fts.assert_called_once_with("芙莉莲", task_type="summary", limit=5)
+        repo.search_fts.assert_called_once_with(["芙莉莲"], task_type="summary", limit=5)
+
+    def test_multi_word_keyword_passed_as_single_phrase(self):
+        """#4 修复：带空格的标题作为整体短语传递（不被空白切碎）。"""
+        retriever, repo = _make_retriever(get_recent=[], search_fts=[])
+
+        retriever.retrieve(
+            "summary", "summary-daily", keywords=["Spy x Family", "芙莉莲"]
+        )
+
+        repo.search_fts.assert_called_once_with(
+            ["Spy x Family", "芙莉莲"], task_type="summary", limit=5
+        )
 
     def test_deduplicate_by_run_id(self):
         """R3：同记忆双路径命中（recent + keywords）只注入一次，recent 优先。"""
