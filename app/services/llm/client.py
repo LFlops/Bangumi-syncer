@@ -19,8 +19,8 @@ from .providers.base import BaseProvider
 from .providers.openai_compat import OpenAICompatProvider
 
 _PROVIDER_MAP: dict[str, type] = {
-    PROVIDER_OPENAI_COMPAT: OpenAICompatProvider,
-    PROVIDER_ANTHROPIC_COMPAT: AnthropicProvider,
+    "openai_compat": OpenAICompatProvider,
+    "anthropic_compat": AnthropicProvider,
 }
 
 
@@ -55,7 +55,7 @@ def _build_provider(
         "proxy": proxy,
     }
     # thinking_level 只传给 anthropic 分支（openai 分支构造函数无此参数）
-    if provider == PROVIDER_ANTHROPIC_COMPAT:
+    if provider == "anthropic_compat":
         kwargs["thinking_level"] = cfg.get("thinking_level", "off")
     return cls(**kwargs)
 

@@ -120,7 +120,7 @@ class LLMUsageRepository(BaseRepository):
         job_id: int | None = None,
         job_name: str | None = None,
         model: str = "",
-        provider: str = PROVIDER_OPENAI_COMPAT,
+        provider: str = "openai_compat",
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         total_tokens: int = 0,

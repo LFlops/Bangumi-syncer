@@ -18,7 +18,7 @@ class LLMConfigResponse(BaseModel):
     max_tokens: int = 2000
     temperature: float = 0.7
     timeout: int = 60
-    provider: str = PROVIDER_OPENAI_COMPAT
+    provider: str = "openai_compat"
     thinking_level: str = "off"
 
 

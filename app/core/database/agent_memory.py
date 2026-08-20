@@ -6,8 +6,6 @@ prune 降级到归档表（冷记忆，search_archive 用 LIKE 检索）。
 
 from __future__ import annotations
 
-from typing import Any
-
 from app.services.memory.models import MemoryEntry
 
 from .base_repository import BaseRepository
@@ -210,8 +208,10 @@ class AgentMemoryRepository(BaseRepository):
     ) -> list[MemoryEntry]:
         """FTS5 全文检索（热记忆），按 task_type 过滤。
 
-        中文子串匹配依赖 trigram tokenizer（SQLite >= 3.34）；查询词短语引号
-        包裹避免特殊字符破坏 MATCH 语法；短词（<3 字符，trigram 无法命中）过滤。
+        多关键词 OR 连接（任一命中即相关——关键词是今日明细标题，目的
+        是捞回与任一标题相关的历史记忆）；中文子串匹配依赖 trigram
+        tokenizer（SQLite >= 3.34）；查询词短语引号包裹避免特殊字符破坏
+        MATCH 语法；短词（<3 字符，trigram 无法命中）过滤。
         """
 
         def _read(conn):
@@ -222,7 +222,7 @@ class AgentMemoryRepository(BaseRepository):
             ]
             if not terms:
                 return []
-            match = " AND ".join(terms)
+            match = " OR ".join(terms)
             cursor = conn.execute(
                 """
                 SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,
@@ -246,12 +246,8 @@ class AgentMemoryRepository(BaseRepository):
 
         def _read(conn):
             like = f"%{keywords}%"
-            params: list[Any] = [like]
-            type_clause = ""
-            if task_type:
-                type_clause = "AND task_type = ?"
-                params.append(task_type)
-            params.append(limit)
+            type_clause = "AND task_type = ?" if task_type else ""
+            args = [like, like] + ([task_type] if task_type else []) + [limit]
             cursor = conn.execute(
                 f"""
                 SELECT {_MAIN_COLS} FROM agent_working_memory_archive
@@ -259,7 +255,7 @@ class AgentMemoryRepository(BaseRepository):
                 ORDER BY id DESC
                 LIMIT ?
                 """,
-                [like, like] + params[1:],
+                args,
             )
             return [MemoryEntry.from_row(row) for row in cursor.fetchall()]
 
