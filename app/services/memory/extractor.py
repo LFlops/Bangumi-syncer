@@ -34,8 +34,9 @@ class MemoryExtractor:
         outcome: str,
         tokens_used: int,
         record_ids: list[int],  # 今日明细记录 id（store_and_mark 标记消费用）
+        job_name: str | None = None,  # 摘要调用用量归属 llm_usage 用
     ) -> None:
-        summary = await self._summarize(messages, response)
+        summary = await self._summarize(messages, response, job_name=job_name)
         if not summary:
             return  # 空响应（LLM 重试耗尽）不写记忆，避免无效条目
         # 原子单元：INSERT 记忆 + 标记消费（同一事务，见 store_and_mark）
@@ -54,12 +55,18 @@ class MemoryExtractor:
         # 清理旧记忆（独立 best-effort 事务，失败不回滚上面的 run）
         self._repo.prune(task_type, task_id, keep=1000)
 
-    async def _summarize(self, messages: list[Message], response: ChatResponse) -> str:
+    async def _summarize(
+        self,
+        messages: list[Message],
+        response: ChatResponse,
+        job_name: str | None = None,
+    ) -> str:
         """一行摘要：复用总结调用的完整对话上下文作前缀，命中 LLM prompt 缓存。
 
         缓存利用：摘要调用紧跟总结调用（同一 execute_job 内，Anthropic 5 分钟
         TTL / OpenAI 自动前缀缓存）——完整历史作前缀，输入 token 按缓存价格，
-        且无截断信息损失。
+        且无截断信息损失。job_name 使摘要调用 token 在 llm_usage 中归属任务
+        （与主调用同组，用量统计口径完整）。
         """
         if not response.content:
             return ""
@@ -68,7 +75,7 @@ class MemoryExtractor:
             summary_messages.append(Message(role="assistant", content=response.content))
             summary_messages.append(Message(role="user", content=_SUMMARY_PROMPT))
             llm = self._llm or get_llm_client()
-            resp = await llm.chat(summary_messages)
+            resp = await llm.chat(summary_messages, job_name=job_name)
             if resp.content:
                 return resp.content.strip()[:_SUMMARY_MAX_LEN]
         except Exception as e:

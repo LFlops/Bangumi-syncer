@@ -155,7 +155,7 @@ async def clear_summary_job_memory(
 ):
     """清空任务记忆（不可恢复，二次确认）。
 
-    同一事务删除主表 + 归档表 + 清相关消费标记（含 feedback 条目）。
+    同一事务删除主表 + 归档表 + 清相关消费标记（不筛 outcome 全部删除）。
     想保留偏好重新开始 → 复制为新 job（旧 job 记忆完整保留）。
     """
     decoded = unquote(name)

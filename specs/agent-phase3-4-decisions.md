@@ -277,8 +277,20 @@ Phase 5   ：知识沉淀闭环 / RAG 演进（按需评估，见 agent-phase3-a
 
 #### A1. R2 将"反馈"列为既有基础，但 Phase 2.3 尚未实现 ✅ 已裁决
 - 问题：代码中 `outcome` 仅 success（`memory/models.py` 注释），`retriever.py` 留有"Phase 2.3 引入后…"挂钩——2.3 只有 spec 无实现，R2 原文却把"反馈"当作可用基础。
-- **裁决：2.3 feedback 落地排在 Phase 3.0 之后（即 §1.1.1 的 3.1）**——需 Web 交互（通知条目"反馈"按钮 + 弹窗），不宜阻塞 3.0 核心交付；效果类增强项（D1/D3/D4）排其后可借助反馈验证效果。
-- 待办：R2 措辞已同步修正；3.1 实施前按 2.3 spec 细化。
+- **裁决（更新）：Phase 2 重新定义为仅含记忆三件套（2.0.1–2.0.3，已完成）**；feedback 落地排在 Phase 3.0 之后（即 §1.1.1 的 3.1）——需 Web 交互（通知条目"反馈"按钮 + 弹窗），不宜阻塞 3.0 核心交付；效果类增强项（D1/D3/D4）排其后可借助反馈验证效果。
+- 同批裁决：原 2.1（工具协议）→ **Phase 4.x**（唯一消费者是 P4 工具注册表；D1 两段式走 JSON 文本 + J3 解析器，不依赖原生 tool calling）；原 2.2（openai 重构 + reasoning_effort）→ **不阻塞 Phase 2，已在本轮直接补齐实施**（见 §11.3）。
+- 已执行：feedback 相关代码预留已从 Phase 2 移除，恢复清单见 `agent-phase3-summary-enhanced.md` §feedback。
+
+#### A2. Phase 编号重定义 ✅ 已裁决
+
+| 原编号 | 新归属 | 理由 |
+|---|---|---|
+| Phase 2 = 2.0.1+2.0.2+2.0.3 | **Phase 2 定稿**（记忆三件套，已完成） | "增加记忆"即 Phase 2 全部范围 |
+| 2.1 工具协议 | **Phase 4.x** | 记忆链路纯文本 chat 零依赖；D1 自检走结构化 JSON 文本而非原生 tool calling；唯一消费者是 P4 工具注册表 |
+| 2.2 openai 重构 | **本轮补齐完成**（provider 结构对称 + reasoning_effort） | 不阻塞记忆链路但属 provider 层欠账；实施记录与双 provider 异同对照见 §11.3 |
+| 2.3 feedback | **Phase 3.1** | 见 A1；代码预留已移除，恢复清单在 phase3 文档 |
+
+> 原 `specs/agent-phase2.1-tools.md` / `agent-phase2.2-openai-refactor.md` / `agent-phase2.3-feedback.md` 三份 spec 内容仍有效，仅执行时机调整；文件重命名随下轮 specs 整理一并处理。
 
 ### B 级 · 设计矛盾 / 意图不明 ⏳ 待逐条裁决
 
@@ -344,3 +356,53 @@ Phase 5   ：知识沉淀闭环 / RAG 演进（按需评估，见 agent-phase3-a
 | C4 SSE 鉴权 | 沿用 sync-retry 的 cookie 方案，属实现细节 |
 | D2 数据来源 | pending_candidates 查询入口现状实施时确认 |
 | 原 phase3-agent.md 子设计沿用度 | budget/trace 等设计的沿用声明放到实施 spec 逐项处理 |
+---
+
+## 11. Phase 2 记忆实现 · 规范性审查（2026-08，按"Phase 2 = 记忆三件套"新定义验收）
+
+### 11.1 已修复（本轮）
+
+| # | 问题 | 修复 |
+|---|---|---|
+| W1 | `MemoryService` 构造签名带 `sync_records_repo` 但 `self._sync` 从未被读（死参数；消费标记联动实际在 repo 内部事务完成） | ✅ 构造收敛为单参（含 hy-review #7 注释） |
+| W2 | extractor 摘要调用 `llm.chat()` 未带 job 标识 → 摘要 token 在 llm_usage 落入空 job_name 组，总结任务真实成本（主调用+摘要）统计口径缺一半 | ✅ `extract_and_store` 增加 `job_name` 参数透传至摘要调用，summary service 传 `job_config.name` |
+| W3 | trigram 降级静默发生（SQLite <3.34 时中文子串检索失效无提示） | ✅ 降级分支补 warning 日志 |
+
+**W3 答疑（SQLite 版本由什么决定）**：`sqlite3` 是 Python **标准库模块**，编译期链接运行环境的 libsqlite3 C 库——**uv.lock 锁不住它**（uv 只管 PyPI 包）。版本来源：本地 = 系统 Python / CLT 自带（本机 3.53.4）；Docker = 基础镜像的 apt 包（`python:3.x-slim` 基于 Debian bookworm 自带 ≥3.40，安全）；Alpine/老发行版可能 <3.34。因此降级分支是防御性的，现在有日志可查。
+
+### 11.2 待明确（业务背景与权衡）
+
+#### E1. "agent_" 命名超前占用
+- **背景**：表名 `agent_working_memory`、repo 名 `AgentMemoryRepository` 出现时项目还没有 Agent——它们实际存的是"定时任务执行记忆"。Phase 4 真 Agent 将引入 agent_runs/agent_steps（运行追踪），届时"agent"前缀会同时表示两种东西：任务记忆 vs 运行轨迹。
+- **权衡**：(a) 维持现名 + 文档注明语义边界——零迁移成本，记忆表语义上确实是"未来 Agent 的长期记忆层"，与 agent_runs 的"短期轨迹"可以构成层次而非冲突；(b) 迁移改名（task_memory）——一次 DROP/RENAME + 全链路改引用，收益仅是命名洁癖。
+- **推荐 (a)**：在 Phase 4 spec 里明确三层语义——`agent_working_memory`（任务级长期记忆）/ `agent_runs+steps`（单次运行轨迹）/ `knowledge_base`(跨任务沉淀知识)，命名不撞车。
+
+#### E2. FTS 索引列不含 full_text → D4 收益论断修正
+- **背景**：触发器只索引 `(task_type, summary, outcome)`，`search_fts` 命中的是一行摘要（≤50 字），不是全文。两个后果：(a) 若历史摘要恰好没提某番剧名，今日关键词捞不回该条；(b) 文档 §2 D4 曾写"结构化输出提升 FTS 检索质量"——检索目标不是 full_text，**此收益不成立**。
+- **权衡**：(a) 把 full_text 加入索引——召回最全，但索引体积 ×N 且摘要已含关键信息，边际收益低；(b) **约束摘要生成必须包含番剧名**（改 _SUMMARY_PROMPT："必须列出涉及的所有番剧名"）——零存储成本修召回缺口；(c) 维持现状接受漏召回。
+- **推荐 (b)**，并同步修正 §2 D4 表述为"结构化输出提升的是通知渲染与后续解析，非 FTS 召回"。
+
+#### E3. memory_limit 有下限无上限
+- **背景**：`max(1, ...)` 只防 0/负数，配 1000 条会注入爆 token（每条约 50 字摘要 + 分隔，1000 条 ≈ 数万 token）。
+- **权衡**：(a) 加硬上限（如 ≤20）并在 from_config_dict 钳制——防呆但限制高级用户；(b) 上限放宽（如 ≤50）+ 文档注明成本自担；(c) 不设限信任用户。
+- **推荐 (b)**：memory_limit 本意是"最近 N 次连续性"，超过 20 已无连续性意义；钳到 ≤50 防呆即可。
+
+### 11.3 Phase 2.2 实施记录（本轮完成）+ 双 provider 异同对照
+
+实施内容：`OpenAICompatProvider.chat()` 拆分为 `_build_request` / `_parse_response`（与 Anthropic 侧对称）；新增 `thinking_level → reasoning_effort` 映射（off 不传字段=现状行为；仅模型名以 o 开头生效，其余 warning 忽略）；content 为 list[ContentBlock] 时取 text block 拼接防御；`client._build_provider` 双 provider 统一传 thinking_level。测试：`test_provider_openai_compat.py` 新增 TestBuildRequest/TestParseResponse 共 7 例；旧断言"openai 不受 thinking_level 影响"更新为新语义。
+
+#### 能力/特性异同对照（当前代码事实）
+
+| 维度 | AnthropicProvider | OpenAICompatProvider | 说明 |
+|---|---|---|---|
+| wire 端点 | `/v1/messages` | `/v1/chat/completions` | 各自官方规范 |
+| 认证 | `x-api-key` + `Authorization: Bearer` 双发 | `Authorization: Bearer` | anthropic 双发兼容 OpenAI 风格网关 |
+| system prompt | 抽顶层参数，多条 `\n\n` 合并 | 留在 messages 内原样转发 | 业务层避免多 system（openai 兼容端点风险） |
+| content 形态 | blocks 数组（text/thinking/redacted/未知跳过告警） | 纯字符串；list 输入取 text 拼接 | 思考内容均不污染 ChatResponse.content |
+| 思考能力 | 原生：budget_tokens 三档映射 + max_tokens 自动抬升 + temperature 强制 1 + haiku 降级 | reasoning_effort 四档映射，仅 o 系列，非 o 忽略告警 | anthropic 侧更重（budget 计入 max_tokens 约束处理） |
+| stop_reason | 透传（end_turn/tool_use/max_tokens） | 未采集（finish_reason 丢弃） | P4 工具协议需要时 openai 侧补 |
+| refusal 处理 | —（无此概念） | message.refusal → ValueError | openai 特有 |
+| usage 映射 | input/output → prompt/completion | 同名字段直取 | 统一 Usage 模型 |
+| 结构 | `_build_request`/`_parse_response`/`_to_wire_message` 对称 | 同左（本轮对齐） | Phase 4 工具协议可在对称结构上加 ToolUseBlock 双向转换 |
+
+> 遗留差异（P4 前不必处理）：openai 侧 finish_reason 未采集；tool_use block 在 anthropic 侧仍是"跳过+warning"（正式解析在 P4.x 工具协议 phase）。

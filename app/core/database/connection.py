@@ -391,7 +391,13 @@ class DatabaseConnection:
                 "tokenize='trigram')"
             )
         except sqlite3.OperationalError:
-            # SQLite < 3.34：trigram 不可用，降级默认分词器
+            # SQLite < 3.34：trigram 不可用，降级默认分词器（中文子串匹配失效，
+            # search_fts 关键词检索能力受限）——显式告警便于排查检索质量问题
+            logger.warning(
+                "当前 SQLite %s 不支持 trigram 分词器，agent_memory_fts 已降级为"
+                "默认分词器：中文关键词检索能力受限（建议 SQLite >= 3.34）",
+                sqlite3.sqlite_version,
+            )
             cursor.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5("
                 "task_type, summary, outcome, "

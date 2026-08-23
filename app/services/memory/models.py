@@ -13,7 +13,7 @@ class MemoryEntry:
     run_id: str = ""
     summary: str = ""  # 一行摘要（注入粒度）
     full_text: str = ""  # 本次总结全文（回溯/诊断用，随 prune/归档同生命周期）
-    outcome: str = "success"  # 本阶段仅 success；feedback 取值 Phase 2.3 引入
+    outcome: str = "success"  # 取值：success | partial（用户反馈类取值由 phase3.x 反馈通道引入，见 specs/agent-phase3-summary-enhanced.md）
     tokens_used: int = 0  # 总结调用的 token（response.usage.total_tokens）
     created_at: str = ""
 

@@ -449,8 +449,8 @@ class TestAnthropicProviderFactory:
         assert isinstance(provider, AnthropicProvider)
         assert provider.thinking_level == "high"
 
-    def test_openai_provider_no_thinking_level(self, reset_llm_singleton):
-        """openai_compat 分支不受 thinking_level 影响（Phase 1 不改动）。"""
+    def test_openai_provider_accepts_thinking_level(self, reset_llm_singleton):
+        """Phase 2.2：双 provider 统一传 thinking_level（openai 侧映射 reasoning_effort）。"""
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -462,7 +462,7 @@ class TestAnthropicProviderFactory:
             client = LLMClient()
 
         assert isinstance(client._provider, OpenAICompatProvider)
-        assert not hasattr(client._provider, "thinking_level")
+        assert client._provider.thinking_level == "high"
 
     def test_unknown_provider_raises(self, reset_llm_singleton):
         """Scenario 4.2: 非法 provider 抛 ValueError 并提示支持列表。"""

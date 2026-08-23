@@ -51,7 +51,7 @@ class MemoryRetriever:
         """按 run_id 去重，保留顺序（recent 在前、keywords 命中随后）。
 
         recent 条数已在 get_recent(limit) 源头受限；keywords 命中不占额度
-        全部保留（Phase 2.3 的 feedback 优先排序也在此扩展）。
+        全部保留（phase3.x 反馈通道的优先排序也在此扩展）。
         """
         seen: set[str] = set()
         ranked: list[MemoryEntry] = []
@@ -65,7 +65,8 @@ class MemoryRetriever:
     def format_memory_context(self, entries: list[MemoryEntry]) -> str:
         """MemoryEntry 列表 → 注入文本（每条一行）。
 
-        Phase 2.3 引入 feedback 后，此处增加 `[用户反馈]` 前缀标记。
+        phase3.x 引入用户反馈后，此处增加 `[用户反馈]` 前缀标记
+        （见 specs/agent-phase3-summary-enhanced.md）。
         """
         return "\n".join(f"- {e.summary}" for e in entries)
 

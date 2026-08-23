@@ -279,11 +279,12 @@ class TestPrune:
         assert {r[3] for r in archive} == {f"run-{i}" for i in range(5)}
         assert all(r[8] for r in archive)  # created_at 非空
 
-    def test_prune_keeps_feedback_outside_window(self, temp_dir, reset_singletons):
-        """W9：outcome=feedback 的旧条目跳过 prune（长期保留）。"""
+    def test_prune_archives_all_outcomes(self, temp_dir, reset_singletons):
+        """prune 不筛 outcome，超窗条目一律归档（feedback 优先保留属 phase3.x，
+        见 specs/agent-phase3-summary-enhanced.md）。"""
         db = _make_db(temp_dir)
         db.memory.store_and_mark(
-            _entry("run-fb", summary="用户反馈：不要太啰嗦", outcome="feedback"), []
+            _entry("run-old", summary="早期总结", outcome="partial"), []
         )
         for i in range(1005):
             db.memory.store_and_mark(_entry(f"run-{i}", summary=f"第{i}次总结"), [])
@@ -291,8 +292,8 @@ class TestPrune:
         db.memory.prune("summary", "summary-daily", keep=1000)
 
         rows = _main_rows(db)
-        assert any(r[3] == "run-fb" for r in rows)
-        assert all(r[3] != "run-fb" for r in _archive_rows(db))
+        assert all(r[3] != "run-old" for r in rows)
+        assert any(r[3] == "run-old" for r in _archive_rows(db))
 
     def test_prune_scoped_to_task(self, temp_dir, reset_singletons):
         db = _make_db(temp_dir)
@@ -493,11 +494,11 @@ class TestClearTask:
         rows = _main_rows(db)
         assert [r[3] for r in rows] == ["v1"]
 
-    def test_clear_task_includes_feedback(self, temp_dir, reset_singletons):
-        """C10：彻底清空语义——feedback 条目一并删除。"""
+    def test_clear_task_includes_all_outcomes(self, temp_dir, reset_singletons):
+        """C10：彻底清空语义——不筛 outcome 全部删除。"""
         db = _make_db(temp_dir)
         db.memory.store_and_mark(
-            _entry("u-fb", task_id="summary-daily", outcome="feedback"), []
+            _entry("u-partial", task_id="summary-daily", outcome="partial"), []
         )
         db.memory.store_and_mark(_entry("u1", task_id="summary-daily"), [])
 

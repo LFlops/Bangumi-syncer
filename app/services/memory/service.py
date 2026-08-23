@@ -45,8 +45,13 @@ class MemoryService:
         outcome: str,
         tokens_used: int,
         record_ids: list[int],
+        job_name: str | None = None,
     ) -> None:
-        """总结执行成功后提炼摘要并写入记忆（含消费标记）。"""
+        """总结执行成功后提炼摘要并写入记忆（含消费标记）。
+
+        job_name 透传给摘要 LLM 调用：摘要 token 在 llm_usage 中与主调用
+        归属同一任务，用量统计口径完整。
+        """
         await self._extractor.extract_and_store(
             task_type=task_type,
             task_id=task_id,
@@ -56,6 +61,7 @@ class MemoryService:
             outcome=outcome,
             tokens_used=tokens_used,
             record_ids=record_ids,
+            job_name=job_name,
         )
 
     def retrieve(
@@ -84,9 +90,8 @@ class MemoryService:
         return self._memory.rename_task(task_type, old_task_id, new_task_id)
 
     def clear_task(self, task_type: str, task_id: str) -> int:
-        """显式清空（不可恢复，调用方二次确认）：记忆 + 归档 + 消费标记原子清空。
+        """显式清空（不可恢复，调用方二次确认）：记忆 + 归档 + 消费标记原子清空
 
-        **含 feedback 条目**（彻底清空语义）——用户要重置就全清（偏好也重来）；
-        想保留偏好用"复制新 job"（旧 job 完整保留）。
+        （不筛 outcome，全部删除；想保留偏好重新开始的场景用"复制新 job"）。
         """
         return self._memory.clear_task(task_type, task_id)

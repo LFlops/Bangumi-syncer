@@ -236,6 +236,7 @@ class SummaryService:
                     outcome="success",
                     tokens_used=response.usage.total_tokens if response.usage else 0,
                     record_ids=[r.id for r in records],  # 同一事务标记消费
+                    job_name=job_config.name,  # 摘要调用用量归属 llm_usage
                 )
 
             # 4. 通知

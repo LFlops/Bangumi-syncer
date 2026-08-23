@@ -65,14 +65,13 @@ class AgentMemoryRepository(BaseRepository):
 
         与 store_and_mark 不同事务：prune 是维护性操作，失败只导致表不清理
         （下次 run 重试），不应回滚一次已成功且已消耗 LLM token 的总结 run。
-        outcome='feedback' 的用户偏好条目跳过 prune（长期保留）。
         """
 
         def _write(conn):
             cursor = conn.execute(
                 """
                 SELECT id FROM agent_working_memory
-                WHERE task_type = ? AND task_id = ? AND outcome != 'feedback'
+                WHERE task_type = ? AND task_id = ?
                 ORDER BY created_at DESC, id DESC
                 LIMIT -1 OFFSET ?
                 """,
@@ -136,7 +135,7 @@ class AgentMemoryRepository(BaseRepository):
         顺序敏感：① 先收集 run_id（主表 + 归档表 UNION）——必须在删表前取，
         否则 run_id→task_id 映射丢失；② 删主表；③ 删归档表；
         ④ 清 sync_records 中 consumed_run_id ∈ run_ids 的消费标记（SET NULL）。
-        含 feedback 条目（彻底清空语义——保留偏好用"复制新 job"）。
+        不筛 outcome，全部删除（想保留偏好重新开始的场景用"复制新 job"）。
         """
 
         def _write(conn):
