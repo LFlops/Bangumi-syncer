@@ -36,7 +36,8 @@ class AnthropicProvider(BaseProvider):
 
     Attributes:
         api_base: API 的基础 URL（如 https://api.anthropic.com/v1）。
-        api_key: 用于 Bearer token 认证的 API key。
+        api_key: 用于认证的 API key（随 x-api-key 与 Authorization: Bearer 双头发送，
+            兼顾官方 API 与 OpenAI 风格网关）。
         model: 默认使用的模型名称。
         max_tokens: 补全的默认最大 token 数（Anthropic API 必填）。
         temperature: 默认采样温度（thinking 开启时被强制为 1）。
@@ -53,6 +54,11 @@ class AnthropicProvider(BaseProvider):
         "medium": 4096,
         "high": 8192,
     }
+
+    # thinking 开启时 max_tokens 的最低抬升余量：Anthropic 约束 budget_tokens
+    # 必须小于 max_tokens（思考 token 计入 max_tokens 上限），默认 max_tokens=2000
+    # 小于三档 budget（2048/4096/8192），需自动抬升并留出实际输出空间。
+    _THINKING_HEADROOM: int = 1024
 
     def __init__(
         self,
@@ -92,14 +98,17 @@ class AnthropicProvider(BaseProvider):
         url = f"{self.api_base}/messages"
         model = kwargs.get("model", self.model)
         proxy_label = f", proxy={self.proxy}" if self.proxy else ""
-        logger.info(
+        logger.debug(
             f"LLM request: url={url}, model={model}, "
             f"timeout={self.timeout}s{proxy_label}"
         )
 
         body = self._build_request(messages, **kwargs)
+        # x-api-key 为 Anthropic 官方文档标准认证头，Authorization: Bearer 兼容
+        # OpenAI 风格网关——双发对两类端点都兼容且无害。
         headers = {
             "Authorization": f"Bearer {self.api_key}",
+            "x-api-key": self.api_key,
             "Content-Type": "application/json",
             "anthropic-version": "2023-06-01",
         }
@@ -141,6 +150,13 @@ class AnthropicProvider(BaseProvider):
         budget = self._thinking_enabled(level, kwargs.get("model", self.model))
         if budget > 0:
             body["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # Anthropic 约束：budget_tokens 必须小于 max_tokens，且 max_tokens
+            # 同时计入思考与输出 token。用户配置的 max_tokens 可能小于 budget
+            # （默认 2000 < 三档 budget），自动抬升到 budget + 余量；
+            # 用户配置更大时保持用户的值不变。
+            body["max_tokens"] = max(
+                body["max_tokens"], budget + self._THINKING_HEADROOM
+            )
             body["temperature"] = (
                 1  # Anthropic 要求 thinking 开启时 temperature 必须为 1
             )
@@ -154,10 +170,14 @@ class AnthropicProvider(BaseProvider):
         return self._THINKING_BUDGETS.get(level, 0)
 
     def _system_text(self, content: str | list[ContentBlock]) -> str:
-        """提取 system 消息文本：str 直接用，list 取 text block 拼接（其余类型跳过）。"""
+        """提取 system 消息文本：str 直接用，list 取 text block 拼接（其余类型跳过）。
+
+        多块拼接与多条 system 消息的合并（\n\n）保持同一分隔语义，避免 Phase 2
+        记忆注入产出多块 system 时与多条 system 消息行为不一致。
+        """
         if isinstance(content, str):
             return content
-        return "".join(b.text for b in content if isinstance(b, TextBlock))
+        return "\n\n".join(b.text for b in content if isinstance(b, TextBlock))
 
     def _to_wire_message(self, m: Message) -> dict:
         """内部消息 → Anthropic wire 消息（content 统一为 blocks 数组）。"""

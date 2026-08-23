@@ -176,7 +176,7 @@ class TestBuildRequest:
         assert body["system"] == "规则A"
 
     def test_system_message_content_blocks(self):
-        """system 消息 content 为 list 时提取 text block 拼接。"""
+        """system 消息 content 为 list 时提取 text block，块间用 \\n\\n 拼接（与多条 system 合并语义一致）。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -187,7 +187,7 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "规则A规则B"
+        assert body["system"] == "规则A\n\n规则B"
 
     def test_system_message_blocks_ignore_non_text(self):
         """system 消息 content 混入 thinking block 时只提取 text。"""
@@ -204,11 +204,42 @@ class TestBuildRequest:
         assert body["system"] == "规则A"
 
     def test_thinking_level_medium_maps_budget(self):
-        """Scenario 1.4: thinking_level=medium 映射 budget_tokens=4096，temperature 强制为 1。"""
+        """Scenario 1.4: thinking_level=medium 映射 budget_tokens=4096，
+        max_tokens 自动抬升到 budget + 余量，temperature 强制为 1。"""
         provider = _make_provider(thinking_level="medium")
         body = provider._build_request([Message(role="user", content="Q")])
         assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+        # Anthropic 约束：budget_tokens 必须小于 max_tokens（思考计入上限）
+        assert body["max_tokens"] == 4096 + 1024
         assert body["temperature"] == 1
+
+    @pytest.mark.parametrize(
+        ("level", "budget"),
+        [("low", 2048), ("medium", 4096), ("high", 8192)],
+    )
+    def test_thinking_max_tokens_raised_above_budget(self, level, budget):
+        """Scenario 1.4: 开启思考时 max_tokens 自动抬升至 budget + 余量。
+
+        默认 max_tokens=2000 小于全部三档 budget，若不抬升 Anthropic API
+        会以 budget_tokens < max_tokens 约束返回 400。
+        """
+        provider = _make_provider(thinking_level=level)
+        body = provider._build_request([Message(role="user", content="Q")])
+        assert body["max_tokens"] == budget + 1024
+
+    def test_thinking_max_tokens_keeps_larger_configured_value(self):
+        """用户配置的 max_tokens 大于 budget + 余量时保持不变。"""
+        provider = _make_provider(thinking_level="low", max_tokens=8000)
+        body = provider._build_request([Message(role="user", content="Q")])
+        assert body["max_tokens"] == 8000
+
+    def test_thinking_max_tokens_per_call_override_also_raised(self):
+        """per-call max_tokens 覆盖值同样受 budget 约束抬升。"""
+        provider = _make_provider(thinking_level="medium")
+        body = provider._build_request(
+            [Message(role="user", content="Q")], max_tokens=1000
+        )
+        assert body["max_tokens"] == 4096 + 1024
 
     def test_thinking_level_high_kwargs_override(self):
         """Scenario 1.4/1.6: kwargs thinking_level=high 覆盖全局。"""
@@ -217,6 +248,7 @@ class TestBuildRequest:
             [Message(role="user", content="Q")], thinking_level="high"
         )
         assert body["thinking"] == {"type": "enabled", "budget_tokens": 8192}
+        assert body["max_tokens"] == 8192 + 1024
         assert body["temperature"] == 1
 
     def test_thinking_level_off_no_thinking(self):
@@ -407,10 +439,32 @@ class TestAnthropicProviderChat:
 
         headers = call_args[1]["headers"]
         assert headers["Authorization"] == "Bearer sk-test"
+        # x-api-key 为 Anthropic 官方标准认证头，与 Bearer 双发兼容两类网关
+        assert headers["x-api-key"] == "sk-test"
         assert headers["Content-Type"] == "application/json"
         assert headers["anthropic-version"] == "2023-06-01"
 
         assert call_args[1]["timeout"] == 60
+
+    @pytest.mark.asyncio
+    async def test_request_logged_at_debug(self):
+        """请求日志与 openai/provider 侧一致，使用 debug 级别而非 info。"""
+        mock_client = _make_mock_client(
+            json_body={
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
+            }
+        )
+        with (
+            patch("httpx.AsyncClient", return_value=mock_client),
+            patch("app.services.llm.providers.anthropic.logger") as mock_log,
+        ):
+            provider = _make_provider()
+            await provider.chat([Message(role="user", content="Q")])
+
+        mock_log.debug.assert_called_once()
+        mock_log.info.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_normal_response_parsing(self):
@@ -456,6 +510,8 @@ class TestAnthropicProviderChat:
 
         body = mock_client.post.call_args[1]["json"]
         assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+        # 默认 max_tokens=2000 < budget=4096，自动抬升
+        assert body["max_tokens"] == 4096 + 1024
         assert body["temperature"] == 1
         # thinking 不计入 content
         assert resp.content == "答案"

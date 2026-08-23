@@ -100,6 +100,26 @@ class TestLLMConfigUpdate:
         assert data["model"] == "gpt-4"
         assert "api_base" not in data
 
+    def test_valid_enum_values_accepted(self):
+        """provider / thinking_level 的合法枚举值可被接受。"""
+        model = LLMConfigUpdate(provider="anthropic_compat", thinking_level="high")
+        assert model.provider == "anthropic_compat"
+        assert model.thinking_level == "high"
+
+    def test_invalid_provider_rejected(self):
+        """非法 provider 在模型层抛 ValidationError。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            LLMConfigUpdate(provider="banana")
+
+    def test_invalid_thinking_level_rejected(self):
+        """非法 thinking_level 在模型层抛 ValidationError（不静默兜底为 off）。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            LLMConfigUpdate(thinking_level="banana")
+
 
 # ========== LLMTestResponse ==========
 
@@ -643,6 +663,38 @@ class TestUpdateLLMConfig:
                 # 没有需要更新的字段，所以不应调用 set_config
                 mock_cm.set_config.assert_not_called()
                 mock_cm.reload_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"provider": "banana"},
+            {"thinking_level": "banana"},
+        ],
+    )
+    async def test_invalid_enum_values_rejected(self, payload):
+        """非法 provider / thinking_level 应在 API 边界被拒绝（422），不写入配置。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with patch("app.api.llm.config_manager") as mock_cm:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.put("/api/llm/conf", json=payload)
+                assert response.status_code == 422
+                mock_cm.set_config.assert_not_called()
 
 
 class TestTestLLMConnection:
