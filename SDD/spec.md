@@ -126,10 +126,12 @@ class BaseProvider(ABC):
     @abstractmethod
     async def chat(self, messages: list[Message], **kwargs) -> ChatResponse: ...
 
+
 # models.py
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str
+
 
 class ChatResponse(BaseModel):
     content: str
