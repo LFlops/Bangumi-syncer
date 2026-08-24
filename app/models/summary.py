@@ -4,7 +4,7 @@ Summary AI 观影报告数据模型。
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LLMConfigResponse(BaseModel):
@@ -58,7 +58,8 @@ class SummaryJobCreate(BaseModel):
     max_records: int = -1  # -1 表示不限制
     enabled: bool = True
     memory_enabled: bool = False  # 记忆开关（默认关闭）
-    memory_limit: int = 5  # 注入记忆条数
+    # 对齐前端约定 1–50（templates/config.html min/max）；过大值注入 token 成本线性膨胀
+    memory_limit: int = Field(default=5, ge=1, le=50)  # 注入记忆条数
 
 
 class SummaryJobUpdate(BaseModel):
@@ -72,7 +73,7 @@ class SummaryJobUpdate(BaseModel):
     max_records: Optional[int] = None
     enabled: Optional[bool] = None
     memory_enabled: Optional[bool] = None
-    memory_limit: Optional[int] = None
+    memory_limit: Optional[int] = Field(default=None, ge=1, le=50)
 
 
 class SummaryJobResponse(BaseModel):
@@ -102,7 +103,7 @@ class SummaryJobResponse(BaseModel):
 
         def _memory_limit() -> int:
             try:
-                return max(1, _int("memory_limit", 5))
+                return min(50, max(1, _int("memory_limit", 5)))
             except ValueError:
                 return 5
 

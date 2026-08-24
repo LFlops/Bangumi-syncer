@@ -31,7 +31,8 @@ class SummaryJobConfig:
 
         def _memory_limit() -> int:
             try:
-                return max(1, int(data.get("memory_limit", 5)))
+                # 对齐前端约定（1–50）：上限防呆——过大值注入 token 成本线性膨胀
+                return min(50, max(1, int(data.get("memory_limit", 5))))
             except (TypeError, ValueError):
                 return 5
 

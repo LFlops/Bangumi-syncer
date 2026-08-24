@@ -102,6 +102,12 @@ def test_memory_limit_min_one():
     assert cfg.memory_limit == 1
 
 
+def test_memory_limit_caps_at_50():
+    """E3 定稿：上限对齐前端约定 1–50（手改 config.ini 传 1000 → 钳到 50）。"""
+    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "1000"})
+    assert cfg.memory_limit == 50
+
+
 def test_memory_limit_invalid_falls_back():
     cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "abc"})
     assert cfg.memory_limit == 5

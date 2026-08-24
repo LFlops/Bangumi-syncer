@@ -10,8 +10,9 @@ from app.services.llm.models import ChatResponse
 from .models import MemoryEntry
 
 _SUMMARY_PROMPT = (
-    "请用一句话总结以下追番总结的内容（不超过 50 字），保留关键信息："
-    "看了哪些番剧、进度、异常情况。只输出摘要本身。"
+    "请用一句话总结以下追番总结的内容（不超过 100 字），保留关键信息："
+    "看了哪些番剧、进度、异常情况。必须列出本次涉及的全部番剧名"
+    "（进度可从简，番剧名供后续关键词检索召回本条记忆）。只输出摘要本身。"
 )
 
 _SUMMARY_MAX_LEN = 200

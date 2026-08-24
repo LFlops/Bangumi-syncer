@@ -12,6 +12,7 @@ _parse_response 两个方法内（与 AnthropicProvider 结构对称）：
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app.core.logging import logger
@@ -137,9 +138,14 @@ class OpenAICompatProvider(BaseProvider):
             "temperature": kwargs.get("temperature", self.temperature),
         }
 
-        # thinking_level：每任务 kwargs 覆盖 > 全局默认；非 o 系列模型忽略并告警
+        # thinking_level：每任务 kwargs 覆盖 > 全局默认；非 o 系列模型忽略并告警；
+        # 端点拒绝过扩展参数时（_extras_disabled）不再发送
         level = kwargs.get("thinking_level", self.thinking_level)
-        effort = self._reasoning_effort(level, body["model"])
+        effort = (
+            None
+            if self._extras_disabled
+            else self._reasoning_effort(level, body["model"])
+        )
         if effort is not None:
             body["reasoning_effort"] = effort
         return body
@@ -165,9 +171,11 @@ class OpenAICompatProvider(BaseProvider):
         """thinking_level → reasoning_effort；off/不支持时返回 None（不传字段）。"""
         if level == "off":
             return None
-        # reasoning_effort 仅 o 系列模型支持（o1/o3/o4-mini 等，模型名以 o 开头）。
-        # OpenAI 对未知参数的行为因 API 版本而异，不冒险传给非 o 系列。
-        if not model.startswith("o"):
+        # reasoning_effort 仅 o 系列模型支持（o1/o3/o4-mini 等）。用 ^o\d 而非
+        # startswith("o")：避免 "ollama/…"、"openrouter/…" 等第三方网关模型名
+        # 误中导致向不支持的端点发送未知参数。OpenAI 对未知参数的行为因 API 版本
+        # 而异，不冒险传给非 o 系列。
+        if not re.match(r"^o\d", model):
             logger.warning(
                 f"model {model} 非 o 系列不支持 reasoning_effort，"
                 f"已忽略 thinking_level={level}"

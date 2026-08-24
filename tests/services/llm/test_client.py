@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, patch
 
+import httpx
 import pytest
 
 from app.services.llm.models import ChatResponse, Message, Usage
@@ -538,3 +539,79 @@ class TestGetLlmClient:
         first = clients[0]
         for c in clients[1:]:
             assert c is first
+
+
+# ===================================================================
+# 方案 C：参数类 400 降级重试（checkbox2 双重保险第二道）
+# ===================================================================
+
+
+class TestParamRejectionDegradation:
+    """端点拒绝扩展参数 → provider._extras_disabled 置位 → 立即重试。"""
+
+    @staticmethod
+    def _httpx_400(text: str) -> httpx.HTTPStatusError:
+        request = httpx.Request("POST", "https://test.api.com/v1/chat/completions")
+        response = httpx.Response(400, text=text, request=request)
+        return httpx.HTTPStatusError("Bad Request", request=request, response=response)
+
+    @pytest.mark.asyncio
+    async def test_param_rejection_degrades_and_retries(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """首次 400（unrecognized argument）→ 降级标记置位 → 重试成功。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls: list[dict] = []
+
+        def _flaky_chat(messages, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise TestParamRejectionDegradation._httpx_400(
+                    '{"error": "Unrecognized request argument supplied: reasoning_effort"}'
+                )
+            return ChatResponse(content="ok", model="gpt-4o", usage=None)
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk-test", thinking_level="high"
+        )
+        provider.chat = AsyncMock(side_effect=_flaky_chat)
+
+        client = LLMClient()
+        client._provider = provider
+        resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == "ok"
+        assert len(calls) == 2  # 降级后立即重试，无退避
+        assert provider._extras_disabled is True
+
+    @pytest.mark.asyncio
+    async def test_non_param_400_no_degration(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """非参数类 400（如 invalid_api_key）不触发降级，走普通退避重试。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+        mock_sleep = AsyncMock()
+
+        async def _always_bad(self, messages, **kwargs):
+            calls.append(1)
+            raise self._httpx_400('{"error": "Invalid API key provided"}')
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk-test"
+        )
+        provider.chat = _always_bad.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == ""  # 重试耗尽返回空响应
+        assert len(calls) == 3  # MAX_RETRIES=2 → 3 次尝试
+        assert provider._extras_disabled is False  # 未降级
+        assert mock_sleep.await_count == 2

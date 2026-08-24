@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
+
 from app.core.config import config_manager
 from app.core.logging import logger
 
@@ -33,6 +35,29 @@ def _format_error_detail(e: Exception) -> str:
     if req is not None:
         parts.append(f"[url: {req.url}]")
     return " ".join(parts)
+
+
+# 端点拒绝扩展参数的响应特征（大小写不敏感子串匹配）。
+# OpenAI: "Unrecognized request argument supplied: reasoning_effort"；
+# Anthropic: invalid_request_error；网关实现各异 —— 以宽泛特征兕底。
+_PARAM_REJECTION_PATTERNS = (
+    "unrecognized",
+    "unknown parameter",
+    "unexpected keyword",
+    "invalid request argument",
+    "extra fields not permitted",
+)
+
+
+def _is_param_rejection(e: Exception) -> bool:
+    """识别"端点不支持某请求参数"类 400（区别于其它 400 如鉴权/格式错误）。"""
+    if not isinstance(e, httpx.HTTPStatusError):
+        return False
+    resp = getattr(e, "response", None)
+    if resp is None or resp.status_code != 400:
+        return False
+    text = (resp.text or "").lower()
+    return any(p in text for p in _PARAM_REJECTION_PATTERNS)
 
 
 def _build_provider(
@@ -95,8 +120,10 @@ class LLMClient:
         """
         last_error: Exception | None = None
         t_start = time.time()
+        attempt = 0
+        extras_degraded = False  # 参数类 400 降级只做一次，不计入退避次数
 
-        for attempt in range(self.MAX_RETRIES + 1):
+        while attempt <= self.MAX_RETRIES:
             try:
                 response = await self._provider.chat(messages, **kwargs)
                 latency_ms = int((time.time() - t_start) * 1000)
@@ -110,6 +137,17 @@ class LLMClient:
                 return response
             except Exception as e:
                 last_error = e
+                # 双重保险第二道：端点拒绝扩展参数（thinking/reasoning 等）→
+                # 置位降级标记后立即重试（该 provider 实例生命周期内不再发送）
+                if not extras_degraded and _is_param_rejection(e):
+                    extras_degraded = True
+                    if hasattr(self._provider, "_extras_disabled"):
+                        self._provider._extras_disabled = True
+                    logger.warning(
+                        "LLM endpoint rejected extra params, "
+                        f"degraded retry without them: {_format_error_detail(e)}"
+                    )
+                    continue
                 if attempt < self.MAX_RETRIES:
                     delay = self.RETRY_BACKOFF[attempt]
                     logger.warning(
@@ -117,6 +155,7 @@ class LLMClient:
                         f"after {delay}s: {_format_error_detail(e)}"
                     )
                     await asyncio.sleep(delay)
+                attempt += 1
 
         # 所有重试耗尽 —— 记录错误并返回空响应
         latency_ms = int((time.time() - t_start) * 1000)
