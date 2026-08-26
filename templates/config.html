@@ -2189,9 +2189,8 @@
     document.getElementById('summary-job-lookback').value = '1'
     document.getElementById('summary-job-user').value = ''
     document.getElementById('summary-job-max-records').value = '-1'
-    document.getElementById('summary-job-memory-enabled').checked = false
-    document.getElementById('summary-job-memory-limit').value = '5'
-    document.getElementById('summary-job-memory-limit').disabled = true
+    document.getElementById('summary-job-memory-limit').value = '0'
+    document.getElementById('summary-job-related-limit').value = '0'
     document.getElementById('summary-job-clear-memory-btn').disabled = true
     document.getElementById('summary-job-prompt').value =
       '你是一个轻松有趣的追番助手。用户会给你一段指定时间范围内的观影记录，请你用亲切自然的中文生成追番总结。\n\n' +
@@ -2203,11 +2202,6 @@
       '5. 限制在 300 字以内'
     if (window.refreshAllCronPreviews) window.refreshAllCronPreviews()
     showModal('summaryJobModal')
-  }
-
-  function toggleSummaryMemoryInput() {
-    var enabled = document.getElementById('summary-job-memory-enabled').checked
-    document.getElementById('summary-job-memory-limit').disabled = !enabled
   }
 
   async function clearSummaryMemory() {
@@ -2252,11 +2246,10 @@
       document.getElementById('summary-job-lookback').value = job.lookback_days
       document.getElementById('summary-job-user').value = job.user_name || ''
       document.getElementById('summary-job-max-records').value = job.max_records
-      document.getElementById('summary-job-memory-enabled').checked =
-        !!job.memory_enabled
       document.getElementById('summary-job-memory-limit').value =
-        job.memory_limit || 5
-      toggleSummaryMemoryInput()
+        job.memory_limit || 0
+      document.getElementById('summary-job-related-limit').value =
+        job.related_limit || 0
       document.getElementById('summary-job-clear-memory-btn').disabled = false
       document.getElementById('summary-job-prompt').value =
         job.system_prompt || ''
@@ -2279,11 +2272,12 @@
         parseInt(document.getElementById('summary-job-lookback').value) || 1,
       user_name: document.getElementById('summary-job-user').value,
       max_records: isNaN(mrVal) ? -1 : mrVal,
-      memory_enabled: document.getElementById('summary-job-memory-enabled')
-        .checked,
       memory_limit: parseInt(
         document.getElementById('summary-job-memory-limit').value,
-      ) || 5,
+      ) || 0,
+      related_limit: parseInt(
+        document.getElementById('summary-job-related-limit').value,
+      ) || 0,
       system_prompt: document.getElementById('summary-job-prompt').value,
     }
     // 前端校验：名称不能含逗号，不能与已有任务重名
@@ -2513,26 +2507,24 @@
                             <small class="text-muted">-1 表示不限制条数</small>
                         </div>
                         <div class="col-md-4">
-                            <label class="form-label">记忆</label>
-                            <div class="form-check form-switch mt-1">
-                                <input class="form-check-input"
-                                       type="checkbox"
-                                       id="summary-job-memory-enabled"
-                                       onchange="toggleSummaryMemoryInput()" />
-                                <label class="form-check-label" for="summary-job-memory-enabled">启用历史记忆</label>
-                            </div>
-                            <small class="text-muted">记忆按任务隔离，多用户场景建议每用户一个任务</small>
-                        </div>
-                        <div class="col-md-4">
                             <label class="form-label">记忆条数</label>
                             <input type="number"
                                    class="form-control"
                                    id="summary-job-memory-limit"
-                                   value="5"
-                                   min="1"
-                                   max="50"
-                                   disabled />
-                            <small class="text-muted">注入最近 N 条执行摘要</small>
+                                   value="0"
+                                   min="0"
+                                   max="1000" />
+                            <small class="text-muted">0 = 关闭记忆；>0 = 注入最近 N 条摘要（含消费排除）</small>
+                        </div>
+                        <div class="col-md-4">
+                            <label class="form-label">同剧关联条数</label>
+                            <input type="number"
+                                   class="form-control"
+                                   id="summary-job-related-limit"
+                                   value="0"
+                                   min="0"
+                                   max="1000" />
+                            <small class="text-muted">0 = 关闭；>0 = 按日期倒序关联最近 N 条同剧历史</small>
                         </div>
                         <div class="col-md-4 d-flex align-items-end">
                             <button type="button"

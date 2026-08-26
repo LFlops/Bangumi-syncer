@@ -62,10 +62,19 @@
 
 ### E1. 命名超前占用 → 维持现名（裁决见 §2）
 
-### E2. FTS 索引不含 full_text → 摘要约束修召回 ✅ 已实施
-- 背景：FTS 只索引 `(task_type, summary, outcome)`，`search_fts` 命中的是一行摘要而非全文——全文入索引体积代价大、边际收益低。
-- **裁决**：约束摘要生成"必须列出本次涉及的全部番剧名"，并把摘要字数上限从 50 放宽至 100（重度用户 10 部番 × 日文名 5–8 字，50 字放不下；硬截断 200 兜底，20 部极端场景尾部截断可接受）。全文索引（及其他 RAG 收益）留给 Phase 5 语义层。
+### E2. 记忆检索：FTS/摘要约束 → 联表反查（v7 终稿）✅ 已实施
+- 演进链：① 摘要强制含番剧名（早期方案，已废弃）→ ② 单列 titles（已废弃）→ **③ 联表反查（终稿）**：`get_related_titles` 经 `sync_records.consumed_run_id` 反查历史总结（主表+归档 UNION、GROUP BY 去重、日期倒序、空标题短路、任务隔离）。消费标记是"该记录被哪次总结消费过"的显式关联，比 FTS 子串猜测精确且自然覆盖冷层。
+- **摘要**（v7）：prompt 仅软约束（"50–100 字为宜，根据内容量自然把握"），**删除 `_SUMMARY_MAX_LEN=200` 硬截断**——成功路径 LLM 输出原文入库零截断；**LLM 摘要失败 → 跳过不写**（与空响应同路径，无截断兜底残留）。
+- **FTS 停用**：`search_fts` 标 deprecated——FTS 搜索的唯一输入（标题词）与联表相同而联表更优；物理结构（虚表/触发器/索引）保留，供 Phase 5 混合检索（FTS5+向量 RRF）复用。trigram 告警降为"无功能影响"提示。
 - 连带修正：D4 的收益表述已改为"结构化输出提升的是通知渲染与后续解析，非 FTS 召回"。
+
+### E3. 配置终态：memory_limit / related_limit（0=关，0–1000）✅ 已实施
+- **背景演进**：早期 1–50 条数 + memory_enabled 开关 → 中途尝试 memory_days（90 天/放开上限，伤害季度低频率用户分析后被否决）→ 最终确定**条数隐式开关**（未发布，直接破坏性重构，无迁移）。
+- **配置**：`memory_limit`（0=关；>0=最近 N 条摘要注入，上限 1000 对齐 prune）、`related_limit`（0=关；>0=同剧关联最近 N 条）。`memory_enabled`/`memory_days` 全部废弃删除。
+- **消费排除**（用户方案的点睛）：`memory_limit>0` 时窗口内 `consumed_run_id` 非空的记录**不进 prompt**（信息由摘要承继——避免重复总结、连贯性内生）；原 `overlap_note` 软提示删除（硬排除替代）；记录数/统计按排除后计算；全部被消费 → 走"无记录"路径。
+- **展示**：`GET /api/summary/jobs/{name}/memory-stats` 返回 total_count/total_chars/avg_chars/memory_limit/related_limit/injected_estimate_tokens（估算口径：条数 × 平均字符 × 0.7 系数，明示估算）。**不做百分比**——API 不暴露模型上下文窗口元数据（/models 仅有 id/created/owned_by），占比无数据基础；文档注明。
+- **注入 token 数学**：注入量 = (min(存量, memory_limit) + related_limit) × 平均 ~80 字 × 0.7 ≈ 常态可控；上限 1000 时为极端自担场景，stats 透明可见。
+- **空记忆行为**：`get_recent` 返回 [] → 注入段为空 → 不拼接历史小节，正常生成总结——空转无害。
 
 ### E3. memory_limit 三层校验不一致 → 后端对齐（min 1 / max 50）✅ 已实施
 - 背景（查证）：前端 `templates/config.html` 已有 `min="1" max="50"`（HTML 软约束）；API Pydantic 裸类型无约束；后台 `from_config_dict` 仅钳下限——手改 config.ini 或直调 API 传 1000 会真实生效。
@@ -83,7 +92,7 @@
 
 ### 准备
 1. config.ini `[llm]` 配好 provider（先 openai_compat 再 anthropic 各跑一轮）
-2. 建 summary job，开 `memory_enabled=true`、`memory_limit=5`
+2. 建 summary job，`memory_limit=5`（>0 即开启记忆特性；`related_limit=3` 可选）
 3. 自检脚本打底：`uv run python scripts/memory_selfcheck.py` → 应全部 OK
 
 ### 场景 1｜写入 + 用量归属（W2 验证点）

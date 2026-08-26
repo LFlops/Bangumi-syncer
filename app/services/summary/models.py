@@ -22,19 +22,22 @@ class SummaryJobConfig:
         "5. 限制在 300 字以内"
     )
     max_records: int = -1  # -1 表示不限制
-    memory_enabled: bool = False  # 记忆开关（默认关闭，每任务显式声明）
-    memory_limit: int = 5  # 注入记忆条数（最小值 1，仅 enabled=true 时生效）
+    # 记忆特性（未发布，直接重构）：
+    # memory_limit=0 关闭记忆（不注入/不写入/不排除已消费记录）；
+    # >0 注入最近 N 条摘要 + 已消费记录排除（信息由摘要承继）。
+    memory_limit: int = 0  # 0=关；1–1000=注入最近 N 条摘要（对齐 prune 上限）
+    related_limit: int = 0  # 0=关；1–1000=同剧关联最近 N 条（日期倒序）
 
     @classmethod
     def from_config_dict(cls, data: dict) -> SummaryJobConfig:
         """从 config_manager.get_summary_configs() 字典创建实例。"""
 
-        def _memory_limit() -> int:
+        def _limit(key: str) -> int:
             try:
-                # 对齐前端约定（1–50）：上限防呆——过大值注入 token 成本线性膨胀
-                return min(50, max(1, int(data.get("memory_limit", 5))))
+                # 0–1000，负值/非法回落 0
+                return max(0, min(1000, int(data.get(key, 0))))
             except (TypeError, ValueError):
-                return 5
+                return 0
 
         return cls(
             name=str(data.get("name", "")),
@@ -46,10 +49,8 @@ class SummaryJobConfig:
             user_name=str(data.get("user_name", "")),
             system_prompt=str(data.get("system_prompt", cls.system_prompt)),
             max_records=int(data.get("max_records", -1)),
-            memory_enabled=data.get("memory_enabled", False)
-            if isinstance(data.get("memory_enabled"), bool)
-            else str(data.get("memory_enabled", "false")).lower() in ("true", "1"),
-            memory_limit=_memory_limit(),
+            memory_limit=_limit("memory_limit"),
+            related_limit=_limit("related_limit"),
         )
 
 

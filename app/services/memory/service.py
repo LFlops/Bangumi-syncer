@@ -64,6 +64,20 @@ class MemoryService:
             job_name=job_name,
         )
 
+    def recent(self, task_type: str, task_id: str, limit: int = 5) -> list[MemoryEntry]:
+        """最近 N 条同任务摘要（通用，不做业务合并）。"""
+        return self._retriever.recent(task_type, task_id, limit=limit)
+
+    def related(
+        self,
+        task_type: str,
+        task_id: str,
+        titles: list[str],
+        limit: int = 5,
+    ) -> list[MemoryEntry]:
+        """同剧关联摘要（含归档冷层，日期倒序）。"""
+        return self._retriever.related(task_type, task_id, titles, limit=limit)
+
     def retrieve(
         self,
         task_type: str,
@@ -71,6 +85,7 @@ class MemoryService:
         limit: int = 5,
         keywords: list[str] | None = None,
     ) -> list[MemoryEntry]:
+        """[deprecated] 旧组合检索（recent + FTS keywords），业务层不再调用。"""
         return self._retriever.retrieve(
             task_type=task_type, task_id=task_id, limit=limit, keywords=keywords
         )

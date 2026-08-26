@@ -167,3 +167,25 @@ class TestFindOverlaps:
         records = [_record(consumed_run_id=None), _record(consumed_run_id=None, id=2)]
 
         assert retriever.find_overlaps(records) == []
+
+
+class TestGenericMethods:
+    """通用方法 recent/related（retrieve 保留 deprecated，业务合并上移 service）。"""
+
+    def test_recent_delegates_to_repo(self):
+        retriever, repo = _make_retriever()
+        repo.get_recent.return_value = [_entry("run-1")]
+        assert retriever.recent("summary", "summary-daily", limit=3) == [
+            _entry("run-1")
+        ]
+        repo.get_recent.assert_called_once_with("summary", "summary-daily", limit=3)
+
+    def test_related_delegates_to_repo(self):
+        retriever, repo = _make_retriever()
+        repo.get_related_titles.return_value = [_entry("run-9")]
+        assert retriever.related(
+            "summary", "summary-daily", ["葬送的芙莉莲"], limit=2
+        ) == [_entry("run-9")]
+        repo.get_related_titles.assert_called_once_with(
+            "summary", "summary-daily", ["葬送的芙莉莲"], limit=2
+        )

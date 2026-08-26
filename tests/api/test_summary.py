@@ -735,9 +735,18 @@ class TestTestLLMConnection:
                 assert response.status_code == 200
                 data = response.json()
                 assert data["success"] is True
-                assert "Hello! How can I help you?" in data["message"]
+                # 响应不含回复正文（S12：message 为固定文案，短回复截停无展示价值）
+                assert data["message"] == "连接成功"
+                assert "Hello! How can I help you?" not in data["message"]
                 assert data["model"] == "gpt-4o-mini"
                 assert data["latency_ms"] is not None
+                # 连通性 ping 应限制生成长度（max_tokens=8）且 prompt 极简
+                call_kwargs = mock_client.chat.await_args.kwargs
+                assert call_kwargs["max_tokens"] == 8
+                assert call_kwargs["job_name"] == "llm_test"
+                msgs = mock_client.chat.await_args.args[0]
+                assert len(msgs) == 1
+                assert msgs[0].content == "ping"
 
     @pytest.mark.asyncio
     async def test_llm_connection_failure(self):
@@ -1419,3 +1428,89 @@ class TestRenameMemoryLinkage:
                     json={"cron": "0 8 * * *"},
                 )
                 mock_memory.rename_task.assert_not_called()
+
+
+class TestMemoryStatsApi:
+    """S10'/S11'：memory-stats 返回记忆总量与注入估算（绝对量，无百分比）。"""
+
+    @pytest.mark.asyncio
+    async def test_stats_with_no_memory(self):
+        """空记忆：count=0、avg=0、注入估算=0（related_limit 只算配置上限）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch(
+                    "app.api.summary_jobs.database_manager.memory.get_recent",
+                    return_value=[],
+                ) as mock_recent,
+            ):
+                mock_cm.get_summary_configs.return_value = [
+                    {"name": "daily", "memory_limit": "5", "related_limit": "3"}
+                ]
+                response = await client.get("/api/summary/jobs/daily/memory-stats")
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert data["total_count"] == 0
+        assert data["total_chars"] == 0
+        assert data["avg_chars"] == 0
+        assert data["memory_limit"] == 5
+        assert data["related_limit"] == 3
+        assert data["injected_estimate_tokens"] == 0
+        mock_recent.assert_called_once_with("summary", "summary-daily", limit=1000)
+
+    @pytest.mark.asyncio
+    async def test_stats_with_accumulated_memory(self):
+        """有记忆：count/chars 正确；估算 = (min(count,limit)+related)×avg×0.7。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.memory.models import MemoryEntry
+
+        app = _make_summary_app()
+        entries = [
+            MemoryEntry(run_id="r-1", summary="芙莉莲S1E10" * 10),  # 100 字
+            MemoryEntry(run_id="r-2", summary="鬼灭S3E5" * 10),  # 100 字
+            MemoryEntry(run_id="r-3", summary="葬送S2E1" * 10),  # 100 字
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch(
+                    "app.api.summary_jobs.database_manager.memory.get_recent",
+                    return_value=entries,
+                ),
+            ):
+                mock_cm.get_summary_configs.return_value = [
+                    {"name": "daily", "memory_limit": "2", "related_limit": "1"}
+                ]
+                response = await client.get("/api/summary/jobs/daily/memory-stats")
+
+        data = response.json()["data"]
+        assert data["total_count"] == 3
+        assert data["total_chars"] == 200  # 80 + 60 + 60
+        assert data["avg_chars"] == 67  # round(200/3)
+        # (min(3,2)+1) × 67 × 0.7 = 3 × 46.9 = 140.7 → round
+        assert data["injected_estimate_tokens"] == 141
+
+    @pytest.mark.asyncio
+    async def test_stats_missing_job_404(self):
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                mock_cm.get_summary_configs.return_value = []
+                response = await client.get("/api/summary/jobs/nope/memory-stats")
+                assert response.status_code == 404

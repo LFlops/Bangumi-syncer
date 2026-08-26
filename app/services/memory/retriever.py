@@ -1,4 +1,4 @@
-"""记忆读取器：检索历史记忆、格式化注入文本、识别窗口重叠。"""
+"""记忆读取器：通用检索方法（业务合并/去重/排序在 SummaryService 层）。"""
 
 from __future__ import annotations
 
@@ -17,6 +17,28 @@ class MemoryRetriever:
     def __init__(self, repo: AgentMemoryRepository):
         self._repo = repo
 
+    # ------------------------------------------------------------------
+    # 通用检索（业务层组合调用：summary service 自行合并/去重/排序）
+    # ------------------------------------------------------------------
+
+    def recent(self, task_type: str, task_id: str, limit: int = 5) -> list[MemoryEntry]:
+        """最近 N 次同任务执行摘要（连续性）。"""
+        return self._repo.get_recent(task_type, task_id, limit=limit)
+
+    def related(
+        self,
+        task_type: str,
+        task_id: str,
+        titles: list[str],
+        limit: int = 5,
+    ) -> list[MemoryEntry]:
+        """同剧关联：按剧名反查历史总结（含归档冷层，日期倒序）。"""
+        return self._repo.get_related_titles(task_type, task_id, titles, limit=limit)
+
+    # ------------------------------------------------------------------
+    # 旧组合检索（deprecated）
+    # ------------------------------------------------------------------
+
     def retrieve(
         self,
         task_type: str,
@@ -24,12 +46,11 @@ class MemoryRetriever:
         limit: int = 5,
         keywords: list[str] | None = None,
     ) -> list[MemoryEntry]:
-        """检索历史记忆：recent 取 limit 条（连续性）+ keywords 命中全保留（相关性）。
+        """[deprecated] 旧组合检索：recent + FTS keywords。
 
-        keywords 命中**不占 memory_limit 额度**——recent 是"上下文连续性"、
-        keywords 是"主题相关性"（今日明细标题捞窗口外相关历史），目的不同都注入；
-        总量 = limit + keywords 命中数（命中通常少，token 可控）。
-        （Phase 2.3 引入 feedback 后，此处再增加"feedback 全量优先"）
+        FTS 检索已停用（相关回忆由 related 联表承担，见
+        specs/agent-phase2-closeout.md §FTS 停用决议）；本方法仅保留
+        keywords/FTS 通路供后续 Phase 5 混合检索评估，业务层不再调用。
         """
         entries: list[MemoryEntry] = []
 

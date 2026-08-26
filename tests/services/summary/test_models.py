@@ -36,8 +36,8 @@ def test_from_config_dict_defaults_empty():
     assert cfg.user_name == ""
     assert cfg.system_prompt == SummaryJobConfig.system_prompt
     assert cfg.max_records == -1
-    assert cfg.memory_enabled is False  # 默认关闭（保守：存量行为不变）
-    assert cfg.memory_limit == 5
+    assert cfg.memory_limit == 0  # 默认关闭（0=关）
+    assert cfg.related_limit == 0
 
 
 def test_from_config_dict_defaults_minimal():
@@ -75,42 +75,72 @@ def test_enabled_already_bool():
     assert cfg_false.enabled is False
 
 
-# ── memory_enabled / memory_limit（R6 配置透传）──────────────────────────
+# ── memory_limit / related_limit（R6 配置透传，0=关）────────────────────
 
 
 def test_memory_config_parsed():
-    """R6：[summary-xxx] memory_enabled=true、memory_limit=3 → 透传。"""
+    """R6：[summary-xxx] memory_limit=3、related_limit=2 → 透传。"""
     cfg = SummaryJobConfig.from_config_dict(
-        {"name": "daily", "memory_enabled": "true", "memory_limit": "3"}
+        {"name": "daily", "memory_limit": "3", "related_limit": "2"}
     )
-    assert cfg.memory_enabled is True
     assert cfg.memory_limit == 3
+    assert cfg.related_limit == 2
 
 
-def test_memory_enabled_bool_variants():
-    for value in ("true", "True", "TRUE", "1", True):
-        cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_enabled": value})
-        assert cfg.memory_enabled is True, f"memory_enabled={value!r} should be True"
-    for value in ("false", "False", "FALSE", "0", False):
-        cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_enabled": value})
-        assert cfg.memory_enabled is False, f"memory_enabled={value!r} should be False"
+def test_memory_defaults_closed():
+    """缺省 = 0（记忆特性关闭），不隐式开启。"""
+    cfg = SummaryJobConfig.from_config_dict({"name": "t"})
+    assert cfg.memory_limit == 0
+    assert cfg.related_limit == 0
 
 
-def test_memory_limit_min_one():
-    """memory_limit 最小值 1（0/负值回落，不用 0 表示关闭）。"""
-    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "0"})
-    assert cfg.memory_limit == 1
+def test_memory_limit_scale_0_to_1000():
+    """0=关、1–1000 生效；负值/超 1000/非法回落 0。"""
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "memory_limit": "0"}
+        ).memory_limit
+        == 0
+    )
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "memory_limit": "1000"}
+        ).memory_limit
+        == 1000
+    )
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "memory_limit": "1001"}
+        ).memory_limit
+        == 1000
+    )
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "memory_limit": "-5"}
+        ).memory_limit
+        == 0
+    )
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "memory_limit": "abc"}
+        ).memory_limit
+        == 0
+    )
 
 
-def test_memory_limit_caps_at_50():
-    """E3 定稿：上限对齐前端约定 1–50（手改 config.ini 传 1000 → 钳到 50）。"""
-    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "1000"})
-    assert cfg.memory_limit == 50
-
-
-def test_memory_limit_invalid_falls_back():
-    cfg = SummaryJobConfig.from_config_dict({"name": "t", "memory_limit": "abc"})
-    assert cfg.memory_limit == 5
+def test_related_limit_scale_0_to_1000():
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "related_limit": "1001"}
+        ).related_limit
+        == 1000
+    )
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "related_limit": "-1"}
+        ).related_limit
+        == 0
+    )
 
 
 # ── int coercion ──────────────────────────────────────────────────────

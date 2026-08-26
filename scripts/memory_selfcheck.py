@@ -123,6 +123,10 @@ def _check(db: sqlite3.Connection) -> bool:
 
 def _keywords_demo(db: sqlite3.Connection, keywords: list[str]) -> None:
     print(f"== 8. FTS 关键词演示（{', '.join(keywords)}） ==")
+    print(
+        f"  {WARN}(deprecated：FTS 检索已停用，相关回忆由联表反查承担；"
+        f"本段仅验证物理索引健康，见 closeout §5){END}"
+    )
     terms = ['"' + t.replace('"', '""') + '"' for t in keywords if len(t.strip()) >= 3]
     if not terms:
         print("  （关键词都短于 3 字符，trigram 无法命中）")
@@ -141,10 +145,38 @@ def _keywords_demo(db: sqlite3.Connection, keywords: list[str]) -> None:
         print(f"  {WARN}(无命中——先确认该关键词出现在某条 summary 摘要中){END}")
 
 
+def _titles_demo(db: sqlite3.Connection, titles: list[str]) -> None:
+    """联表反查演示（线上等价于 get_related_titles）：同步记录消费标记 → 摘要。"""
+    print(f"== 9. 同剧关联演示（{', '.join(titles)}） ==")
+    placeholders = ",".join("?" * len(titles))
+    rows = db.execute(
+        f"""SELECT m.task_id, m.run_id, substr(m.summary,1,60), '热层' AS layer, m.created_at
+            FROM agent_working_memory m
+            JOIN sync_records s ON s.consumed_run_id = m.run_id
+            WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
+           UNION
+           SELECT m.task_id, m.run_id, substr(m.summary,1,60), '冷层' AS layer, m.created_at
+            FROM agent_working_memory_archive m
+            JOIN sync_records s ON s.consumed_run_id = m.run_id
+            WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
+           ORDER BY created_at DESC, id DESC LIMIT 5""",
+        (*titles, *titles),
+    ).fetchall()
+    for r in rows:
+        print(f"  [{r[3]}] {r[0]:<20} {r[1][:8]:<10} {r[4]}  {r[2]}...")
+    if not rows:
+        print(
+            f"  {WARN}(无命中——需先有：同剧记录被某次总结消费过（consumed_run_id 非空）){END}"
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", default=str(DB_DEFAULT), help="SQLite 库路径")
-    parser.add_argument("--keywords", nargs="*", default=[], help="FTS 演示关键词")
+    parser.add_argument(
+        "--keywords", nargs="*", default=[], help="FTS 演示关键词(deprecated)"
+    )
+    parser.add_argument("--titles", nargs="*", default=[], help="同剧关联演示（剧名）")
     args = parser.parse_args()
 
     path = Path(args.db)
@@ -160,6 +192,8 @@ def main() -> int:
         ok = _check(db)
         if args.keywords:
             _keywords_demo(db, args.keywords)
+        if args.titles:
+            _titles_demo(db, args.titles)
     finally:
         db.close()
 

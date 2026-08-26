@@ -10,12 +10,9 @@ from app.services.llm.models import ChatResponse
 from .models import MemoryEntry
 
 _SUMMARY_PROMPT = (
-    "请用一句话总结以下追番总结的内容（不超过 100 字），保留关键信息："
-    "看了哪些番剧、进度、异常情况。必须列出本次涉及的全部番剧名"
-    "（进度可从简，番剧名供后续关键词检索召回本条记忆）。只输出摘要本身。"
+    "请用一句话总结以下追番总结的内容（50–100 字为宜，根据内容量自然把握），"
+    "保留关键信息：看了哪些番剧、进度、异常情况。只输出摘要本身。"
 )
-
-_SUMMARY_MAX_LEN = 200
 
 
 class MemoryExtractor:
@@ -78,7 +75,9 @@ class MemoryExtractor:
             llm = self._llm or get_llm_client()
             resp = await llm.chat(summary_messages, job_name=job_name)
             if resp.content:
-                return resp.content.strip()[:_SUMMARY_MAX_LEN]
+                return resp.content.strip()
         except Exception as e:
-            logger.warning(f"摘要 LLM 调用失败，使用规则截取: {e}")
-        return response.content.strip()[:_SUMMARY_MAX_LEN]  # 规则兜底：截断
+            # LLM 摘要失败：跳过不写记忆（与空响应同路径）——不保留截断兜底，
+            # 保证所有入库摘要均为 LLM 完整输出、零截断（见 closeout §4 修订）
+            logger.warning(f"摘要 LLM 调用失败，跳过记忆写入: {e}")
+        return ""

@@ -168,3 +168,43 @@ async def clear_summary_job_memory(
         "message": "任务记忆已清空",
         "deleted_records": deleted,
     }
+
+
+@router.get("/{name:path}/memory-stats")
+async def summary_job_memory_stats(name: str, _=Depends(get_current_user_flexible)):
+    """记忆规模统计：该任务已积累多少记忆、按当前配置将注入多大上下文。
+
+    返回绝对量（不做百分比）：
+    - total_count / total_chars / avg_chars：任务已积累的摘要规模（热层）
+    - memory_limit / related_limit：当前配置
+    - injected_estimate_tokens：按配置估算的注入量（估算口径：
+      字符数 × 0.7 粗略中文 token 系数，见 closeout §评测；仅展示参考）
+    """
+    decoded = unquote(name)
+    _find_config(decoded)  # 任务不存在 404
+    task_id = f"summary-{decoded}"
+
+    rows = database_manager.memory.get_recent("summary", task_id, limit=1000)
+    total_count = len(rows)
+    total_chars = sum(len(e.summary) for e in rows)
+    avg_chars = round(total_chars / total_count) if total_count else 0
+
+    cfg = SummaryJobConfig.from_config_dict(_find_config(decoded))
+    memory_limit = cfg.memory_limit
+    related_limit = cfg.related_limit
+    # 估算：recent 注入 = min(存量, memory_limit) 条；related 按配置深度估算
+    injected_count = min(total_count, memory_limit) + related_limit
+    injected_estimate_tokens = round(injected_count * avg_chars * 0.7)
+
+    return {
+        "status": "success",
+        "data": {
+            "task_id": task_id,
+            "total_count": total_count,
+            "total_chars": total_chars,
+            "avg_chars": avg_chars,
+            "memory_limit": memory_limit,
+            "related_limit": related_limit,
+            "injected_estimate_tokens": injected_estimate_tokens,
+        },
+    }

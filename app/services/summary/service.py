@@ -9,6 +9,7 @@ from app.core.database import database_manager
 from app.core.logging import logger
 
 from ..llm import Message, get_llm_client
+from ..memory.models import MemoryEntry
 from ..memory.service import MemoryService
 from ..notification_service import notification_service
 from .models import SummaryJobConfig, SummaryRecord
@@ -19,7 +20,6 @@ _USER_PROMPT_TEMPLATE = (
 )
 
 _MEMORY_SECTION = "## 历史执行上下文"
-_OVERLAP_NOTE = "以下记录已在上次总结中覆盖，可简述或跳过，不必重复展开：\n"
 
 # 执行阶段（execute_job 出错时用于定位失败环节；任何阶段失败都会通知，文案按阶段区分）
 _STAGE_QUERY = "query"  # 查询明细 + 注入记忆 + 构建消息
@@ -122,37 +122,42 @@ class SummaryService:
     def _build_memory_context(
         self, job_config: SummaryJobConfig, task_id: str, records: list[SummaryRecord]
     ) -> str:
-        """检索历史记忆并格式化为注入文本（含重叠标注）。"""
-        # 关键词 = 今日明细标题提取（规则提取，bgm_title 去重取前 5）
-        keywords: list[str] = []
-        seen: set[str] = set()
-        for r in records:
-            t = r.bgm_title
-            if t and t not in seen:
-                seen.add(t)
-                keywords.append(t)
-            if len(keywords) >= 5:
-                break
-        past_memories = self.memory.retrieve(
-            task_type="summary",
-            task_id=task_id,
-            limit=job_config.memory_limit,
-            keywords=keywords,
-        )
-        context = self.memory.format_memory_context(past_memories)
+        """注入文本：recent（最近 N 条摘要）+ related（同剧关联）合并去重。
 
-        # 窗口重叠标注：今日明细中已被消费的记录提示简述/跳过
-        # （context 为空时直接以标注开头，避免前导空行，见 hy-review20260817 #9）
-        overlaps = self.memory.find_overlaps(records)
-        if overlaps:
-            lines = "\n".join(
-                f"- {r.bgm_title} S{r.season}E{r.episode}"
-                f"（已消费于总结 {r.consumed_run_id[:8]}）"
-                for r in overlaps[:20]
-            )
-            note = f"{_OVERLAP_NOTE}{lines}"
-            context = f"{context}\n{note}" if context else note
-        return context
+        合并/去重/排序在 service 层完成（MemoryRetriever 保持通用方法）：
+        recent 在前（连续性优先），related 随后（跨窗口回忆）冠 [同剧历史] 前缀；
+        按 run_id 去重防双路径命中。
+        """
+        merged: list[tuple[MemoryEntry, bool]] = []  # (entry, is_related)
+        seen: set[str] = set()
+
+        # 1. 最近 N 条摘要（连续性）
+        if job_config.memory_limit > 0:
+            for e in self.memory.recent(
+                "summary", task_id, limit=job_config.memory_limit
+            ):
+                if e.run_id not in seen:
+                    seen.add(e.run_id)
+                    merged.append((e, False))
+
+        # 2. 同剧关联（跨窗口回忆；日期倒序最近 N 条，不占 memory_limit 额度）
+        if job_config.related_limit > 0:
+            titles = list(
+                dict.fromkeys(r.bgm_title for r in records if r.bgm_title)
+            )  # 去重且保序
+            if titles:
+                for e in self.memory.related(
+                    "summary", task_id, titles, limit=job_config.related_limit
+                ):
+                    if e.run_id not in seen:
+                        seen.add(e.run_id)
+                        merged.append((e, True))
+
+        lines = []
+        for e, is_related in merged:
+            prefix = "[同剧历史] " if is_related else ""
+            lines.append(f"- {prefix}{e.summary}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # 对外入口
@@ -196,12 +201,19 @@ class SummaryService:
         task_id = f"summary-{job_config.name}"
         stage = _STAGE_QUERY
         try:
-            # 1. 查询明细 + 注入记忆 + 构建消息
+            # 1. 查询明细
             records, date_from, date_to = self._query_records(job_config)
 
-            # 注入历史上下文（memory_enabled 开关短路，不调 retrieve）
+            # 记忆开启（memory_limit>0）时：已消费记录不进 prompt（信息由摘要承继，
+            # 避免重复总结、提升连贯性）；消费标记只标新记录（extract_and_store 用
+            # 过滤后的 records 列表）
+            memory_enabled = job_config.memory_limit > 0
+            if memory_enabled:
+                records = [r for r in records if r.consumed_run_id is None]
+
+            # 注入历史上下文（memory_limit=0 时短路）
             memory_context = ""
-            if job_config.memory_enabled:
+            if memory_enabled:
                 memory_context = self._build_memory_context(
                     job_config, task_id, records
                 )
@@ -223,8 +235,8 @@ class SummaryService:
                 job_name=job_config.name,
             )
 
-            # 3. 提取记忆（读写同开关：memory_enabled=false 不注入也不写入）
-            if job_config.memory_enabled:
+            # 3. 提取记忆（读写同开关：memory_limit=0 不注入也不写入）
+            if memory_enabled:
                 stage = _STAGE_STORE
                 run_id = str(uuid4())  # 单次执行的唯一标识（记忆写入与消费标记共用）
                 await self.memory.extract_and_store(
@@ -235,7 +247,7 @@ class SummaryService:
                     response=response,  # 响应：summary 生成 + full_text 存储
                     outcome="success",
                     tokens_used=response.usage.total_tokens if response.usage else 0,
-                    record_ids=[r.id for r in records],  # 同一事务标记消费
+                    record_ids=[r.id for r in records],  # 同一事务标记消费（仅新记录）
                     job_name=job_config.name,  # 摘要调用用量归属 llm_usage
                 )
 

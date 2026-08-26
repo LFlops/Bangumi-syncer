@@ -530,3 +530,78 @@ class TestClearTask:
         recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
         marked = [r for r in recs if r["consumed_run_id"] is not None]
         assert marked == []
+
+
+# ── 同剧关联联表（S5/S6/S7：get_related_titles）─────────────────────
+
+
+class TestGetRelatedTitles:
+    """按剧名反查历史总结：consumed_run_id 联表，主表+归档 UNION。"""
+
+    def test_empty_titles_short_circuits(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        assert (
+            db.memory.get_related_titles("summary", "summary-daily", [], limit=5) == []
+        )
+        assert (
+            db.memory.get_related_titles(
+                "summary", "summary-daily", ["", "  "], limit=5
+            )
+            == []
+        )
+
+    def test_hits_main_and_archive(self, temp_dir, reset_singletons):
+        db = _make_db(temp_dir)
+        # run-1 消费了《葬送的芙莉莲》记录（主表）
+        r1 = _log_record(db, bgm_title="葬送的芙莉莲")
+        db.memory.store_and_mark(_entry("run-1", summary="芙莉莲 S1E10"), [r1])
+        # run-2 消费《鬼灭之刃》记录后归档（冷层）
+        r2 = _log_record(db, title="鬼灭之刃", bgm_title="鬼灭之刃")
+        db.memory.store_and_mark(_entry("run-2", summary="鬼灭 S3E5"), [r2])
+        # prune run-2 到归档
+        db.memory.prune("summary", "summary-daily", keep=0)
+
+        hits = db.memory.get_related_titles(
+            "summary", "summary-daily", ["葬送的芙莉莲", "鬼灭之刃"], limit=5
+        )
+        run_ids = {h.run_id for h in hits}
+        assert run_ids == {"run-1", "run-2"}  # 主表 + 归档冷层都命中
+
+    def test_same_run_multi_episodes_deduped(self, temp_dir, reset_singletons):
+        """S6：同剧 12 集被同一次总结消费 → GROUP BY m.id 只返回一条。"""
+        db = _make_db(temp_dir)
+        ids = [
+            _log_record(db, bgm_title="葬送的芙莉莲", episode=i) for i in range(1, 4)
+        ]
+        db.memory.store_and_mark(_entry("run-1", summary="芙莉莲三集"), ids)
+
+        hits = db.memory.get_related_titles(
+            "summary", "summary-daily", ["葬送的芙莉莲"], limit=5
+        )
+        assert len(hits) == 1
+        assert hits[0].run_id == "run-1"
+
+    def test_task_isolation(self, temp_dir, reset_singletons):
+        """任务隔离：其他任务的记忆不命中。"""
+        db = _make_db(temp_dir)
+        r = _log_record(db, bgm_title="葬送的芙莉莲")
+        db.memory.store_and_mark(
+            _entry("run-1", summary="芙莉莲", task_id="summary-weekly"), [r]
+        )
+
+        hits = db.memory.get_related_titles(
+            "summary", "summary-daily", ["葬送的芙莉莲"], limit=5
+        )
+        assert hits == []
+
+    def test_order_desc_and_limit(self, temp_dir, reset_singletons):
+        """日期倒序 + LIMIT 生效。"""
+        db = _make_db(temp_dir)
+        for i in range(3):
+            r = _log_record(db, bgm_title="葬送的芙莉莲", episode=i + 1)
+            db.memory.store_and_mark(_entry(f"run-{i}", summary=f"第{i}次"), [r])
+
+        hits = db.memory.get_related_titles(
+            "summary", "summary-daily", ["葬送的芙莉莲"], limit=2
+        )
+        assert [h.run_id for h in hits] == ["run-2", "run-1"]  # 倒序取最近 2

@@ -202,10 +202,68 @@ class AgentMemoryRepository(BaseRepository):
 
         return self._run_read(_read, error_msg="获取最近任务记忆失败", default=[])
 
+    def get_related_titles(
+        self,
+        task_type: str,
+        task_id: str,
+        titles: list[str],
+        limit: int = 5,
+    ) -> list[MemoryEntry]:
+        """同剧关联：按今日记录的剧名反查历史总结（日期倒序最近 N 条）。
+
+        机制：sync_records.consumed_run_id 是"该记录被哪次总结消费过"的显式
+        关联——以今日 bgm_title 集合为键，联表 JOIN 主表 + 归档表 UNION，
+        即"同类剧目的历史总结"（含已归档冷层）。比 FTS 子串猜测更精确，
+        且自然覆盖冷层（消费标记不随 prune 清理）。
+
+        边界：titles 为空/全空 → 短路返回 []；同剧多集被同一次总结消费 →
+        GROUP BY m.id 去重；主表/归档表同 run_id 不可能共存（run_id UNIQUE，
+        prune 搬家）→ UNION 天然去重；排序 = get_recent 同款稳定序；
+        性能：bgm_title 暂无索引，全表扫 JOIN（10 万行内毫秒级），
+        超量预案见 closeout §3 性能注记。
+        """
+        clean = [t for t in titles if t and t.strip()]
+        if not clean:
+            return []
+        placeholders = ",".join("?" * len(clean))
+
+        def _read(conn):
+            cursor = conn.execute(
+                f"""
+                SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,
+                       m.full_text, m.outcome, m.tokens_used, m.created_at
+                FROM agent_working_memory m
+                JOIN sync_records s ON s.consumed_run_id = m.run_id
+                WHERE s.bgm_title IN ({placeholders})
+                  AND m.task_type = ? AND m.task_id = ?
+                GROUP BY m.id
+                UNION
+                SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,
+                       m.full_text, m.outcome, m.tokens_used, m.created_at
+                FROM agent_working_memory_archive m
+                JOIN sync_records s ON s.consumed_run_id = m.run_id
+                WHERE s.bgm_title IN ({placeholders})
+                  AND m.task_type = ? AND m.task_id = ?
+                GROUP BY m.id
+                -- UNION 结果集列名取自首个 SELECT，排序用序号避免列名歧义
+                ORDER BY 9 DESC, 1 DESC
+                LIMIT ?
+                """,
+                (*clean, task_type, task_id, *clean, task_type, task_id, limit),
+            )
+            return [MemoryEntry.from_row(row) for row in cursor.fetchall()]
+
+        return self._run_read(_read, error_msg="获取同剧关联记忆失败", default=[])
+
     def search_fts(
         self, terms: list[str], task_type: str, limit: int = 5
     ) -> list[MemoryEntry]:
-        """FTS5 全文检索（热记忆），按 task_type 过滤。
+        """[deprecated] FTS5 全文检索（热记忆），按 task_type 过滤。
+
+        **已停用**：相关回忆由 get_related_titles（联表反查）承担——FTS 搜索的
+        输入（标题词）与联表相同，而联表经 consumed_run_id 显式关联更精确、
+        且覆盖归档冷层。物理结构（虚表/触发器/索引）保留，供 Phase 5
+        混合检索（FTS5 + 向量，RRF 融合）复用；无业务调用方。
 
         多关键词 OR 连接（任一命中即相关——关键词是今日明细标题，目的
         是捞回与任一标题相关的历史记忆）；**每个关键词作为一个整体短语**

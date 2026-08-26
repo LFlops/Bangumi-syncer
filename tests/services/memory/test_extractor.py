@@ -78,25 +78,6 @@ class TestExtractAndStore:
 
         repo.prune.assert_called_once_with("summary", "summary-daily", keep=1000)
 
-    @pytest.mark.asyncio
-    async def test_summary_truncated_to_200_chars(self):
-        long_text = "长" * 500
-        extractor, repo, llm = _make_extractor()
-        llm.chat = AsyncMock(return_value=ChatResponse(content=long_text, model="m"))
-
-        await extractor.extract_and_store(
-            task_type="summary",
-            task_id="summary-daily",
-            run_id="run-1",
-            messages=_messages(),
-            response=_response(),
-            outcome="success",
-            tokens_used=0,
-            record_ids=[],
-        )
-        entry = repo.store_and_mark.call_args.args[0]
-        assert len(entry.summary) == 200
-
 
 # ── W2 摘要 LLM 失败规则兜底 ────────────────────────────────────────────
 
@@ -120,31 +101,67 @@ class TestLazyLlmClient:
         mock_llm.chat.assert_awaited_once()
 
 
-class TestSummarizeFallback:
+# ── 摘要失败跳过不写（S9：无截断兜底，所有入库摘要均为 LLM 完整输出）──────
+
+
+class TestSummarizeFailSkips:
     @pytest.mark.asyncio
-    async def test_llm_exception_falls_back_to_truncated_content(self):
-        """W2：_summarize LLM 抛异常 → 不抛，规则截断兜底。"""
+    async def test_llm_exception_returns_empty_and_skips_write(self):
+        """S9：_summarize LLM 抛异常 → 返回空串（不写记忆，无截断兜底）。"""
         extractor, repo, llm = _make_extractor()
         llm.chat = AsyncMock(side_effect=RuntimeError("llm down"))
-        response = _response("规则截断的全文内容" * 30)
+        response = _response("很长的全文" * 100)
 
         summary = await extractor._summarize(_messages(), response)
 
-        assert summary == ("规则截断的全文内容" * 30)[:200]
+        assert summary == ""
+        # extract_and_store 空摘要时跳过写入（同空响应路径）
+        await extractor.extract_and_store(
+            task_type="summary",
+            task_id="summary-daily",
+            run_id="run-1",
+            messages=_messages(),
+            response=response,
+            outcome="success",
+            tokens_used=0,
+            record_ids=[],
+        )
+        repo.store_and_mark.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_empty_llm_summary_falls_back_to_truncated_content(self):
-        """摘要 LLM 返回空内容 → 规则截断兜底。"""
+    async def test_empty_llm_summary_returns_empty(self):
+        """摘要 LLM 返回空内容 → 返回空串，不写记忆。"""
         extractor, repo, llm = _make_extractor()
         llm.chat = AsyncMock(return_value=ChatResponse(content="", model="m"))
         response = _response("兜底全文" * 100)
 
         summary = await extractor._summarize(_messages(), response)
 
-        assert summary == ("兜底全文" * 100)[:200]
+        assert summary == ""
+
+    @pytest.mark.asyncio
+    async def test_long_summary_kept_intact(self):
+        """S8：成功路径零截断——LLM 输出多长存多长（无 _SUMMARY_MAX_LEN）。"""
+        long_text = "长" * 500
+        extractor, repo, llm = _make_extractor()
+        llm.chat = AsyncMock(return_value=ChatResponse(content=long_text, model="m"))
+        response = _response("全文")
+
+        await extractor.extract_and_store(
+            task_type="summary",
+            task_id="summary-daily",
+            run_id="run-1",
+            messages=_messages(),
+            response=response,
+            outcome="success",
+            tokens_used=0,
+            record_ids=[],
+        )
+        entry: MemoryEntry = repo.store_and_mark.call_args.args[0]
+        assert entry.summary == long_text  # 500 字完整原文
 
 
-# ── W3 空响应不写记忆 ───────────────────────────────────────────────────
+# ── 空响应不写记忆 ───────────────────────────────────────────────────
 
 
 class TestEmptyResponse:

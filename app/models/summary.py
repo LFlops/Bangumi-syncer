@@ -57,9 +57,9 @@ class SummaryJobCreate(BaseModel):
     system_prompt: str = ""
     max_records: int = -1  # -1 表示不限制
     enabled: bool = True
-    memory_enabled: bool = False  # 记忆开关（默认关闭）
-    # 对齐前端约定 1–50（templates/config.html min/max）；过大值注入 token 成本线性膨胀
-    memory_limit: int = Field(default=5, ge=1, le=50)  # 注入记忆条数
+    # 记忆特性（未发布）：0=关闭；1–1000=注入最近 N 条摘要（对齐 prune 上限）
+    memory_limit: int = Field(default=0, ge=0, le=1000)
+    related_limit: int = Field(default=0, ge=0, le=1000)  # 0=关；>0=同剧关联最近 N 条
 
 
 class SummaryJobUpdate(BaseModel):
@@ -72,8 +72,8 @@ class SummaryJobUpdate(BaseModel):
     system_prompt: Optional[str] = None
     max_records: Optional[int] = None
     enabled: Optional[bool] = None
-    memory_enabled: Optional[bool] = None
-    memory_limit: Optional[int] = Field(default=None, ge=1, le=50)
+    memory_limit: Optional[int] = Field(default=None, ge=0, le=1000)
+    related_limit: Optional[int] = Field(default=None, ge=0, le=1000)
 
 
 class SummaryJobResponse(BaseModel):
@@ -86,8 +86,8 @@ class SummaryJobResponse(BaseModel):
     system_prompt: str
     max_records: int
     enabled: bool
-    memory_enabled: bool = False
-    memory_limit: int = 5
+    memory_limit: int = 0
+    related_limit: int = 0
     # 只读的 notification_type，供前端展示
     notification_type: str = ""
 
@@ -101,11 +101,11 @@ class SummaryJobResponse(BaseModel):
                 return default
             return int(v)
 
-        def _memory_limit() -> int:
+        def _limit(key: str) -> int:
             try:
-                return min(50, max(1, _int("memory_limit", 5)))
+                return max(0, min(1000, _int(key, 0)))
             except ValueError:
-                return 5
+                return 0
 
         name = str(data.get("name", ""))
         user_name = str(data.get("user_name", "") or "")
@@ -115,10 +115,6 @@ class SummaryJobResponse(BaseModel):
         if not isinstance(enabled, bool):
             enabled = str(enabled).lower() in ("true", "1")
 
-        memory_enabled = data.get("memory_enabled", False)
-        if not isinstance(memory_enabled, bool):
-            memory_enabled = str(memory_enabled).lower() in ("true", "1")
-
         return cls(
             name=str(data.get("name", "")),
             cron=str(data.get("cron", "0 21 * * *")),
@@ -127,8 +123,8 @@ class SummaryJobResponse(BaseModel):
             system_prompt=str(data.get("system_prompt", "")),
             max_records=_int("max_records", -1),
             enabled=enabled,
-            memory_enabled=memory_enabled,
-            memory_limit=_memory_limit(),
+            memory_limit=_limit("memory_limit"),
+            related_limit=_limit("related_limit"),
             notification_type=notif_type,
         )
 
