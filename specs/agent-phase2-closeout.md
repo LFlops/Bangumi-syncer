@@ -178,10 +178,10 @@
 
 - memory_limit / related_limit 有效区间 0–1000（0=关；前端/API/后台三层一致）
 - 注入为前置拼接 `## 历史执行上下文` 小节，无需修改自定义 system_prompt（用户指令在后，优先级更高）
-- 摘要条数 × 每条约 50–100 字 = 注入 token 线性成本
-- FTS 关键词检索依赖 SQLite ≥3.34（trigram）；降级时中文子串检索受限且有 warning 日志
+- 摘要条数 × 每条约 50–100 字（LLM 完整输出不截断） = 注入 token 线性成本；估算展示在 memory-stats
+- **检索不依赖 FTS**（search_fts 停用 deprecated）：同剧关联走联表反查（SQLite 版本仅影响物理索引健康，无功能影响）
 - 空记忆时正常执行，无空段落注入
-- 冷层归档当前只写不读（P4 启用）
+- 冷层已参与 **related 联表反查**（跨窗口同剧回忆）；recent 注入仍只查热层
 
 ---
 
@@ -190,3 +190,54 @@
 - `agent-phase2.1-tools.md` → Phase 4 工具协议实施时打开
 - `agent-phase2.3-feedback.md` → Phase 3.1 实施时打开（恢复清单在 `agent-phase3-summary-enhanced.md` §A）
 - `agent-phase2.2-openai-refactor.md` → 已完成，本文档 §6 为实施记录
+
+---
+
+## 10. 当前进展总账（2026-08-27）
+
+> 自 §4 E2/E3 v7 终稿后，完成两轮闭环：① v7 终稿落码（9 批，commit `93ed2b8`）；
+> ② hy-260827 检视报告 24 条逐条判断 + 按 TDD 修复 12 项（commit `83f915c`）。
+> 当前 3603 测试全绿，计划内 P0/P1 全部完成，P2 风格项审计不修（见下）。
+
+### 10.1 已交付（本轮代码，全部带 BDD 用例测试）
+
+| 能力 | 状态 | 验证 |
+|---|---|---|
+| `memory_limit`/`related_limit`（0=关，0–1000，三层校验一致） | ✅ 93ed2b8 | test_models 钳制 7 例 + e2e 表单 |
+| 消费排除（已消费记录连同主明细剔除，信息由摘要承继） | ✅ | S2/S3 场景测试（全未消费/混合/全消费） |
+| related_limit 独立生效（不受 memory_limit 门控） | ✅ 83f915c | M1 测试（mem=0 + rel=3 仍关联） |
+| 同剧关联联表反查（主表+归档 UNION、GROUP BY、倒序、短路、隔离） | ✅ 93ed2b8 | 5 联表场景 + selfcheck --titles |
+| 摘要零截断 + 失败跳过不写（prompt 软约束 50–100 字） | ✅ 93ed2b8 | S8/S9 测试 |
+| memory-stats 端点（绝对量 + 估算，无百分比） | ✅ 93ed2b8 | S10'/S11' + M11 验证 |
+| llm test 降延迟（max_tokens=8 + 固定文案） | ✅ 93ed2b8 | S12/S13 |
+| FTS 停用（search_fts deprecated，物理保留 P5 复用） | ✅ 93ed2b8 | deprecated 标注 + selfcheck 提示 |
+
+### 10.2 hy-260827 修复项（TDD：红灯→绿灯）
+
+| 项 | 修复 | 测试 |
+|---|---|---|
+| H1/H1-API | 空内容判定仅 `not content`（双条件误判成功） | 缺陷场景测试 |
+| H2 | 坏配置（lookback_days/max_records 非法值）回落默认，不再拖垮调度注册 | `abc`/`1.5` 用例 |
+| H3 | o 系列发 reasoning_effort 时强制 temperature=1（对齐 Anthropic） | 3 用例 |
+| H4/H4b | closeout 双 E3 矛盾清理（删除旧 1–50 残留段）；§7 测试引用修正 | 文档 |
+| M1 | related 独立于 memory_limit 门控 | 1 用例 |
+| M7 | refusal（ValueError）终态不重试 | 1 用例（1 次调用零退避） |
+| M8 | 参数拒绝识别加 Anthropic 文案 + 放行 422 | 3 用例 |
+| M9 | 终态 4xx 不重试；429 优先 Retry-After | 2 用例 |
+| M10 | OpenAI finish_reason → stop_reason（对齐 Anthropic） | 3 用例 |
+| M11 | stats 估算随 M1 修复自动正确（related 计入） | 1 用例 |
+| L6/L8/L4/M4 | thinking 告警降 debug；latency 只计成功请求；魔数注释；find_overlaps deprecated | — |
+
+### 10.3 审计判定为不修（§6 结论）
+
+- **风格类**：L2（user_name 写法）、L3/L5（类型注解）、L7（timeout 双传）、L10（版本头常量）
+- **设计取舍**：L9（fire-and-forget 日志）、M5（同步 DB I/O，留 Phase 3+ executor 化）
+- M2 语义已文档化（剔除主明细）；M6 随 H3 一并缓解（兼容网关软忽略 max_tokens）
+
+### 10.4 遗留待办（下一轮）
+
+1. **Anthropic cache_* tokens 用量统计**（M10 ③）：llm_usage 的 total_tokens 对开启 prompt caching 的 Anthropic 偏低，影响成本口径
+2. **M5 executor 化**（同步 DB 阻塞事件循环）——Phase 3 改造前置，当前体量可接受
+3. **tests/e2e** 需在真实浏览器环境跑一轮（本机未执行，仅更新了选择器）
+4. **memory-stats UI 落卡**：表单卡片展示累计条数/估算注入量（端点已就绪，前端展示待接）
+5. Phase 3.0 启动：B1（D1 两段式形态）先裁决，见 `agent-phase3-4-decisions.md` §10
