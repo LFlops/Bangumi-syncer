@@ -576,8 +576,8 @@ class SyncRecordsRepository(BaseRepository):
                     "media_type": row[12] or "episode",
                     "bgm_title": row[13] or "",
                     "consumed_run_id": row[14],
-                    "run_id": row[14] or "",
-                    "batch_id": row[15] or "",
+                    "run_id": row[15] or "",
+                    "batch_id": row[16] or "",
                 }
                 for row in cursor.fetchall()
             ]

@@ -83,13 +83,18 @@ def _is_terminal_error(e: Exception) -> bool:
 
 
 def _retry_delay(e: Exception, fallback: int) -> int:
-    """429 优先读取 Retry-After（秒）；其余用固定退避。"""
+    """429 优先读取 Retry-After（秒）；其余用固定退避。
+
+    顺手项 2：Retry-After 钳制到 60s 上限，避免恶意/异常端点返回超大值导致
+    请求长时间挂起（退避本就只用于吸收短暂限流，过长无收益）。
+    """
+    _RETRY_AFTER_CAP = 60
     if isinstance(e, httpx.HTTPStatusError):
         resp = getattr(e, "response", None)
         if resp is not None and getattr(resp, "status_code", None) == 429:
             ra = resp.headers.get("Retry-After")
             if ra and ra.isdigit():
-                return int(ra)
+                return min(int(ra), _RETRY_AFTER_CAP)
     return fallback
 
 
@@ -181,6 +186,8 @@ class LLMClient:
                         "LLM endpoint rejected extra params, "
                         f"degraded retry without them: {_format_error_detail(e)}"
                     )
+                    # 顺手项 1：降级重试前重置计时，避免把首次失败请求的耗时计入 latency
+                    t_attempt = time.time()
                     continue
                 # M7/M9：确定性错误（refusal/鉴权/参数类）不重试
                 if _is_terminal_error(e):

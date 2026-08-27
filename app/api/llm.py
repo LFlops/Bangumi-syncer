@@ -76,7 +76,8 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
         )
         latency = int((time.time() - t0) * 1000)
         # chat() 永不抛异常，重试耗尽时返回空响应
-        if not response.model and not response.content:
+        # H1：仅以 content 是否为空判定失败（model 存在但 content 为空仍算失败）
+        if not response.content:
             return LLMTestResponse(
                 success=False, message="LLM 调用失败（所有重试已耗尽）"
             )

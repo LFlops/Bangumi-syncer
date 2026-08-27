@@ -587,6 +587,43 @@ class TestParamRejectionDegradation:
         assert provider._extras_disabled is True
 
     @pytest.mark.asyncio
+    async def test_param_rejection_latency_excludes_failed_attempt(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """顺手项 1：降级重试不把首次失败请求耗时计入成功 latency。
+
+        首次请求返回 400 参数拒绝（模拟耗时很长），降级重试成功；latency 应只
+        计量第二次成功请求，而非 1000s 跨度。
+        """
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+
+        def _flaky(messages, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TestParamRejectionDegradation._httpx_400(
+                    '{"error": "Unrecognized request argument supplied: reasoning_effort"}'
+                )
+            return ChatResponse(content="ok", model="gpt-4o", usage=None)
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk-test", thinking_level="high"
+        )
+        provider.chat = AsyncMock(side_effect=_flaky)
+
+        # time.time 序列：首次尝试起点 1000 → 降级重置 2000 → 成功测得 2000.5
+        times = [1000.0, 2000.0, 2000.5, 2000.5, 2000.5]
+        with patch("app.services.llm.client.time.time", side_effect=times):
+            client = LLMClient()
+            client._provider = provider
+            resp = await client.chat([Message(role="user", content="Q")])
+
+        # 旧实现未重置 t_attempt → latency=(2000.5-1000)=1000ms；修复后=500ms
+        assert resp.latency == 500
+
+    @pytest.mark.asyncio
     async def test_non_param_400_no_degration(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
@@ -722,6 +759,46 @@ class TestTerminalErrorsNoRetry:
         assert resp.content == "ok"
         assert len(calls) == 2
         assert mock_sleep.await_args.args[0] == 5  # Retry-After 优先
+
+    @pytest.mark.asyncio
+    async def test_429_retry_after_capped_at_60(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """顺手项 2：429 Retry-After 超大值被钳制到 60s，避免请求长时间挂起。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+        mock_sleep = AsyncMock()
+
+        async def _limited(self, messages, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+                response = _h.Response(
+                    429,
+                    text="rate limited",
+                    request=request,
+                    headers={"Retry-After": "9999"},
+                )
+                raise _h.HTTPStatusError("Too Many", request=request, response=response)
+            return ChatResponse(content="ok", model="m", usage=None)
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _limited.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == "ok"
+        assert len(calls) == 2
+        assert mock_sleep.await_args.args[0] == 60  # 钳制到 60s 上限
 
 
 class TestParamRejectionExtended:

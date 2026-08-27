@@ -96,15 +96,19 @@ class SummaryJobResponse(BaseModel):
         """从 config_manager.get_summary_configs() 字典构建"""
 
         def _int(key: str, default: int) -> int:
+            """H2 同源：非法值回落默认——单个坏配置不得拖垮列表接口。"""
             v = data.get(key, default)
             if v == "" or v is None:
                 return default
-            return int(v)
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
 
         def _limit(key: str) -> int:
             try:
                 return max(0, min(1000, _int(key, 0)))
-            except ValueError:
+            except (TypeError, ValueError):
                 return 0
 
         name = str(data.get("name", ""))

@@ -365,6 +365,21 @@ class TestSummaryJobResponse:
         model = SummaryJobResponse.from_config_dict(data)
         assert model.name == "Extra Keys"
 
+    def test_from_config_dict_invalid_int_falls_back_to_default(self):
+        """F3（H2 同源）：lookback_days/max_records 为非法字符串时回落默认而非抛 500。
+
+        config.ini 写 `lookback_days=abc`/`max_records=abc` 不得让整个端点 500。
+        """
+        data = {
+            "id": 9,
+            "name": "Bad Int Job",
+            "lookback_days": "abc",
+            "max_records": "abc",
+        }
+        model = SummaryJobResponse.from_config_dict(data)
+        assert model.lookback_days == 1  # 默认 1
+        assert model.max_records == -1  # 默认 -1（不限制）
+
 
 # ========== SummaryJobTestResponse ==========
 
@@ -778,8 +793,46 @@ class TestTestLLMConnection:
                 assert data["success"] is False
                 assert "Connection refused" in data["message"]
 
+    @pytest.mark.asyncio
+    async def test_llm_connection_empty_content_with_model_fails(self):
+        """F2（H1 同步）：content 为空但 model 存在 → 仍视为失败（仅判 not content）。
 
-class TestGetLLMStats:
+        旧逻辑 `not response.model and not response.content` 在 model 存在时会误判为
+        成功；修复后与 summary 侧一致，仅 `not content` 即失败。
+        """
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+        from app.services.llm.models import ChatResponse, Usage
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        mock_client = MagicMock()
+        mock_client.chat = AsyncMock(
+            return_value=ChatResponse(
+                content="",
+                model="gpt-4o-mini",
+                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+            )
+        )
+
+        with patch("app.api.llm.get_llm_client", return_value=mock_client):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/llm/test")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["success"] is False
+
     """GET /api/llm/stats 端点测试。"""
 
     @pytest.mark.asyncio
@@ -906,6 +959,51 @@ class TestListSummaryJobs:
                     data["data"][1]["notification_type"]
                     == "watching_summary_Dad Summary"
                 )
+
+    @pytest.mark.asyncio
+    async def test_returns_200_with_invalid_int_config(self):
+        """F3（API 级）：config.ini 含非法整型字段时整体返回 200 而非 500。
+
+        旧实现裸 `int()` 会让 `lookback_days=abc`/`max_records=abc` 直接 500。
+        """
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with patch("app.api.summary_jobs.config_manager") as mock_cm:
+            mock_cm.get_summary_configs.return_value = [
+                {
+                    "id": 1,
+                    "name": "Bad Int Job",
+                    "cron": "0 21 * * *",
+                    "lookback_days": "abc",
+                    "user_name": "",
+                    "system_prompt": "",
+                    "max_records": "abc",
+                    "enabled": True,
+                },
+            ]
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.get("/api/summary/jobs")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                assert len(data["data"]) == 1
+                # 回落默认：lookback_days=1, max_records=-1
+                assert data["data"][0]["lookback_days"] == 1
+                assert data["data"][0]["max_records"] == -1
 
     @pytest.mark.asyncio
     async def test_returns_empty_list_when_no_configs(self):
@@ -1163,6 +1261,66 @@ class TestTestSummaryJob:
             ) as client:
                 response = await client.post("/api/summary/jobs/Nonexistent/test")
                 assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_empty_summary_text_with_usage_fails(self):
+        """F6（H1-API 回归）：summary_text 为空但 usage 存在 → success=False + error_message。
+
+        H1 修复后判定条件为仅 `not summary_text`；此前缺此缺陷场景测试。
+        """
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+        from app.services.llm.models import Usage
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_service") as mock_service,
+        ):
+            mock_cm.get_summary_configs.return_value = [
+                {
+                    "id": 1,
+                    "name": "Empty Job",
+                    "cron": "0 21 * * *",
+                    "lookback_days": 1,
+                    "user_name": "",
+                    "system_prompt": "",
+                    "max_records": 200,
+                    "enabled": True,
+                },
+            ]
+            mock_service.generate_summary = AsyncMock(
+                return_value={
+                    "summary_text": "",  # 空正文（如重试耗尽）
+                    "model": "gpt-4o-mini",
+                    "usage": Usage(
+                        prompt_tokens=100, completion_tokens=0, total_tokens=100
+                    ),
+                    "record_count": 3,
+                    "date_from": "2024-01-01",
+                    "date_to": "2024-01-02",
+                }
+            )
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/summary/jobs/Empty%20Job/test")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["success"] is False
+                assert data["error_message"]
+                assert data["record_count"] == 3
 
 
 class TestTriggerSummaryJob:

@@ -283,3 +283,52 @@ class TestGetRecordsInDateRange:
         assert r["source"] == "api"
         assert r["media_type"] == "episode"
         assert r["bgm_title"] == ""
+
+    def test_run_id_and_batch_id_columns_not_misindexed(
+        self, temp_dir, reset_singletons
+    ):
+        """F1：consumed_run_id/run_id/batch_id 三列必须各自映射到对应列，不得错位。
+
+        历史 bug：dict 把 run_id 写成 row[14]（实为 consumed_run_id）、batch_id
+        写成 row[15]（实为 run_id），导致列错位。插入三个互不相同的值逐列断言。
+        """
+        db_path = temp_dir / "run_id_cols.db"
+        with patch("app.core.database.logger"):
+            from app.core.database import DatabaseManager
+
+            db = DatabaseManager(str(db_path))
+
+        with sqlite3.connect(str(db_path)) as raw:
+            raw.execute(
+                """INSERT INTO sync_records
+                (timestamp, user_name, title, ori_title, season, episode,
+                 subject_id, episode_id, status, message, source, media_type,
+                 bgm_title, consumed_run_id, run_id, batch_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    "2025-02-01 10:00:00",
+                    "u",
+                    "T",
+                    None,
+                    1,
+                    1,
+                    None,
+                    None,
+                    "success",
+                    "",
+                    "api",
+                    "episode",
+                    "",
+                    "consumed-XYZ",
+                    "run-ABC",
+                    "batch-DEF",
+                ),
+            )
+            raw.commit()
+
+        records = db.get_records_in_date_range("2025-02-01", "2025-02-01")
+        assert len(records) == 1
+        r = records[0]
+        assert r["consumed_run_id"] == "consumed-XYZ"
+        assert r["run_id"] == "run-ABC"
+        assert r["batch_id"] == "batch-DEF"

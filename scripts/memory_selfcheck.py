@@ -7,6 +7,7 @@ FTS 关键词命中演示。全部只读，可反复执行。
 用法：
     uv run python scripts/memory_selfcheck.py                     # 基础检查
     uv run python scripts/memory_selfcheck.py --keywords 芙莉莲   # 附带 FTS 演示
+    uv run python scripts/memory_selfcheck.py --titles 芙莉莲 葬送的芙莉莲  # 同剧关联演示
     uv run python scripts/memory_selfcheck.py --db /path/to.db    # 指定库路径
 
 退出码：0 = 检查通过；1 = 表结构缺失等问题。
@@ -83,7 +84,9 @@ def _check(db: sqlite3.Connection) -> bool:
 
     print("== 4. 冷层归档规模 ==")
     n = db.execute("SELECT COUNT(*) FROM agent_working_memory_archive").fetchone()[0]
-    print(f"  {n} 条归档（prune 下沉产物，当前只写不读，供 Phase 4 全量查史）")
+    print(
+        f"  {n} 条归档（prune 下沉产物，已参与 related 联表反查；search_archive 留给 Phase 4 全量查史）"
+    )
 
     print("== 5. 消费标记一致性 ==")
     marked = db.execute(

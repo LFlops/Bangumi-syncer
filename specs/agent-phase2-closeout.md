@@ -33,7 +33,7 @@
 │    消费方式：get_recent 最近 N 条（连续性）+ search_fts 关键词命中（相关性，不占额度）
 │    消费标记：sync_records.consumed_run_id（防窗口重叠重复展开，store_and_mark 原子写入）
 ├─ 冷层 agent_working_memory_archive ← prune 下沉产物：无索引，search_archive 仅 LIKE 检索
-│          ⚠️ 现状：只写不读（P4 之前无消费方；search_archive 留给 P4 Agent 全量查史）
+│          ⚠️ 现状：已参与 related 联表反查（跨窗口同剧回忆）；search_archive 留给 P4 Agent 全量查史
 └─（未建层）
     ├─ 用户偏好反馈  → Phase 3.1（feedback 条目长期保留、强约束注入）
     ├─ knowledge_base → Phase 4（跨任务诊断知识沉淀）
