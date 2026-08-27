@@ -1,5 +1,11 @@
 # Phase 2.0.2: 读取并使用记忆
 
+> [!WARNING]
+> ### 已被 closeout 取代（2026-08）
+> 本文档为 Phase 2.0.x 原始设计。终稿以 `agent-phase2-closeout.md` §4（E2/E3 v7）为准：
+> 记忆配置改为 `memory_limit`/`related_limit`（0=关，0–1000）；摘要零截断+失败跳过；
+> 检索改联表反查（FTS 停用）；消费排除替代 overlap 软标注。本文档保留演进史，勿按原文判断当前行为。
+
 > 所属计划：Bangumi-Syncer Agent 化三步增量计划
 > 前置依赖：Phase 2.0.1（表 + repository + extractor）
 > 交付物：MemoryRetriever + execute_job 注入 + memory_limit 配置 + 窗口重叠去重（读取侧完整能力）

@@ -92,10 +92,9 @@ class MemoryRetriever:
         return "\n".join(f"- {e.summary}" for e in entries)
 
     def find_overlaps(self, records: list[SummaryRecord]) -> list[SummaryRecord]:
-        """返回今日明细中已被消费的记录（consumed_run_id IS NOT NULL）。
+        """[deprecated] 返回被消费的记录（consumed_run_id IS NOT NULL）。
 
-        数据基础：2.0.1 的 store_and_mark 在每次总结成功后标记 sync_records。
-        精确到集、无窗口近似——无论多早被消费都能命中（covered 方案的
-        "最近 K 条并集"对超过窗口的旧集会漏标）。
+        v7 起业务方改为硬排除（execute_job 内过滤），本方法保留为通用工具；
+        overlap 软标注流程已移除（见 closeout §4 E3）。
         """
         return [r for r in records if r.consumed_run_id is not None]

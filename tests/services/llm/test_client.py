@@ -615,3 +615,156 @@ class TestParamRejectionDegradation:
         assert len(calls) == 3  # MAX_RETRIES=2 → 3 次尝试
         assert provider._extras_disabled is False  # 未降级
         assert mock_sleep.await_count == 2
+
+
+class TestTerminalErrorsNoRetry:
+    """M7/M9：确定性错误（refusal/4xx）不重试；429 尊重 Retry-After。"""
+
+    @pytest.mark.asyncio
+    async def test_refusal_valueerror_no_retry(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """M7：refusal（ValueError）为终态——只尝试一次，不再退避重试。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+        mock_sleep = AsyncMock()
+
+        async def _refuse(self, messages, **kwargs):
+            calls.append(1)
+            raise ValueError("模型拒绝响应: 内容违反政策")
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _refuse.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            await client.chat([Message(role="user", content="Q")])
+
+        assert len(calls) == 1  # 不重试
+        assert mock_sleep.await_count == 0  # 无退避
+
+    @pytest.mark.asyncio
+    async def test_401_no_retry(self, reset_llm_singleton, mock_config, mock_log_usage):
+        """M9：401（密钥错误）为终态——只尝试一次。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+        mock_sleep = AsyncMock()
+
+        def _raise401():
+            request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+            response = _h.Response(
+                401, text='{"error": "Invalid API key"}', request=request
+            )
+            raise _h.HTTPStatusError("Unauthorized", request=request, response=response)
+
+        async def _bad(self, messages, **kwargs):
+            calls.append(1)
+            _raise401()
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _bad.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            await client.chat([Message(role="user", content="Q")])
+
+        assert len(calls) == 1
+        assert mock_sleep.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_429_respects_retry_after(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """M9：429 尊重 Retry-After（5s）→ 退避 5s 重试。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        calls = []
+        mock_sleep = AsyncMock()
+
+        async def _limited(self, messages, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+                response = _h.Response(
+                    429,
+                    text="rate limited",
+                    request=request,
+                    headers={"Retry-After": "5"},
+                )
+                raise _h.HTTPStatusError("Too Many", request=request, response=response)
+            return ChatResponse(content="ok", model="m", usage=None)
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _limited.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == "ok"
+        assert len(calls) == 2
+        assert mock_sleep.await_args.args[0] == 5  # Retry-After 优先
+
+
+class TestParamRejectionExtended:
+    """M8：Anthropic invalid_request_error / 422 网关也触发降级。"""
+
+    def test_anthropic_text_422_matches(self):
+        import httpx as _h
+
+        from app.services.llm.client import _is_param_rejection
+
+        request = _h.Request("POST", "https://test.api.com/v1/messages")
+        response = _h.Response(
+            400,
+            text='{"type": "error", "error": {"type": "invalid_request_error", "message": "does not support thinking"}}',
+            request=request,
+        )
+        e = _h.HTTPStatusError("err", request=request, response=response)
+        assert _is_param_rejection(e) is True
+
+    def test_422_gateway_matches(self):
+        import httpx as _h
+
+        from app.services.llm.client import _is_param_rejection
+
+        request = _h.Request("POST", "https://gateway/v1/chat/completions")
+        response = _h.Response(
+            422,
+            text='{"detail": "extra fields not permitted"}',
+            request=request,
+        )
+        e = _h.HTTPStatusError("err", request=request, response=response)
+        assert _is_param_rejection(e) is True
+
+    def test_terminal_400_not_param(self):
+        """普通 400（API key 无效）不是参数拒绝、是终态错误。"""
+        import httpx as _h
+
+        from app.services.llm.client import _is_param_rejection, _is_terminal_error
+
+        request = _h.Request("POST", "https://test.api.com/v1")
+        response = _h.Response(
+            400, text='{"error": "Invalid API key"}', request=request
+        )
+        e = _h.HTTPStatusError("err", request=request, response=response)
+        assert _is_param_rejection(e) is False
+        assert _is_terminal_error(e) is True

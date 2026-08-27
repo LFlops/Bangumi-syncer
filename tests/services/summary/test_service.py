@@ -404,7 +404,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -425,7 +425,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -478,7 +478,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -560,7 +560,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -593,7 +593,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -616,7 +616,7 @@ class TestExecuteJob:
             patch.object(
                 svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
             ),
-            self._patch_llm(empty)[0],
+            TestExecuteJob._patch_llm(svc, empty)[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -756,7 +756,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
             patch.object(svc, "memory") as mock_memory,
         ):
@@ -783,7 +783,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -923,7 +923,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(records, "2026-07-14", "2026-07-15"),
             ),
-            self._patch_llm(_mock_chat_response())[0],
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
             patch.object(svc, "memory") as mock_memory,
         ):
@@ -1027,3 +1027,61 @@ class TestRelatedInjection:
         assert ctx.count("芙莉莲近况") == 1  # 双路径命中按 run_id 去重
         mock_memory.recent.assert_called_once()
         mock_memory.related.assert_called_once()
+
+
+class TestEmptyContentWithModel:
+    """H1：空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
+
+    @pytest.mark.asyncio
+    async def test_empty_content_with_model_name_sends_failure(
+        self, temp_dir, reset_singletons
+    ):
+        """provider 返回空 choices 但带上 model 名 → 仍发 summary_llm_failed。"""
+        svc = TestExecuteJob._make_svc()
+        config = _make_config(name="empty_model_job")
+        empty = ChatResponse(content="", model="gpt-4o-mini", usage=None, latency=5)
+
+        with (
+            patch.object(
+                svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
+            ),
+            TestExecuteJob._patch_llm(svc, empty)[0],
+            patch("app.services.summary.service.notification_service") as mock_ns,
+        ):
+            await svc.execute_job(config)
+
+        call_args = mock_ns.notify.call_args
+        assert call_args.kwargs["in_app_type"] == "summary_llm_failed"
+
+
+class TestRelatedIndependentOfMemoryLimit:
+    """M1：related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
+
+    @pytest.mark.asyncio
+    async def test_related_works_when_memory_limit_zero(
+        self, temp_dir, reset_singletons
+    ):
+        """memory_limit=0（不写入/不排除）+ related_limit=3 → related 仍被调用。"""
+        svc, _ = TestExecuteJob._svc_with_real_memory(temp_dir)
+        records = [_summary_record(id=1, bgm_title="葬送的芙莉莲")]
+        config = _make_config(memory_limit=0, related_limit=3)
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(records, "2026-07-14", "2026-07-15"),
+            ),
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            patch("app.services.summary.service.notification_service"),
+            patch.object(svc, "memory") as mock_memory,
+        ):
+            mock_memory.recent.return_value = []
+            mock_memory.related.return_value = []
+            await svc.execute_job(config)
+
+        mock_memory.related.assert_called_once_with(
+            "summary", "summary-test_job", ["葬送的芙莉莲"], limit=3
+        )
+        # 不写入记忆（memory_limit=0）
+        assert not mock_memory.extract_and_store.called

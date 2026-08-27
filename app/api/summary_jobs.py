@@ -116,7 +116,8 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
     summary_text = result["summary_text"]
     usage = result.get("usage")
 
-    if not summary_text and usage is None:
+    if not summary_text:
+        # H1-API 修正：空内容即失败（usage 存在但空 choices 仍可能是失败调用）
         return SummaryJobTestResponse(
             success=False,
             job_name=job_config.name,

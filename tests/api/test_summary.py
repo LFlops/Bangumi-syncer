@@ -1514,3 +1514,35 @@ class TestMemoryStatsApi:
                 mock_cm.get_summary_configs.return_value = []
                 response = await client.get("/api/summary/jobs/nope/memory-stats")
                 assert response.status_code == 404
+
+
+class TestMemoryStatsEstimateM11:
+    """M11：注入估算需体现 related 独立生效（不因 memory_limit=0 而遗漏 related）。"""
+
+    @pytest.mark.asyncio
+    async def test_stats_includes_related_when_memory_zero(self):
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.memory.models import MemoryEntry
+
+        app = _make_summary_app()
+        entries = [MemoryEntry(run_id="r-1", summary="芙莉莲S1E10" * 10)]  # 80 字
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch(
+                    "app.api.summary_jobs.database_manager.memory.get_recent",
+                    return_value=entries,
+                ),
+            ):
+                mock_cm.get_summary_configs.return_value = [
+                    {"name": "daily", "memory_limit": "0", "related_limit": "2"}
+                ]
+                response = await client.get("/api/summary/jobs/daily/memory-stats")
+
+        data = response.json()["data"]
+        # related 独立生效：估算 = (min(1,0)=0 + 2) × 80 × 0.7 = 112
+        assert data["injected_estimate_tokens"] == 112

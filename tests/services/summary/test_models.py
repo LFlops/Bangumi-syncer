@@ -182,3 +182,20 @@ def test_no_user_prompt_template_attribute():
     """user_prompt_template 不应该是 dataclass 的属性。"""
     cfg = SummaryJobConfig.from_config_dict({"name": "t"})
     assert not hasattr(cfg, "user_prompt_template")
+
+
+def test_bad_lookback_days_does_not_crash():
+    """H2：非法 lookback_days/max_records 不抛异常（坏配置不拖垮调度注册）。"""
+    cfg = SummaryJobConfig.from_config_dict(
+        {"name": "t", "lookback_days": "abc", "max_records": "1.5"}
+    )
+    assert cfg.lookback_days == 1  # 回落默认
+    assert cfg.max_records == -1  # 回落默认
+
+
+def test_bad_max_records_negative_ok():
+    """max_records=-1 合法；'abc' 回落 -1。"""
+    cfg = SummaryJobConfig.from_config_dict({"name": "t", "max_records": "-1"})
+    assert cfg.max_records == -1
+    cfg = SummaryJobConfig.from_config_dict({"name": "t", "max_records": "abc"})
+    assert cfg.max_records == -1

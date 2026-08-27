@@ -71,17 +71,10 @@
 ### E3. 配置终态：memory_limit / related_limit（0=关，0–1000）✅ 已实施
 - **背景演进**：早期 1–50 条数 + memory_enabled 开关 → 中途尝试 memory_days（90 天/放开上限，伤害季度低频率用户分析后被否决）→ 最终确定**条数隐式开关**（未发布，直接破坏性重构，无迁移）。
 - **配置**：`memory_limit`（0=关；>0=最近 N 条摘要注入，上限 1000 对齐 prune）、`related_limit`（0=关；>0=同剧关联最近 N 条）。`memory_enabled`/`memory_days` 全部废弃删除。
-- **消费排除**（用户方案的点睛）：`memory_limit>0` 时窗口内 `consumed_run_id` 非空的记录**不进 prompt**（信息由摘要承继——避免重复总结、连贯性内生）；原 `overlap_note` 软提示删除（硬排除替代）；记录数/统计按排除后计算；全部被消费 → 走"无记录"路径。
+- **消费排除**（用户方案的点睛）：`memory_limit>0` 时窗口内 `consumed_run_id` 非空的记录**连同主明细一并整体剔除**（不是仅从历史小节隐藏——`_build_messages` 收到的就是过滤后的记录集，信息由摘要承继；避免重复总结、连贯性内生）；原 `overlap_note` 软提示删除（硬排除替代）；记录数/统计按排除后计算；全部被消费 → 走"无记录"路径。
 - **展示**：`GET /api/summary/jobs/{name}/memory-stats` 返回 total_count/total_chars/avg_chars/memory_limit/related_limit/injected_estimate_tokens（估算口径：条数 × 平均字符 × 0.7 系数，明示估算）。**不做百分比**——API 不暴露模型上下文窗口元数据（/models 仅有 id/created/owned_by），占比无数据基础；文档注明。
 - **注入 token 数学**：注入量 = (min(存量, memory_limit) + related_limit) × 平均 ~80 字 × 0.7 ≈ 常态可控；上限 1000 时为极端自担场景，stats 透明可见。
 - **空记忆行为**：`get_recent` 返回 [] → 注入段为空 → 不拼接历史小节，正常生成总结——空转无害。
-
-### E3. memory_limit 三层校验不一致 → 后端对齐（min 1 / max 50）✅ 已实施
-- 背景（查证）：前端 `templates/config.html` 已有 `min="1" max="50"`（HTML 软约束）；API Pydantic 裸类型无约束；后台 `from_config_dict` 仅钳下限——手改 config.ini 或直调 API 传 1000 会真实生效。
-- **裁决**：后端对齐前端的既有约定——Pydantic `Create/Update` 加 `ge=1, le=50`；`SummaryJobConfig.from_config_dict` 与 `SummaryJobResponse.from_config_dict` 补 `min(50, …)`。50 不是新限制，是把既成事实补到服务端。Response 模型不加约束（存量 config 兼容）。
-- **下限语义**（为何 `max(1,…)`）：单一开关原则——开/关由 `memory_enabled` 表达，条数由 `memory_limit` 表达；允许 0 会出现两种"关闭"语义含糊。"没有记忆也可以"的需求已被 `memory_enabled=false`（不注入也不写入）覆盖。
-- **上限成本**：每条约 50–100 字摘要，5 条约 150–300 token 注入；50 条约 1.5–3K token——docs 已注明线性成本。
-- **空记忆行为**（沿调用链核实）：无记忆时 `get_recent` 返回 `[]` → `format_memory_context` 空串 → `if memory_context:` 为假 → 不拼接历史小节，正常生成总结——空转但无害，无空段落注入。
 
 ---
 
@@ -104,8 +97,8 @@
 2. 通知文案出现延续性表述（如"接着上次…"）即通过；脚本 §3 显示条目数 +1（上次被引用）
 
 ### 场景 3｜关键词跨日召回（E2 验证点）
-1. 第一天看过《芙莉莲》并 trigger；第二天
-2. `uv run python scripts/memory_selfcheck.py --keywords 芙莉莲` → 命中昨日条目
+1. 第一天看过《芙莉莲》并 trigger（记忆开启）；第二天
+2. `uv run python scripts/memory_selfcheck.py --titles 芙莉莲` → 命中昨日条目（联表反查演示；`--keywords` 已是 deprecated FTS 路径）
 
 ### 场景 4｜改名迁移 / 清空
 1. Web UI 改 job 名 → 脚本 §7 的 task_id 已变新名
@@ -175,7 +168,7 @@
 
 | 层 | 方式 |
 |---|---|
-| 单元 | `tests/core/test_agent_memory.py`（W/C 系列）、`tests/services/memory/*`（检索/提取/服务）、`tests/services/llm/test_client.py`（降级重试）、`tests/services/summary/test_models.py`（1–50 钳制） |
+| 单元 | `tests/core/test_agent_memory.py`（W/C 系列）、`tests/services/memory/*`（检索/提取/服务）、`tests/services/llm/test_client.py`（降级重试）、`tests/services/summary/test_models.py`（0–1000 钳制） |
 | 集成 | `tests/e2e/test_summary_memory.py`（前端表单渲染/提交）、`tests/api/test_summary.py` |
 | 手工 | §5 指南 + `scripts/memory_selfcheck.py` |
 
@@ -183,7 +176,7 @@
 
 ## 8. 已知边界（docs 已同步）
 
-- memory_limit 有效区间 1–50（前端/API/后台三层一致）
+- memory_limit / related_limit 有效区间 0–1000（0=关；前端/API/后台三层一致）
 - 注入为前置拼接 `## 历史执行上下文` 小节，无需修改自定义 system_prompt（用户指令在后，优先级更高）
 - 摘要条数 × 每条约 50–100 字 = 注入 token 线性成本
 - FTS 关键词检索依赖 SQLite ≥3.34（trigram）；降级时中文子串检索受限且有 warning 日志

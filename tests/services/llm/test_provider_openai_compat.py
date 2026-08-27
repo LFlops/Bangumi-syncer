@@ -353,3 +353,80 @@ class TestOpenAICompatParseResponse:
         resp = provider._parse_response({"choices": [{"message": {}}]})
         assert resp.content == ""
         assert resp.usage is None
+
+
+class TestReasoningTemperatureAlignment:
+    """H3：o 系列发 reasoning_effort 时 temperature 强制 1（与 Anthropic 侧对齐），
+    避免推理模型对非 1 temperature 的硬 400。"""
+
+    def test_o_series_forces_temperature_one(self):
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1",
+            api_key="sk-test",
+            model="o4-mini",
+            thinking_level="high",
+        )
+        body = provider._build_request([Message(role="user", content="Q")])
+        assert body["reasoning_effort"] == "high"
+        assert body["temperature"] == 1  # 硬 400 修复点
+
+    def test_non_o_series_keeps_configured_temperature(self):
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1",
+            api_key="sk-test",
+            model="gpt-4o-mini",
+            temperature=0.7,
+            thinking_level="off",
+        )
+        body = provider._build_request([Message(role="user", content="Q")])
+        assert body["temperature"] == 0.7
+
+    def test_o_series_user_temperature_overridden(self):
+        """用户显式传 temperature=0.2 也被强制为 1（推理模型不接受非 1）。"""
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1",
+            api_key="sk-test",
+            model="o3",
+            thinking_level="low",
+        )
+        body = provider._build_request(
+            [Message(role="user", content="Q")], temperature=0.2
+        )
+        assert body["temperature"] == 1
+
+
+class TestFinishReasonMapping:
+    """M10：OpenAI finish_reason → stop_reason（与 Anthropic 对齐，供 P4 截断判断）。"""
+
+    def test_finish_reason_stop_mapped(self):
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1", api_key="sk-test"
+        )
+        resp = provider._parse_response(
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "model": "gpt-4o-mini",
+            }
+        )
+        assert resp.stop_reason == "stop"
+
+    def test_finish_reason_length_mapped(self):
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1", api_key="sk-test"
+        )
+        resp = provider._parse_response(
+            {
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "length"}],
+                "model": "gpt-4o-mini",
+            }
+        )
+        assert resp.stop_reason == "length"
+
+    def test_missing_finish_reason_defaults_empty(self):
+        provider = OpenAICompatProvider(
+            api_base="https://api.openai.com/v1", api_key="sk-test"
+        )
+        resp = provider._parse_response(
+            {"choices": [{"message": {"content": "ok"}}], "model": "gpt-4o-mini"}
+        )
+        assert resp.stop_reason == ""

@@ -148,6 +148,9 @@ class OpenAICompatProvider(BaseProvider):
         )
         if effort is not None:
             body["reasoning_effort"] = effort
+            # H3：o 系列推理模型拒绝非 1 的 temperature（硬 400），
+            # 与 Anthropic thinking 开启时的处理对齐（anthropic.py 强制 1）
+            body["temperature"] = 1
         return body
 
     def _to_wire_message(self, m: Message) -> dict:
@@ -176,7 +179,9 @@ class OpenAICompatProvider(BaseProvider):
         # 误中导致向不支持的端点发送未知参数。OpenAI 对未知参数的行为因 API 版本
         # 而异，不冒险传给非 o 系列。
         if not re.match(r"^o\d", model):
-            logger.warning(
+            # L6：配置/模型不匹配是静态事实，warning 刷屏无益——降为 debug
+            # （用户可通过 stats/日志在调优期定位）
+            logger.debug(
                 f"model {model} 非 o 系列不支持 reasoning_effort，"
                 f"已忽略 thinking_level={level}"
             )
@@ -189,6 +194,8 @@ class OpenAICompatProvider(BaseProvider):
         message = choice.get("message", {})
         content = message.get("content")
         refusal = message.get("refusal")
+        # M10：finish_reason → stop_reason（与 Anthropic 对齐，P4 判断 max_tokens 截断用）
+        stop_reason = choice.get("finish_reason") or ""
 
         if content is None:
             if refusal:
@@ -205,4 +212,6 @@ class OpenAICompatProvider(BaseProvider):
                 total_tokens=u.get("total_tokens", 0),
             )
 
-        return ChatResponse(content=content, model=model, usage=usage)
+        return ChatResponse(
+            content=content, model=model, usage=usage, stop_reason=stop_reason
+        )

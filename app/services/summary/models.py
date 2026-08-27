@@ -39,16 +39,23 @@ class SummaryJobConfig:
             except (TypeError, ValueError):
                 return 0
 
+        def _int(key: str, default: int) -> int:
+            """H2：非法值回落默认——单个坏配置不得拖垮调度注册（与 _limit 同款保护）。"""
+            try:
+                return int(data.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
         return cls(
             name=str(data.get("name", "")),
             enabled=data.get("enabled", True)
             if isinstance(data.get("enabled"), bool)
             else str(data.get("enabled", "true")).lower() in ("true", "1"),
             cron=str(data.get("cron", "0 21 * * *")),
-            lookback_days=int(data.get("lookback_days", 1)),
+            lookback_days=_int("lookback_days", 1),
             user_name=str(data.get("user_name", "")),
             system_prompt=str(data.get("system_prompt", cls.system_prompt)),
-            max_records=int(data.get("max_records", -1)),
+            max_records=_int("max_records", -1),
             memory_limit=_limit("memory_limit"),
             related_limit=_limit("related_limit"),
         )

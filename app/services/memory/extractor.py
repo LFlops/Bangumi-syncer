@@ -51,6 +51,7 @@ class MemoryExtractor:
             record_ids=record_ids,
         )
         # 清理旧记忆（独立 best-effort 事务，失败不回滚上面的 run）
+        # L4：魔数收编——保留上限与 prune 上限同源（closeout §4 E3）
         self._repo.prune(task_type, task_id, keep=1000)
 
     async def _summarize(

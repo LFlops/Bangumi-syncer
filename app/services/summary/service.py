@@ -211,9 +211,10 @@ class SummaryService:
             if memory_enabled:
                 records = [r for r in records if r.consumed_run_id is None]
 
-            # 注入历史上下文（memory_limit=0 时短路）
+            # 注入历史上下文：recent（memory_limit>0）与 related（related_limit>0）
+            # 各自独立生效（M1：related 不受 memory_limit 门控）；两者皆 0 时短路
             memory_context = ""
-            if memory_enabled:
+            if job_config.memory_limit > 0 or job_config.related_limit > 0:
                 memory_context = self._build_memory_context(
                     job_config, task_id, records
                 )
@@ -289,7 +290,9 @@ class SummaryService:
         date_to: str,
     ) -> None:
         """空内容→失败通知 / 正常→成功通知（保持既有失败语义）。"""
-        if not response.content and not response.model:
+        # H1 修正：provider 空内容时 model 可能仍非空，仅以 content 判定失败
+        # （空 choices + model 名 会误走成功分支、吞掉失败通知）
+        if not response.content:
             summary_text = (
                 "AI 追番总结生成失败：LLM 返回空内容（所有重试已耗尽）。\n"
                 "请检查 LLM 配置中的 api_base、api_key 是否正确，"
