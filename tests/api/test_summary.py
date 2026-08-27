@@ -833,6 +833,8 @@ class TestTestLLMConnection:
                 data = response.json()
                 assert data["success"] is False
 
+
+class TestGetLLMStats:
     """GET /api/llm/stats 端点测试。"""
 
     @pytest.mark.asyncio

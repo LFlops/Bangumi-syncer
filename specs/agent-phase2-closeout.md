@@ -197,7 +197,8 @@
 
 > 自 §4 E2/E3 v7 终稿后，完成两轮闭环：① v7 终稿落码（9 批，commit `93ed2b8`）；
 > ② hy-260827 检视报告 24 条逐条判断 + 按 TDD 修复 12 项（commit `83f915c`）。
-> 当前 3603 测试全绿，计划内 P0/P1 全部完成，P2 风格项审计不修（见下）。
+> 当前 3610 测试全绿，计划内 P0/P1 全部完成，P2 风格项审计不修（见下）。
+> ③ 圆桌复检修复（commit `251c3c7`）：F1 sync_records run_id/batch_id 列索引错位 + 值级断言；F2 /api/llm/test 空响应判定同步 H1；F3 SummaryJobResponse._int 容错回落；F4 config.example.ini 残留清理；F5 docs memory-stats UI 承诺改写；F6 H1-API 回归用例；顺手项 latency 口径 / Retry-After 钳制 / 冷层文档对齐。
 
 ### 10.1 已交付（本轮代码，全部带 BDD 用例测试）
 
@@ -227,6 +228,7 @@
 | M10 | OpenAI finish_reason → stop_reason（对齐 Anthropic） | 3 用例 |
 | M11 | stats 估算随 M1 修复自动正确（related 计入） | 1 用例 |
 | L6/L8/L4/M4 | thinking 告警降 debug；latency 只计成功请求；魔数注释；find_overlaps deprecated | — |
+| 圆桌复检（251c3c7） | F1 run_id/batch_id 列索引错位 + 值级断言；F2 空响应判定同步 H1；F3 `_int` 容错回落；F4 config.example.ini 残留清理；F5 docs memory-stats UI 承诺改写；F6 H1-API 回归用例；顺手项 latency 口径 / Retry-After 钳制 / 冷层文档对齐 | F-R1 恢复 TestGetLLMStats 类声明 + F-R3 closeout 总账更新 |
 
 ### 10.3 审计判定为不修（§6 结论）
 
