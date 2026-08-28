@@ -1,12 +1,12 @@
-# Phase 3 实施 spec：LLM 匹配增强（Match Assist）
+# Phase 3 实施 spec：通用 Agent 骨架 + LLM 匹配增强（Match Assist）
 
 > 所属计划：Bangumi-Syncer Agent 化增量计划
-> 性质：Phase 3 实施 spec（重新定义：首个落地场景 = 番剧名匹配，非总结增强）
+> 性质：Phase 3 实施 spec——**通用 Agent 骨架先行，匹配增强作为首个落地场景**（对齐 2026-08 范围调整决议）
 > 状态：**待评审**——评审通过后按 §9 子 phase 拆分实施
 > 关联：
-> - `agent-phase3-4-decisions.md`（原 P3 总结增强 → 本文档替换；该文档的 J3/J4/C 系列接缝结论仍有效）
+> - `agent-phase3-4-decisions.md`（原 P3 总结增强 → 本文档替换；J3/J4/C 系列接缝结论仍有效）
 > - `agent-phase2.1-tools.md`（工具协议 spec——本文档 §3.2 补齐其未落地的代码）
-> - `agent-phase3-agent.md`（Phase 4 参考资料：本文档实现的 registry/工具协议是 Phase 4 Agent 循环的接缝）
+> - `agent-phase3-agent.md`（Phase 4 参考资料：诊断场景设计、budget 完整版）
 > - `agent-phase3-assistant.md`（ADR：自建循环不用 LangGraph——继续有效）
 
 ---
@@ -25,17 +25,21 @@
 
 LLM 介入价值集中在 **A1/A2（跨季判断）与 B1（多语言语义）**——恰是规则瀑布最难覆盖、用户反馈最多的场景。
 
-### 0.2 目标
+### 0.2 目标与范围调整（2026-08 决议）
 
-规则匹配全部失败后，由 LLM 单点介入评估候选/补充搜索，产出**待用户手动确认的建议**；用户确认后写入自定义映射并自动补发。Agent 是**建议者而非定案者**——永不自动放通。
+**范围调整**：不做"匹配特化先行、未来再泛化"，而是**通用 Agent 骨架一次建对，匹配增强作为首个消费方**。
+
+- 通用骨架：工具协议 + 工具注册表 + 结构化解析 + 轻量循环 + otel 概念追踪 + 通用会话表 `agent_runs`/`agent_steps`
+- 首个场景：匹配失败后的 LLM 建议（产出**待用户手动确认的建议**，确认后写映射并自动补发；Agent 是**建议者而非定案者**，永不自动放通）
+- 关键简化：匹配场景的请求上下文（title/season/media_type/release_date/user_name/match_trace 候选）**全部可从 `sync_records` 还原** → 不需要特化任务表，`agent_runs` 通用承载
 
 ### 0.3 对"workflow 越写越重"的回应
 
-本次封装**通用能力原语**（工具协议 + 结构化输出 + 轻量循环），匹配仅作为首个消费方；编排由 LLM 工具调用自主决定，不写死匹配专用 workflow。Phase 4 的通用 Agent 循环直接消费本次组件。
+封装**通用能力原语**（工具协议/结构化输出/轻量循环/session 模型），场景只做接入；编排由 LLM 工具调用自主决定，不写死场景专用 workflow。
 
 ### 0.4 记忆边界（本功能无记忆依赖）
 
-本功能是"单次失败 → 独立判定 → 状态机轮转"的闭环：**不写 `agent_working_memory`、不注入历史记忆**。与 Phase 2 记忆（summary 连续性场景，需要"上次看了什么"保持连贯）本质不同。预留（Phase 5）：该标题历史建议被确认/拒绝的反馈沉淀（feedback→知识库联动），本次不做。
+本功能是"单次失败 → 独立判定 → 会话状态机轮转"的闭环：**不写 `agent_working_memory`、不注入历史记忆**。与 Phase 2 记忆（summary 连续性场景）本质不同。记忆的"工具化检索 + 原文优先"演进属 Phase 4 备忘（见 §8），本次不做。
 
 ---
 
@@ -45,17 +49,21 @@ LLM 介入价值集中在 **A1/A2（跨季判断）与 B1（多语言语义）**
 |---|---|---|
 | D1 | Agent 介入位置 | `_handle_match_failure`（orchestrator.py:326）挂接，**不进匹配管道**；Agent 永不直接命中，永远产出待确认建议 |
 | D2 | Agent 输出形态 | **直选一个推荐** `{subject_id, reason}`；新 subject 追加进 `candidates_json`；现有多候选列表与手动确认保留 |
-| D3 | 落库形态 | 新增 `match_llm_jobs` 独立表（LLM 执行层状态机）+ `pending_candidates` 加 `llm_subject_id`/`llm_reason` 两列（用户确认层）；**不用 JSON TEXT 存结构化数据** |
+| D3 | 落库形态 | **通用会话表 `agent_runs` + `agent_steps`**（替代特化 match_llm_jobs）+ `pending_candidates` 加 `llm_subject_id`/`llm_reason` 两列（用户确认层）；**不用 JSON TEXT 存结构化数据** |
 | D4 | 执行方式 | 异步：失败匹配立即落库返回，`llm_match_scheduler` 定时任务轮询处理（AsyncIOScheduler，可直接 await LLM，无同步桥接问题） |
 | D5 | 调度参数 | 轮询 60s、LLM 调用失败重试上限 3 次（对齐 `LLMClient.MAX_RETRIES=2` 保守风格） |
-| D6 | 状态联动 | `match_llm_jobs` 终态（applied/rejected）随 `pending_candidates` 确认/忽略 API 联动流转 |
+| D6 | 状态联动 | `agent_runs` 终态（applied/rejected）随 `pending_candidates` 确认/忽略 API 联动流转（经 sync_record_id 关联） |
 | D7 | 开关/降级 | `[sync] llm_match_assist=false` 默认关；开关关 / LLM 配置缺失 / 调用失败 → 不落任务或标 failed，**原失败逻辑完全不变**；LLM 缺失时日志说明 |
 | D8 | 前后端检查 | 后端校验 LLM 配置存在才允许开启；前端开关仅 LLM 已配置时显示（参照 dashboard 用量卡片条件渲染先例） |
 | D9 | 通知 | 复用 `pending_candidate` 类型，**补站内信**（in_app_type + 标题模板），文案"已由 Agent 匹配，待确认"；不新增通知类型 |
 | D10 | KV cache | 循环轮次间前缀复用（必做）+ 静态 system/tools 前缀跨调用缓存（推荐，可开关） |
 | D11 | 循环形态 | **轻量 for 循环**：`max_iterations` 由 `thinking_level` 映射（off=1 / low=2 / medium=3 / high=5，可配置覆盖）；每轮 chat 返回 tool_use 则执行后继续，`end_turn` 或达上限即终止；不引入 Phase 4 完整 budget 系统 |
 | D12 | 输出符合性 | 决策不靠自由文本提取：`submit_suggestion(subject_id, reason)` 作为**终止性工具**（调用即 break，结构保证只生效一次）+ provider 侧 `tool_choice` 强制结构化收尾 |
-| D13 | 任务生命周期 | failed 允许**重新入队**（同 key 再次失败时复用记录重置 attempts）；终态（done/no_suggestion/failed/applied/rejected）超保留期（7 天）由调度器每轮顺带清理，删除数量打日志 |
+| D13 | 任务生命周期 | failed 允许**重新入队**（同 key 再次失败时复用记录重置 attempts）；终态超保留期（7 天）由调度器每轮顺带清理，删除数量打日志 |
+| D14 | stop_reason 统一 | 所有会话结束必须记录 `stop_reason`：`end_turn` / `submit_suggestion` / `exhausted` / `failed` / `cancelled` / `error`——不裸用成功/失败二分（Phase 4 消费） |
+| D15 | 追踪形态 | **自建 otel 概念模型**（trace_id/span_id/parent/span 层级/status/attribute 语义对齐，**不引入 opentelemetry SDK**——零新增依赖，符合项目风格；未来可映射导出） |
+| D16 | span 粒度 | **每轮 LLM 调用 + 每次工具执行各一条 span**（agent_steps），可完整复盘 |
+| D17 | 观测演进 | 内建"Agent 观测页"（Web UI + chart.js，Phase 4）；远期 `/metrics` 导出（Prometheus 格式，可选，Phase 5）——**默认不引入 Prometheus/Grafana**（单实例 SQLite 数据源用不上，自部署用户零额外负担） |
 
 ---
 
@@ -89,11 +97,12 @@ _handle_match_failure（orchestrator.py:326-384）＝统一失败入口
 - 调度器先例：`bangumi_replay_scheduler.py`（BaseScheduler + AsyncIOScheduler + 队列空跳过）——`llm_match_scheduler` 同构
 - KV cache 先例：`MemoryExtractor._summarize`（extractor.py:56-83）完整历史作前缀命中缓存
 - 清理先例：`llm_usage.cleanup_old_llm_usage_logs(30)`（llm_usage.py:311）、`agent_memory.prune(keep=1000)`
+- 可观测性：**无 opentelemetry 依赖**（pyproject 确认）；现有唯一"追踪"是 `MatchTrace`（业务级匹配过程，非可观测性追踪）
 
 ### 2.5 trace 机制现状
 
 - `MatchTrace.start_step / record_step / to_dict`（match_trace.py:146-271）：steps 序列化进 `sync_records.match_trace` JSON，`finish()` 幂等
-- **关键约束**：trace 入库后不可再改——异步评估结果**不回写 trace**，承载于 `match_llm_jobs`（同步记录详情页联查）
+- **关键约束**：trace 入库后不可再改——异步评估结果**不回写 trace**，承载于 `agent_runs`/`agent_steps`（同步记录详情页联查）
 
 ---
 
@@ -107,27 +116,27 @@ _handle_match_failure（orchestrator.py:326-384）＝统一失败入口
   → 成功：bangumi_id_found + 打格子（现有逻辑不变）
   → 失败：_handle_match_failure
       ├─ sync_records(error) + anime_not_found + 候选沉淀（原逻辑不变）
-      ├─ trace 追加 llm_assist step（status="pending"，标记"已提交 AI 评估"，persist 之前）
-      └─ 开关开 + LLM 可用 → 落 match_llm_jobs(pending)
+      ├─ trace 追加 llm_assist step（status="pending"，persist 之前）
+      └─ 开关开 + LLM 可用 → 落 agent_runs(pending, task_type='match')
                                     ↓
 llm_match_scheduler（AsyncIOScheduler，每 60s）
-  ├─ 清理：终态且 finished_at 超 7 天 → DELETE + 日志
+  ├─ 清理：终态且 ended_at 超 7 天 → DELETE + 日志
   ├─ 统计 pending → 0 则跳过
-  └─ 逐条处理（llm_assist.run，见 3.2.3）：
-       ├─ 轻量循环（max_iterations 由 thinking_level 映射）
-       │    chat → end_turn？→ 终止
-       │        → tool_use？→ 执行工具 → 回填 tool_result + [剩余轮次：N] → 继续
-       │        → submit_suggestion？→ 捕获参数，break
-       ├─ done + 有建议 → 立即校验 + 写 pending_candidates（llm 两列，无候选也落）
-       │       + 回填 candidate_id + 任务 done + 发待确认通知（方法返回前完成）
-       ├─ done + 无建议 → 任务终态 no_suggestion（原失败路径不动）
+  └─ 逐条处理（matching/llm_assist.run）：
+       ├─ agent 骨架循环（agent/loop.py）
+       │    chat(span) → end_turn？→ 终止（stop_reason=end_turn）
+       │        → tool_use？→ 执行工具(span) → 回填 tool_result + [剩余轮次：N] → 继续
+       │        → submit_suggestion？→ 捕获参数，break（stop_reason=submit_suggestion）
+       ├─ succeeded + 有建议 → 立即校验 + 写 pending_candidates（llm 两列）
+       │       + 发待确认通知（方法返回前完成）
+       ├─ 无建议 → no_suggestion（原失败路径不动）
        └─ LLM 调用失败 → attempts+1，≤3 重试；=3 → failed（last_error 记录）
                                     ↓
 用户（候选确认页）
   ├─ 应用建议（bypass）→ 写映射 + _auto_replay_after_confirm 补发
-  │       → bangumi_id_found（已匹配通知）；match_llm_jobs → applied
-  ├─ 手动确认其他候选（现有逻辑保留）；match_llm_jobs → applied
-  └─ 忽略 → rejected；match_llm_jobs → rejected
+  │       → bangumi_id_found（已匹配通知）；agent_runs → applied
+  ├─ 手动确认其他候选（现有逻辑保留）；agent_runs → applied
+  └─ 忽略 → rejected；agent_runs → rejected
 ```
 
 ### 3.2 通用能力封装（本次实现，Phase 4 消费）
@@ -155,89 +164,85 @@ llm_match_scheduler（AsyncIOScheduler，每 60s）
 | `get_related_subjects(subject_id)` | `bgm.get_related_subjects()` | read | 同上 |
 | `submit_suggestion(subject_id, reason)` | 无（终止性工具） | **终止** | `subject_id: string pattern ^\d+$ (required)`、`reason: string maxLength 200` |
 
-> `submit_suggestion` 是**终止性工具**：执行器不落库、仅捕获参数返回循环，循环收到即 break。写库由 `llm_assist` 服务层完成（见 3.2.3）——Agent 只输出决策，天然满足"不自动放通"。
+> `submit_suggestion` 是**终止性工具**：执行器不落库、仅捕获参数返回循环，循环收到即 break。写库由场景服务层完成（见 3.8）——Agent 只输出决策，天然满足"不自动放通"。
 
-**3.2.3 LLM 匹配服务（新文件 `app/services/matching/llm_assist.py`）**
-
-**轻量循环（D11）**：
-
-```
-async def run(job) -> None:
-    messages = [system(匹配指令+输出约束), user(请求上下文+候选摘要)]
-    remaining = max_iterations_for(job.thinking_level)   # off=1/low=2/medium=3/high=5
-    for i in range(max_iter):
-        resp = await llm.chat(messages, tools=TOOL_SCHEMAS,
-                              tool_choice=... )           # 见下
-        if resp.stop_reason == "end_turn":
-            break                                         # 无工具调用 → 终止
-        for tc in resp.tool_calls:
-            if tc.name == "submit_suggestion":
-                suggestion = validate_and_capture(tc)     # 捕获决策
-                break  # 调用即终止（结构保证只生效一次）
-            result = await tools.execute(tc)              # 执行读工具
-            messages.append(tool_result(tc, result))
-        messages.append(assistant(tc_blocks))
-        remaining -= 1
-        if remaining == 0:
-            messages.append(user("[剩余轮次：0] 你必须调用 submit_suggestion 提交当前最佳判断（可注明不确定性），或声明放弃"))
-    # ── 写入（方法返回前完成，见 3.7）──
-    if suggestion and validate_subject_id(suggestion.subject_id):
-        write_pending_candidate(job, suggestion)          # 落库 + 回填 candidate_id
-        mark_done(job, suggestion)                        # 任务 done + 发通知
-    else:
-        suggestion = output_parser.extract(last_text)     # 兜底：文本提取
-        ...同上或 no_suggestion
-```
-
-关键点：
-- **透明预算**：每轮 tool_result 后注入 `[剩余轮次：N]`，让 LLM 自主控制节奏；剩余 0 时强制收敛
-- **提前终止被接受**：LLM 第一轮就调用 submit_suggestion 表示已确定，接受并 break（比"拒绝重来"可靠）
-- **耗尽兜底**：循环达上限且未收到 submit_suggestion → 用最后响应文本经 `output_parser` 提取 → 仍无 → `no_suggestion`，不追加轮次（预算刚性）
-- **写操作时序（D3 补充）**：写入发生在 `run()` 方法内、方法返回前——校验 → 写 pending_candidates → 回填 candidate_id → 任务 done → 发通知
-
-**输出符合性（D12，三层保证）**：
-
-1. **结构强制**：`tool_choice` 指定 `submit_suggestion`（anthropic `tool_choice={"type":"tool","name":"submit_suggestion"}` / openai `{"type":"function","function":{"name":...}}`）——模型必须以该工具调用收尾，参数天然结构化
-2. **schema 校验**：arguments 受 JSON Schema 约束；解析失败兜底 `{"raw": ...}`（phase2.1 T5）；执行器校验必填缺失 → 返回 `is_error=true` 的 tool_result 让 LLM 修正
-3. **业务校验**：`submit_suggestion.subject_id` 经 `_validate_subject_id`（存在 + 动画/三次元）→ 非法则视为无建议，不落库
-
-**3.2.4 结构化输出解析器（新文件 `app/services/llm/output_parser.py`）**
+**3.2.3 结构化输出解析器（新文件 `app/services/llm/output_parser.py`）**
 
 - J3 组件：LLM 返回 JSON 的提取/校验/容错/失败降级（消费方：本场景耗尽兜底 + Phase 4 诊断报告解析）
 - 输出模型 `LLMSuggestion` dataclass：`subject_id: str`、`reason: str`
 - 本场景中它是**兜底**（主路径是 submit_suggestion 工具化输出），不承担主决策解析
 
+**3.2.4 Agent 骨架：轻量循环（新文件 `app/services/agent/loop.py`）**
+
+```
+async def run(task_ctx, *, max_iterations, tools, tool_choice_terminal, span_recorder) -> RunResult:
+    messages = [system, user]                      # 场景构建
+    for i in range(max_iterations):
+        resp = await llm.chat(messages, tools=schemas, tool_choice=...)   # span: llm_chat
+        if resp.stop_reason == "end_turn":
+            return RunResult(stop_reason="end_turn", text=resp.content)
+        for tc in resp.tool_calls:
+            if tc.name == tool_choice_terminal:    # submit_suggestion
+                return RunResult(stop_reason="submit_suggestion", suggestion=tc.input)
+            result = await tools.execute(tc)       # span: tool_execute
+            messages.append(tool_result(tc, result))
+        messages.append(assistant(tc_blocks))
+        messages.append(user(f"[剩余轮次：{remaining}]"))   # 透明预算
+    return RunResult(stop_reason="exhausted")      # 预算刚性
+```
+
+关键点：
+- **透明预算**：每轮注入 `[剩余轮次：N]`；剩余 0 时 prompt 强制"必须调用终止工具或声明放弃"
+- **提前终止被接受**：第一轮就调用 submit_suggestion 表示已确定，接受并 break
+- **结束必有 stop_reason（D14）**：end_turn / submit_suggestion / exhausted / failed / cancelled / error
+- 本轮不实现 Phase 4 的 while budget（token/wall-time 预算系统），只做轮次上限
+
 ### 3.3 数据层
 
-**3.3.1 `match_llm_jobs` 新表（LLM 执行层）**
-
-每字段用途标注（无预留字段）：
+**3.3.1 `agent_runs` 通用会话表（替代特化 match_llm_jobs）**
 
 ```
-match_llm_jobs
+agent_runs
   id INTEGER PK AUTOINCREMENT
-  created_at DATETIME                        -- 创建时间
-  request_title TEXT NOT NULL                -- LLM 上下文主标题
-  request_ori_title TEXT DEFAULT ''          -- LLM 上下文别名（ori_title）
-  request_season INTEGER DEFAULT 1           -- LLM 季判断 + 映射写入 season
-  request_media_type TEXT DEFAULT 'episode'  -- 决定搜索 subject_types（api_search_main.py:67-77）
-  request_release_date TEXT DEFAULT ''       -- search 日期参数（日期精确搜索）
-  user_name TEXT DEFAULT ''                  -- 构造用户 Bangumi API 实例（_get_bangumi_api_for_user）
-  source TEXT DEFAULT ''                     -- 来源（日志/审计）
-  sync_record_id INTEGER                     -- 关联 sync_records：补发 + 从 match_trace 还原候选列表
-  candidate_id INTEGER                       -- 建议写入 pending_candidates 后回填；用户确认/忽略联动
-  status TEXT DEFAULT 'pending'              -- pending/processing/done/failed/no_suggestion/applied/rejected
-  attempts INTEGER DEFAULT 0                 -- LLM 调用失败次数（≤3 重试）
-  last_attempt_at DATETIME                   -- 上次处理时间
-  last_error TEXT                            -- 失败原因（供排查）
-  llm_subject_id TEXT DEFAULT ''             -- 决策结果（done 后回填）
-  llm_reason TEXT DEFAULT ''                 -- 建议理由（UI 展示）
-  finished_at DATETIME                       -- 终态时间（清理依据）
+  run_id TEXT NOT NULL UNIQUE            -- uuid：日志/步骤/记忆统一标识
+  task_type TEXT NOT NULL                -- 'match' / 'summary' / 'diagnostic'（Phase 4 扩展）
+  sync_record_id INTEGER                 -- 业务关联（match 场景：失败同步记录；上下文从 sync_records 还原）
+  status TEXT DEFAULT 'pending'          -- pending/processing/succeeded/no_suggestion/failed/cancelled/exhausted/applied/rejected
+  stop_reason TEXT DEFAULT ''            -- end_turn/submit_suggestion/exhausted/failed/cancelled/error（D14）
+  attempts INTEGER DEFAULT 0             -- LLM 调用失败次数（≤3 重试）
+  last_attempt_at DATETIME
+  last_error TEXT
+  total_tokens INTEGER DEFAULT 0
+  started_at DATETIME                    -- 处理开始（调度器置 processing 时）
+  ended_at DATETIME                      -- 终态时间（清理依据，D13）
+  created_at DATETIME                    -- 落库时间
 ```
 
-> 已删除的预留字段：`request_episode`（LLM 匹配不需要，补发走 sync_record_id）、`trace_summary`（候选从 `sync_records.match_trace` 还原，不冗余存储）。
+> 请求上下文（title/ori_title/season/media_type/release_date/user_name/source）与候选列表**不冗余存储**——从 `sync_records`（含 match_trace）还原；user_name 用于构造用户 Bangumi API 实例。无预留字段。
 
-**3.3.2 `pending_candidates` 加两列（用户确认层）**
+**3.3.2 `agent_steps` span 表（D15/D16）**
+
+```
+agent_steps
+  id INTEGER PK AUTOINCREMENT
+  run_id TEXT NOT NULL                   -- 关联 agent_runs.run_id
+  span_id TEXT NOT NULL                  -- uuid（otel span id）
+  parent_id TEXT DEFAULT ''              -- 父 span（root span = agent_runs 本身，不单独存）
+  name TEXT NOT NULL                     -- llm_chat / tool_execute
+  status TEXT DEFAULT 'ok'               -- ok / error
+  model TEXT DEFAULT ''                  -- llm_chat：模型名
+  tokens INTEGER DEFAULT 0               -- llm_chat：token 数
+  latency_ms INTEGER DEFAULT 0
+  tool_name TEXT DEFAULT ''              -- tool_execute：工具名
+  input_summary TEXT DEFAULT ''          -- 入参摘要（截断 ≤500 字符）
+  error TEXT DEFAULT ''
+  started_at DATETIME
+  ended_at DATETIME
+```
+
+> span 语义对齐 otel：root span = 一次会话（agent_runs 行），child spans = 每轮 LLM 调用 + 每次工具执行各一条（D16）。不引入 SDK，概念可未来映射导出（§8）。
+
+**3.3.3 `pending_candidates` 加两列（用户确认层）**
 
 ```
 ALTER TABLE pending_candidates ADD COLUMN llm_subject_id TEXT DEFAULT ''
@@ -250,58 +255,67 @@ ALTER TABLE pending_candidates ADD COLUMN llm_reason TEXT DEFAULT ''
 
 ```
 执行层（调度器驱动）：
-  pending → processing → done / failed / no_suggestion
-     done+有建议 → 写 pending_candidates(pending) + 回填 candidate_id + 通知
+  pending → processing → succeeded / no_suggestion / failed / exhausted
+     succeeded（有建议）→ 写 pending_candidates(pending) + 发通知
 
-用户处理层（随候选确认/忽略 API 联动）：
-  done → applied   （确认建议 → pending_candidates: pending→confirmed）
-      → rejected  （忽略 → pending_candidates: pending→rejected）
+用户处理层（随候选确认/忽略 API 联动，经 sync_record_id 关联）：
+  succeeded → applied   （确认建议 → pending_candidates: pending→confirmed）
+           → rejected  （忽略 → pending_candidates: pending→rejected）
 
 生命周期（D13）：
   failed ──同 key 再次失败到达──→ 复用记录重置 attempts=0 → pending（重新入队）
-  终态（done/no_suggestion/failed/applied/rejected）──finished_at 超 7 天──→ 清理删除
+  终态（succeeded/no_suggestion/failed/applied/rejected/exhausted）──ended_at 超 7 天──→ 清理删除
 ```
 
-联动实现：`confirm_pending_candidate` / `reject_pending_candidate`（__init__.py:214/513）内部追加一步，按 `candidate_id` 更新 `match_llm_jobs` 终态。两个维度互不阻塞：LLM 任务可独立重试/重跑，不影响用户确认。
+联动实现：`confirm_pending_candidate` / `reject_pending_candidate`（__init__.py:214/513）内部追加一步，按 `sync_record_id` 更新 `agent_runs` 终态（applied/rejected）。两个维度互不阻塞：LLM 任务可独立重试/重跑，不影响用户确认。
 
-### 3.5 `llm_match_scheduler`
+### 3.5 追踪设计（otel 概念，D15/D16）
+
+- span 记录器：`app/services/agent/trace.py`——`start_span(run_id, name, ...)` / `end_span(...)`，写 `agent_steps`（同一事务或独立 best-effort）
+- root span（agent_runs 行）由调度器/场景服务维护（status/stop_reason/tokens/ended_at）
+- 追踪 API（Phase 3 最小，Phase 4 观测页消费）：
+  - `GET /api/agent/runs/{run_id}` → run 信息（status/stop_reason/tokens）
+  - `GET /api/agent/runs/{run_id}/steps` → span 列表（按 started_at 排序）
+- Phase 3 展示：候选确认页"AI 评估过程"折叠区（见 §4）；完整观测页 Phase 4（§8）
+
+### 3.6 `llm_match_scheduler`
 
 - 位置：`app/services/llm_match_scheduler.py`（顶层，继承 `BaseScheduler`，同构 `bangumi_replay_scheduler`）
 - 注册：`scheduler_bootstrap.py` 加 `JobSpec(scheduler_id="llm_match", runner=llm_match_scheduler)`
 - 启用条件：`[sync] llm_match_assist=true` 且 LLM 配置存在（否则不启动，日志说明"LLM 配置缺失，匹配增强已禁用"）
 - cron：`*/1 * * * *`（每 60s，可在 `[sync]` 配置覆盖）
 - 每轮顺序：
-  1. **清理**：终态且 `finished_at` 超保留期（7 天，可配置）→ DELETE + 日志删除数量（同构 `llm_usage.cleanup_old_llm_usage_logs`）
+  1. **清理**：终态且 `ended_at` 超保留期（7 天，可配置）→ DELETE + 日志删除数量（同构 `llm_usage.cleanup_old_llm_usage_logs`）
   2. 统计 pending → 0 则跳过
-  3. 逐条：置 processing → `await llm_assist.run(job)` → 写结果（方法内完成）
+  3. 逐条：置 processing + started_at → `await llm_assist.run(run)` → 写结果（方法内完成，见 3.8）
 - 重试：LLM 调用失败 attempts+1，< 3 重试，= 3 标 failed（`last_error` 记录）
 
-### 3.6 匹配接入点（`_handle_match_failure`）
+### 3.7 匹配接入点（`_handle_match_failure`）
 
 ```
 追加：
 1. 开关关 / LLM 配置缺失 → 跳过（日志说明）
-2. 同 key 已存在 failed 记录 → 复用重置（D13 重新入队），否则新增
+2. 同 key（title+season+user+source）已存在 failed 记录 → 复用重置（D13 重新入队），否则新增
 3. trace 追加 start_step("llm_assist")（status="pending"，reason="已提交 AI 评估"）
    ——必须发生在 _persist_sync_record 之前（trace 入库后不可改）；
-   评估结果异步承载于 match_llm_jobs，不回写 trace
-4. 写 match_llm_jobs(pending)：请求字段 + sync_record_id
+   评估结果异步承载于 agent_runs/agent_steps，不回写 trace
+4. 写 agent_runs(pending, task_type='match')：run_id + sync_record_id
 5. 失败不阻塞主流程（落库异常仅日志）
 ```
 
-### 3.7 确认闭环（bypass）与写操作时序
+### 3.8 确认闭环（bypass）与写操作时序
 
-- **写入时序（确认）**：`llm_assist.run()` 方法内、方法返回前完成全部写入——校验 subject_id → 写 `pending_candidates`（llm 两列）→ 回填 `candidate_id` → 任务 done → 发待确认通知。调度器本轮即结束，无后续步骤
-- 候选确认页 AI 推荐区块：「应用建议」按钮 → `POST /api/pending-candidates/{id}/confirm`（复用现有端点，body 带 `llm_subject_id`）→ `confirm_pending_candidate` 现有逻辑（校验 subject → 写映射 → 补发）+ 联动 `match_llm_jobs → applied`
+- **写入时序（确认）**：`llm_assist.run()` 方法内、方法返回前完成全部写入——校验 subject_id → 写 `pending_candidates`（llm 两列）→ `agent_runs` succeeded + stop_reason → 发待确认通知。调度器本轮即结束，无后续步骤
+- 候选确认页 AI 推荐区块：「应用建议」按钮 → `POST /api/pending-candidates/{id}/confirm`（复用现有端点，body 带 `llm_subject_id`）→ `confirm_pending_candidate` 现有逻辑（校验 subject → 写映射 → 补发）+ 联动 `agent_runs → applied`
 - 补发成功 → `bangumi_id_found`（已匹配通知，现有逻辑自动触发）
 
-### 3.8 通知
+### 3.9 通知
 
 - `notification_registry.py`：`pending_candidate` 增加 `in_app_type="match_pending"`（站内信专用类型，同 sync_failed 模式）+ `in_app_title_template="匹配待确认：{title} {ep_label}"`
 - 文案：通知标题/正文体现"已由 Agent 匹配，待用户手动确认"；`anime_not_found` 保留原义（Agent 无建议/未介入时的纯失败）
 - `resolve_in_app_type("pending_candidate")` 现有逻辑自动生效（registry:403-412），无需改动通知服务
 
-### 3.9 开关、降级、前后端检查
+### 3.10 开关、降级、前后端检查
 
 | 层 | 实现 |
 |---|---|
@@ -310,13 +324,13 @@ ALTER TABLE pending_candidates ADD COLUMN llm_reason TEXT DEFAULT ''
 | 前端 | config 页"匹配增强"开关：仅 `llm_available` 时显示；未配置时显示提示"需先配置 LLM"（参照 dashboard 用量卡片条件渲染先例） |
 | 降级 | 开关关/配置缺失/LLM 调用失败 → 不落任务或标 failed，**原失败路径零改动** |
 
-### 3.10 死循环防护（三层，不上 Phase 4 budget 系统）
+### 3.11 死循环防护（三层，不上 Phase 4 budget 系统）
 
 1. **`max_iterations` 刚性上限**：thinking_level 映射（off=1/low=2/medium=3/high=5），循环结构保证不会超过
 2. **`submit_suggestion` 调用即 break**：终止性工具，收到即终止，不可能重复调用
 3. **每轮 `max_tokens` 限制**：沿用现有 LLM 配置
 
-### 3.11 KV cache 设计
+### 3.12 KV cache 设计
 
 **轮次内（必做，零成本）——循环轮次间前缀复用**
 
@@ -345,21 +359,21 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 ```
 列表行：
   ├─ 现有：时间/标题/季集/来源/候选数/状态/操作
-  └─ 新增徽标：AI 评估中（processing）/ AI 推荐（done+建议）/ 普通（无 AI 介入）
-              → 徽标数据源：GET /api/pending-candidates 返回 llm 字段 + 关联 match_llm_jobs 状态
+  └─ 新增徽标：AI 评估中（processing）/ AI 推荐（succeeded+建议）/ 普通（无 AI 介入）
+              → 徽标数据源：GET /api/pending-candidates 返回 llm 字段 + 关联 agent_runs 状态
 
 详情弹窗：
   ├─ 现有：请求信息 / 候选列表（确认按钮）/ 手动指定 ID
-  └─ 新增：AI 推荐区块（当 llm_subject_id 有值）
-      ┌────────────────────────────────────────┐
-      │ [AI 推荐] 剧场版 花咲くいろは HOME SWEET HOME (ID 49892) │
-      │ 理由：标题语义相近……（llm_reason）               │
-      │ [应用建议]（bypass，跳过手动流程）                │
-      └────────────────────────────────────────┘
-      应用后：写映射 + 自动补发 → 已匹配通知（bangumi_id_found）
+  ├─ 新增：AI 推荐区块（当 llm_subject_id 有值）
+  │    [AI 推荐] 剧场版 花咲くいろは HOME SWEET HOME (ID 49892)
+  │    理由：标题语义相近……（llm_reason）
+  │    [应用建议]（bypass，跳过手动流程）
+  │    应用后：写映射 + 自动补发 → 已匹配通知（bangumi_id_found）
+  └─ 新增：AI 评估过程折叠区（GET /api/agent/runs/{run_id}/steps）
+       展开：span 简表（LLM 调用 N 轮 / 工具调用列表 / 每轮耗时）
 ```
 
-状态实时反馈：列表/详情接口合并返回 `match_llm_jobs.status`，前端刷新即见"评估中 → 已推荐 → 已应用/已忽略"流转。
+状态实时反馈：列表/详情接口合并返回 `agent_runs.status`，前端刷新即见"评估中 → 已推荐 → 已应用/已忽略"流转。
 
 ---
 
@@ -367,35 +381,41 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 
 | 操作 | 文件 | 说明 |
 |---|---|---|
-| **通用能力** | | |
+| **LLM 能力层（通用）** | | |
 | 修改 | `app/services/llm/models.py` | ToolUseBlock/ToolResultBlock |
 | 修改 | `app/services/llm/providers/anthropic.py` | tool wire 1:1 + tools/tool_choice 透传 + cache_control |
 | 修改 | `app/services/llm/providers/openai_compat.py` | tool 拆并 + tools/tool_choice 透传 |
 | 新增 | `app/services/llm/tools.py` | ToolDefinition/ToolRegistry/execute + JSON Schema |
 | 新增 | `app/services/llm/output_parser.py` | J3 结构化解析 + LLMSuggestion |
+| **Agent 骨架（通用）** | | |
+| 新增 | `app/services/agent/__init__.py` | 包入口 |
+| 新增 | `app/services/agent/loop.py` | 轻量循环（max_iterations + 终止工具 + 透明预算 + stop_reason） |
+| 新增 | `app/services/agent/trace.py` | otel 概念 span 记录器 |
 | **数据层** | | |
-| 新增 | `app/core/database/match_llm_jobs.py` | 任务表 repository（含重新入队/清理） |
+| 新增 | `app/core/database/agent_runs.py` | agent_runs + agent_steps repository（含重新入队/清理） |
 | 修改 | `app/core/database/connection.py` | 建表 + pending_candidates 迁移两列 |
 | 修改 | `app/core/database/pending_candidates.py` | 查询/写入带 llm 两列 |
-| **业务层** | | |
-| 新增 | `app/services/matching/llm_assist.py` | 轻量循环编排 + 工具执行 + 方法内写入 |
+| **场景层（match）** | | |
+| 新增 | `app/services/matching/llm_assist.py` | 场景接入：上下文构建（从 sync_records 还原）+ 工具注册 + 调用 loop + 方法内写入 |
 | 新增 | `app/services/llm_match_scheduler.py` | 调度器（BaseScheduler，含清理） |
 | 修改 | `app/services/scheduler_bootstrap.py` | 注册 llm_match |
 | 修改 | `app/services/sync_service/__init__.py` | `_handle_match_failure` 接入 / confirm、reject 联动 / 重新入队 |
 | 修改 | `app/services/sync_service/orchestrator.py` | 失败分支提交任务 + trace step（persist 前） |
 | **API/配置** | | |
+| 新增 | `app/api/agent_runs.py` | GET /api/agent/runs/{id} + /steps（追踪查询） |
 | 修改 | `app/api/sync.py` | pending-candidates 列表/详情带 llm 字段与任务状态 |
 | 修改 | `app/api/config.py`（或 sync config 端点） | llm_match_assist 开关校验 + llm_available |
 | 修改 | `app/core/config.py` | `[sync]` 新增键读取 |
 | 修改 | `app/core/notification_registry.py` | pending_candidate 补 in_app |
+| 修改 | `app/main.py` | 注册 agent_runs router |
 | **前端** | | |
-| 修改 | `templates/pending_candidates.html` | AI 推荐区块 + 徽标 |
-| 修改 | `static/js/` | 徽标/应用建议交互 |
+| 修改 | `templates/pending_candidates.html` | AI 推荐区块 + 徽标 + 评估过程折叠区 |
+| 修改 | `static/js/` | 徽标/应用建议/折叠区交互 |
 | 修改 | `templates/config.html` | 开关条件渲染 |
 | **测试** | | |
 | 新增/修改 | `tests/` | 见 §6 场景 |
 
-> 总计：新增 ~6 文件，修改 ~13 文件。
+> 总计：新增 ~9 文件，修改 ~14 文件。
 
 ---
 
@@ -404,46 +424,46 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 ### 场景 M1 失败落任务
 - **Given** `llm_match_assist=true` 且 LLM 已配置
 - **When** 同步请求匹配失败（含候选）
-- **Then** `match_llm_jobs` 新增 pending 行（含请求字段 + sync_record_id）
+- **Then** `agent_runs` 新增 pending 行（task_type='match'，含 run_id + sync_record_id）
 - **And** trace 含 llm_assist step（status="pending"）；`pending_candidates` 按现有逻辑沉淀（不变）
 
 ### 场景 M2 无候选也落任务
 - **Given** 匹配失败且 trace 无候选（如 `花开伊吕波剧场版` 类场景）
 - **When** 失败处理执行
-- **Then** `match_llm_jobs` 仍新增 pending 行（LLM 可补充搜索）
+- **Then** `agent_runs` 仍新增 pending 行（LLM 可补充搜索）
 
 ### 场景 M3 开关关闭不介入
 - **Given** `llm_match_assist=false`
 - **When** 同步请求匹配失败
-- **Then** 不写 `match_llm_jobs`，原失败逻辑（error 记录 + anime_not_found + 候选沉淀）完全不变
+- **Then** 不写 `agent_runs`，原失败逻辑（error 记录 + anime_not_found + 候选沉淀）完全不变
 
 ### 场景 M4 LLM 配置缺失降级
 - **Given** `llm_match_assist=true` 但 LLM api_key 为空
 - **When** 失败处理执行
 - **Then** 不落任务，日志包含"LLM 配置缺失"说明
 
-### 场景 M5 循环执行到 done（有建议）
-- **Given** `match_llm_jobs` 有 pending 行
+### 场景 M5 循环执行到成功（有建议）
+- **Given** `agent_runs` 有 pending 行
 - **When** 调度器调用 `llm_assist.run`（mock LLM：第一轮 tool_use 调 `search_bangumi`，第二轮调 `submit_suggestion`）
-- **Then** 循环按轮次推进，第二轮收到 submit_suggestion 即 break
-- **And** 任务 processing → done，`llm_subject_id`/`llm_reason` 回填
+- **Then** 循环按轮次推进，第二轮收到 submit_suggestion 即 break，`stop_reason=submit_suggestion`
+- **And** 任务 processing → succeeded，`total_tokens` 回填
 - **And** `pending_candidates` 新增/更新行（candidates_json 追加新 subject，llm 两列有值）
 - **And** 触发 `pending_candidate` 通知（含站内信）
 
 ### 场景 M6 end_turn 直接终止
 - **Given** mock LLM 首轮返回 end_turn（无工具调用）
 - **When** 调度器处理
-- **Then** 循环立即终止，不追加轮次
+- **Then** 循环立即终止（`stop_reason=end_turn`），不追加轮次，任务 → no_suggestion
 
-### 场景 M7 done 无建议
-- **Given** mock LLM 循环耗尽且未调用 submit_suggestion（文本声明放弃，output_parser 提取失败）
-- **When** 调度器完成评估
-- **Then** 任务终态 `no_suggestion`，不产生 `pending_candidates` 行，不追加轮次
+### 场景 M7 预算耗尽无建议
+- **Given** mock LLM 每轮都调工具但不调用 submit_suggestion
+- **When** 调度器处理
+- **Then** 循环达 max_iterations 终止（`stop_reason=exhausted`），任务 → no_suggestion，不追加轮次
 
 ### 场景 M8 LLM 调用失败重试
 - **Given** mock LLM 连续抛错
 - **When** 调度器轮询
-- **Then** attempts 递增，≤3 次重试；第 3 次后终态 `failed`，`last_error` 记录原因
+- **Then** attempts 递增，≤3 次重试；第 3 次后终态 `failed`，`stop_reason=failed`，`last_error` 记录原因
 
 ### 场景 M9 failed 重新入队
 - **Given** 同 key 存在 failed 记录（attempts=3）
@@ -451,21 +471,21 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - **Then** 复用该记录：attempts 重置 0、status 回 pending、时间刷新，不新增行
 
 ### 场景 M10 终态清理
-- **Given** 存在终态记录且 `finished_at` 超保留期（7 天）
+- **Given** 存在终态记录且 `ended_at` 超保留期（7 天）
 - **When** 调度器每轮清理
 - **Then** 记录被删除，日志记录删除数量；未超保留期的不删
 
 ### 场景 M11 应用建议（bypass）
-- **Given** `pending_candidates` 行带 llm_subject_id，任务状态 done
+- **Given** `pending_candidates` 行带 llm_subject_id，任务状态 succeeded
 - **When** 用户 POST confirm（body 带 llm_subject_id）
 - **Then** 写入自定义映射 + 自动补发（复用 `_auto_replay_after_confirm`）
-- **And** `match_llm_jobs` → applied；`pending_candidates` → confirmed
+- **And** `agent_runs` → applied；`pending_candidates` → confirmed
 - **And** 补发成功后触发 `bangumi_id_found`
 
 ### 场景 M12 忽略建议
 - **Given** 同 M11 前置
 - **When** 用户 POST reject
-- **Then** `pending_candidates` → rejected；`match_llm_jobs` → rejected
+- **Then** `pending_candidates` → rejected；`agent_runs` → rejected
 
 ### 场景 M13 工具协议（Anthropic 1:1 + tool_choice）
 - **Given** 内部 assistant 消息含 ToolUseBlock，`tool_choice` 指定 submit_suggestion
@@ -497,29 +517,55 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - **When** 打开 config 页
 - **Then** "匹配增强"开关不显示，展示"需先配置 LLM"提示；配置保存 API 拒绝开启并返回原因
 
+### 场景 M19 span 记录（D16）
+- **Given** 一次含 2 轮 chat + 3 次工具调用的循环执行
+- **When** 调度器处理完成
+- **Then** `agent_steps` 新增 5 条 span（2 条 llm_chat + 3 条 tool_execute），含 model/tokens/latency/tool_name/input_summary，parent 归属正确
+
+### 场景 M20 stop_reason 完整性（D14）
+- **Given** 各种结束路径（end_turn / submit_suggestion / exhausted / failed）
+- **When** 循环终止
+- **Then** `agent_runs.stop_reason` 正确记录对应枚举，无空值
+
+### 场景 M21 追踪 API
+- **Given** `agent_runs` 有已完成 run
+- **When** `GET /api/agent/runs/{run_id}` 与 `/steps`
+- **Then** 返回 run 信息（status/stop_reason/tokens）与 span 列表（按时间排序）
+
 ---
 
 ## 7. 验证方式
 
 | 层级 | 方式 |
 |---|---|
-| 单元 | §6 M1-M18 全部通过；工具协议回归 phase2.1 T1-T7 |
-| 集成 | mock LLM：构造"跨季错配"（Re0 场景）与"无候选"（花开伊吕波场景）fixture，验证建议产出 + 候选落库 + 补发；循环防护（M6/M7）与生命周期（M9/M10） |
-| 手工 | 真实 LLM + 真实失败记录：观察候选页"评估中→已推荐→应用→已匹配"全链路；对比开关前后的失败处理延迟（webhook 均应立即返回） |
+| 单元 | §6 M1-M21 全部通过；工具协议回归 phase2.1 T1-T7 |
+| 集成 | mock LLM：构造"跨季错配"（Re0 场景）与"无候选"（花开伊吕波场景）fixture，验证建议产出 + 候选落库 + 补发；循环防护（M6/M7）与生命周期（M9/M10）；span 完整性（M19/M20） |
+| 手工 | 真实 LLM + 真实失败记录：观察候选页"评估中→已推荐→应用→已匹配"全链路 + 评估过程折叠区 span 展示；对比开关前后的失败处理延迟（webhook 均应立即返回） |
 | 性能 | webhook 响应不因 LLM 介入变慢（异步落库即返回）；调度器轮询不堆积；清理不删除未过期记录 |
 
 ---
 
-## 8. 边界与 Phase 4 预留
+## 8. 边界与 Phase 4/5 预留
 
-**本次不做**：自由 Agent 循环（while budget 迭代 + budget.py/trace.py）、`agent_runs/agent_steps` 表、日志诊断、知识沉淀、多用户分解、记忆注入（§0.4）。
+**本次不做**：完整 while budget 系统（token/wall-time）、`/api/agent/*` 通用执行接口、诊断场景、知识库、记忆工具、取消语义（C2）完整实现、完整观测页。
 
 **Phase 4 接缝（本次建立）**：
-- `app/services/llm/tools.py`（ToolDefinition/registry/execute + JSON Schema）→ Phase 4 Agent 循环直接消费
+- `app/services/llm/tools.py`（ToolDefinition/registry/execute + JSON Schema）→ Agent 循环直接消费
+- `app/services/agent/loop.py` + `trace.py`（stop_reason / span 语义）→ Phase 4 while budget 循环的骨架与可观测性基础
+- `agent_runs`/`agent_steps` 通用表 → Phase 4 诊断任务同构（task_type='diagnostic'），观测页数据源
 - `output_parser`（J3）→ 诊断报告解析复用
-- 轻量循环（max_iterations + submit_suggestion 终止模式）→ Phase 4 while budget 循环的简化先例
-- `match_llm_jobs` 任务表 + 调度器模式 → Phase 4 诊断任务同构
 - KV cache 前缀约定 → Phase 4 任意多轮任务沿用
+
+**Phase 4 内容（范围声明）**：
+- 完整 Agent 循环（budget.py：token/wall-time + 取消 C2）+ 诊断场景
+- **内建"Agent 观测页"**（Web UI + chart.js：概览卡片 + 运行列表 + span 瀑布），复用现有仪表盘先例
+- 记忆工具化（`tools/memory.py`：search_memory 返回 full_text 原文片段 / store_memory / export_memory 导出 jsonl）——"原文优先 + 工具化检索"演进（2026-08 讨论备忘）
+- 统一 session 模型深化：取消语义、消息历史持久化策略
+
+**Phase 5 内容（评估）**：
+- `/metrics` 端点（Prometheus 文本格式，从 agent_runs 聚合）→ 重度自部署用户接 Grafana/Tempo（默认不开）
+- knowledge_base 知识沉淀 + 记忆重要性维度（feedback→知识库联动）
+- 匹配建议历史反馈沉淀（确认/拒绝 → 后续建议参考）
 
 ---
 
@@ -527,6 +573,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 
 | 子 phase | 范围 | 依赖 |
 |---|---|---|
-| 3.0 | 通用能力：工具协议补齐（3.2.1）+ tools.py + output_parser + 循环骨架（llm_assist.run 空转验证） | 无 |
-| 3.1 | 数据层 + 调度器：match_llm_jobs 表/repo（含重新入队/清理）+ pending_candidates 两列 + llm_assist 完整实现 + llm_match_scheduler | 3.0 |
-| 3.2 | 接入 + 闭环 + 通知 + 前端：_handle_match_failure 接入 + confirm/reject 联动 + registry 站内信 + 候选页 UI + config 开关 | 3.1 |
+| 3.0 | **LLM 能力层**：工具协议补齐（3.2.1）+ tools.py + output_parser | 无 |
+| 3.1 | **Agent 骨架**：agent/loop.py + agent/trace.py + agent_runs/agent_steps 表/repo + 追踪 API + 循环/span 单测（M13/M14/M19/M20/M21） | 3.0 |
+| 3.2 | **match 场景**：llm_assist + llm_match_scheduler + _handle_match_failure 接入 + confirm/reject 联动 + 通知 + 重新入队/清理（M1-M12/M15-M17） | 3.1 |
+| 3.3 | **前端与开关**：候选页 AI 推荐 + 徽标 + 评估过程折叠区 + config 开关条件渲染（M18） | 3.2 |
