@@ -64,6 +64,7 @@ LLM 介入价值集中在 **A1/A2（跨季判断）与 B1（多语言语义）**
 | D15 | 追踪形态 | **自建 otel 概念模型**（trace_id/span_id/parent/span 层级/status/attribute 语义对齐，**不引入 opentelemetry SDK**——零新增依赖，符合项目风格；未来可映射导出） |
 | D16 | span 粒度 | **每轮 LLM 调用 + 每次工具执行各一条 span**（agent_steps），可完整复盘 |
 | D17 | 观测演进 | 内建"Agent 观测页"（Web UI + chart.js，Phase 4）；远期 `/metrics` 导出（Prometheus 格式，可选，Phase 5）——**默认不引入 Prometheus/Grafana**（单实例 SQLite 数据源用不上，自部署用户零额外负担） |
+| D18 | 断点重入 | 会话状态机对 `processing` 的 run **可从断点恢复**：每轮 LLM 调用前后、工具调用前后持久化会话增量（`agent_steps.payload_json`）；服务重启后调度器扫描 processing 遗留 → 重建种子 messages（system 静态模板 + user 从 sync_records 还原）→ 按 steps 重放增量 → 续跑 |
 
 ---
 
@@ -208,6 +209,7 @@ agent_runs
   task_type TEXT NOT NULL                -- 'match' / 'summary' / 'diagnostic'（Phase 4 扩展）
   sync_record_id INTEGER                 -- 业务关联（match 场景：失败同步记录；上下文从 sync_records 还原）
   status TEXT DEFAULT 'pending'          -- pending/processing/succeeded/no_suggestion/failed/cancelled/exhausted/applied/rejected
+                                          -- processing = 运行中，兼作"待恢复"标记（D18：重启后由调度器扫描恢复）
   stop_reason TEXT DEFAULT ''            -- end_turn/submit_suggestion/exhausted/failed/cancelled/error（D14）
   attempts INTEGER DEFAULT 0             -- LLM 调用失败次数（≤3 重试）
   last_attempt_at DATETIME
@@ -220,7 +222,7 @@ agent_runs
 
 > 请求上下文（title/ori_title/season/media_type/release_date/user_name/source）与候选列表**不冗余存储**——从 `sync_records`（含 match_trace）还原；user_name 用于构造用户 Bangumi API 实例。无预留字段。
 
-**3.3.2 `agent_steps` span 表（D15/D16）**
+**3.3.2 `agent_steps` span 表（D15/D16/D18）**
 
 ```
 agent_steps
@@ -236,11 +238,21 @@ agent_steps
   tool_name TEXT DEFAULT ''              -- tool_execute：工具名
   input_summary TEXT DEFAULT ''          -- 入参摘要（截断 ≤500 字符）
   error TEXT DEFAULT ''
+  payload_json TEXT DEFAULT ''           -- 会话增量/响应（D18，截断 ≤2KB/条，见写入时机表）
   started_at DATETIME
   ended_at DATETIME
 ```
 
 > span 语义对齐 otel：root span = 一次会话（agent_runs 行），child spans = 每轮 LLM 调用 + 每次工具执行各一条（D16）。不引入 SDK，概念可未来映射导出（§8）。
+>
+> **payload_json 写入时机（D18，每轮 LLM 调用前后、工具调用前后）**：
+
+| span | 前（start） | 后（end） |
+|---|---|---|
+| `llm_chat` | started_at 记录 | `{response: {stop_reason, content 摘要, tool_calls 摘要}}` + tokens/latency |
+| `tool_execute` | `{input: 入参摘要}` | `{result: 截断 tool_result, delta: [assistant(tool_use), user(tool_result)]}`——delta = 本轮会话增量，断点重放的关键 |
+
+> **JSON TEXT 边界说明**：`payload_json` 存的是**会话事件内容**（LLM 对话协议定义的自由结构：role + content blocks），与 otel span attributes 同理——观测/事件数据允许 JSON；业务结构化数据（subject_id/reason 等）仍用独立列。
 
 **3.3.3 `pending_candidates` 加两列（用户确认层）**
 
@@ -258,6 +270,9 @@ ALTER TABLE pending_candidates ADD COLUMN llm_reason TEXT DEFAULT ''
   pending → processing → succeeded / no_suggestion / failed / exhausted
      succeeded（有建议）→ 写 pending_candidates(pending) + 发通知
 
+断点恢复（D18）：
+  processing ──服务重启──→ 调度器恢复扫描：重建种子 + 重放增量 → 续跑（仍 processing，直至终态）
+
 用户处理层（随候选确认/忽略 API 联动，经 sync_record_id 关联）：
   succeeded → applied   （确认建议 → pending_candidates: pending→confirmed）
            → rejected  （忽略 → pending_candidates: pending→rejected）
@@ -269,10 +284,19 @@ ALTER TABLE pending_candidates ADD COLUMN llm_reason TEXT DEFAULT ''
 
 联动实现：`confirm_pending_candidate` / `reject_pending_candidate`（__init__.py:214/513）内部追加一步，按 `sync_record_id` 更新 `agent_runs` 终态（applied/rejected）。两个维度互不阻塞：LLM 任务可独立重试/重跑，不影响用户确认。
 
-### 3.5 追踪设计（otel 概念，D15/D16）
+### 3.5 追踪设计（otel 概念，D15/D16/D18）
 
-- span 记录器：`app/services/agent/trace.py`——`start_span(run_id, name, ...)` / `end_span(...)`，写 `agent_steps`（同一事务或独立 best-effort）
+- span 记录器：`app/services/agent/trace.py`——`start_span(run_id, name, ...)` / `end_span(...)`，写 `agent_steps`（独立 best-effort 事务）
+- **会话增量记录（D18）**：`tool_execute` span end 时写入 `delta`（assistant tool_use + user tool_result）；`llm_chat` span end 时写入响应摘要——`agent_steps` 从"纯观测"升级为**可重放会话日志**（jsonl append-only 思想的 DB 落地）
 - root span（agent_runs 行）由调度器/场景服务维护（status/stop_reason/tokens/ended_at）
+- **断点恢复（D18）**：
+  1. 调度器启动后首轮扫描 `status='processing'` 的 run（上次崩溃遗留）
+  2. 重建种子 messages：system（静态匹配指令）+ user（从 sync_records 还原）
+  3. 按 `agent_steps` 顺序重放：每条 `tool_execute.payload.delta` 追加 `[assistant, user(tool_result)]`
+  4. 续跑：剩余轮次 = `max_iterations - 已执行 llm_chat 数`
+     - 最后一条是完整 `llm_chat`（响应已存）且未产生 tool/终止 → 直接用已存响应继续（不重新调 LLM）
+     - 最后是 `tool_execute`（完整）→ 正常续跑下一轮 chat
+     - 极端情况（响应未存）→ 从上一完整点重放后重新 chat（正确性优先，可接受）
 - 追踪 API（Phase 3 最小，Phase 4 观测页消费）：
   - `GET /api/agent/runs/{run_id}` → run 信息（status/stop_reason/tokens）
   - `GET /api/agent/runs/{run_id}/steps` → span 列表（按 started_at 排序）
@@ -285,9 +309,10 @@ ALTER TABLE pending_candidates ADD COLUMN llm_reason TEXT DEFAULT ''
 - 启用条件：`[sync] llm_match_assist=true` 且 LLM 配置存在（否则不启动，日志说明"LLM 配置缺失，匹配增强已禁用"）
 - cron：`*/1 * * * *`（每 60s，可在 `[sync]` 配置覆盖）
 - 每轮顺序：
-  1. **清理**：终态且 `ended_at` 超保留期（7 天，可配置）→ DELETE + 日志删除数量（同构 `llm_usage.cleanup_old_llm_usage_logs`）
-  2. 统计 pending → 0 则跳过
-  3. 逐条：置 processing + started_at → `await llm_assist.run(run)` → 写结果（方法内完成，见 3.8）
+  1. **恢复扫描（D18）**：首轮（或每轮）检查 `status='processing'` 的遗留 run → 重建种子 messages → 重放 `agent_steps` 增量 → 续跑（幂等：恢复中崩溃 → 下次再扫）
+  2. **清理**：终态且 `ended_at` 超保留期（7 天，可配置）→ DELETE + 日志删除数量（同构 `llm_usage.cleanup_old_llm_usage_logs`）
+  3. 统计 pending → 0 则跳过
+  4. 逐条：置 processing + started_at → `await llm_assist.run(run)` → 写结果（方法内完成，见 3.8）
 - 重试：LLM 调用失败 attempts+1，< 3 重试，= 3 标 failed（`last_error` 记录）
 
 ### 3.7 匹配接入点（`_handle_match_failure`）
@@ -390,7 +415,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 | **Agent 骨架（通用）** | | |
 | 新增 | `app/services/agent/__init__.py` | 包入口 |
 | 新增 | `app/services/agent/loop.py` | 轻量循环（max_iterations + 终止工具 + 透明预算 + stop_reason） |
-| 新增 | `app/services/agent/trace.py` | otel 概念 span 记录器 |
+| 新增 | `app/services/agent/trace.py` | otel 概念 span 记录器 + 会话增量持久化（payload_json） + 断点重放 |
 | **数据层** | | |
 | 新增 | `app/core/database/agent_runs.py` | agent_runs + agent_steps repository（含重新入队/清理） |
 | 修改 | `app/core/database/connection.py` | 建表 + pending_candidates 迁移两列 |
@@ -532,14 +557,25 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - **When** `GET /api/agent/runs/{run_id}` 与 `/steps`
 - **Then** 返回 run 信息（status/stop_reason/tokens）与 span 列表（按时间排序）
 
+### 场景 M22 崩溃恢复（断点重入）
+- **Given** 服务重启，`agent_runs` 存在 `processing` 遗留 run（已执行 1 轮 chat + 1 次工具，agent_steps 完整）
+- **When** 调度器恢复扫描
+- **Then** 重建种子 messages → 重放 delta（assistant + tool_result）→ 从第 2 轮续跑
+- **And** 续跑轮数 = max_iterations - 已执行 llm_chat 数；最终正常完成（succeeded/failed），不重复执行已记录的步骤
+
+### 场景 M23 崩溃中间态
+- **Given** 服务在 llm_chat 响应已存但工具未执行的间隙崩溃
+- **When** 调度器恢复扫描
+- **Then** 直接用已存响应继续（不重新调 LLM）；极端情况（响应未存）→ 从上一完整点重放后重新 chat
+
 ---
 
 ## 7. 验证方式
 
 | 层级 | 方式 |
 |---|---|
-| 单元 | §6 M1-M21 全部通过；工具协议回归 phase2.1 T1-T7 |
-| 集成 | mock LLM：构造"跨季错配"（Re0 场景）与"无候选"（花开伊吕波场景）fixture，验证建议产出 + 候选落库 + 补发；循环防护（M6/M7）与生命周期（M9/M10）；span 完整性（M19/M20） |
+| 单元 | §6 M1-M23 全部通过；工具协议回归 phase2.1 T1-T7 |
+| 集成 | mock LLM：构造"跨季错配"（Re0 场景）与"无候选"（花开伊吕波场景）fixture，验证建议产出 + 候选落库 + 补发；循环防护（M6/M7）与生命周期（M9/M10）；span 完整性（M19/M20）；**断点恢复（M22/M23：模拟 processing 遗留 + 重放续跑）** |
 | 手工 | 真实 LLM + 真实失败记录：观察候选页"评估中→已推荐→应用→已匹配"全链路 + 评估过程折叠区 span 展示；对比开关前后的失败处理延迟（webhook 均应立即返回） |
 | 性能 | webhook 响应不因 LLM 介入变慢（异步落库即返回）；调度器轮询不堆积；清理不删除未过期记录 |
 
@@ -551,7 +587,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 
 **Phase 4 接缝（本次建立）**：
 - `app/services/llm/tools.py`（ToolDefinition/registry/execute + JSON Schema）→ Agent 循环直接消费
-- `app/services/agent/loop.py` + `trace.py`（stop_reason / span 语义）→ Phase 4 while budget 循环的骨架与可观测性基础
+- `app/services/agent/loop.py` + `trace.py`（stop_reason / span 语义 / 会话增量持久化）→ Phase 4 while budget 循环的骨架、可观测性与**断点重入**基础（D18）
 - `agent_runs`/`agent_steps` 通用表 → Phase 4 诊断任务同构（task_type='diagnostic'），观测页数据源
 - `output_parser`（J3）→ 诊断报告解析复用
 - KV cache 前缀约定 → Phase 4 任意多轮任务沿用
@@ -560,7 +596,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - 完整 Agent 循环（budget.py：token/wall-time + 取消 C2）+ 诊断场景
 - **内建"Agent 观测页"**（Web UI + chart.js：概览卡片 + 运行列表 + span 瀑布），复用现有仪表盘先例
 - 记忆工具化（`tools/memory.py`：search_memory 返回 full_text 原文片段 / store_memory / export_memory 导出 jsonl）——"原文优先 + 工具化检索"演进（2026-08 讨论备忘）
-- 统一 session 模型深化：取消语义、消息历史持久化策略
+- 统一 session 模型深化：取消语义、消息历史持久化策略（D18 已建立增量持久化骨架，Phase 4 评估完整消息保留策略）
 
 **Phase 5 内容（评估）**：
 - `/metrics` 端点（Prometheus 文本格式，从 agent_runs 聚合）→ 重度自部署用户接 Grafana/Tempo（默认不开）
@@ -574,6 +610,6 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 | 子 phase | 范围 | 依赖 |
 |---|---|---|
 | 3.0 | **LLM 能力层**：工具协议补齐（3.2.1）+ tools.py + output_parser | 无 |
-| 3.1 | **Agent 骨架**：agent/loop.py + agent/trace.py + agent_runs/agent_steps 表/repo + 追踪 API + 循环/span 单测（M13/M14/M19/M20/M21） | 3.0 |
+| 3.1 | **Agent 骨架**：agent/loop.py + agent/trace.py（含 payload_json 会话增量 + 断点重放）+ agent_runs/agent_steps 表/repo + 追踪 API + 循环/span/恢复单测（M13/M14/M19/M20/M21/M22/M23） | 3.0 |
 | 3.2 | **match 场景**：llm_assist + llm_match_scheduler + _handle_match_failure 接入 + confirm/reject 联动 + 通知 + 重新入队/清理（M1-M12/M15-M17） | 3.1 |
 | 3.3 | **前端与开关**：候选页 AI 推荐 + 徽标 + 评估过程折叠区 + config 开关条件渲染（M18） | 3.2 |
