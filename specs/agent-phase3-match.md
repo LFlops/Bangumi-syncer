@@ -57,7 +57,7 @@ LLM 介入价值集中在 **A1/A2（跨季判断）与 B1（多语言语义）**
 | D8 | 前后端检查 | 后端校验 LLM 配置存在才允许开启；前端开关仅 LLM 已配置时显示（参照 dashboard 用量卡片条件渲染先例） |
 | D9 | 通知 | 复用 `pending_candidate` 类型，**补站内信**（in_app_type + 标题模板），文案"已由 Agent 匹配，待确认"；不新增通知类型 |
 | D10 | KV cache | 循环轮次间前缀复用（必做）+ 静态 system/tools 前缀跨调用缓存（推荐，可开关） |
-| D11 | 循环形态 | **轻量 for 循环**：`max_iterations` 由 `thinking_level` 映射（off=1 / low=2 / medium=3 / high=5，可配置覆盖）；每轮 chat 返回 tool_use 则执行后继续，`end_turn` 或达上限即终止；不引入 Phase 4 完整 budget 系统 |
+| D11 | 循环形态 | **轻量 for 循环**：`max_iterations` 由 **IterationStrategy 策略注册表**按 task_type 映射（match 预设 off=1/low=2/medium=3/high=5，Phase 4 任务类型可注册各自策略；优先级：`llm_match_max_iterations` 配置覆盖 > 策略映射 > 默认兜底）；每轮 chat 返回 tool_use 则执行后继续，`end_turn` 或达上限即终止；不引入 Phase 4 完整 budget 系统 |
 | D12 | 输出符合性 | 决策不靠自由文本提取：`submit_suggestion(subject_id, reason)` 作为**终止性工具**（调用即 break，结构保证只生效一次）+ provider 侧 `tool_choice` 强制结构化收尾 |
 | D13 | 任务生命周期 | failed 允许**重新入队**（同 key 再次失败时复用记录重置 attempts，`total_attempts` 累计 ≤10 抑制无限循环）；终态超保留期（7 天）由调度器每轮顺带清理（先删 steps 再删 runs），删除数量打日志 |
 | D14 | stop_reason 统一 | 所有会话结束必须记录 `stop_reason`：`end_turn` / `submit_suggestion` / `exhausted` / `failed` / `cancelled` / `error`——不裸用成功/失败二分（Phase 4 消费）；**exhausted 仅作 stop_reason 不作 status**（预算耗尽 status 统一 no_suggestion） |
@@ -164,8 +164,9 @@ llm_match_scheduler（AsyncIOScheduler，每 60s）
 
 **3.2.2 工具注册表与执行器（新文件 `app/services/llm/tools.py`）**
 
-- `ToolDefinition(name, description, parameters, handler, access: "read"/"write"/"terminal")`
+- `ToolDefinition(name, description, parameters, handler, access: "read"/"write"/"terminal", readonly: bool | None = None)`
   - `access` 枚举（F16）：`read`（只读查询）/ `write`（写操作，执行前审计日志）/ `terminal`（终止性工具——不落库、仅捕获参数返回，由循环 break）
+  - `readonly`（新增）：**仅代码层面属性，不序列化进 tools schema**（LLM 只见 name/description/parameters）——默认由 `access` 推导（read→True，write/terminal→False），注册时可显式覆盖（预留"读但需串行"的罕见场景）；决定 §3.2.4 的**分段并行**执行策略（连续全-read 段并行、非只读单独串行）
 - `parameters` 为 **JSON Schema**（OpenAI function calling 标准）；provider 侧把 schema 转为各自 wire 格式（anthropic `input_schema` / openai `parameters`）
 - `ToolRegistry.register / execute(name, args)`：write 级工具执行前记录审计日志；terminal 级工具捕获参数返回（不执行 handler）
 - **工具执行超时（R26）**：外部 API 类工具默认 30s 超时，超时视为工具错误（回填 `is_error=True`）
@@ -207,12 +208,32 @@ async def run(task_ctx, *, max_iterations, tools, tool_choice_terminal, span_rec
         # ① 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加
         #    （Anthropic/OpenAI 均要求一个 assistant message 携带多个 tool_use/tool_calls）
         messages.append(assistant([tool_use_block(tc) for tc in resp.tool_calls]))
-        # ② 再逐条执行工具并追加 tool_result（每条携带对应 tool_use_id）
+        # ② 终止工具优先：本轮含 submit_suggestion → 捕获即 break（其他工具不执行，保持终局语义）
+        if any(tc.name == tool_choice_terminal for tc in resp.tool_calls):
+            suggestion = next(tc for tc in resp.tool_calls if tc.name == tool_choice_terminal)
+            return RunResult(stop_reason="submit_suggestion", suggestion=suggestion.input)
+        # ③ 分段并行（readonly 属性，仅代码层面）：按原始顺序扫描，连续全-read 段 gather 并行；
+        #    遇非只读工具单独串行（write 相对顺序保持，防副作用竞争）
+        results: dict[str, Any] = {}
+        i = 0
+        while i < len(resp.tool_calls):
+            if tools.registry.get(resp.tool_calls[i].name).readonly:
+                j = i
+                while j < len(resp.tool_calls) and tools.registry.get(resp.tool_calls[j].name).readonly:
+                    j += 1
+                seg = resp.tool_calls[i:j]
+                seg_results = await asyncio.gather(
+                    *[tools.execute(tc) for tc in seg]   # span: tool_execute（见异常处理）
+                )
+                for tc, r in zip(seg, seg_results):
+                    results[tc.id] = r
+                i = j
+            else:
+                results[resp.tool_calls[i].id] = await tools.execute(resp.tool_calls[i])  # 非只读串行
+                i += 1
+        # ④ 按原始顺序逐条追加 tool_result（每条携带对应 tool_use_id，消息顺序与 tool_calls 一致）
         for tc in resp.tool_calls:
-            if tc.name == tool_choice_terminal:    # submit_suggestion：终止工具，捕获即 break
-                return RunResult(stop_reason="submit_suggestion", suggestion=tc.input)
-            result = await tools.execute(tc)       # span: tool_execute（见异常处理）
-            messages.append(tool_result(tc, result))
+            messages.append(tool_result(tc, results[tc.id]))
         remaining -= 1
         # I-4：末轮强制 tool_choice；预算消息同时入 replay_delta（I-2，见 §3.3.2 写入时机）
         messages.append(user(f"[剩余轮次：{remaining}]"))   # 透明预算
@@ -224,6 +245,15 @@ async def run(task_ctx, *, max_iterations, tools, tool_choice_terminal, span_rec
 **消息协议要点（F1 修正）**：
 - assistant 消息（含全部 tool_use blocks）**必须先于**对应 tool_result 消息——伪代码顺序已保证
 - 一轮返回多个 tool_calls 时，assistant 消息**聚合为单条**，tool_result 逐条追加（每条 `tool_use_id` 对应各自调用）
+
+**分段并行执行（readonly 属性）**：
+- **协议依据**：同一轮的工具调用入参在 LLM 生成响应时**已全部固定**（工具调用是并行发出的）——LLM 不可能依赖同轮内其他工具的结果构造入参，故同轮工具间**无数据依赖**
+- **分段策略**：按原始顺序扫描——**连续全-read 段** `asyncio.gather` 并行（保序返回，延迟 = max 而非 sum）；**非只读工具单独串行**（write 相对顺序保持，防副作用竞争）
+  - `[read_A, read_B, write_C, read_D]` → 并行(A,B) → C 串行 → D 执行（read_D 在 C 后看到新状态）
+  - 含 terminal（submit_suggestion）的轮次：终局优先捕获 break，read 不执行（结果无意义）
+- readonly 是**仅代码层面属性**——不序列化进 tools schema，LLM 感知不到（天然防诱导）
+- 并行仅影响执行阶段，replay_delta 记录结果序列，**断点重放无影响**（重放纯内存拼装，无执行）
+- 速率限制：并行同时打 Bangumi API 有速率风险，匹配失败量小可接受；如需可加 `asyncio.Semaphore` 并发上限（Phase 4 评估）
 
 **异常处理（F9/F10）**：
 - **工具执行异常**（网络失败/超时）：执行器 try/except → 回填 `is_error=True` 的 ToolResultBlock（内容="工具执行失败: {error_type}"）→ **循环继续**，让 LLM 自我纠正；span status=error
@@ -239,6 +269,36 @@ async def run(task_ctx, *, max_iterations, tools, tool_choice_terminal, span_rec
 **结束必有 stop_reason（D14）**：end_turn / submit_suggestion / exhausted / failed / cancelled / error。
 **耗尽兜底（F19）**：loop 返回 `stop_reason="exhausted"` 后，`llm_assist.run()` 调用 `output_parser` 解析最后响应文本——解析成功且校验通过 → 按建议落库（status=succeeded）；失败 → `no_suggestion`。
 **本轮不实现 Phase 4 的 while budget**（token/wall-time 预算系统），只做轮次上限。
+
+**3.2.5 预算策略：IterationStrategy（新文件 `app/services/agent/budget.py`，Phase 4 budget.py 前身）**
+
+```
+class IterationStrategy(Protocol):
+    """思考强度 → 轮次上限的映射协议（轻量策略模式，不过度工程化）"""
+    def max_iterations(self, thinking_level: str) -> int: ...
+
+_ITERATION_STRATEGIES: dict[str, IterationStrategy] = {}
+def register_iteration_strategy(task_type: str, strategy: IterationStrategy) -> None: ...
+def get_max_iterations(task_type: str, thinking_level: str) -> int: ...
+
+# match 场景预设（骨架默认注册）
+class MatchIterationStrategy:
+    PRESET = {"off": 1, "low": 2, "medium": 3, "high": 5}
+    def max_iterations(self, level: str) -> int:
+        return self.PRESET.get(level, 3)   # 未知 level 兜底 medium=3
+
+# Phase 4 示例：diagnostic 可注册自己的映射（如 {"off": 2, "low": 4, "medium": 6, "high": 10}）
+```
+
+关键点：
+- **loop.py 无感知**：循环只接收计算好的 `max_iterations`（或 strategy 对象），不关心映射来源——通用骨架不绑定场景细节
+- **按 task_type 注册**：与 `agent_runs.task_type` 字段天然对应（'match'/'summary'/'diagnostic'）；Phase 4 加新任务类型 = 注册新策略，零改动骨架
+- **不过度工程化**：Protocol + 注册表 + 预设常量；每个策略 = "一个 dict + 一个方法"，不做类层级/工厂
+- **优先级（定稿）**：
+  1. `[sync] llm_match_max_iterations` 配置（显式整体覆盖，最高）
+  2. task_type 对应策略映射
+  3. 默认兜底 `{"off":1, "low":2, "medium":3, "high":5}`
+- **Phase 4 接缝**：budget.py 在此模块上扩展为完整预算（token/wall-time + ThinkingBudget.PRESETS，对齐 phase3-agent.md 既有设计）
 
 ### 3.3 数据层
 
@@ -500,7 +560,8 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 | 新增 | `app/services/llm/output_parser.py` | J3 结构化解析 + LLMSuggestion |
 | **Agent 骨架（通用）** | | |
 | 新增 | `app/services/agent/__init__.py` | 包入口 |
-| 新增 | `app/services/agent/loop.py` | 轻量循环（max_iterations + 终止工具 + 透明预算 + stop_reason） |
+| 新增 | `app/services/agent/budget.py` | IterationStrategy 策略注册表（task_type → 思考强度映射，Phase 4 budget 前身） |
+| 新增 | `app/services/agent/loop.py` | 轻量循环（max_iterations + 终止工具 + 分段并行 + 透明预算 + stop_reason） |
 | 新增 | `app/services/agent/trace.py` | otel 概念 span 记录器 + 会话增量持久化（payload_json） + 断点重放 |
 | **数据层** | | |
 | 新增 | `app/core/database/agent_runs.py` | agent_runs + agent_steps repository（原子拾取/重新入队含 total_attempts/级联清理） |
@@ -526,7 +587,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 | **测试** | | |
 | 新增/修改 | `tests/` | 见 §6 场景 |
 
-> 总计：新增 ~9 文件，修改 ~14 文件。
+> 总计：新增 ~10 文件，修改 ~14 文件。
 
 ---
 
@@ -710,11 +771,13 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - **Then** 回填 `is_error=True` 的 ToolResultBlock（内容含具体原因），循环继续，不崩溃
 - **And** 重复 tool_use_id 仅执行第一个
 
-### 场景 M27 max_iterations 映射（D11）
-- **Given** 各 thinking_level 配置（off/low/medium/high）
+### 场景 M27 max_iterations 映射（D11 + 策略注册表）
+- **Given** 各 thinking_level 配置（off/low/medium/high）与 task_type='match'
 - **When** 计算循环轮次上限
-- **Then** max_iterations = 1/2/3/5（参数化场景）
-- **And** `llm_match_max_iterations` 配置覆盖时以配置值为准
+- **Then** max_iterations = 1/2/3/5（参数化场景，来自 MatchIterationStrategy 预设）
+- **And** `llm_match_max_iterations` 配置覆盖时以配置值为准（优先级高于策略映射）
+- **And** 注册其他 task_type 策略（如 diagnostic）后，`get_max_iterations("diagnostic", level)` 返回该策略的映射（互不影响）
+- **And** 未知 thinking_level 兜底返回默认（medium=3）
 
 ### 场景 M28 透明预算注入（D11）
 - **Given** max_iterations=3 的循环执行
@@ -728,6 +791,14 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 - **Then** 重复注册被拒绝（或告警覆盖）；未注册工具返回错误；schema 校验失败返回错误且不调用 handler
 - **And** 工具执行超时（30s，R26）→ 回填 `is_error=True` 的 ToolResultBlock（内容含超时信息）
 - **And** terminal 级工具被调用时**不执行 handler**、仅捕获参数（与 §3.2.2 一致）
+
+### 场景 M29b 分段并行执行策略（readonly）
+- **Given** 一轮含 3 个只读工具调用（search_bangumi × 1 + get_subject_detail × 2）
+- **When** 循环执行该轮
+- **Then** 工具**并行执行**（mock 验证 gather 路径：并发启动、保序返回），tool_result 按 tool_use_id 顺序追加
+- **And** 一轮含 `[read_A, read_B, write_C, read_D]` 构成时：并行(A,B) → C 串行 → D 执行（**write 相对顺序保持**，read_D 在 C 之后）
+- **And** 一轮含 submit_suggestion：终局优先捕获 break，其他工具不执行
+- **And** readonly 属性**不出现**在发送给 LLM 的 tools schema 中
 
 ### 场景 M30 同 key 去重（F7 半程）
 - **Given** 同 key 已存在 `pending`/`processing`/`succeeded` 记录
@@ -756,7 +827,7 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 
 | 层级 | 方式 |
 |---|---|
-| 单元 | §6 M1-M33 全部通过（含 M5b/M12b/M18a/M18b/M21b/M22b/M29-M33）；工具协议回归 phase2.1 T1-T7 |
+| 单元 | §6 M1-M33 全部通过（含 M5b/M12b/M18a/M18b/M21b/M22b/M29b/M30-M33）；工具协议回归 phase2.1 T1-T7 |
 | 集成 | mock LLM：构造"跨季错配"（Re0 场景）与"无候选"（花开伊吕波场景）fixture，验证建议产出 + 候选落库 + 补发；循环防护（M6/M7）与生命周期（M9/M10）；span 完整性（M19/M20）；断点恢复（M22/M22b/M23：模拟 processing 遗留 + 分组重放 + sync 缺失降级）；工具失败/畸形输出（M25/M26/M29）；去重（M9/M30） |
 | 手工 | 真实 LLM + 真实失败记录：观察候选页"评估中→已推荐→应用→已匹配"全链路 + 评估过程折叠区 span 展示；对比开关前后的失败处理延迟 |
 | 性能 | webhook 响应不因 LLM 介入变慢（异步落库即返回，**P99 增幅 < 50ms**）；调度器每轮处理 ≤ 5 条（队列不堆积）；清理不删除未过期记录 |
@@ -768,9 +839,10 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 **本次不做**：完整 while budget 系统（token/wall-time）、`/api/agent/*` 通用执行接口、诊断场景、知识库、记忆工具、取消语义（C2）完整实现、完整观测页。
 
 **Phase 4 接缝（本次建立）**：
-- `app/services/llm/tools.py`（ToolDefinition/registry/execute + JSON Schema）→ Agent 循环直接消费
+- `app/services/llm/tools.py`（ToolDefinition/registry/execute + JSON Schema + readonly 分段并行）→ Agent 循环直接消费
+- `app/services/agent/budget.py`（IterationStrategy 注册表）→ Phase 4 扩展为完整 budget（token/wall-time + ThinkingBudget.PRESETS）
 - `app/services/agent/loop.py` + `trace.py`（stop_reason / span 语义 / 会话增量持久化）→ Phase 4 while budget 循环的骨架、可观测性与**断点重入**基础（D18）
-- `agent_runs`/`agent_steps` 通用表 → Phase 4 诊断任务同构（task_type='diagnostic'），观测页数据源
+- `agent_runs`/`agent_steps` 通用表 → Phase 4 诊断任务同构（task_type='diagnostic' 注册自有 IterationStrategy），观测页数据源
 - `output_parser`（J3）→ 诊断报告解析复用
 - KV cache 前缀约定 → Phase 4 任意多轮任务沿用
 
@@ -791,8 +863,8 @@ Round N+1: 前述全部 + 新 [assistant(tool_use), user(tool_result)]
 
 | 子 phase | 范围 | 依赖 |
 |---|---|---|
-| 3.0 | **LLM 能力层**：工具协议补齐（3.2.1，含 provider 映射表）+ tools.py（terminal 枚举/超时/schema 校验）+ output_parser + 协议层单测（**M13/M14/M29** + phase2.1 T1-T7 回归） | 无 |
-| 3.1 | **Agent 骨架**：agent/loop.py（消息顺序 + 末轮 tool_choice + 异常处理）+ agent/trace.py（replay_delta 格式 I-1 + 预算消息 I-2 + 断点重放 + iteration/sequence）+ agent_runs/agent_steps 表/repo（原子拾取 + total_attempts + 级联清理 + 索引）+ 追踪 API（含 403）+ 循环/span/恢复单测（M19/M20/M21/M21b/M22/M22b/M23/M26/M27/M28） | 3.0 |
+| 3.0 | **LLM 能力层**：工具协议补齐（3.2.1，含 provider 映射表）+ tools.py（terminal 枚举/readonly 属性/超时/schema 校验）+ output_parser + 协议层单测（**M13/M14/M29/M29b** + phase2.1 T1-T7 回归） | 无 |
+| 3.1 | **Agent 骨架**：agent/budget.py（IterationStrategy 注册表 + M27）+ agent/loop.py（消息顺序 + 末轮 tool_choice + 分段并行 + 异常处理）+ agent/trace.py（replay_delta 格式 I-1 + 预算消息 I-2 + 断点重放 + iteration/sequence）+ agent_runs/agent_steps 表/repo（原子拾取 + total_attempts + 级联清理 + 索引）+ 追踪 API（含 403）+ 循环/span/恢复单测（M19/M20/M21/M21b/M22/M22b/M23/M26/M27/M28） | 3.0 |
 | 3.2 | **match 场景**：llm_assist（事务包裹 + 通知移出事务 I-5 + output_parser 兜底）+ llm_match_scheduler（原子拾取 + 去重含 no_suggestion I-7 + 恢复扫描 + 清理）+ _handle_match_failure 接入 + confirm/reject 联动守卫 + 通知（站内信 + 双转义）+ 重新入队/清理（M1-M12/M12b/M15/M16/M17/M24/M25/M30/M32/M33） | 3.1 |
 | 3.3 | **前端与开关**：候选页 AI 推荐 + 徽标（含 pending 态）+ 评估过程折叠区 + config 开关条件渲染 + 读路径字段合并（M18a/M18b/M31） | 3.2 |
 
