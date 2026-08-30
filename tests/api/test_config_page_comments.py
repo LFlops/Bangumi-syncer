@@ -110,11 +110,11 @@ def test_llm_api_base_comment_becomes_tooltip_icon():
 
 
 def test_llm_thinking_level_comment_becomes_tooltip_icon():
-    """LLM 卡片 思考强度 label 旁应出现问号图标，title 同时含两条关键内容。"""
+    """LLM 卡片 思考强度 label 旁应出现问号图标，title 同时覆盖双 provider 映射。"""
     _, llm, _ = _fetch_config_html()
-    title = _find_tooltip_title(llm, "仅 anthropic_compat 生效")
+    title = _find_tooltip_title(llm, "reasoning_effort")
     assert title is not None, (
-        "LLM 卡片『思考强度』旁应出现问号图标，title 含『仅 anthropic_compat 生效』"
+        "LLM 卡片『思考强度』旁应出现问号图标，title 含『reasoning_effort』"
     )
     assert "budget_tokens" in title, (
         "思考强度图标 title 需同时含『budget_tokens』，实际 title={title!r}"
