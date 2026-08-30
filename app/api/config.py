@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import time
 from datetime import datetime
@@ -30,6 +31,21 @@ router = APIRouter(prefix="/api", tags=["config"])
 # ------------------------------------------------------------------
 # 配置备份 I/O 辅助函数（同步阻塞，需通过 asyncio.to_thread 调用）
 # ------------------------------------------------------------------
+
+_BACKUP_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.ini$")
+
+
+def _safe_backup_path(filename: str) -> Path:
+    """校验备份文件名并返回备份目录内的安全路径"""
+    if not _BACKUP_NAME_RE.fullmatch(filename):
+        raise HTTPException(status_code=404, detail="备份文件不存在")
+    backup_dir = Path("config_backups").resolve()
+    backup_path = (Path("config_backups") / filename).resolve()
+    if backup_path == backup_dir or not backup_path.is_relative_to(backup_dir):
+        raise HTTPException(status_code=404, detail="备份文件不存在")
+    if not backup_path.is_file():
+        raise HTTPException(status_code=404, detail="备份文件不存在")
+    return backup_path
 
 
 def _list_config_backups() -> list[dict]:
@@ -59,18 +75,14 @@ def _list_config_backups() -> list[dict]:
 
 def _read_config_backup(filename: str) -> str:
     """读取指定备份文件内容，不存在则抛 HTTPException"""
-    backup_path = Path("config_backups") / filename
-    if not backup_path.exists():
-        raise HTTPException(status_code=404, detail="备份文件不存在")
+    backup_path = _safe_backup_path(filename)
     with open(backup_path, encoding="utf-8") as f:
         return f.read()
 
 
 def _delete_config_backup(filename: str) -> None:
     """删除指定备份文件，不存在则抛 HTTPException"""
-    backup_path = Path("config_backups") / filename
-    if not backup_path.exists():
-        raise HTTPException(status_code=404, detail="备份文件不存在")
+    backup_path = _safe_backup_path(filename)
     backup_path.unlink()
 
 
@@ -87,9 +99,7 @@ def _create_config_backup() -> str:
 
 def _restore_config_backup(filename: str) -> None:
     """从指定备份恢复配置，不存在则抛 HTTPException"""
-    backup_path = Path("config_backups") / filename
-    if not backup_path.exists():
-        raise HTTPException(status_code=404, detail="备份文件不存在")
+    backup_path = _safe_backup_path(filename)
     shutil.copy2(backup_path, config_manager.active_config_path)
     config_manager.reload_config()
 

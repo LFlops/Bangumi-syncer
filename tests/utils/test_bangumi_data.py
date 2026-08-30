@@ -2331,6 +2331,119 @@ class TestBangumiDataComprehensiveMerged:
         assert isinstance(result, (int, float))
 
 
+def _truncation_rezero_dataset():
+    """构造 Re:Zero 风格数据集：S1 完全匹配 + 10 个干扰部分匹配 + 正确季置末。"""
+    search_title = "Re:从零开始的异世界生活"
+    items = [
+        {
+            "title": search_title,
+            "titleTranslate": {"zh-Hans": [search_title]},
+            "begin": "2016-04-03",
+            "sites": [{"site": "bangumi", "id": "140001"}],
+        }
+    ]
+    decoy_begins = [
+        "2016-07-06",
+        "2018-10-09",
+        "2019-06-25",
+        "2020-01-01",
+        "2021-03-15",
+        "2022-07-20",
+        "2023-09-10",
+        "2024-04-01",
+        "2024-10-05",
+        "2025-12-12",
+    ]
+    for i, begin in enumerate(decoy_begins, start=2):
+        title = f"{search_title} 第{i}季"
+        items.append(
+            {
+                "title": title,
+                "titleTranslate": {"zh-Hans": [title]},
+                "begin": begin,
+                "sites": [{"site": "bangumi", "id": f"20000{i}"}],
+            }
+        )
+    items.append(
+        {
+            "title": f"{search_title} 第四季 夺还篇",
+            "titleTranslate": {"zh-Hans": [f"{search_title} 第四季 夺还篇"]},
+            "begin": "2026-07-20",
+            "sites": [{"site": "bangumi", "id": "633836"}],
+        }
+    )
+    return items
+
+
+def _truncation_all_partial_dataset():
+    """构造无完全匹配的数据集，用于验证无 release_date 时仍按 10 截断。"""
+    search_title = "Re:从零开始的异世界生活"
+    items = []
+    for i in range(11):
+        title = f"{search_title} 第{i + 1}季"
+        items.append(
+            {
+                "title": title,
+                "titleTranslate": {"zh-Hans": [title]},
+                "begin": "2020-01-01",
+                "sites": [{"site": "bangumi", "id": f"30000{i}"}],
+            }
+        )
+    return items
+
+
+class TestPartialMatchScanTruncation:
+    """部分匹配扫描截断修复：带 release_date 时保留全部候选供日期择优。"""
+
+    @patch("app.utils.bangumi_data.BangumiData._preload_data_to_memory")
+    @patch("app.utils.bangumi_data.BangumiData._parse_data")
+    def test_release_date_keeps_late_correct_season(self, mock_parse, mock_preload):
+        """带 release_date 时，排在扫描末位的正确季应进入部分匹配池（11 个）。"""
+        data = BangumiData()
+        mock_parse.return_value = _truncation_rezero_dataset()
+
+        exact, partial, _ = data._scan_candidates(
+            "Re:从零开始的异世界生活", "", "2026-08-18"
+        )
+
+        ids = [bid for _, _, bid in partial]
+        assert "633836" in ids
+        # S1 为完全匹配进入 exact，部分匹配池含 10 个干扰 + 正确季共 11 个
+        assert len(partial) == 11
+
+    @patch("app.utils.bangumi_data.BangumiData._preload_data_to_memory")
+    @patch("app.utils.bangumi_data.BangumiData._parse_data")
+    def test_no_release_date_still_caps_at_ten(self, mock_parse, mock_preload):
+        """无 release_date 时仍按 10 截断，避免线性扫描性能回归。"""
+        data = BangumiData()
+        mock_parse.return_value = _truncation_all_partial_dataset()
+
+        _, partial, _ = data._scan_candidates("Re:从零开始的异世界生活", "", None)
+
+        assert len(partial) == 10
+        # 第 11 个（id 300010）应被截断
+        ids = [bid for _, _, bid in partial]
+        assert "300010" not in ids
+
+    @patch("app.utils.bangumi_data.BangumiData._preload_data_to_memory")
+    @patch("app.utils.bangumi_data.BangumiData._parse_data")
+    def test_rezero_s04_selects_season4_recapture(self, mock_parse, mock_preload):
+        """Re:Zero S04 经日期择优应命中第四季 夺还篇（633836）而非第一季。"""
+        data = BangumiData()
+        mock_parse.return_value = _truncation_rezero_dataset()
+        with patch.object(data, "_title_index", {}):
+            result = data._find_bangumi_id_optimized(
+                title="Re:从零开始的异世界生活",
+                ori_title="",
+                release_date="2026-08-18",
+                season=1,
+            )
+
+        assert result is not None
+        assert result[0] == "633836"
+        assert result[2] is True
+
+
 class TestBangumiDataCacheHelpersMerged:
     """自 test_bangumi_data_internals.py 并入的缓存/下载边界用例。"""
 
