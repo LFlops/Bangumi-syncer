@@ -247,6 +247,11 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         database_manager.update_pending_candidate_status(
             candidate_id, "confirmed", confirmed_subject_id=str(subject_id)
         )
+        # 联动 agent_runs：确认建议后将该会话流转为 applied（仅 succeeded 守卫；
+        # 无关联 run（如开关关的纯手动流）则 no-op，不影响主流程）
+        sync_record_id = record.get("sync_record_id")
+        if sync_record_id:
+            self._linkage_mark_applied(int(sync_record_id))
         # 批量更新同 key 的其它 pending 行，避免残留（去重后通常无额外行）
         database_manager.resolve_similar_pending_candidates(
             request_title=title,
@@ -512,11 +517,47 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
     def reject_pending_candidate(self, candidate_id: int) -> tuple[bool, str]:
         """拒绝待确认候选"""
+        record = database_manager.get_pending_candidate_by_id(candidate_id)
+        if not record:
+            return False, "候选记录不存在或已处理"
         if not database_manager.update_pending_candidate_status(
             candidate_id, "rejected"
         ):
             return False, "候选记录不存在或已处理"
+        # 联动 agent_runs：忽略建议后将该会话流转为 rejected（仅 succeeded 守卫；
+        # 无关联 run 时 no-op，不影响主流程）
+        sync_record_id = record.get("sync_record_id")
+        if sync_record_id:
+            self._linkage_mark_rejected(int(sync_record_id))
         return True, "已忽略"
+
+    # ------------------------------------------------------------------
+    # 候选确认/忽略与 agent_runs 状态机联动（T14，守卫见 spec §3.4）
+    # ------------------------------------------------------------------
+
+    def _linkage_mark_applied(self, sync_record_id: int) -> None:
+        """确认建议后联动 agent_runs → applied（仅 succeeded 可流转）。
+
+        无关联 run / run 非 succeeded / 任何异常 → no-op，不影响确认主流程。
+        """
+        try:
+            run = database_manager.agent_runs.find_active_by_sync_record(sync_record_id)
+            if run and run.get("status") == "succeeded":
+                database_manager.agent_runs.mark_applied(run["run_id"])
+        except Exception as e:
+            logger.warning(f"联动 agent_runs→applied 失败（不影响主流程）: {e}")
+
+    def _linkage_mark_rejected(self, sync_record_id: int) -> None:
+        """忽略建议后联动 agent_runs → rejected（仅 succeeded 可流转）。
+
+        无关联 run / run 非 succeeded / 任何异常 → no-op，不影响忽略主流程。
+        """
+        try:
+            run = database_manager.agent_runs.find_active_by_sync_record(sync_record_id)
+            if run and run.get("status") == "succeeded":
+                database_manager.agent_runs.mark_rejected(run["run_id"])
+        except Exception as e:
+            logger.warning(f"联动 agent_runs→rejected 失败（不影响主流程）: {e}")
 
     def delete_pending_candidate(self, candidate_id: int) -> tuple[bool, str]:
         """删除待确认候选"""

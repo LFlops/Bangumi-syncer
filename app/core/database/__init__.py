@@ -20,6 +20,7 @@ from typing import Any, Optional
 from ..logging import logger as logger
 from .accounts import BangumiAccountRepository, OAuthStateRepository
 from .agent_memory import AgentMemoryRepository
+from .agent_runs import AgentRunsRepository
 from .connection import (
     FEINIU_MIN_UPDATE_WATERMARK_META_KEY as FEINIU_MIN_UPDATE_WATERMARK_META_KEY,
     INBOX_ERROR_BACKFILL_META_KEY as INBOX_ERROR_BACKFILL_META_KEY,
@@ -59,6 +60,7 @@ class DatabaseManager:
         self._oauth_state = OAuthStateRepository(self._connection)
         self.llm_usage = LLMUsageRepository(self._connection)
         self.memory = AgentMemoryRepository(self._connection)
+        self.agent_runs = AgentRunsRepository(self._connection)
         self._pending = PendingCandidatesRepository(self._connection)
         self._pending_sync = PendingSyncQueueRepository(self._connection)
         # 公开别名（消费标记写/清归 memory 域，业务层经此只读访问同步记录）
@@ -282,6 +284,12 @@ class DatabaseManager:
     ) -> Optional[dict[str, Any]]:
         """获取单条待确认候选详情"""
         return self._pending.get_pending_candidate_by_id(candidate_id)
+
+    def get_pending_candidate_by_sync_record_id(
+        self, sync_record_id: int
+    ) -> Optional[dict[str, Any]]:
+        """按 sync_record_id 查询关联的候选记录（records 页「查看候选」入口）"""
+        return self._pending.get_pending_candidate_by_sync_record_id(sync_record_id)
 
     def update_pending_candidate_status(
         self,

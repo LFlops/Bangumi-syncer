@@ -364,22 +364,22 @@ class TestParseResponse:
         assert isinstance(resp.blocks[0], RedactedThinkingBlock)
 
     def test_unknown_block_type_skipped(self):
-        """Scenario 2.4: 未知 block 类型（tool_use）跳过不崩溃，content 只取 text。"""
+        """Scenario 2.4: 真正未知 block 类型跳过不崩溃，content 只取 text（tool_use 已被正式解析，不在此列）。"""
         provider = _make_provider()
         with patch("app.services.llm.providers.anthropic.logger") as mock_log:
             resp = provider._parse_response(
                 {
                     "content": [
-                        {"type": "tool_use", "id": "u1", "name": "search", "input": {}},
+                        {"type": "bogus_unknown", "foo": 1},
                         {"type": "text", "text": "结果"},
                     ],
-                    "stop_reason": "tool_use",
+                    "stop_reason": "end_turn",
                 }
             )
         assert resp.content == "结果"
         assert len(resp.blocks) == 1
         assert isinstance(resp.blocks[0], TextBlock)
-        assert resp.stop_reason == "tool_use"
+        assert resp.stop_reason == "end_turn"
         mock_log.warning.assert_called_once()
 
     def test_no_usage(self):

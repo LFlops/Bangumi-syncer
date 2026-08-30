@@ -151,6 +151,34 @@ async def get_config(
         raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
 
 
+@router.get("/sync/config")
+async def get_sync_config(
+    request: Request, current_user: dict = Depends(get_current_user_flexible)
+) -> dict[str, Any]:
+    """获取 [sync] 段 LLM 匹配增强配置 + llm_available 标志（M18a）。
+
+    - llm_available：LLM api_key 是否非空（true=已配置）。
+    - llm_api_key_masked：按 app/api/llm.py 的脱敏方式返回掩码值（不泄露明文）。
+    """
+    llm_match_cfg = config_manager.get_sync_llm_match_config()
+    llm_cfg = config_manager.get_llm_config()
+    api_key = llm_cfg.get("api_key", "") or ""
+    llm_available = bool(api_key.strip())
+    # 脱敏（参照 app/api/llm.py 的 get_llm_config 掩码逻辑）
+    if api_key:
+        masked_key = "***" + api_key[-4:] if len(api_key) > 4 else "***"
+    else:
+        masked_key = ""
+    return {
+        "status": "success",
+        "data": {
+            **llm_match_cfg,
+            "llm_available": llm_available,
+            "llm_api_key_masked": masked_key,
+        },
+    }
+
+
 @router.get("/config/schema")
 async def get_config_schema(
     request: Request, current_user: dict = Depends(get_current_user_flexible)
@@ -181,6 +209,44 @@ async def get_scheduler_status(
     return {"status": "success", "data": scheduler_registry.get_status_list()}
 
 
+def _truthy(value: Any) -> bool:
+    """宽松布尔解析：实际 bool 或字符串 true/1/yes/on/enabled（任意大小写）。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in ("true", "1", "yes", "on", "enabled")
+
+
+def _llm_match_assist_will_be_enabled(data: dict) -> bool:
+    """计算保存后 llm_match_assist 是否将处于开启态。
+
+    payload 携带 sync.llm_match_assist 时以 payload 为准，否则取当前配置。
+    """
+    sync = data.get("sync") or {}
+    if "llm_match_assist" in sync:
+        return _truthy(sync["llm_match_assist"])
+    return bool(config_manager.get("sync", "llm_match_assist", fallback=False))
+
+
+def _effective_llm_api_key_nonempty(data: dict) -> bool:
+    """计算保存后生效的 LLM api_key 是否非空。
+
+    payload 同时携带 llm.api_key（非空且非掩码值）时视为将生效；
+    否则以当前 get_llm_config()["api_key"] 为准。
+    """
+    current = (config_manager.get_llm_config().get("api_key") or "").strip()
+    llm = data.get("llm") or {}
+    incoming = llm.get("api_key")
+    if (
+        isinstance(incoming, str)
+        and incoming.strip()
+        and not incoming.startswith("***")
+    ):
+        return True
+    return bool(current)
+
+
 @router.post("/config")
 async def update_config(
     request: Request, current_user: dict = Depends(get_current_user_flexible)
@@ -197,6 +263,14 @@ async def update_config(
         data.pop("multi_accounts", None)
         # 遗留单用户段 [bangumi] 账号字段已迁移到 DB，忽略前端回写避免与 DB 真相源分裂
         data.pop("bangumi", None)
+
+        # ── M18a：开启 llm_match_assist 时校验 LLM api_key 已配置 ──
+        # 拒绝原因须为"需先配置 LLM"（M18a 场景）。HTTPException 需透传，
+        # 不能被下方 except Exception 吞掉成 500。
+        if _llm_match_assist_will_be_enabled(data) and not (
+            _effective_llm_api_key_nonempty(data)
+        ):
+            raise HTTPException(status_code=400, detail="需先配置 LLM")
 
         # 更新常规配置
         password_updated = False
@@ -290,6 +364,8 @@ async def update_config(
             logger.info("密码更新完成，认证配置已重新加载")
 
         return {"status": "success", "message": "配置更新成功"}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"更新配置失败: {e}")
         raise HTTPException(status_code=500, detail=f"更新配置失败: {str(e)}")

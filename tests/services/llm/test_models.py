@@ -44,12 +44,39 @@ class TestContentBlock:
             ThinkingBlock(type="text", thinking="x")  # type: ignore[arg-type]
 
     def test_unknown_block_type_not_in_union(self):
-        """Phase 1 union 不含 tool_use——Message 解析 tool_use block 抛 ValidationError。"""
+        """Union 仅接受已知 block 类型。
+
+        Phase 3（T1/§3.2.1）已将 tool_use / tool_result 纳入 ContentBlock，
+        故这两个类型现在可被 Message 正常解析；真正未知的 block type 仍抛
+        ValidationError（向后强约束）。
+        """
+        from app.services.llm.models import ToolResultBlock, ToolUseBlock
+
+        # tool_use / tool_result 现属合法 union 成员
+        msg = Message.model_validate(
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "u1", "name": "search"}],
+            }
+        )
+        assert isinstance(msg.content[0], ToolUseBlock)
+
+        msg2 = Message.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "u1", "content": "ok"}
+                ],
+            }
+        )
+        assert isinstance(msg2.content[0], ToolResultBlock)
+
+        # 真正未知的类型仍被拒绝
         with pytest.raises(ValidationError):
             Message.model_validate(
                 {
                     "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "u1", "name": "search"}],
+                    "content": [{"type": "bogus", "foo": 1}],
                 }
             )
 

@@ -23,6 +23,8 @@ from app.services.llm.models import (
     TextBlock,
     ThinkingBlock,
     ThinkingLevel,
+    ToolResultBlock,
+    ToolUseBlock,
     Usage,
 )
 from app.services.llm.providers.base import BaseProvider
@@ -145,6 +147,16 @@ class AnthropicProvider(BaseProvider):
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
 
+        # tools / tool_choice：工具协议参数透传（name/description/input_schema 与
+        # {"type": "tool", "name": ...} 格式由调用方构造，provider 仅 1:1 透传；
+        # tools 列表内可携带 cache_control 标记，同样随 dict 透传，实现以透传为主）
+        tools = kwargs.get("tools")
+        if tools is not None:
+            body["tools"] = tools
+        tool_choice = kwargs.get("tool_choice")
+        if tool_choice is not None:
+            body["tool_choice"] = tool_choice
+
         # thinking_level：每任务 kwargs 覆盖 > 全局默认；模型不支持时降级；
         # 端点拒绝过扩展参数时（_extras_disabled）不再发送
         level = kwargs.get("thinking_level", self.thinking_level)
@@ -190,8 +202,33 @@ class AnthropicProvider(BaseProvider):
         if isinstance(m.content, str):
             blocks = [{"type": "text", "text": m.content}]
         else:
-            blocks = [block.model_dump(exclude_none=True) for block in m.content]
+            blocks = [self._to_wire_block(block) for block in m.content]
         return {"role": m.role, "content": blocks}
+
+    def _to_wire_block(self, block: ContentBlock) -> dict:
+        """内部 content block → Anthropic wire content block。
+
+        工具协议（Phase 3 / §3.2.1）：
+        - ToolUseBlock → {"type": "tool_use", "id", "name", "input"}（assistant 消息，1:1）
+        - ToolResultBlock → {"type": "tool_result", "tool_use_id", "content", "is_error"}（user 消息）
+        其余类型沿用 model_dump（exclude_none）保持向后行为一致。block 若携带
+        cache_control 等透传字段，model_dump 已含则一并透传。
+        """
+        if isinstance(block, ToolUseBlock):
+            return {
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            }
+        if isinstance(block, ToolResultBlock):
+            return {
+                "type": "tool_result",
+                "tool_use_id": block.tool_use_id,
+                "content": block.content,
+                "is_error": block.is_error,
+            }
+        return block.model_dump(exclude_none=True)
 
     def _parse_response(self, data: dict) -> ChatResponse:
         """Anthropic wire 格式 → 内部模型。"""
@@ -212,9 +249,18 @@ class AnthropicProvider(BaseProvider):
                 )
             elif btype == "redacted_thinking":
                 blocks.append(RedactedThinkingBlock(data=block.get("data", "")))
+            elif btype == "tool_use":
+                # 工具调用请求块（Phase 3 / §3.2.1）：转为内部 ToolUseBlock，
+                # stop_reason 为 "tool_use" 时由调用方驱动 agent 循环执行工具。
+                blocks.append(
+                    ToolUseBlock(
+                        id=block.get("id", ""),
+                        name=block.get("name", ""),
+                        input=block.get("input", {}) or {},
+                    )
+                )
             else:
-                # 未知 block 类型（如 tool_use）：跳过 + warning，不崩溃
-                # （正式解析在 Phase 2.1）
+                # 真正未知的 block 类型：跳过 + warning，不崩溃
                 logger.warning(f"未知 content block 类型 {btype!r}，已跳过")
 
         # Anthropic usage 字段映射：input_tokens → prompt_tokens,
