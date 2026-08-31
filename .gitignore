@@ -186,5 +186,9 @@ sync_records.db-shm
 # Claude Code
 .claude/
 
+
 # 本地嵌套的第三方仓库（如 jellyfin-plugin-bangumi），仅本地开发用，不纳入分发
 rrr/
+
+# Pi Agent
+.pi

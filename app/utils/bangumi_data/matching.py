@@ -328,8 +328,8 @@ class MatchingMixin:
                 if bangumi_id:
                     partial_matches.append((item, match_info["score"], bangumi_id))
 
-                    # 限制部分匹配的数量以提高性能
-                    if len(partial_matches) >= 10:
+                    # 限制部分匹配的数量以提高性能，但指定 release_date 时保留全部候选供日期择优，防止因截断遗漏正确季
+                    if not release_date and len(partial_matches) >= 10:
                         break
 
         return exact_matches, partial_matches, processed_count

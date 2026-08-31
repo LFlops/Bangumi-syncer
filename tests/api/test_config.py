@@ -5,7 +5,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 
 from app.api import config, deps
@@ -411,6 +411,68 @@ async def test_update_config_password_update_reloads_auth(
             )
     assert response.status_code == 200
     mock_security_manager._init_auth_config.assert_called()
+
+
+# ========== 备份路径安全测试 ==========
+
+
+@pytest.fixture
+def backup_layout(tmp_path, monkeypatch):
+    """在隔离目录下创建 config_backups 布局"""
+    monkeypatch.chdir(tmp_path)
+    backup_dir = tmp_path / "config_backups"
+    backup_dir.mkdir()
+    return backup_dir
+
+
+def test_safe_backup_path_valid_names(backup_layout):
+    """合法备份文件名应解析到 config_backups 内"""
+    for name in ("config_backup_20260101_000000.ini", "test_backup.ini"):
+        (backup_layout / name).write_text("content", encoding="utf-8")
+        path = config._safe_backup_path(name)
+        assert path.is_file()
+        assert path.name == name
+
+
+def test_safe_backup_path_rejects_invalid_names(backup_layout):
+    """危险或非法文件名应统一返回 404"""
+    invalid_names = [
+        "..\\secret.ini",
+        "../secret.ini",
+        "C:\\Windows\\win.ini",
+        "..ini",
+        "",
+        "no_ini_suffix",
+        "bad/name.ini",
+    ]
+    for name in invalid_names:
+        with pytest.raises(HTTPException) as exc_info:
+            config._safe_backup_path(name)
+        assert exc_info.value.status_code == 404
+        assert exc_info.value.detail == "备份文件不存在"
+
+
+def test_safe_backup_path_rejects_symlink_escape(backup_layout, tmp_path):
+    """符号链接指向备份目录外时应被拒绝"""
+    secret = tmp_path / "secret.ini"
+    secret.write_text("SECRET", encoding="utf-8")
+    (backup_layout / "escape.ini").symlink_to(secret)
+    with pytest.raises(HTTPException) as exc_info:
+        config._safe_backup_path("escape.ini")
+    assert exc_info.value.status_code == 404
+    assert secret.is_file()
+
+
+def test_safe_backup_path_traversal_does_not_touch_outside_file(
+    backup_layout, tmp_path
+):
+    """穿越文件名不应读取或影响目录外文件"""
+    secret = tmp_path / "secret.ini"
+    secret.write_text("SECRET", encoding="utf-8")
+    with pytest.raises(HTTPException):
+        config._safe_backup_path("..\\secret.ini")
+    assert secret.is_file()
+    assert secret.read_text(encoding="utf-8") == "SECRET"
 
 
 # ========== 备份功能测试 ==========
