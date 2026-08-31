@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import time
 
+import httpx
+
 from app.core.config import config_manager
 from app.core.logging import logger
 
@@ -35,6 +37,67 @@ def _format_error_detail(e: Exception) -> str:
     return " ".join(parts)
 
 
+# 端点拒绝扩展参数的响应特征（大小写不敏感子串匹配）。
+# OpenAI: "Unrecognized request argument supplied: reasoning_effort"；
+# Anthropic: invalid_request_error；网关实现各异 —— 以宽泛特征兕底。
+# M8：模式串含 Anthropic 文案；状态码放行 400/422（pydantic 网关）。
+_PARAM_REJECTION_PATTERNS = (
+    "unrecognized",
+    "unknown parameter",
+    "unexpected keyword",
+    "invalid request argument",
+    "extra fields not permitted",
+    "invalid_request_error",
+    "does not support",
+)
+
+_PARAM_REJECTION_STATUSES = (400, 422)
+
+
+def _is_param_rejection(e: Exception) -> bool:
+    """识别"端点不支持某请求参数"类错误（区别于鉴权/格式错误）。"""
+    if not isinstance(e, httpx.HTTPStatusError):
+        return False
+    resp = getattr(e, "response", None)
+    if resp is None or resp.status_code not in _PARAM_REJECTION_STATUSES:
+        return False
+    text = (resp.text or "").lower()
+    return any(p in text for p in _PARAM_REJECTION_PATTERNS)
+
+
+# M7/M9：确定性错误 —— 重试无意义（refusal / 鉴权 / 参数类 / 不存在）
+_TERMINAL_STATUSES = (400, 401, 403, 404, 422)
+
+
+def _is_terminal_error(e: Exception) -> bool:
+    """refusal（ValueError）与确定性 4xx 不重试；其余（429/5xx/超时）可重试。"""
+    if isinstance(e, ValueError):
+        return True  # 解析失败/refusal，重试结果不变
+    if isinstance(e, httpx.HTTPStatusError):
+        resp = getattr(e, "response", None)
+        status = getattr(resp, "status_code", None)
+        if status in _TERMINAL_STATUSES:
+            # 参数类 400/422 由调用方先走降级路径，此处仅兜底其它确定性 4xx
+            return not _is_param_rejection(e)
+    return False
+
+
+def _retry_delay(e: Exception, fallback: int) -> int:
+    """429 优先读取 Retry-After（秒）；其余用固定退避。
+
+    顺手项 2：Retry-After 钳制到 60s 上限，避免恶意/异常端点返回超大值导致
+    请求长时间挂起（退避本就只用于吸收短暂限流，过长无收益）。
+    """
+    _RETRY_AFTER_CAP = 60
+    if isinstance(e, httpx.HTTPStatusError):
+        resp = getattr(e, "response", None)
+        if resp is not None and getattr(resp, "status_code", None) == 429:
+            ra = resp.headers.get("Retry-After")
+            if ra and ra.isdigit():
+                return min(int(ra), _RETRY_AFTER_CAP)
+    return fallback
+
+
 def _build_provider(
     provider: str, cfg: dict[str, object], proxy: str | None
 ) -> BaseProvider:
@@ -52,10 +115,9 @@ def _build_provider(
         "temperature": cfg["temperature"],
         "timeout": cfg["timeout"],
         "proxy": proxy,
+        # 双 provider 构造函数均接受 thinking_level（openai 侧映射 reasoning_effort）
+        "thinking_level": cfg.get("thinking_level", "off"),
     }
-    # thinking_level 只传给 anthropic 分支（openai 分支构造函数无此参数）
-    if provider == "anthropic_compat":
-        kwargs["thinking_level"] = cfg.get("thinking_level", "off")
     return cls(**kwargs)
 
 
@@ -95,12 +157,15 @@ class LLMClient:
             成功时返回 ChatResponse，所有重试耗尽时返回空的 ChatResponse。
         """
         last_error: Exception | None = None
-        t_start = time.time()
+        # L8：latency 只计量成功那次请求（不含退避睡眠墙钟）
+        t_attempt = time.time()
+        attempt = 0
+        extras_degraded = False  # 参数类 400 降级只做一次，不计入退避次数
 
-        for attempt in range(self.MAX_RETRIES + 1):
+        while attempt <= self.MAX_RETRIES:
             try:
                 response = await self._provider.chat(messages, **kwargs)
-                latency_ms = int((time.time() - t_start) * 1000)
+                latency_ms = int((time.time() - t_attempt) * 1000)
                 response.latency = latency_ms
                 self._log_success(response, job_id=job_id, job_name=job_name)
                 logger.debug(
@@ -111,16 +176,34 @@ class LLMClient:
                 return response
             except Exception as e:
                 last_error = e
+                # 双重保险第二道：端点拒绝扩展参数（thinking/reasoning 等）→
+                # 置位降级标记后立即重试（该 provider 实例生命周期内不再发送）
+                if not extras_degraded and _is_param_rejection(e):
+                    extras_degraded = True
+                    if hasattr(self._provider, "_extras_disabled"):
+                        self._provider._extras_disabled = True
+                    logger.warning(
+                        "LLM endpoint rejected extra params, "
+                        f"degraded retry without them: {_format_error_detail(e)}"
+                    )
+                    # 顺手项 1：降级重试前重置计时，避免把首次失败请求的耗时计入 latency
+                    t_attempt = time.time()
+                    continue
+                # M7/M9：确定性错误（refusal/鉴权/参数类）不重试
+                if _is_terminal_error(e):
+                    break
                 if attempt < self.MAX_RETRIES:
-                    delay = self.RETRY_BACKOFF[attempt]
+                    delay = _retry_delay(e, self.RETRY_BACKOFF[attempt])
                     logger.warning(
                         f"LLM retry {attempt + 1}/{self.MAX_RETRIES} "
                         f"after {delay}s: {_format_error_detail(e)}"
                     )
                     await asyncio.sleep(delay)
+                attempt += 1
+                t_attempt = time.time()  # L8：重试后重新计时
 
-        # 所有重试耗尽 —— 记录错误并返回空响应
-        latency_ms = int((time.time() - t_start) * 1000)
+        # 所有重试耗尽 —— 记录错误并返回空响应（latency 仅最后尝试耗时）
+        latency_ms = int((time.time() - t_attempt) * 1000)
         error_detail = _format_error_detail(last_error) if last_error else "unknown"
         logger.error(
             f"LLM call failed after {self.MAX_RETRIES} retries: {error_detail}"
