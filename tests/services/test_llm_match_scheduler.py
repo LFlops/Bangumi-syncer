@@ -515,6 +515,148 @@ def test_continue_replay_tool_use_backfills_and_continues_loop():
 
 
 # ---------------------------------------------------------------------------
+# G3：恢复路径 config_override 非正数 → 回退 None（由策略默认接管）
+# ---------------------------------------------------------------------------
+
+
+def _replay_stub_end_turn() -> ReplayResult:
+    return ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response={"stop_reason": "end_turn", "content": "x", "tool_calls": []},
+    )
+
+
+def _run_continue_replay_with_config(raw_max: str):
+    """以指定 llm_match_max_iterations 跑一次 _continue_replay，返回捕获的 config_override。"""
+    sched = LlmMatchScheduler()
+    captured = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["config_override"] = config_override
+        return 3
+
+    log = MagicMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=_replay_stub_end_turn()),
+        patch("app.services.agent.budget.get_max_iterations", _gmi),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(_make_repo()),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": raw_max,
+        }
+        asyncio.run(
+            sched._continue_replay({"run_id": "r", "sync_record_id": 1}, {"id": 1})
+        )
+    return captured.get("config_override"), log
+
+
+def test_continue_replay_zero_config_override_falls_back_to_none():
+    override, log = _run_continue_replay_with_config("0")
+    assert override is None, "0 应回退 None（避免 max_iterations=0 空跑）"
+    assert log.warning.called
+
+
+def test_continue_replay_negative_config_override_falls_back_to_none():
+    override, log = _run_continue_replay_with_config("-3")
+    assert override is None, "负值应回退 None"
+    assert log.warning.called
+
+
+def test_continue_replay_positive_config_override_is_passed_through():
+    override, _ = _run_continue_replay_with_config("7")
+    assert override == 7
+
+
+# ---------------------------------------------------------------------------
+# G4：tool_use 补执行后 remaining<=0 → 必须标记终态（no_suggestion/exhausted），
+# 不得直接 return 让 run 滞留 processing
+# ---------------------------------------------------------------------------
+
+
+def test_continue_replay_tool_use_no_remaining_marks_no_suggestion():
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
+    # medium → max_iterations=3；executed=2 → remaining=1；补执行后 -1 → 0
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=2,
+        missing_tool_calls=[missing],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "go",
+            "tool_calls": [missing],
+        },
+    )
+    loop = AsyncMock()
+    backfill = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch.object(sched, "_replay_missing_tool", backfill),
+        patch("app.services.agent.loop.run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay({"run_id": "r", "sync_record_id": 1}, {"id": 1})
+        )
+
+    # 不再续跑 loop，但必须落终态（否则 run 永久 processing）
+    loop.assert_not_awaited()
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+
+
+def test_continue_replay_no_remaining_before_replay_marks_no_suggestion():
+    """replay 后剩余轮次已耗尽（remaining<=0）同样必须落终态。"""
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=3,  # medium=3 → remaining=0
+        missing_tool_calls=[],
+        last_response=None,
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.agent.loop.run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay({"run_id": "r", "sync_record_id": 1}, {"id": 1})
+        )
+
+    loop.assert_not_awaited()
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+
+
+# ---------------------------------------------------------------------------
 # F4：缺失工具补执行结果回填 messages（assistant 后有对应 tool_result）
 # ---------------------------------------------------------------------------
 
@@ -595,6 +737,102 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
     assert any(t.tool_use_id == "t2" and t.content == "SEARCH-RESULT" for t in trs), (
         "补执行的 tool_result 应对应缺失的 tool_use t2"
     )
+
+
+# ---------------------------------------------------------------------------
+# G5：非 read（write/terminal/未注册）缺失工具 → 回填占位 tool_result 闭合协议
+# （不重放副作用，但必须让每条 tool_use 都有对应 tool_result）
+# ---------------------------------------------------------------------------
+
+_SKIP_PLACEHOLDER = "skipped: will be re-invoked in continuation"
+
+
+def _last_tool_result(messages: list) -> ToolResultBlock | None:
+    for m in reversed(messages):
+        if m.role == "user" and isinstance(m.content, list) and m.content:
+            blk = m.content[0]
+            if isinstance(blk, ToolResultBlock):
+                return blk
+    return None
+
+
+def _registry_with(name: str, access: str, called: list) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name=name,
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda args: called.append(name) or "X",
+            access=access,
+        )
+    )
+    return registry
+
+
+def test_replay_missing_write_tool_appends_placeholder_tool_result():
+    sched = LlmMatchScheduler()
+    called: list = []
+    registry = _registry_with("write_mapping", "write", called)
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="w1", name="write_mapping", input={})],
+        )
+    ]
+
+    asyncio.run(
+        sched._replay_missing_tool(
+            {"id": "w1", "name": "write_mapping", "input": {}}, registry, messages
+        )
+    )
+
+    # 写工具不重放（避免重复副作用）
+    assert called == []
+    blk = _last_tool_result(messages)
+    assert blk is not None, "write 缺失工具也必须回填 tool_result 闭合协议"
+    assert blk.tool_use_id == "w1"
+    assert blk.is_error is False
+    assert blk.content == _SKIP_PLACEHOLDER
+
+
+def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
+    sched = LlmMatchScheduler()
+    called: list = []
+    registry = _registry_with("submit_suggestion", "terminal", called)
+    messages: list = []
+
+    asyncio.run(
+        sched._replay_missing_tool(
+            {"id": "s1", "name": "submit_suggestion", "input": {"subject_id": "1"}},
+            registry,
+            messages,
+        )
+    )
+
+    assert called == []
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.tool_use_id == "s1"
+    assert blk.content == _SKIP_PLACEHOLDER
+    assert blk.is_error is False
+
+
+def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
+    sched = LlmMatchScheduler()
+    registry = ToolRegistry()
+    messages: list = []
+
+    asyncio.run(
+        sched._replay_missing_tool(
+            {"id": "u1", "name": "ghost_tool", "input": {}}, registry, messages
+        )
+    )
+
+    blk = _last_tool_result(messages)
+    assert blk is not None, "未注册工具同样需回填占位，避免 tool_use 悬空"
+    assert blk.tool_use_id == "u1"
+    assert blk.content == _SKIP_PLACEHOLDER
 
 
 # ---------------------------------------------------------------------------

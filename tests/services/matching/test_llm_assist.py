@@ -622,6 +622,74 @@ def test_register_match_tools_idempotent_no_duplicate_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
+# G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
+# 否则多用户跨 run 复用首次注册的错误 token
+# ---------------------------------------------------------------------------
+
+
+def test_register_match_tools_rebinds_handlers_to_latest_bgm():
+    from app.services.llm.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    bgm1 = _make_bgm(search_result=[{"id": 1, "name": "first"}])
+    bgm2 = _make_bgm(search_result=[{"id": 2, "name": "second"}])
+
+    llm_assist.register_match_tools(registry, bgm1)
+    llm_assist.register_match_tools(registry, bgm2)
+
+    # search handler 闭包应指向第二个 bgm
+    search = registry.get("search_bangumi")
+    assert search is not None
+    assert search.handler({"title": "x"}) == [{"id": 2, "name": "second"}]
+
+
+@pytest.mark.asyncio
+async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
+    """两次 run（共享模块单例 registry）→ 第二次的 search handler 调用第二个 bgm。"""
+    used: list[str] = []
+
+    def _bgm(tag: str):
+        class _B:
+            def search(self, **kwargs):
+                used.append(tag)
+                return [{"id": 1}]
+
+            def get_subject(self, sid):
+                return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+            def get_related_subjects(self, sid):
+                return []
+
+        return _B()
+
+    bgm1, bgm2 = _bgm("bgm1"), _bgm("bgm2")
+
+    run_a, sr_a = "run-g1-a", 60
+    database_manager.agent_runs.create_pending(run_a, "match", sr_a)
+    await llm_assist.run(
+        run_a,
+        sync_record=_make_sync_record(sync_record_id=sr_a),
+        bgm=bgm1,
+        chat_fn=_chat_side_effect([_search_response()]),
+        span_recorder=None,
+    )
+    assert used == ["bgm1"], "首个 run 应使用第一个 bgm"
+
+    run_b, sr_b = "run-g1-b", 61
+    database_manager.agent_runs.create_pending(run_b, "match", sr_b)
+    await llm_assist.run(
+        run_b,
+        sync_record=_make_sync_record(sync_record_id=sr_b),
+        bgm=bgm2,
+        chat_fn=_chat_side_effect([_search_response()]),
+        span_recorder=None,
+    )
+    assert used == ["bgm1", "bgm2"], (
+        f"第二个 run 必须使用第二个 bgm（实际 {used}）——handler 闭包不得钉死首次注册"
+    )
+
+
+# ---------------------------------------------------------------------------
 # F5：llm_assist.run 将 config_override（llm_match_max_iterations）透传给
 # get_max_iterations（优先级：配置覆盖 > 策略 > 默认）；空值传 None
 # ---------------------------------------------------------------------------
@@ -700,6 +768,102 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm())
 
     assert captured["config_override"] is None
+
+
+# ---------------------------------------------------------------------------
+# G3：config_override 非正数（0 / 负值）→ 告警并回退 None（由策略默认接管），
+# 否则 max_iterations<=0 会让循环空跑并把 run 滞留在 processing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,tag",
+    [("0", "zero"), ("-1", "neg1"), ("-10", "neg10"), (" 0 ", "padded-zero")],
+)
+@pytest.mark.asyncio
+async def test_run_non_positive_config_override_falls_back_to_none(
+    monkeypatch, raw, tag
+):
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    captured = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["config_override"] = config_override
+        return 3
+
+    monkeypatch.setattr(llm_assist, "get_max_iterations", _gmi)
+
+    cm = MagicMock()
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_max_iterations": raw,
+        "llm_match_thinking_level": "medium",
+    }
+    monkeypatch.setattr(llm_assist, "config_manager", cm)
+
+    log = MagicMock()
+    monkeypatch.setattr(llm_assist, "logger", log)
+
+    async def _fake_loop(**kwargs):
+        return RunResult(stop_reason="end_turn")
+
+    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+
+    run_id = f"run-g3-{tag}"
+    sr_id = 70
+    assert database_manager.agent_runs.create_pending(run_id, "match", sr_id), (
+        "前置：agent_run 应创建成功（否则 run 会因抢占失败提前返回 skipped）"
+    )
+    sr = _make_sync_record(sync_record_id=sr_id)
+    status = await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm())
+    assert status != "skipped"
+
+    assert captured["config_override"] is None, (
+        f"非正数配置 {raw!r} 应回退 None，交由策略默认"
+    )
+    assert log.warning.called, "非正数配置应打印告警"
+
+
+@pytest.mark.asyncio
+async def test_run_invalid_config_override_logs_warning(monkeypatch):
+    """非法字符串（无法转 int）→ 回退 None 且告警。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    captured = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["config_override"] = config_override
+        return 3
+
+    monkeypatch.setattr(llm_assist, "get_max_iterations", _gmi)
+
+    cm = MagicMock()
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_max_iterations": "abc",
+        "llm_match_thinking_level": "medium",
+    }
+    monkeypatch.setattr(llm_assist, "config_manager", cm)
+    log = MagicMock()
+    monkeypatch.setattr(llm_assist, "logger", log)
+
+    async def _fake_loop(**kwargs):
+        return RunResult(stop_reason="end_turn")
+
+    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+
+    run_id = "run-g3-invalid"
+    sr_id = 71
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    await llm_assist.run(
+        run_id, sync_record=_make_sync_record(sync_record_id=sr_id), bgm=_make_bgm()
+    )
+
+    assert captured["config_override"] is None
+    assert log.warning.called
 
 
 # ---------------------------------------------------------------------------

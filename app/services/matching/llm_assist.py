@@ -225,9 +225,11 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         ),
     ]
     for d in defns:
-        # 幂等：模块单例 registry 重复注册会刷 warning（F7）；已存在则跳过。
-        if registry.get(d.name) is None:
-            registry.register(d)
+        # G1：必须**始终覆盖**注册。handler 是捕获本次 ``bgm`` 的闭包，若沿用已存在的
+        # 定义（幂等跳过），模块单例 registry 会把首个 run 的 bgm（及其 access_token）
+        # 钉死，导致多用户 / 跨 run 复用错误账号。quiet=True：覆盖属预期语义，
+        # 只打 debug 不刷 warning（F7）。
+        registry.register(d, quiet=True)
     return defns
 
 
@@ -583,6 +585,40 @@ def _send_notification(
 # ---------------------------------------------------------------------------
 
 
+def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None:
+    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（F5 / G3）。
+
+    返回 ``None`` 表示不覆盖（交由 thinking_level 策略与默认兜底）：
+    - 空值（None / 空串）→ None（静默，属默认配置）
+    - 非法整数 → None + 告警
+    - 非正数（<=0）→ None + 告警（否则 max_iterations<=0 会让循环空跑，
+      run 无 LLM 调用即耗尽，容易滞留/误判）
+
+    ``log`` 可注入调用方 logger（如调度器），默认使用本模块 logger。
+    """
+    _log = log if log is not None else logger
+    if raw_max is None:
+        return None
+    text = str(raw_max).strip()
+    if text == "":
+        return None
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        _log.warning(
+            f"[llm_assist] llm_match_max_iterations={raw_max!r} 非法整数，"
+            f"已忽略该覆盖（回退思考强度策略默认）"
+        )
+        return None
+    if value <= 0:
+        _log.warning(
+            f"[llm_assist] llm_match_max_iterations={value} 必须为正整数，"
+            f"已忽略该覆盖（回退思考强度策略默认）"
+        )
+        return None
+    return value
+
+
 def _build_default_chat_fn():
     """构造默认 chat_fn：包装 LLMClient.chat（job_name='llm_match' 归属用量）。"""
     from app.services.llm import get_llm_client
@@ -636,13 +672,9 @@ async def run(
     # > thinking_level 策略映射 > 默认兜底）。调度器负责把 thinking_level 透传进来，
     # 配置覆盖值由本层从集中配置读取，保证单一来源。
     match_cfg = config_manager.get_sync_llm_match_config()
-    raw_max = match_cfg.get("llm_match_max_iterations")
-    config_override = None
-    if raw_max not in (None, ""):
-        try:
-            config_override = int(str(raw_max).strip())
-        except (TypeError, ValueError):
-            config_override = None
+    config_override = resolve_max_iterations_override(
+        match_cfg.get("llm_match_max_iterations")
+    )
     max_iterations = get_max_iterations(
         "match", thinking_level, config_override=config_override
     )

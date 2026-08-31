@@ -480,8 +480,9 @@ async def test_execute_batch_unknown_tool_wrapped_as_error_block():
 
 
 # ---------------------------------------------------------------------------
-# execute_batch：重复 tool_use_id（F10 / M26）
-#   重复 id 仅执行第一个，后续直接回填 is_error='duplicate tool_use_id'
+# execute_batch：重复 tool_use_id（F10 / M26 / G2）
+#   重复 id 仅执行第一个；每个 tool_call 有独立结果槽位（ordered）：
+#   首个保留真实结果，第二及以后为 duplicate 错误块（不覆盖首个）
 # ---------------------------------------------------------------------------
 
 
@@ -510,11 +511,55 @@ async def test_execute_batch_duplicate_tool_use_id_executes_only_first():
     results = await reg.execute_batch(calls)
     # handler 仅被调用一次（第一个执行，第二个不执行）
     assert called == [1]
-    # 重复 id 被回填为 is_error + duplicate 文案
-    blk = results["same"]
-    assert isinstance(blk, ToolResultBlock)
-    assert blk.is_error is True
-    assert blk.content == "duplicate tool_use_id"
+    # G2：独立槽位与 tool_calls 一一对应（顺序一致）
+    assert len(results.ordered) == len(calls)
+    first_id, first = results.ordered[0]
+    second_id, second = results.ordered[1]
+    assert first_id == second_id == "same"
+    # 首个槽位保留真实执行结果（不被 dup 错误块覆盖）
+    assert isinstance(first, ToolResultBlock)
+    assert first.is_error is False
+    assert first.content == "ran"
+    # 第二个槽位为 duplicate 错误块
+    assert isinstance(second, ToolResultBlock)
+    assert second.is_error is True
+    assert second.content == "duplicate tool_use_id"
+    # 兼容的 dict 视图按 id 取值 → 首个真实结果
+    assert results["same"] is first
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_duplicate_write_tool_keeps_first_result():
+    """非 readonly（write）串行分支同样保留首个真实结果，第二个为 dup 错误块。"""
+    reg = ToolRegistry()
+    called = []
+
+    def handler(args):
+        called.append(args.get("k"))
+        return "written"
+
+    reg.register(
+        ToolDefinition(
+            name="w",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="write",
+        )
+    )
+    calls = [
+        ToolUseBlock(id="w1", name="w", input={"k": "first"}),
+        ToolUseBlock(id="w1", name="w", input={"k": "second"}),
+    ]
+    results = await reg.execute_batch(calls)
+    # 仅首个执行（写工具不重复副作用）
+    assert called == ["first"]
+    assert [i for i, _ in results.ordered] == ["w1", "w1"]
+    assert results.ordered[0][1].is_error is False
+    assert results.ordered[0][1].content == "written"
+    assert results.ordered[1][1].is_error is True
+    assert results.ordered[1][1].content == "duplicate tool_use_id"
+    assert results["w1"].content == "written"
 
 
 @pytest.mark.asyncio
@@ -549,10 +594,16 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     assert results["a"].content == "ran"
     assert results["b"].is_error is False
     assert results["b"].content == "ran"
-    # 重复 id 被回填为错误块
-    assert isinstance(results["dup"], ToolResultBlock)
-    assert results["dup"].is_error is True
-    assert results["dup"].content == "duplicate tool_use_id"
+    # G2：重复 id 的首个槽位保留真实结果，第二个槽位为错误块
+    slots = results.ordered
+    assert [i for i, _ in slots] == ["a", "dup", "dup", "b"]
+    assert slots[1][1].is_error is False
+    assert slots[1][1].content == "ran"
+    assert isinstance(slots[2][1], ToolResultBlock)
+    assert slots[2][1].is_error is True
+    assert slots[2][1].content == "duplicate tool_use_id"
+    # dict 视图保留首个真实结果
+    assert results["dup"].is_error is False
 
 
 # ---------------------------------------------------------------------------

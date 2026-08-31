@@ -80,6 +80,24 @@ class ToolDefinition:
         }
 
 
+class BatchResults(dict):
+    """批量执行结果：``ordered`` 独立槽位 + 兼容的 ``dict[tool_use_id, result]`` 视图。
+
+    - ``ordered``：``[(tool_use_id, result), ...]``，与传入 ``tool_calls`` 一一对应
+      （长度与顺序一致），消费方（loop.py）按槽位回填 tool_result，保证每条 tool_use
+      都有且仅有一条对应结果
+    - dict 视图：同一 ``tool_use_id`` 重复出现时保留**首个**结果（真实执行结果不会被
+      后续 duplicate 错误块覆盖）
+    """
+
+    def __init__(self, ordered: Optional[list[tuple[str, Any]]] = None) -> None:
+        self.ordered: list[tuple[str, Any]] = list(ordered or [])
+        mapping: dict[str, Any] = {}
+        for tool_use_id, result in self.ordered:
+            mapping.setdefault(tool_use_id, result)
+        super().__init__(mapping)
+
+
 class ToolRegistry:
     """工具注册表与执行器。"""
 
@@ -88,10 +106,17 @@ class ToolRegistry:
 
     # -- 注册 / 查询 ---------------------------------------------------------
 
-    def register(self, defn: ToolDefinition) -> None:
-        """注册工具；重复注册告警覆盖。"""
+    def register(self, defn: ToolDefinition, quiet: bool = False) -> None:
+        """注册工具；重复注册**始终覆盖**（后注册的 handler 生效）。
+
+        ``quiet=True``：调用方明确以覆盖为语义（如场景层每次 run 重新绑定
+        handler 闭包），重复注册降为 debug 日志，不刷 warning。
+        """
         if defn.name in self._tools:
-            logger.warning("工具 %r 重复注册，已覆盖旧定义", defn.name)
+            if quiet:
+                logger.debug("工具 %r 重新注册（覆盖旧定义）", defn.name)
+            else:
+                logger.warning("工具 %r 重复注册，已覆盖旧定义", defn.name)
         self._tools[defn.name] = defn
 
     def get(self, name: str) -> Optional[ToolDefinition]:
@@ -186,62 +211,61 @@ class ToolRegistry:
 
     # -- 批量分段并行执行 ---------------------------------------------------
 
-    async def execute_batch(self, tool_calls: list[ToolUseBlock]) -> dict[str, Any]:
+    async def execute_batch(self, tool_calls: list[ToolUseBlock]) -> "BatchResults":
         """分段并行批量执行（spec §3.2.2 / §3.2.4 ③）。
 
         - 按原始顺序扫描：连续 readonly 段 ``asyncio.gather`` 并行（保序返回）
         - 非 readonly（write / terminal）单独串行，相对顺序保持
-        - 返回 ``{tool_use_id: result}``：
+        - 返回 ``BatchResults``：``ordered`` 与 ``tool_calls`` **一一对应的独立槽位**，
+          同时兼容 ``{tool_use_id: result}`` 的 dict 视图（按 id 取首个结果）：
           - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
           - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
           - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
-          - 重复 ``tool_use_id``：仅执行第一个，后续直接回填
-            ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``（F10/M26）
+          - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
+            槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
+            （F10/M26；独立槽位避免 dup 错误块覆盖首个真实结果）
         """
-        results: dict[str, Any] = {}
+        n = len(tool_calls)
+        slots: list[Any] = [None] * n
         seen_ids: set[str] = set()
         i = 0
-        n = len(tool_calls)
         while i < n:
             tc = tool_calls[i]
-            # 重复 tool_use_id：不执行 handler，直接回填错误块（F10/M26）
+            # 重复 tool_use_id：不执行 handler，本槽位回填错误块（F10/M26）
             if tc.id in seen_ids:
-                results[tc.id] = ToolResultBlock(
-                    tool_use_id=tc.id,
-                    content="duplicate tool_use_id",
-                    is_error=True,
-                )
+                slots[i] = self._duplicate_block(tc.id)
                 i += 1
                 continue
             if self.is_readonly(tc.name):
                 # 收集连续 readonly 段，段内同样跳过重复 id（不进入 gather）
                 j = i
-                seg: list[ToolUseBlock] = []
-                dup_ids: list[str] = []
+                seg: list[tuple[int, ToolUseBlock]] = []
                 while j < n and self.is_readonly(tool_calls[j].name):
                     cur = tool_calls[j]
                     if cur.id in seen_ids:
-                        dup_ids.append(cur.id)
+                        slots[j] = self._duplicate_block(cur.id)
                     else:
                         seen_ids.add(cur.id)
-                        seg.append(cur)
+                        seg.append((j, cur))
                     j += 1
-                seg_results = await asyncio.gather(*[self._exec_one(t) for t in seg])
-                for t, r in zip(seg, seg_results):
-                    results[t.id] = r
-                # 段内重复 id 回填错误块（覆盖首个执行结果，F10/M26）
-                for did in dup_ids:
-                    results[did] = ToolResultBlock(
-                        tool_use_id=did,
-                        content="duplicate tool_use_id",
-                        is_error=True,
-                    )
+                seg_results = await asyncio.gather(*[self._exec_one(t) for _, t in seg])
+                for (idx, _), r in zip(seg, seg_results):
+                    slots[idx] = r
                 i = j
             else:
                 seen_ids.add(tc.id)
-                results[tc.id] = await self._exec_one(tc)
+                slots[i] = await self._exec_one(tc)
                 i += 1
-        return results
+        return BatchResults([(tc.id, slots[idx]) for idx, tc in enumerate(tool_calls)])
+
+    @staticmethod
+    def _duplicate_block(tool_use_id: str) -> ToolResultBlock:
+        """重复 tool_use_id 的占位错误块（不执行 handler，F10/M26）。"""
+        return ToolResultBlock(
+            tool_use_id=tool_use_id,
+            content="duplicate tool_use_id",
+            is_error=True,
+        )
 
     async def _exec_one(self, tc: ToolUseBlock) -> Any:
         """执行单条并统一包装为 ToolResultBlock / TerminalCapture。"""

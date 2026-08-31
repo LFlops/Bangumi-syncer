@@ -25,6 +25,10 @@ from app.services.base.scheduler import BaseScheduler
 from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
 
+# G5：非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
+# ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
+_SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
+
 
 def _cfg_bool(value: Any) -> bool:
     """宽松布尔解析：实际 bool 或字符串 true/1/yes/on（任意大小写）。"""
@@ -180,15 +184,12 @@ class LlmMatchScheduler(BaseScheduler):
 
         try:
             # F5：thinking_level 与 config_override 统一从集中配置读取
+            # G3：非法 / 非正数覆盖值由 resolve_max_iterations_override 统一告警并回退 None
             match_cfg = config_manager.get_sync_llm_match_config()
             thinking_level = match_cfg.get("llm_match_thinking_level") or "medium"
-            raw_max = match_cfg.get("llm_match_max_iterations")
-            config_override = None
-            if raw_max not in (None, ""):
-                try:
-                    config_override = int(str(raw_max).strip())
-                except (TypeError, ValueError):
-                    config_override = None
+            config_override = llm_assist_module.resolve_max_iterations_override(
+                match_cfg.get("llm_match_max_iterations"), log=logger
+            )
 
             max_iterations = get_max_iterations(
                 "match", thinking_level, config_override=config_override
@@ -204,7 +205,10 @@ class LlmMatchScheduler(BaseScheduler):
             )
             remaining = max_iterations - replay_result.executed_iterations
             if remaining <= 0:
-                logger.debug(f"🤖 恢复 {run_id} 已无剩余轮次，跳过续跑")
+                # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
+                # 下一轮恢复扫描又会重复捞起）→ 落终态 no_suggestion/exhausted
+                logger.debug(f"🤖 恢复 {run_id} 已无剩余轮次，标记 no_suggestion")
+                repo.mark_no_suggestion(run_id, stop_reason="exhausted")
                 return
 
             last_response = replay_result.last_response
@@ -255,7 +259,11 @@ class LlmMatchScheduler(BaseScheduler):
                 # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
                 remaining = max(0, remaining - 1)
                 if remaining <= 0:
-                    logger.debug(f"🤖 恢复 {run_id} 补执行后已无剩余轮次，跳过续跑")
+                    # G4：同上，补执行后预算耗尽也必须落终态而非静默返回
+                    logger.debug(
+                        f"🤖 恢复 {run_id} 补执行后已无剩余轮次，标记 no_suggestion"
+                    )
+                    repo.mark_no_suggestion(run_id, stop_reason="exhausted")
                     return
                 defns = llm_assist_module.register_match_tools(registry, bgm)
                 tools_schemas = [d.to_schema() for d in defns]
@@ -325,16 +333,22 @@ class LlmMatchScheduler(BaseScheduler):
         F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
         追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
         符合会话协议（每条 tool_use 有且仅有一条 tool_result）。
+
+        G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
+        tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
+        真实调用留给续跑 loop 自然触发。
         """
         name = (tool_call or {}).get("name")
         if not name:
             return
-        defn = registry.get(name)
-        if defn is None or defn.access != "read":
-            # 非只读（write/terminal）不重放，续跑 loop 中自然触发
-            return
         args = (tool_call or {}).get("input") or {}
         tool_use_id = (tool_call or {}).get("id", "")
+        defn = registry.get(name)
+        if defn is None or defn.access != "read":
+            self._append_tool_result(
+                messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
+            )
+            return
         try:
             result = await registry.execute(name, args)
             content = str(result)
@@ -343,6 +357,13 @@ class LlmMatchScheduler(BaseScheduler):
             logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
             content = f"工具执行失败: {type(e).__name__}"
             is_error = True
+        self._append_tool_result(messages, tool_use_id, content, is_error=is_error)
+
+    @staticmethod
+    def _append_tool_result(
+        messages: list, tool_use_id: str, content: str, *, is_error: bool
+    ) -> None:
+        """追加一条 tool_result 消息（闭合 assistant 的 tool_use，F4/G5）。"""
         messages.append(
             Message(
                 role="user",

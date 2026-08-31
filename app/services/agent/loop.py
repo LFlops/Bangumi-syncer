@@ -7,7 +7,8 @@
 - **不直接依赖 LLMClient**：LLM 调用经注入的 ``chat_fn(messages, tools=, tool_choice=)``，
   便于测试 mock 与场景层（llm_assist）注入真实客户端。
 - **工具执行经注入的 ``tool_calls_fn``**：循环把整批 tool_calls 一次性交给执行器
-  （``tool_registry.execute_batch`` 做分段并行 gather/串行），按原始顺序回填 tool_result。
+  （``tool_registry.execute_batch`` 做分段并行 gather/串行），按**独立结果槽位**逐条回填
+  tool_result（重复 tool_use_id 时首个保留真实结果、后续为 duplicate 错误块，F10/M26）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
 - **透明预算**：每轮追加 ``[剩余轮次：N]``；末轮（remaining==1 起手）强制 ``tool_choice=terminal``（I-4）。
 - **span 钩子**：每轮 chat 前后调用 ``span_recorder.start_span/end_span``（name=llm_chat），
@@ -65,6 +66,23 @@ def _input_summary(inp: dict) -> str:
     return ", ".join(f"{k}:{type(v).__name__}" for k, v in (inp or {}).items())
 
 
+def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
+    """把执行器返回值对齐为与 ``tool_calls`` 一一对应的结果槽位列表。
+
+    - 执行器返回 ``BatchResults``（带 ``ordered`` 槽位）→ 按槽位取，重复 tool_use_id
+      的每条 tool_use 各取自身结果（首个真实结果不被 duplicate 错误块覆盖，F10/M26）
+    - 普通 ``dict[tool_use_id, result]``（旧契约 / 注入的简易执行器）→ 回退按 id 取值
+    """
+    ordered = getattr(results, "ordered", None)
+    if isinstance(ordered, list) and len(ordered) == len(tool_calls):
+        if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls)):
+            return [result for _, result in ordered]
+    getter = getattr(results, "get", None)
+    if getter is None:
+        return [None] * len(tool_calls)
+    return [getter(tc.id) for tc in tool_calls]
+
+
 async def run(
     *,
     chat_fn: ChatFn,
@@ -80,7 +98,9 @@ async def run(
     参数（除 spec 约定的 seed_messages 外，全部经注入解耦，零 LLMClient 依赖）：
     - ``chat_fn``：``(messages, tools=, tool_choice=) -> ChatResponse`` 的异步可调用对象
     - ``tools_schemas``：传给 provider 的 tools 参数（schema 列表）
-    - ``tool_calls_fn``：``(tool_calls) -> {tool_use_id: ToolResultBlock | TerminalCapture}`` 批量执行器
+    - ``tool_calls_fn``：批量执行器，返回 ``BatchResults``（``ordered`` 与 tool_calls 一一对应的
+      结果槽位；同时兼容 ``{tool_use_id: ToolResultBlock | TerminalCapture}`` 的 dict 视图）。
+      普通 dict 亦可（按 id 取值，重复 id 场景无法区分槽位）
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）
@@ -148,8 +168,8 @@ async def run(
         #    span start 在拿到结果后（started_at 有微小误差，可接受），但语义完整：
         #    span 存在 + replay_delta 含完整 tool_result，供断点重放（trace.replay）重建。
         tool_execute_span_ids: list[str] = []
-        for seq, tc in enumerate(tool_calls):
-            result = results.get(tc.id)
+        aligned = _align_results(tool_calls, results)
+        for seq, (tc, result) in enumerate(zip(tool_calls, aligned)):
             if result is None or not isinstance(result, ToolResultBlock):
                 # 防御：缺失结果或非 ToolResultBlock（如极少数 TerminalCapture 泄漏）跳过
                 continue

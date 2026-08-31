@@ -357,6 +357,93 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
 
 
 # ---------------------------------------------------------------------------
+# 7b. G2：重复 tool_use_id → 循环按独立槽位（ordered）逐条回填，
+#     首个 tool_result 为真实结果，第二个为 duplicate 错误块
+# ---------------------------------------------------------------------------
+
+
+async def test_duplicate_tool_use_ids_backfill_each_slot_independently():
+    from app.services.llm.tools import BatchResults
+
+    dup_a = _tool_use("same", "search_bangumi")
+    dup_b = _tool_use("same", "search_bangumi")
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        if len(calls) == 1:
+            return _resp("tool_use", [dup_a, dup_b])
+        return _resp("end_turn", None)
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    ok = ToolResultBlock(tool_use_id="same", content="real", is_error=False)
+    dup = ToolResultBlock(
+        tool_use_id="same", content="duplicate tool_use_id", is_error=True
+    )
+    tool_calls_fn = AsyncMock(return_value=BatchResults([("same", ok), ("same", dup)]))
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    second_messages = calls[1]
+    blocks = [
+        b
+        for m in second_messages
+        if isinstance(m.content, list)
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+    # 每个 tool_use 各有一条 tool_result（协议闭合），且首个保留真实结果
+    assert len(blocks) == 2
+    assert blocks[0].content == "real"
+    assert blocks[0].is_error is False
+    assert blocks[1].content == "duplicate tool_use_id"
+    assert blocks[1].is_error is True
+
+
+async def test_plain_dict_tool_results_still_supported():
+    """向后兼容：tool_calls_fn 返回普通 dict（无 ordered）时按 id 取值。"""
+    a = _tool_use("t1", "search_bangumi")
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        if len(calls) == 1:
+            return _resp("tool_use", [a])
+        return _resp("end_turn", None)
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(return_value={"t1": _ok_result(a, content="plain")})
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    blocks = [
+        b
+        for m in calls[1]
+        if isinstance(m.content, list)
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+    assert len(blocks) == 1
+    assert blocks[0].content == "plain"
+
+
+# ---------------------------------------------------------------------------
 # 8. 耗尽：max_iterations 内始终调工具不终止 → exhausted + last_response
 # ---------------------------------------------------------------------------
 
