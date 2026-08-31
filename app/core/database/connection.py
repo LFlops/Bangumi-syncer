@@ -42,12 +42,6 @@ class DatabaseConnection:
 
         self._lock = threading.Lock()
         self._conn: Optional[sqlite3.Connection] = None
-        self._media_type_migrated = False
-        self._bgm_title_migrated = False
-        self._trakt_filter_migrated = False
-        self._match_fields_migrated = False
-        self._pending_sync_sync_record_id_migrated = False
-        self._pending_candidates_sync_record_id_migrated = False
         self._agent_memory_migrated = False
         # 已确认存在（或已补上）的列集合，避免每次读写前的 ensure_schema
         # 回调重复执行 PRAGMA table_info
