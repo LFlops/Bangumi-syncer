@@ -68,6 +68,14 @@ class MemoryService:
         """最近 N 条同任务摘要（通用，不做业务合并）。"""
         return self._retriever.recent(task_type, task_id, limit=limit)
 
+    def get_task_run_ids(self, task_type: str, task_id: str) -> set[str]:
+        """本任务全部 run_id 集合（含归档）。
+
+        供消费排除按任务隔离——判断记录的 consumed_run_ids 是否与当前任务
+        的 run_id 集合有交集。
+        """
+        return self._memory.get_task_run_ids(task_type, task_id)
+
     def related(
         self,
         task_type: str,

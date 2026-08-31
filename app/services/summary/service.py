@@ -66,14 +66,31 @@ class SummaryService:
     # ------------------------------------------------------------------
 
     def _query_records(
-        self, job_config: SummaryJobConfig
+        self, job_config: SummaryJobConfig, incremental: bool = False
     ) -> tuple[list[SummaryRecord], str, str]:
-        """计算日期范围并查询记录，返回 (records, date_from, date_to)。"""
+        """计算日期范围并查询记录，返回 (records, date_from, date_to)。
+
+        增量窗口（incremental=True，execute_job 使用）：记忆开启
+        （memory_limit>0）且本任务存在历史记忆时，date_from = 本任务最后一条
+        记忆的 created_at 日期（只总结上次总结点之后的增量记录）；无历史记忆
+        或 preview（generate_summary，incremental=False）时回退 lookback_days。
+        """
         now = datetime.now()
+        date_to = now.strftime("%Y-%m-%d")
+
         date_from = (now - timedelta(days=job_config.lookback_days)).strftime(
             "%Y-%m-%d"
         )
-        date_to = now.strftime("%Y-%m-%d")
+        # 增量窗口：记忆开启 + 有历史 → 起点 = 上次总结点（created_at 日期）
+        if incremental and job_config.memory_limit > 0:
+            task_id = f"summary-{job_config.name}"
+            last = self.memory.recent("summary", task_id, limit=1)
+            if last and last[0].created_at:
+                # "YYYY-MM-DD HH:MM:SS" → 日期；长度不足（异常格式）时跳过
+                # 保持 lookback 默认，避免 date_from 变非法字符串
+                last_date = last[0].created_at[:10]
+                if len(last_date) == 10:
+                    date_from = last_date
 
         records = database_manager.get_records_in_date_range(
             date_from=date_from,
@@ -93,7 +110,7 @@ class SummaryService:
                 media_type=r.get("media_type") or "episode",
                 source=r["source"],
                 status=r["status"],
-                consumed_run_id=r.get("consumed_run_id"),
+                consumed_run_ids=r.get("consumed_run_ids") or set(),
             )
             for r in records
         ]
@@ -201,15 +218,20 @@ class SummaryService:
         task_id = f"summary-{job_config.name}"
         stage = _STAGE_QUERY
         try:
-            # 1. 查询明细
-            records, date_from, date_to = self._query_records(job_config)
+            # 1. 查询明细（增量窗口：记忆开启时起点=上次总结点）
+            records, date_from, date_to = self._query_records(
+                job_config, incremental=True
+            )
 
-            # 记忆开启（memory_limit>0）时：已消费记录不进 prompt（信息由摘要承继，
-            # 避免重复总结、提升连贯性）；消费标记只标新记录（extract_and_store 用
-            # 过滤后的 records 列表）
+            # 记忆开启（memory_limit>0）时：本任务已消费记录不进 prompt（信息由摘要
+            # 承继，避免重复总结、提升连贯性）；消费排除**按任务隔离**——仅当记录的
+            # consumed_run_ids 与【当前任务】的 run_id 集合有交集才剔除；被其他任务
+            # 消费（如年度总结被每日总结消费过的记录）仍保留，跨任务互斥解除。
+            # 消费标记只标新记录（extract_and_store 用过滤后的 records 列表）
             memory_enabled = job_config.memory_limit > 0
             if memory_enabled:
-                records = [r for r in records if r.consumed_run_id is None]
+                my_run_ids = self.memory.get_task_run_ids("summary", task_id)
+                records = [r for r in records if not (r.consumed_run_ids & my_run_ids)]
 
             # 注入历史上下文：recent（memory_limit>0）与 related（related_limit>0）
             # 各自独立生效（M1：related 不受 memory_limit 门控）；两者皆 0 时短路

@@ -2273,7 +2273,7 @@
       name: document.getElementById('summary-job-name').value,
       cron: document.getElementById('summary-job-cron').value,
       lookback_days:
-        parseInt(document.getElementById('summary-job-lookback').value, 10) || 1,
+        parseInt(document.getElementById('summary-job-lookback').value) || 1,
       user_name: document.getElementById('summary-job-user').value,
       max_records: mrVal,
       memory_limit: parseInt(
@@ -2289,6 +2289,14 @@
     // 前端校验：名称不能含逗号，不能与已有任务重名
     if (data.name.indexOf(',') !== -1) {
       showAlert('任务名称不能包含逗号（,）', 'danger')
+      return
+    }
+    // 最大记录数校验：只允许 -1（不限制）或正整数
+    if (
+      data.max_records !== -1 &&
+      (isNaN(data.max_records) || data.max_records <= 0)
+    ) {
+      showAlert('最大记录数只能填 -1（不限制）或正整数', 'danger')
       return
     }
     // 记忆条数校验：0-1000 整数（0=关闭记忆），用正则+Number 严格校验

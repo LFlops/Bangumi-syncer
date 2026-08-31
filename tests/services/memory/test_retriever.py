@@ -18,7 +18,7 @@ def _entry(run_id: str, summary: str = "昨日看了芙莉莲") -> MemoryEntry:
     )
 
 
-def _record(consumed_run_id: str | None = None, **overrides) -> SummaryRecord:
+def _record(consumed_run_ids: set[str] | None = None, **overrides) -> SummaryRecord:
     defaults = {
         "id": 1,
         "timestamp": "2026-08-13 20:00:00",
@@ -30,7 +30,7 @@ def _record(consumed_run_id: str | None = None, **overrides) -> SummaryRecord:
         "media_type": "episode",
         "source": "plex",
         "status": "success",
-        "consumed_run_id": consumed_run_id,
+        "consumed_run_ids": consumed_run_ids or set(),
     }
     defaults.update(overrides)
     return SummaryRecord(**defaults)
@@ -141,12 +141,12 @@ class TestFormatMemoryContext:
 
 class TestFindOverlaps:
     def test_returns_only_consumed_records(self):
-        """D2：只返回 consumed_run_id 非空的记录。"""
+        """D2：只返回 consumed_run_ids 非空的记录。"""
         retriever, _ = _make_retriever()
         records = [
-            _record(consumed_run_id="run-1"),
-            _record(consumed_run_id=None, id=2),
-            _record(consumed_run_id="run-3", id=3),
+            _record(consumed_run_ids={"run-1"}),
+            _record(consumed_run_ids=set(), id=2),
+            _record(consumed_run_ids={"run-3"}, id=3),
         ]
 
         overlaps = retriever.find_overlaps(records)
@@ -156,7 +156,7 @@ class TestFindOverlaps:
     def test_any_old_consumed_record_hits(self):
         """D5：无窗口限制——任意久远被消费都命中（精确到集）。"""
         retriever, _ = _make_retriever()
-        records = [_record(consumed_run_id="very-old-run-id", id=99)]
+        records = [_record(consumed_run_ids={"very-old-run-id"}, id=99)]
 
         overlaps = retriever.find_overlaps(records)
 
@@ -164,7 +164,10 @@ class TestFindOverlaps:
 
     def test_all_new_records_no_overlap(self):
         retriever, _ = _make_retriever()
-        records = [_record(consumed_run_id=None), _record(consumed_run_id=None, id=2)]
+        records = [
+            _record(consumed_run_ids=set()),
+            _record(consumed_run_ids=set(), id=2),
+        ]
 
         assert retriever.find_overlaps(records) == []
 

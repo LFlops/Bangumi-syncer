@@ -21,12 +21,13 @@ class AgentMemoryRepository(BaseRepository):
     # ------------------------------------------------------------------
 
     def store_and_mark(self, entry: MemoryEntry, record_ids: list[int]) -> int:
-        """同一事务：INSERT 记忆（entry）+ UPDATE sync_records 消费标记
-        （consumed_run_id=entry.run_id WHERE id IN record_ids）。
+        """同一事务：INSERT 记忆（entry）+ 关联表写入消费标记
+        （sync_records_consumed：每条记录一行 (sync_record_id, run_id)）。
 
         run 的原子单元——"记忆记录 + 记录消费"要么全成功要么全回滚，
         消除"记忆已写但标记未写"的中间态。消费标记是记忆域数据，故在同一
-        事务内直连 sync_records 表执行。
+        事务内直连关联表执行。多对多：一条记录可被多个任务的 run 消费，
+        互不覆盖（INSERT OR IGNORE 幂等，同 run 不重复记）。
         """
 
         def _write(conn):
@@ -49,10 +50,11 @@ class AgentMemoryRepository(BaseRepository):
             n1 = cur.rowcount
             n2 = 0
             if record_ids:
-                placeholders = ",".join("?" * len(record_ids))
-                cur = conn.execute(
-                    f"UPDATE sync_records SET consumed_run_id = ? WHERE id IN ({placeholders})",
-                    [entry.run_id, *record_ids],
+                # 多对多：INSERT OR IGNORE——记录已存在 (record, run) 时不重复
+                cur = conn.executemany(
+                    "INSERT OR IGNORE INTO sync_records_consumed "
+                    "(sync_record_id, run_id) VALUES (?, ?)",
+                    [(rid, entry.run_id) for rid in record_ids],
                 )
                 n2 = cur.rowcount
             return n1 + n2
@@ -111,7 +113,7 @@ class AgentMemoryRepository(BaseRepository):
     def rename_task(self, task_type: str, old_task_id: str, new_task_id: str) -> int:
         """改名迁移：同一事务 UPDATE 主表 + 归档表的 task_id（记忆跟随任务）。
 
-        消费标记无需迁移（consumed_run_id 只关联 run_id，不依赖 task_id）。
+        消费标记无需迁移（关联表只关联 sync_record_id + run_id，不依赖 task_id）。
         """
 
         def _write(conn):
@@ -134,7 +136,8 @@ class AgentMemoryRepository(BaseRepository):
 
         顺序敏感：① 先收集 run_id（主表 + 归档表 UNION）——必须在删表前取，
         否则 run_id→task_id 映射丢失；② 删主表；③ 删归档表；
-        ④ 清 sync_records 中 consumed_run_id ∈ run_ids 的消费标记（SET NULL）。
+        ④ 清关联表中 run_id ∈ 本任务 run_ids 的消费标记（DELETE 关联表行，
+        天然只影响本任务——其他任务消费同一记录的标记保留，跨任务隔离）。
         不筛 outcome，全部删除（想保留偏好重新开始的场景用"复制新 job"）。
         """
 
@@ -171,8 +174,8 @@ class AgentMemoryRepository(BaseRepository):
             if run_ids:
                 placeholders = ",".join("?" * len(run_ids))
                 n3 = conn.execute(
-                    "UPDATE sync_records SET consumed_run_id = NULL "
-                    f"WHERE consumed_run_id IN ({placeholders})",
+                    "DELETE FROM sync_records_consumed "
+                    f"WHERE run_id IN ({placeholders})",
                     tuple(run_ids),
                 ).rowcount
             return n1 + n2 + n3
@@ -202,6 +205,32 @@ class AgentMemoryRepository(BaseRepository):
 
         return self._run_read(_read, error_msg="获取最近任务记忆失败", default=[])
 
+    def get_task_run_ids(self, task_type: str, task_id: str) -> set[str]:
+        """按任务取本任务全部 run_id 集合（主表 + 归档 UNION）。
+
+        供消费排除按任务隔离：判断记录在关联表中的 consumed_run_ids 是否属于
+        「当前任务」——有交集则剔除（同任务去重），无交集则保留（跨任务互斥解除，
+        如每日总结消费后年度总结仍可消费）。prune 下沉归档后 run_id 仍归属
+        本任务（消费标记不随归档失效），故必须 UNION 归档表。
+        """
+
+        def _read(conn):
+            rows = conn.execute(
+                """
+                SELECT run_id FROM agent_working_memory
+                WHERE task_type = ? AND task_id = ?
+                UNION
+                SELECT run_id FROM agent_working_memory_archive
+                WHERE task_type = ? AND task_id = ?
+                """,
+                (task_type, task_id, task_type, task_id),
+            ).fetchall()
+            return {row[0] for row in rows}
+
+        return self._run_read(
+            _read, error_msg="获取任务 run_id 集合失败", default=set()
+        )
+
     def get_related_titles(
         self,
         task_type: str,
@@ -211,8 +240,8 @@ class AgentMemoryRepository(BaseRepository):
     ) -> list[MemoryEntry]:
         """同剧关联：按今日记录的剧名反查历史总结（日期倒序最近 N 条）。
 
-        机制：sync_records.consumed_run_id 是"该记录被哪次总结消费过"的显式
-        关联——以今日 bgm_title 集合为键，联表 JOIN 主表 + 归档表 UNION，
+        机制：sync_records_consumed 关联表是"该记录被哪次总结消费过"的显式
+        关联——以今日 bgm_title 集合为键，经关联表 JOIN 主表 + 归档表 UNION，
         即"同类剧目的历史总结"（含已归档冷层）。比 FTS 子串猜测更精确，
         且自然覆盖冷层（消费标记不随 prune 清理）。
 
@@ -233,7 +262,8 @@ class AgentMemoryRepository(BaseRepository):
                 SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,
                        m.full_text, m.outcome, m.tokens_used, m.created_at
                 FROM agent_working_memory m
-                JOIN sync_records s ON s.consumed_run_id = m.run_id
+                JOIN sync_records_consumed c ON c.run_id = m.run_id
+                JOIN sync_records s ON s.id = c.sync_record_id
                 WHERE s.bgm_title IN ({placeholders})
                   AND m.task_type = ? AND m.task_id = ?
                 GROUP BY m.id
@@ -241,7 +271,8 @@ class AgentMemoryRepository(BaseRepository):
                 SELECT m.id, m.task_type, m.task_id, m.run_id, m.summary,
                        m.full_text, m.outcome, m.tokens_used, m.created_at
                 FROM agent_working_memory_archive m
-                JOIN sync_records s ON s.consumed_run_id = m.run_id
+                JOIN sync_records_consumed c ON c.run_id = m.run_id
+                JOIN sync_records s ON s.id = c.sync_record_id
                 WHERE s.bgm_title IN ({placeholders})
                   AND m.task_type = ? AND m.task_id = ?
                 GROUP BY m.id
@@ -261,7 +292,7 @@ class AgentMemoryRepository(BaseRepository):
         """[deprecated] FTS5 全文检索（热记忆），按 task_type 过滤。
 
         **已停用**：相关回忆由 get_related_titles（联表反查）承担——FTS 搜索的
-        输入（标题词）与联表相同，而联表经 consumed_run_id 显式关联更精确、
+        输入（标题词）与联表相同，而联表经关联表（sync_records_consumed）显式关联更精确、
         且覆盖归档冷层。物理结构（虚表/触发器/索引）保留，供 Phase 5
         混合检索（FTS5 + 向量，RRF 融合）复用；无业务调用方。
 
