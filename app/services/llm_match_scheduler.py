@@ -345,6 +345,7 @@ class LlmMatchScheduler(BaseScheduler):
         tool_use_id = (tool_call or {}).get("id", "")
         defn = registry.get(name)
         if defn is None or defn.access != "read":
+            logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
             self._append_tool_result(
                 messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
             )

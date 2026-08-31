@@ -592,11 +592,11 @@ def _make_notify():
 
 
 # ---------------------------------------------------------------------------
-# F7：register_match_tools 幂等，重复调用不产生“重复注册”warning
-# ---------------------------------------------------------------------------
+# G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
+#     且覆盖时不得产生“重复注册”warning（quiet=True）
 
 
-def test_register_match_tools_idempotent_no_duplicate_warning(caplog):
+def test_register_match_tools_overwrite_no_warning(caplog):
     import logging
 
     from app.services.llm.tools import ToolRegistry
@@ -604,7 +604,7 @@ def test_register_match_tools_idempotent_no_duplicate_warning(caplog):
     registry = ToolRegistry()
     bgm = _make_bgm()
 
-    # 连续两次注册到同一（模块单例）registry：第二次应全部跳过
+    # 连续两次注册到同一（模块单例）registry：第二次应覆盖 handler（G1），且不刷 warning
     with caplog.at_level(logging.WARNING):
         llm_assist.register_match_tools(registry, bgm)
         llm_assist.register_match_tools(registry, bgm)

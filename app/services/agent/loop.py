@@ -77,6 +77,9 @@ def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
     if isinstance(ordered, list) and len(ordered) == len(tool_calls):
         if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls)):
             return [result for _, result in ordered]
+        from app.core.logging import logger
+
+        logger.debug("ordered 槽位与 tool_calls 不一致，回退 dict 取值")
     getter = getattr(results, "get", None)
     if getter is None:
         return [None] * len(tool_calls)
