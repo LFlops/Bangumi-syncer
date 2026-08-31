@@ -195,23 +195,51 @@ class ToolRegistry:
           - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
           - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
           - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
+          - 重复 ``tool_use_id``：仅执行第一个，后续直接回填
+            ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``（F10/M26）
         """
         results: dict[str, Any] = {}
+        seen_ids: set[str] = set()
         i = 0
         n = len(tool_calls)
         while i < n:
-            if self.is_readonly(tool_calls[i].name):
-                # 收集连续 readonly 段
+            tc = tool_calls[i]
+            # 重复 tool_use_id：不执行 handler，直接回填错误块（F10/M26）
+            if tc.id in seen_ids:
+                results[tc.id] = ToolResultBlock(
+                    tool_use_id=tc.id,
+                    content="duplicate tool_use_id",
+                    is_error=True,
+                )
+                i += 1
+                continue
+            if self.is_readonly(tc.name):
+                # 收集连续 readonly 段，段内同样跳过重复 id（不进入 gather）
                 j = i
+                seg: list[ToolUseBlock] = []
+                dup_ids: list[str] = []
                 while j < n and self.is_readonly(tool_calls[j].name):
+                    cur = tool_calls[j]
+                    if cur.id in seen_ids:
+                        dup_ids.append(cur.id)
+                    else:
+                        seen_ids.add(cur.id)
+                        seg.append(cur)
                     j += 1
-                seg = tool_calls[i:j]
-                seg_results = await asyncio.gather(*[self._exec_one(tc) for tc in seg])
-                for tc, r in zip(seg, seg_results):
-                    results[tc.id] = r
+                seg_results = await asyncio.gather(*[self._exec_one(t) for t in seg])
+                for t, r in zip(seg, seg_results):
+                    results[t.id] = r
+                # 段内重复 id 回填错误块（覆盖首个执行结果，F10/M26）
+                for did in dup_ids:
+                    results[did] = ToolResultBlock(
+                        tool_use_id=did,
+                        content="duplicate tool_use_id",
+                        is_error=True,
+                    )
                 i = j
             else:
-                results[tool_calls[i].id] = await self._exec_one(tool_calls[i])
+                seen_ids.add(tc.id)
+                results[tc.id] = await self._exec_one(tc)
                 i += 1
         return results
 

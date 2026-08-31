@@ -589,3 +589,160 @@ def _make_notify():
     ns = MagicMock()
     ns.notify.return_value = True
     return ns
+
+
+# ---------------------------------------------------------------------------
+# F7：register_match_tools 幂等，重复调用不产生“重复注册”warning
+# ---------------------------------------------------------------------------
+
+
+def test_register_match_tools_idempotent_no_duplicate_warning(caplog):
+    import logging
+
+    from app.services.llm.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    bgm = _make_bgm()
+
+    # 连续两次注册到同一（模块单例）registry：第二次应全部跳过
+    with caplog.at_level(logging.WARNING):
+        llm_assist.register_match_tools(registry, bgm)
+        llm_assist.register_match_tools(registry, bgm)
+
+    # 不应出现任何“重复注册”warning
+    dup = [r for r in caplog.records if "重复注册" in r.message]
+    assert not dup, f"重复注册 warning 不应出现: {dup}"
+
+    # 工具仍全部可用（首次注册即已落位）
+    assert registry.get("submit_suggestion") is not None
+    assert registry.get("search_bangumi") is not None
+    assert registry.get("get_subject_detail") is not None
+    assert registry.get("check_subject") is not None
+    assert registry.get("get_related_subjects") is not None
+
+
+# ---------------------------------------------------------------------------
+# F5：llm_assist.run 将 config_override（llm_match_max_iterations）透传给
+# get_max_iterations（优先级：配置覆盖 > 策略 > 默认）；空值传 None
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    captured = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["task_type"] = task_type
+        captured["thinking_level"] = thinking_level
+        captured["config_override"] = config_override
+        return 1
+
+    monkeypatch.setattr(llm_assist, "get_max_iterations", _gmi)
+
+    cm = MagicMock()
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_max_iterations": "10",
+        "llm_match_thinking_level": "high",
+    }
+    monkeypatch.setattr(llm_assist, "config_manager", cm)
+
+    async def _fake_loop(**kwargs):
+        return RunResult(stop_reason="end_turn")
+
+    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+
+    run_id = "run-f5"
+    sr_id = 50
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+    await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="high")
+
+    assert captured["task_type"] == "match"
+    assert captured["thinking_level"] == "high"
+    assert captured["config_override"] == 10
+
+
+@pytest.mark.asyncio
+async def test_run_empty_config_override_passes_none(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    captured = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["config_override"] = config_override
+        return 1
+
+    monkeypatch.setattr(llm_assist, "get_max_iterations", _gmi)
+
+    cm = MagicMock()
+    # 空字符串（默认）→ 应传 None，交由策略/默认兜底
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_max_iterations": "",
+        "llm_match_thinking_level": "medium",
+    }
+    monkeypatch.setattr(llm_assist, "config_manager", cm)
+
+    async def _fake_loop(**kwargs):
+        return RunResult(stop_reason="end_turn")
+
+    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+
+    run_id = "run-f5b"
+    sr_id = 51
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+    await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm())
+
+    assert captured["config_override"] is None
+
+
+# ---------------------------------------------------------------------------
+# F8：事务内不应发起 HTTP（bgm.get_subject 在事务外预取一次）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
+    from unittest.mock import MagicMock
+
+    bgm = MagicMock()
+    bgm.get_subject.return_value = {"name": "N", "name_cn": "NC"}
+
+    conn = MagicMock()
+    captured = {}
+    real_get = bgm.get_subject
+
+    def _exec_with_lock(fn):
+        before = real_get.call_count
+        # 运行事务回调：必须不在此处发起 HTTP 调用
+        fn(conn)
+        after = real_get.call_count
+        captured["in_tx_calls"] = after - before
+        return 1
+
+    dbm = MagicMock()
+    dbm._execute_with_lock.side_effect = _exec_with_lock
+
+    llm_assist._persist_and_notify(
+        dbm,
+        "run-f8",
+        sync_record=_make_sync_record(sync_record_id=52),
+        sync_record_id=52,
+        bgm=bgm,
+        subject_id="5",
+        reason="r",
+        stop_reason="submit_suggestion",
+        total_tokens=0,
+        notification_service=None,
+    )
+
+    # 事务回调内不得发起 bgm.get_subject（HTTP）
+    assert captured["in_tx_calls"] == 0, "事务内不应发起 HTTP(bgm.get_subject)"
+    # 事务外应预取恰好一次标题
+    assert bgm.get_subject.call_count == 1, "应在事务外预取一次标题"

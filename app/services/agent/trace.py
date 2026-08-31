@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 from app.core.database import get_database_manager
 from app.core.logging import logger
+from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 
 # 观测摘要上限（spec §3.3.2：payload_json 截断 ≤2KB）
 MAX_PAYLOAD_JSON_BYTES = 2 * 1024
@@ -250,6 +251,13 @@ class ReplayResult:
     last_response: dict | None = None
     unrecoverable_iteration: int | None = None
 
+    # 类型注解（运行期仍为 list，便于混合 seed 与重建消息）：
+    # messages: list[Message] —— seed 前缀（调用方提供，应为 Message）+ 各轮重建的 Message
+    #   - assistant: Message(role="assistant", content=list[ToolUseBlock])
+    #   - 每条 tool_result: Message(role="user", content=[ToolResultBlock(...)])(逐条不合并)
+    #   - 预算: Message(role="user", content=f"[剩余轮次：N]")
+    # 该列表可直接作为 loop.run(seed_messages=...) 的入参。
+
 
 def _parse_json(raw: str, default: Any = None) -> Any:
     try:
@@ -284,13 +292,24 @@ def replay(
     seed_builder: Callable[[], list],
     max_iterations: int | None = None,
 ) -> ReplayResult:
-    """按 (iteration, sequence) 重放会话增量，重建可续跑消息列表（spec §3.5 / I-1 / I-2）。
+    """按 (iteration, sequence) 重放会话增量，重建可续跑 ``list[Message]``（spec §3.5 / I-1 / I-2）。
 
     ``seed_builder`` 返回种子消息（system + user 列表），由场景层提供
-    （llm_assist 从 sync_records 还原）。重建规则：每轮从 ``llm_chat.replay_delta``
-    聚合重建一条 assistant 消息 → 逐条追加各 ``tool_execute.replay_delta.tool_result``
-    → 追加预算消息（优先用存储的 ``budget_message``，否则按
-    ``max_iterations - 已重放 llm_chat 数 - 1`` 确定性重建）。
+    （llm_assist 从 sync_records 还原），原样保留（调用方应返回 ``Message`` 实例，
+    以便整体可直接作为 ``loop.run(seed_messages=...)`` 消费的列表）。
+
+    重建规则（与原执行 ``loop.run`` 完全一致，I-1 逐字节一致）：
+    - 每轮从 ``llm_chat.replay_delta`` 重建**一条** assistant 消息：
+      ``Message(role="assistant", content=[ToolUseBlock(...) for tc in tool_calls])``
+      （content 为 ``list[ToolUseBlock]``，与原执行对齐）。
+    - 逐条追加各 ``tool_execute.replay_delta.tool_result`` 重建的
+      ``Message(role="user", content=[ToolResultBlock(...)])``（每条工具结果独立成消息，不合并）。
+    - 预算消息：``Message(role="user", content=f"[剩余轮次：N]")``。
+      优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入，I-2）；
+      缺失时按 ``N = max_iterations - executed_iterations`` 计算（修正 H4：用已执行轮数而非
+      iteration 索引，避免稀疏 iteration 时算错剩余轮次）。
+    - 缺失工具识别（S(tool_calls) - R(已记录 tool_execute)）逻辑不变；命中缺失的该轮
+      不追加预算消息、不计入 executed_iterations，交回调用方补执行。
     """
     dbm = get_database_manager()
     steps = dbm.agent_runs.get_steps(run_id)
@@ -327,11 +346,18 @@ def replay(
 
         response = _parse_response(chat)
         tool_calls = response.get("tool_calls") or []
-        assistant_msg = {
-            "role": "assistant",
-            "content": response.get("content", ""),
-            "tool_calls": tool_calls,
-        }
+        # 重建 assistant 消息：content 为 list[ToolUseBlock]（与原执行对齐）
+        assistant_msg = Message(
+            role="assistant",
+            content=[
+                ToolUseBlock(
+                    id=tc.get("id", ""),
+                    name=tc.get("name", ""),
+                    input=tc.get("input", {}) or {},
+                )
+                for tc in tool_calls
+            ],
+        )
 
         if tool_calls:
             messages.append(assistant_msg)
@@ -343,26 +369,41 @@ def replay(
                 tr = _parse_tool_result(t)
                 if tr is None:
                     continue
-                messages.append({"role": "user", "tool_results": [tr]})
+                # 逐条 tool_result 独立成 Message（不合并），与原执行一致
+                messages.append(
+                    Message(
+                        role="user",
+                        content=[
+                            ToolResultBlock(
+                                tool_use_id=tr.get("tool_use_id", ""),
+                                content=tr.get("content", ""),
+                                is_error=bool(tr.get("is_error", False)),
+                            )
+                        ],
+                    )
+                )
                 recorded_ids.add(tr.get("tool_use_id"))
                 bm = _extract_budget_message(t)
                 if bm is not None:
                     budget_message = bm
-            if budget_message is None and max_iterations is not None:
-                # 确定性重建预算消息（I-2）：本轮之后剩余轮次
-                budget_message = f"[剩余轮次：{max(0, max_iterations - (it + 1))}]"
-            if budget_message is not None:
-                messages.append(
-                    {"role": "user", "content": budget_message, "budget_message": True}
-                )
 
             missing = [tc for tc in tool_calls if tc.get("id") not in recorded_ids]
             if missing:
-                # 最后一轮工具未全部执行完：返回缺失项供调用方补执行
+                # 最后一轮工具未全部执行完：返回缺失项供调用方补执行；
+                # 该轮未完整，不追加预算消息（避免与调用方重跑该轮产生的预算重复）
                 missing_tool_calls = missing
                 last_response = response
                 break
+
+            # 本轮完整执行：计入 executed_iterations 并追加预算消息
             executed_iterations += 1
+            if budget_message is None and max_iterations is not None:
+                # 确定性重建预算消息（修正 H4）：用已执行轮数而非 iteration 索引
+                budget_message = (
+                    f"[剩余轮次：{max(0, max_iterations - executed_iterations)}]"
+                )
+            if budget_message is not None:
+                messages.append(Message(role="user", content=budget_message))
             last_response = None
         else:
             # 无工具调用（end_turn / submit_suggestion）：终局响应，直接交回调用方消费

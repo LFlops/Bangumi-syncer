@@ -22,6 +22,7 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.base.scheduler import BaseScheduler
+from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
 
 
@@ -161,25 +162,37 @@ class LlmMatchScheduler(BaseScheduler):
     async def _continue_replay(self, run: dict, sync_record: dict) -> None:
         """断点恢复续跑（简化版，spec §3.6 / I-2）。
 
-        重建种子消息 → trace.replay 重建可续跑消息列表 → 补执行缺失只读工具
-        → 以剩余轮次续跑通用循环（last_response 直接分派由 loop 接管）。
+        重建种子消息 → trace.replay 重建可续跑消息列表 + 终局响应：
+        - ``last_response`` 为 None → 全部轮次已完整记录 → 以剩余轮次续跑通用循环
+        - ``last_response`` 非 None（F2）：
+          * stop_reason=end_turn → 直接 mark_no_suggestion（不调 LLM）
+          * 捕获 submit_suggestion（含 tool_calls 中的 terminal 工具）→ 走校验落库
+          * 含 tool_use（非终局，缺失工具）→ 补执行缺失只读工具 + 回填结果后
+            进入下一轮 loop（remaining 已减 1，因为该轮 LLM 已经发生过）
         """
         from app.services.agent import trace
         from app.services.agent.budget import get_max_iterations
-        from app.services.agent.loop import run as loop_run
+        from app.services.agent.loop import RunResult, run as loop_run
         from app.services.llm.tools import get_tool_registry
 
         run_id = run["run_id"]
         repo = get_database_manager().agent_runs
 
         try:
-            thinking_level = (
-                config_manager.get(
-                    "sync", "llm_match_thinking_level", fallback="medium"
-                )
-                or "medium"
+            # F5：thinking_level 与 config_override 统一从集中配置读取
+            match_cfg = config_manager.get_sync_llm_match_config()
+            thinking_level = match_cfg.get("llm_match_thinking_level") or "medium"
+            raw_max = match_cfg.get("llm_match_max_iterations")
+            config_override = None
+            if raw_max not in (None, ""):
+                try:
+                    config_override = int(str(raw_max).strip())
+                except (TypeError, ValueError):
+                    config_override = None
+
+            max_iterations = get_max_iterations(
+                "match", thinking_level, config_override=config_override
             )
-            max_iterations = get_max_iterations("match", thinking_level)
 
             candidates = llm_assist_module._extract_candidates(sync_record)
             seed = llm_assist_module.build_seed_messages(
@@ -194,6 +207,82 @@ class LlmMatchScheduler(BaseScheduler):
                 logger.debug(f"🤖 恢复 {run_id} 已无剩余轮次，跳过续跑")
                 return
 
+            last_response = replay_result.last_response
+
+            # F2：终局响应直接分派，避免无谓重调 LLM
+            if last_response is not None:
+                stop = last_response.get("stop_reason")
+                tcs = last_response.get("tool_calls") or []
+
+                if stop == "end_turn":
+                    # 无建议：直接标记，不调 LLM
+                    repo.mark_no_suggestion(run_id, stop_reason="end_turn")
+                    return
+
+                # 捕获 submit_suggestion（终局）→ 走校验落库路径
+                submit_tc = next(
+                    (tc for tc in tcs if tc.get("name") == "submit_suggestion"), None
+                )
+                if stop == "submit_suggestion" or submit_tc is not None:
+                    sug = (submit_tc or {}).get("input") or {}
+                    result = RunResult(
+                        stop_reason="submit_suggestion",
+                        suggestion=sug,
+                        last_response=None,
+                    )
+                    bgm = self._build_bgm(sync_record)
+                    llm_assist_module._handle_result(
+                        get_database_manager(),
+                        run_id,
+                        result,
+                        sync_record=sync_record,
+                        sync_record_id=sync_record.get("id"),
+                        bgm=bgm,
+                        notification_service=None,
+                    )
+                    return
+
+                # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
+                bgm = self._build_bgm(sync_record)
+                registry = get_tool_registry()
+                # 先确保工具已注册（恢复路径可能尚未在正常路径注册过），否则补执行时
+                # registry.get 找不到工具；同时注册后才能拿到 tools_schemas 供 loop 续跑。
+                llm_assist_module.register_match_tools(registry, bgm)
+                for tc in replay_result.missing_tool_calls:
+                    await self._replay_missing_tool(
+                        tc, registry, replay_result.messages
+                    )
+                # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
+                remaining = max(0, remaining - 1)
+                if remaining <= 0:
+                    logger.debug(f"🤖 恢复 {run_id} 补执行后已无剩余轮次，跳过续跑")
+                    return
+                defns = llm_assist_module.register_match_tools(registry, bgm)
+                tools_schemas = [d.to_schema() for d in defns]
+                # 注：register_match_tools 已在补执行前调用过，此处再调用为幂等刷新
+                chat_fn = llm_assist_module._build_default_chat_fn()
+                span_recorder = llm_assist_module._SpanRecorder(run_id)
+                result = await loop_run(
+                    chat_fn=chat_fn,
+                    tools_schemas=tools_schemas,
+                    tool_calls_fn=registry.execute_batch,
+                    max_iterations=remaining,
+                    tool_choice_terminal="submit_suggestion",
+                    seed_messages=replay_result.messages,
+                    span_recorder=span_recorder,
+                )
+                llm_assist_module._handle_result(
+                    get_database_manager(),
+                    run_id,
+                    result,
+                    sync_record=sync_record,
+                    sync_record_id=sync_record.get("id"),
+                    bgm=bgm,
+                    notification_service=None,
+                )
+                return
+
+            # last_response 为 None：全部轮次已完整记录 → 续跑通用循环
             bgm = self._build_bgm(sync_record)
             registry = get_tool_registry()
             defns = llm_assist_module.register_match_tools(registry, bgm)
@@ -201,7 +290,7 @@ class LlmMatchScheduler(BaseScheduler):
 
             # 缺失工具补执行（仅 readonly，写/终止性工具在续跑 loop 中自然触发）
             for tc in replay_result.missing_tool_calls:
-                await self._replay_missing_tool(tc, registry)
+                await self._replay_missing_tool(tc, registry, replay_result.messages)
 
             # 续跑 loop（从 replay 重建消息续跑）
             chat_fn = llm_assist_module._build_default_chat_fn()
@@ -228,8 +317,15 @@ class LlmMatchScheduler(BaseScheduler):
             logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
             repo.increment_attempts(run_id)
 
-    async def _replay_missing_tool(self, tool_call: dict, registry) -> None:
-        """补执行单条缺失的只读工具调用（readonly 校验）。"""
+    async def _replay_missing_tool(
+        self, tool_call: dict, registry, messages: list
+    ) -> None:
+        """补执行单条缺失的只读工具调用（readonly 校验）。
+
+        F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
+        追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
+        符合会话协议（每条 tool_use 有且仅有一条 tool_result）。
+        """
         name = (tool_call or {}).get("name")
         if not name:
             return
@@ -238,10 +334,25 @@ class LlmMatchScheduler(BaseScheduler):
             # 非只读（write/terminal）不重放，续跑 loop 中自然触发
             return
         args = (tool_call or {}).get("input") or {}
+        tool_use_id = (tool_call or {}).get("id", "")
         try:
-            await registry.execute(name, args)
+            result = await registry.execute(name, args)
+            content = str(result)
+            is_error = False
         except Exception as e:
             logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
+            content = f"工具执行失败: {type(e).__name__}"
+            is_error = True
+        messages.append(
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(
+                        tool_use_id=tool_use_id, content=content, is_error=is_error
+                    )
+                ],
+            )
+        )
 
     # ------------------------------------------------------------------
     # 正常处理
@@ -262,8 +373,17 @@ class LlmMatchScheduler(BaseScheduler):
 
         bgm = self._build_bgm(sync_record)
         try:
+            # F5：thinking_level 统一从集中配置读取并透传给 llm_assist.run
+            # （config_override 由 llm_assist.run 内部从同一配置读取）。
+            match_cfg = config_manager.get_sync_llm_match_config()
+            thinking_level = match_cfg.get("llm_match_thinking_level") or "medium"
             # atomic_claim / 状态流转 / 落库均在 llm_assist.run 内部完成
-            await llm_assist_module.run(run_id, sync_record=sync_record, bgm=bgm)
+            await llm_assist_module.run(
+                run_id,
+                sync_record=sync_record,
+                bgm=bgm,
+                thinking_level=thinking_level,
+            )
         except Exception as e:
             logger.error(f"🤖 处理 run {run_id} 异常: {e}")
             attempts = repo.increment_attempts(run_id)

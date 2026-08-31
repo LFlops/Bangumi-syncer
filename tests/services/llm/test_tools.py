@@ -480,6 +480,82 @@ async def test_execute_batch_unknown_tool_wrapped_as_error_block():
 
 
 # ---------------------------------------------------------------------------
+# execute_batch：重复 tool_use_id（F10 / M26）
+#   重复 id 仅执行第一个，后续直接回填 is_error='duplicate tool_use_id'
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_duplicate_tool_use_id_executes_only_first():
+    reg = ToolRegistry()
+    called = []
+
+    def handler(args):
+        called.append(1)
+        return "ran"
+
+    reg.register(
+        ToolDefinition(
+            name="dup",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    calls = [
+        ToolUseBlock(id="same", name="dup", input={}),
+        ToolUseBlock(id="same", name="dup", input={}),
+    ]
+    results = await reg.execute_batch(calls)
+    # handler 仅被调用一次（第一个执行，第二个不执行）
+    assert called == [1]
+    # 重复 id 被回填为 is_error + duplicate 文案
+    blk = results["same"]
+    assert isinstance(blk, ToolResultBlock)
+    assert blk.is_error is True
+    assert blk.content == "duplicate tool_use_id"
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_duplicate_does_not_affect_unique_ids():
+    reg = ToolRegistry()
+    called = []
+
+    def handler(args):
+        called.append(args.get("k"))
+        return "ran"
+
+    reg.register(
+        ToolDefinition(
+            name="t",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    calls = [
+        ToolUseBlock(id="a", name="t", input={"k": "a"}),  # 唯一，正常
+        ToolUseBlock(id="dup", name="t", input={"k": "dup"}),  # 重复对的首个，执行
+        ToolUseBlock(id="dup", name="t", input={"k": "dup2"}),  # 重复，不执行
+        ToolUseBlock(id="b", name="t", input={"k": "b"}),  # 唯一，正常
+    ]
+    results = await reg.execute_batch(calls)
+    # 唯一 id 各自执行一次；重复的那个不执行 → 共 3 次
+    assert called == ["a", "dup", "b"]
+    # 唯一 id 结果不受影响
+    assert results["a"].is_error is False
+    assert results["a"].content == "ran"
+    assert results["b"].is_error is False
+    assert results["b"].content == "ran"
+    # 重复 id 被回填为错误块
+    assert isinstance(results["dup"], ToolResultBlock)
+    assert results["dup"].is_error is True
+    assert results["dup"].content == "duplicate tool_use_id"
+
+
+# ---------------------------------------------------------------------------
 # execute_batch：含 terminal → 返回 TerminalCapture（不执行 handler）
 # ---------------------------------------------------------------------------
 

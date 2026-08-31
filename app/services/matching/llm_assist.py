@@ -20,6 +20,7 @@ from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Callable
 
+from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent.budget import get_max_iterations
@@ -224,7 +225,9 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         ),
     ]
     for d in defns:
-        registry.register(d)
+        # 幂等：模块单例 registry 重复注册会刷 warning（F7）；已存在则跳过。
+        if registry.get(d.name) is None:
+            registry.register(d)
     return defns
 
 
@@ -321,14 +324,22 @@ class _SpanRecorder:
     def __init__(self, run_id: str) -> None:
         self.run_id = run_id
 
-    def start_span(self, name: str, iteration: int, sequence: int) -> str:
-        return trace_start_span(self.run_id, name, iteration, sequence)
+    def start_span(
+        self, name: str, iteration: int, sequence: int, parent_id: str = ""
+    ) -> str:
+        return trace_start_span(self.run_id, name, iteration, sequence, parent_id)
 
     def end_span(
-        self, span_id: str, status: str = "ok", response: ChatResponse | None = None
+        self,
+        span_id: str,
+        status: str = "ok",
+        response: ChatResponse | None = None,
+        *,
+        tool_name: str = "",
+        input_summary: str = "",
+        payload_json: Any = "",
+        replay_delta: Any = "",
     ) -> None:
-        replay_delta: Any = ""
-        payload_json: Any = ""
         if response is not None:
             tool_calls = [
                 b.model_dump() if hasattr(b, "model_dump") else asdict(b)
@@ -346,12 +357,22 @@ class _SpanRecorder:
             if response.usage is not None:
                 tokens = response.usage.total_tokens
             payload_json = {"model": response.model, "tokens": tokens}
-        trace_end_span(
-            span_id,
-            status=status,
-            payload_json=payload_json,
-            replay_delta=replay_delta,
-        )
+            trace_end_span(
+                span_id,
+                status=status,
+                payload_json=payload_json,
+                replay_delta=replay_delta,
+            )
+        else:
+            # tool_execute span：携带 tool_name / input_summary / 完整 replay_delta
+            trace_end_span(
+                span_id,
+                status=status,
+                tool_name=tool_name,
+                input_summary=input_summary,
+                payload_json=payload_json,
+                replay_delta=replay_delta,
+            )
 
     def record_budget_message(self, span_id: str, budget_message: str) -> None:
         trace_record_budget_message(span_id, budget_message)
@@ -391,6 +412,22 @@ def ensure_llm_columns(dbm) -> None:
     dbm._execute_with_lock(_w)
 
 
+def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
+    """事务外预取 Bangumi 条目名称（F8：避免事务内发起 HTTP 调用）。
+
+    失败（网络/类型）时返回空串，由调用方仅存 id。
+    """
+    if bgm is None:
+        return ""
+    try:
+        data = bgm.get_subject(int(subject_id))
+        if isinstance(data, dict):
+            return data.get("name") or data.get("name_cn") or ""
+    except Exception:
+        pass
+    return ""
+
+
 def _persist_llm_candidate(
     dbm,
     *,
@@ -402,8 +439,12 @@ def _persist_llm_candidate(
     stop_reason: str,
     total_tokens: int = 0,
     bgm: Any = None,
+    bgm_title: str = "",
 ) -> int:
     """在单一事务内：写 pending_candidates（llm 两列，有则更新/无则新建）+ 置 succeeded。
+
+    ``bgm_title`` 必须在事务外预取（见 ``_prefetch_bgm_name`` / ``_persist_and_notify``），
+    事务内只做纯 DB 操作（F8：将外部 HTTP 调用移出事务，保持原子性语义不变）。
 
     返回 pending_candidates 行 id。异常时整体回滚（F6）。
     """
@@ -418,15 +459,7 @@ def _persist_llm_candidate(
             (sync_record_id,),
         ).fetchone()
 
-        # 尝试用 bgm 补全 subject 名称（失败则仅存 id）
-        name = ""
-        if bgm is not None:
-            try:
-                data = bgm.get_subject(int(subject_id))
-                if isinstance(data, dict):
-                    name = data.get("name") or data.get("name_cn") or ""
-            except Exception:
-                name = ""
+        name = bgm_title
 
         new_cand = {
             "subject_id": subject_id,
@@ -599,7 +632,20 @@ async def run(
     if span_recorder is None:
         span_recorder = _SpanRecorder(run_id)
 
-    max_iterations = get_max_iterations("match", thinking_level)
+    # F5：config_override 优先（[sync] llm_match_max_iterations 显式整体覆盖
+    # > thinking_level 策略映射 > 默认兜底）。调度器负责把 thinking_level 透传进来，
+    # 配置覆盖值由本层从集中配置读取，保证单一来源。
+    match_cfg = config_manager.get_sync_llm_match_config()
+    raw_max = match_cfg.get("llm_match_max_iterations")
+    config_override = None
+    if raw_max not in (None, ""):
+        try:
+            config_override = int(str(raw_max).strip())
+        except (TypeError, ValueError):
+            config_override = None
+    max_iterations = get_max_iterations(
+        "match", thinking_level, config_override=config_override
+    )
 
     if chat_fn is None:
         chat_fn = _build_default_chat_fn()
@@ -721,7 +767,12 @@ def _persist_and_notify(
     total_tokens: int,
     notification_service: Any | None,
 ) -> None:
-    """单一事务落库 + 事务提交后 best-effort 通知（F6 / I-5）。"""
+    """单一事务落库 + 事务提交后 best-effort 通知（F6 / I-5）。
+
+    Bangumi 标题在事务外预取一次（F8），事务内不再发起 HTTP 调用，
+    同时通知复用同一名称避免重复请求。
+    """
+    bgm_title = _prefetch_bgm_name(bgm, subject_id)
     _persist_llm_candidate(
         dbm,
         run_id=run_id,
@@ -732,20 +783,13 @@ def _persist_and_notify(
         stop_reason=stop_reason,
         total_tokens=total_tokens,
         bgm=bgm,
+        bgm_title=bgm_title,
     )
     if notification_service is not None:
-        name = ""
-        if bgm is not None:
-            try:
-                data = bgm.get_subject(int(subject_id))
-                if isinstance(data, dict):
-                    name = data.get("name") or data.get("name_cn") or ""
-            except Exception:
-                name = ""
         _send_notification(
             notification_service,
             sync_record=sync_record,
             subject_id=subject_id,
             reason=reason,
-            name=name,
+            name=bgm_title,
         )

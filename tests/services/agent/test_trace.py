@@ -18,6 +18,7 @@ import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent import trace
+from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 
 
 @pytest.fixture
@@ -211,8 +212,8 @@ class TestBudgetMessage:
 class TestReplayReconstruct:
     def _seed(self):
         return [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "ctx"},
+            Message(role="system", content="sys"),
+            Message(role="user", content="ctx"),
         ]
 
     def _build_two_rounds(self, dbm):
@@ -247,25 +248,51 @@ class TestReplayReconstruct:
     def test_replay_reconstructs_two_rounds(self, dbm):
         self._build_two_rounds(dbm)
         result = trace.replay("run-r", self._seed)
-        # messages = seed + 轮1(assistant + 2 tool_result + budget)
-        assert result.messages[0] == {"role": "system", "content": "sys"}
-        assert result.messages[1] == {"role": "user", "content": "ctx"}
-        # 轮1 聚合 assistant
+        # 全部为 Message 实例（无 dict）
+        assert all(isinstance(m, Message) for m in result.messages)
+        # seed 原样保留
+        assert result.messages[0] == Message(role="system", content="sys")
+        assert result.messages[1] == Message(role="user", content="ctx")
+
+        # 轮1 聚合 assistant：content 为 list[ToolUseBlock]
         assistant = result.messages[2]
-        assert assistant["role"] == "assistant"
-        assert [tc["id"] for tc in assistant["tool_calls"]] == ["t1", "t2"]
-        # 2 条 tool_result
+        assert isinstance(assistant, Message)
+        assert assistant.role == "assistant"
+        assert isinstance(assistant.content, list)
+        assert all(isinstance(b, ToolUseBlock) for b in assistant.content)
+        assert [b.id for b in assistant.content] == ["t1", "t2"]
+        assert [b.name for b in assistant.content] == [
+            "search_bangumi",
+            "get_subject_detail",
+        ]
+        # 可被 Message.model_validate 校验（content 格式合法）
+        roundtrip = Message.model_validate(assistant.model_dump())
+        assert roundtrip == assistant
+
+        # tool_result 逐条 Message(role="user", content=[ToolResultBlock])，不合并
         tr_msgs = [
             m
-            for m in result.messages[3:]
-            if m.get("role") == "user" and "tool_results" in m
+            for m in result.messages
+            if m.role == "user"
+            and isinstance(m.content, list)
+            and any(isinstance(b, ToolResultBlock) for b in m.content)
         ]
-        assert len(tr_msgs) == 2
-        assert tr_msgs[0]["tool_results"][0]["tool_use_id"] == "t1"
-        assert tr_msgs[1]["tool_results"][0]["tool_use_id"] == "t2"
-        # 预算消息
-        budget_msgs = [m for m in result.messages if m.get("budget_message")]
-        assert budget_msgs and budget_msgs[0]["content"] == "[剩余轮次：1]"
+        assert len(tr_msgs) == 2  # 数量与工具数一致
+        assert tr_msgs[0].content[0].tool_use_id == "t1"
+        assert tr_msgs[0].content[0].content == "res1"
+        assert tr_msgs[1].content[0].tool_use_id == "t2"
+        assert tr_msgs[1].content[0].content == "res2"
+
+        # 预算消息为 Message(role="user", content="[剩余轮次：1]")
+        budget_msgs = [
+            m
+            for m in result.messages
+            if isinstance(m, Message)
+            and m.role == "user"
+            and m.content == "[剩余轮次：1]"
+        ]
+        assert budget_msgs and budget_msgs[0].content == "[剩余轮次：1]"
+
         # 轮2 响应在 last_response，不在 messages
         assert result.last_response is not None
         assert result.last_response["stop_reason"] == "end_turn"
@@ -273,6 +300,110 @@ class TestReplayReconstruct:
         assert result.executed_iterations == 1
         assert result.missing_tool_calls == []
         assert result.unrecoverable_iteration is None
+
+    def test_replay_messages_byte_equivalent_to_loop_run(self, dbm):
+        """replay 重建的 messages 与原执行路径（loop.run）消息列表逐字节一致。
+
+        构造对照：按 loop.run 的构建规则手工拼出期望 Message 列表，与 replay 输出比较。
+        """
+        self._build_two_rounds(dbm)
+        result = trace.replay("run-r", self._seed)
+
+        expected = [
+            Message(role="system", content="sys"),
+            Message(role="user", content="ctx"),
+            # 轮1 assistant（content=list[ToolUseBlock]）
+            Message(
+                role="assistant",
+                content=[
+                    ToolUseBlock(
+                        id="t1", name="search_bangumi", input={"title": "foo"}
+                    ),
+                    ToolUseBlock(
+                        id="t2", name="get_subject_detail", input={"subject_id": "2"}
+                    ),
+                ],
+            ),
+            # 逐条 tool_result
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id="t1", content="res1", is_error=False)
+                ],
+            ),
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id="t2", content="res2", is_error=False)
+                ],
+            ),
+            # 预算消息
+            Message(role="user", content="[剩余轮次：1]"),
+        ]
+        assert result.messages == expected
+
+    def test_replay_budget_n_uses_executed_iterations(self, dbm):
+        """预算消息 N 用 executed_iterations 计算（无存储 budget_message 时回退计算）。"""
+        # 单轮 2 工具，未记录 budget_message，max_iterations=3 → N = 3 - 1 = 2
+        c = trace.start_span("run-b", "llm_chat", 0, 0)
+        tcs = [
+            {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}},
+            {"id": "t2", "name": "get_subject_detail", "input": {"subject_id": "2"}},
+        ]
+        trace.end_span(c, replay_delta=_chat_replay_delta("tool_use", "go", tcs))
+        e1 = trace.start_span("run-b", "tool_execute", 0, 1)
+        trace.end_span(e1, replay_delta=_tool_replay_delta("t1", "r1"))
+        e2 = trace.start_span("run-b", "tool_execute", 0, 2)
+        trace.end_span(e2, replay_delta=_tool_replay_delta("t2", "r2"))
+        # 注意：未调用 record_budget_message
+
+        result = trace.replay("run-b", lambda: [], max_iterations=3)
+        assert result.executed_iterations == 1
+        budget_msgs = [
+            m
+            for m in result.messages
+            if m.role == "user" and isinstance(m.content, str)
+        ]
+        assert budget_msgs and budget_msgs[0].content == "[剩余轮次：2]"
+
+    def test_replay_budget_n_uses_executed_iterations_not_index_h4(self, dbm):
+        """H4 修正：稀疏 iteration 时，N 用已执行轮数而非 iteration 索引。
+
+        构造两轮 {0, 5}，max_iterations=7：
+        - 按 executed_iterations：第 2 轮执行后 = 2 → N = 7 - 2 = 5
+        - 若误用 iteration 索引：7 - (5 + 1) = 1（错误）
+        """
+        # 轮 0
+        c0 = trace.start_span("run-h4", "llm_chat", 0, 0)
+        trace.end_span(
+            c0,
+            replay_delta=_chat_replay_delta(
+                "tool_use", "go", [{"id": "a", "name": "x", "input": {}}]
+            ),
+        )
+        e0 = trace.start_span("run-h4", "tool_execute", 0, 1)
+        trace.end_span(e0, replay_delta=_tool_replay_delta("a", "ra"))
+        # 轮 5（刻意稀疏，模拟恢复后重跑留下的非连续 iteration）
+        c5 = trace.start_span("run-h4", "llm_chat", 5, 0)
+        trace.end_span(
+            c5,
+            replay_delta=_chat_replay_delta(
+                "tool_use", "go", [{"id": "b", "name": "y", "input": {}}]
+            ),
+        )
+        e5 = trace.start_span("run-h4", "tool_execute", 5, 1)
+        trace.end_span(e5, replay_delta=_tool_replay_delta("b", "rb"))
+
+        result = trace.replay("run-h4", lambda: [], max_iterations=7)
+        assert result.executed_iterations == 2
+        budget_msgs = [
+            m
+            for m in result.messages
+            if m.role == "user" and isinstance(m.content, str)
+        ]
+        # 两条预算消息，最后一条对应第 2 轮执行：N = 7 - 2 = 5
+        assert len(budget_msgs) == 2
+        assert budget_msgs[-1].content == "[剩余轮次：5]"
 
 
 # ----------------------------------------------------------------------
@@ -296,20 +427,31 @@ class TestMissingToolIdentification:
         # 故意不写 t2 的 tool_execute
 
         result = trace.replay("run-m", lambda: [])
+        assert all(isinstance(m, Message) for m in result.messages)
         assert result.executed_iterations == 0
         missing_ids = [tc["id"] for tc in result.missing_tool_calls]
         assert missing_ids == ["t2"]
         # last_response 携带该轮响应供调用方执行缺失工具
         assert result.last_response is not None
         assert result.last_response["tool_calls"][1]["id"] == "t2"
-        # messages 含 assistant + 已记录的 tool_result
-        assert any(m.get("role") == "assistant" for m in result.messages)
+        # messages 含 assistant + 已记录的 tool_result（逐条 Message）
+        assert any(
+            isinstance(m, Message) and m.role == "assistant" for m in result.messages
+        )
         tr_ids = [
-            m["tool_results"][0]["tool_use_id"]
+            m.content[0].tool_use_id
             for m in result.messages
-            if m.get("tool_results")
+            if isinstance(m, Message)
+            and m.role == "user"
+            and isinstance(m.content, list)
+            and any(isinstance(b, ToolResultBlock) for b in m.content)
         ]
         assert tr_ids == ["t1"]
+        # 缺失轮次不追加预算消息
+        assert not any(
+            isinstance(m, Message) and m.role == "user" and isinstance(m.content, str)
+            for m in result.messages
+        )
 
 
 # ----------------------------------------------------------------------
@@ -340,11 +482,12 @@ class TestUnrecoverableSpan:
         assert err_step["status"] == "error"
 
         # 重放：返回不可恢复 iteration=1，且不重建该轮
-        result = trace.replay("run-u", lambda: [{"role": "system", "content": "s"}])
+        result = trace.replay("run-u", lambda: [Message(role="system", content="s")])
         assert result.unrecoverable_iteration == 1
         # messages 只含 seed(1) + 轮0(assistant + tool_result)，不含轮1
         assert len(result.messages) == 1 + 2
-        assert result.messages[0] == {"role": "system", "content": "s"}
+        assert all(isinstance(m, Message) for m in result.messages)
+        assert result.messages[0] == Message(role="system", content="s")
         assert result.last_response is None
 
     def test_first_span_error_returns_unrecoverable_zero(self, dbm):
