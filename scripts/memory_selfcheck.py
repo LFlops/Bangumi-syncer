@@ -151,19 +151,24 @@ def _keywords_demo(db: sqlite3.Connection, keywords: list[str]) -> None:
 def _titles_demo(db: sqlite3.Connection, titles: list[str]) -> None:
     """联表反查演示（线上等价于 get_related_titles）：同步记录消费标记 → 摘要。"""
     print(f"== 9. 同剧关联演示（{', '.join(titles)}） ==")
-    placeholders = ",".join("?" * len(titles))
+    clean = [t for t in titles if t and t.strip()]
+    if not clean:
+        print(f"  {WARN}(无有效剧名){END}")
+        return
+    placeholders = ",".join("?" * len(clean))
     rows = db.execute(
-        f"""SELECT m.task_id, m.run_id, substr(m.summary,1,60), '热层' AS layer, m.created_at
+        f"""SELECT m.task_id, m.run_id, substr(m.summary,1,60), '热层' AS layer, m.created_at, m.id
             FROM agent_working_memory m
             JOIN sync_records s ON s.consumed_run_id = m.run_id
             WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
            UNION
-           SELECT m.task_id, m.run_id, substr(m.summary,1,60), '冷层' AS layer, m.created_at
+           SELECT m.task_id, m.run_id, substr(m.summary,1,60), '冷层' AS layer, m.created_at, m.id
             FROM agent_working_memory_archive m
             JOIN sync_records s ON s.consumed_run_id = m.run_id
             WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
-           ORDER BY created_at DESC, id DESC LIMIT 5""",
-        (*titles, *titles),
+           -- UNION 结果集列名取自首个 SELECT，排序用序号避免列名歧义
+           ORDER BY 5 DESC, 6 DESC LIMIT 5""",
+        (*clean, *clean),
     ).fetchall()
     for r in rows:
         print(f"  [{r[3]}] {r[0]:<20} {r[1][:8]:<10} {r[4]}  {r[2]}...")
