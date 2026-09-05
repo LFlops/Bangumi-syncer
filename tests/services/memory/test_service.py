@@ -79,7 +79,7 @@ class TestClearTask:
 
         assert n == 2  # 1 记忆 + 1 消费标记
         recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
-        assert recs[0]["consumed_run_id"] is None
+        assert recs[0]["consumed_run_ids"] == set()
 
     def test_clear_idempotent(self, temp_dir, reset_singletons):
         db = _make_db(temp_dir)
@@ -140,7 +140,7 @@ class TestReadWriteDelegation:
                 media_type="episode",
                 source="s",
                 status="success",
-                consumed_run_id="run-1",
+                consumed_run_ids={"run-1"},
             ),
             SummaryRecord(
                 id=2,
@@ -153,7 +153,7 @@ class TestReadWriteDelegation:
                 media_type="episode",
                 source="s",
                 status="success",
-                consumed_run_id=None,
+                consumed_run_ids=set(),
             ),
         ]
         assert [r.id for r in svc.find_overlaps(records)] == [1]

@@ -92,9 +92,9 @@ class MemoryRetriever:
         return "\n".join(f"- {e.summary}" for e in entries)
 
     def find_overlaps(self, records: list[SummaryRecord]) -> list[SummaryRecord]:
-        """[deprecated] 返回被消费的记录（consumed_run_id IS NOT NULL）。
+        """[deprecated] 返回已被任意任务消费的记录（consumed_run_ids 非空）。
 
         v7 起业务方改为硬排除（execute_job 内过滤），本方法保留为通用工具；
         overlap 软标注流程已移除（见 closeout §4 E3）。
         """
-        return [r for r in records if r.consumed_run_id is not None]
+        return [r for r in records if r.consumed_run_ids]

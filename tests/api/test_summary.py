@@ -5,6 +5,7 @@ Summary API 模型验证测试与端点集成测试。
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 from app.models.summary import (
     LLMConfigResponse,
@@ -183,6 +184,32 @@ class TestSummaryJobCreate:
         assert model.max_records == 500
         assert model.enabled is False
 
+    def test_memory_limit_negative_rejected(self):
+        """memory_limit=-1 在模型层抛 ValidationError（ge=0）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(memory_limit=-1)
+
+    def test_related_limit_negative_rejected(self):
+        """related_limit=-1 在模型层抛 ValidationError（ge=0）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(related_limit=-1)
+
+    def test_memory_limit_too_large_rejected(self):
+        """memory_limit=1001 在模型层抛 ValidationError（le=1000）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(memory_limit=1001)
+
+    def test_related_limit_too_large_rejected(self):
+        """related_limit=1001 在模型层抛 ValidationError（le=1000）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(related_limit=1001)
+
+    def test_boundary_values_accepted(self):
+        """边界值 memory_limit=0 与 related_limit=1000 构造成功。"""
+        model = SummaryJobCreate(memory_limit=0, related_limit=1000)
+        assert model.memory_limit == 0
+        assert model.related_limit == 1000
+
 
 # ========== SummaryJobUpdate ==========
 
@@ -224,6 +251,32 @@ class TestSummaryJobUpdate:
         data = model.model_dump(exclude_none=True)
         assert "enabled" in data
         assert "name" not in data
+
+    def test_memory_limit_negative_rejected(self):
+        """memory_limit=-1 在模型层抛 ValidationError（ge=0）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobUpdate(memory_limit=-1)
+
+    def test_related_limit_negative_rejected(self):
+        """related_limit=-1 在模型层抛 ValidationError（ge=0）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobUpdate(related_limit=-1)
+
+    def test_memory_limit_too_large_rejected(self):
+        """memory_limit=1001 在模型层抛 ValidationError（le=1000）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobUpdate(memory_limit=1001)
+
+    def test_related_limit_too_large_rejected(self):
+        """related_limit=1001 在模型层抛 ValidationError（le=1000）。"""
+        with pytest.raises(ValidationError):
+            SummaryJobUpdate(related_limit=1001)
+
+    def test_boundary_values_accepted(self):
+        """边界值 memory_limit=0 与 related_limit=1000 构造成功。"""
+        model = SummaryJobUpdate(memory_limit=0, related_limit=1000)
+        assert model.memory_limit == 0
+        assert model.related_limit == 1000
 
 
 # ========== SummaryJobResponse ==========
@@ -1453,6 +1506,123 @@ def _make_summary_app():
 
     app.dependency_overrides[get_current_user_flexible] = mock_auth
     return app
+
+
+def _assert_422_detail_contract(response, loc_field):
+    """断言 422 响应体 detail 结构契约（供前端 apiFetch 解析）。
+
+    - detail 必须是列表（不是对象），否则前端 `[object Object]` 解析失败
+    - 列表项含 "msg" 字符串键
+    - 至少一项定位到 ["body", loc_field]
+    """
+    detail = response.json()["detail"]
+    assert isinstance(detail, list)
+    assert all(
+        isinstance(item, dict) and isinstance(item.get("msg"), str) for item in detail
+    )
+    assert any(item.get("loc") == ["body", loc_field] for item in detail)
+
+
+class TestSummaryLimitValidation:
+    """记忆/关联条数越界契约测试（T1）。
+
+    锁定后端对 memory_limit / related_limit 的校验契约：
+    非法值 → 422 且 detail 为对象数组（含 msg 与 loc），且不得入库；
+    边界合法值 → 200 且正常保存。
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_memory_limit_negative_rejected_and_not_saved(self):
+        """POST memory_limit=-1 → 422，save_summary_config 不被调用。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                response = await client.post(
+                    "/api/summary/jobs", json={"memory_limit": -1}
+                )
+                assert response.status_code == 422
+                mock_cm.save_summary_config.assert_not_called()
+                _assert_422_detail_contract(response, "memory_limit")
+
+    @pytest.mark.asyncio
+    async def test_create_related_limit_too_large_rejected(self):
+        """POST related_limit=1001 → 422（le=1000）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                response = await client.post(
+                    "/api/summary/jobs", json={"related_limit": 1001}
+                )
+                assert response.status_code == 422
+                mock_cm.save_summary_config.assert_not_called()
+                _assert_422_detail_contract(response, "related_limit")
+
+    @pytest.mark.asyncio
+    async def test_create_boundary_values_accepted_and_saved(self):
+        """POST memory_limit=0, related_limit=1000（边界）→ 200 且保存调用。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                response = await client.post(
+                    "/api/summary/jobs",
+                    json={"memory_limit": 0, "related_limit": 1000},
+                )
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                mock_cm.save_summary_config.assert_called_once()
+                mock_cm.reload_config.assert_called_once()
+                mock_scheduler.apply_config_after_save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_memory_limit_negative_rejected(self):
+        """PUT /api/summary/jobs/foo memory_limit=-1 → 422（update 路径同样收口）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                response = await client.put(
+                    "/api/summary/jobs/foo", json={"memory_limit": -1}
+                )
+                assert response.status_code == 422
+                mock_cm.save_summary_config.assert_not_called()
+                _assert_422_detail_contract(response, "memory_limit")
+
+    @pytest.mark.asyncio
+    async def test_update_related_limit_too_large_rejected(self):
+        """PUT /api/summary/jobs/foo related_limit=1001 → 422（update 路径同样收口）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                response = await client.put(
+                    "/api/summary/jobs/foo", json={"related_limit": 1001}
+                )
+                assert response.status_code == 422
+                mock_cm.save_summary_config.assert_not_called()
+                _assert_422_detail_contract(response, "related_limit")
 
 
 class TestClearMemoryApi:

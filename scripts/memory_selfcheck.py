@@ -46,6 +46,7 @@ def _check(db: sqlite3.Connection) -> bool:
         "agent_working_memory",
         "agent_working_memory_archive",
         "agent_memory_fts",
+        "sync_records_consumed",
     ):
         if t in tables:
             print(f"  {OK}[OK]{END} 表 {t} 存在")
@@ -56,8 +57,8 @@ def _check(db: sqlite3.Connection) -> bool:
     }:
         fail("索引 idx_sync_records_consumed_run_id 缺失")
     cols = {r[1] for r in db.execute("PRAGMA table_info(sync_records)")}
-    if "consumed_run_id" not in cols:
-        fail("sync_records.consumed_run_id 列缺失")
+    if "consumed_run_id" in cols:
+        fail("sync_records.consumed_run_id 旧列应已删除（迁移为关联表）")
 
     print("== 2. FTS 分词器 ==")
     try:
@@ -88,15 +89,15 @@ def _check(db: sqlite3.Connection) -> bool:
         f"  {n} 条归档（prune 下沉产物，已参与 related 联表反查；search_archive 留给 Phase 4 全量查史）"
     )
 
-    print("== 5. 消费标记一致性 ==")
+    print("== 5. 消费标记一致性（关联表 sync_records_consumed） ==")
     marked = db.execute(
-        "SELECT COUNT(*) FROM sync_records WHERE consumed_run_id IS NOT NULL"
+        "SELECT COUNT(DISTINCT sync_record_id) FROM sync_records_consumed"
     ).fetchone()[0]
     orphans = db.execute(
-        """SELECT COUNT(*) FROM sync_records s
-           LEFT JOIN agent_working_memory m ON s.consumed_run_id = m.run_id
-           LEFT JOIN agent_working_memory_archive a ON s.consumed_run_id = a.run_id
-           WHERE s.consumed_run_id IS NOT NULL AND m.run_id IS NULL AND a.run_id IS NULL"""
+        """SELECT COUNT(*) FROM sync_records_consumed c
+           LEFT JOIN agent_working_memory m ON c.run_id = m.run_id
+           LEFT JOIN agent_working_memory_archive a ON c.run_id = a.run_id
+           WHERE m.run_id IS NULL AND a.run_id IS NULL"""
     ).fetchone()[0]
     print(f"  {marked} 条记录已消费，{orphans} 条悬空（应为 0）")
     if orphans:
@@ -159,12 +160,14 @@ def _titles_demo(db: sqlite3.Connection, titles: list[str]) -> None:
     rows = db.execute(
         f"""SELECT m.task_id, m.run_id, substr(m.summary,1,60), '热层' AS layer, m.created_at, m.id
             FROM agent_working_memory m
-            JOIN sync_records s ON s.consumed_run_id = m.run_id
+            JOIN sync_records_consumed c ON c.run_id = m.run_id
+            JOIN sync_records s ON s.id = c.sync_record_id
             WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
            UNION
            SELECT m.task_id, m.run_id, substr(m.summary,1,60), '冷层' AS layer, m.created_at, m.id
             FROM agent_working_memory_archive m
-            JOIN sync_records s ON s.consumed_run_id = m.run_id
+            JOIN sync_records_consumed c ON c.run_id = m.run_id
+            JOIN sync_records s ON s.id = c.sync_record_id
             WHERE s.bgm_title IN ({placeholders}) GROUP BY m.id
            -- UNION 结果集列名取自首个 SELECT，排序用序号避免列名歧义
            ORDER BY 5 DESC, 6 DESC LIMIT 5""",
@@ -174,7 +177,7 @@ def _titles_demo(db: sqlite3.Connection, titles: list[str]) -> None:
         print(f"  [{r[3]}] {r[0]:<20} {r[1][:8]:<10} {r[4]}  {r[2]}...")
     if not rows:
         print(
-            f"  {WARN}(无命中——需先有：同剧记录被某次总结消费过（consumed_run_id 非空）){END}"
+            f"  {WARN}(无命中——需先有：同剧记录被某次总结消费过（关联表有消费标记）){END}"
         )
 
 

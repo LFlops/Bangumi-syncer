@@ -48,7 +48,6 @@ class DatabaseConnection:
         self._match_fields_migrated = False
         self._pending_sync_sync_record_id_migrated = False
         self._pending_candidates_sync_record_id_migrated = False
-        self._sync_records_consumed_migrated = False
         self._agent_memory_migrated = False
         # 已确认存在（或已补上）的列集合，避免每次读写前的 ensure_schema
         # 回调重复执行 PRAGMA table_info
@@ -342,17 +341,27 @@ class DatabaseConnection:
             logger.warning(f"token 加密迁移失败（将在下次启动重试）: {e}")
 
     def _ensure_sync_records_consumed(self, cursor) -> None:
-        """旧库迁移：为 sync_records 增加 consumed_run_id（剧集消费标记，NULL = 未消费）。"""
-        if self._sync_records_consumed_migrated:
-            return
-        cursor.execute("PRAGMA table_info(sync_records)")
-        cols = [row[1] for row in cursor.fetchall()]
-        if "consumed_run_id" in cols:
-            self._sync_records_consumed_migrated = True
-            return
-        cursor.execute("ALTER TABLE sync_records ADD COLUMN consumed_run_id TEXT")
-        self._sync_records_consumed_migrated = True
-        logger.info("sync_records 已迁移：增加 consumed_run_id 列")
+        """消费标记关联表 schema：多对多（sync_record_id, run_id）。
+
+        一条记录可被多个任务的多个 run 消费，互不覆盖（INSERT OR IGNORE）。
+        开发阶段直接建新表，无旧库迁移；SQL 幂等（IF NOT EXISTS），
+        重复执行安全。
+        """
+        # ① 关联表（多对多消费标记）
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_records_consumed (
+                sync_record_id INTEGER NOT NULL,
+                run_id         TEXT NOT NULL,
+                PRIMARY KEY (sync_record_id, run_id)
+            )
+            """
+        )
+        # ② run_id 反查索引（clear_task 按 run_id 删、get_related_titles JOIN）
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sync_records_consumed_run_id "
+            "ON sync_records_consumed(run_id)"
+        )
 
     def _ensure_agent_memory(self, cursor) -> None:
         """Agent 工作记忆 schema：主表 + 归档表 + 索引 + FTS5 + 同步触发器。
@@ -716,13 +725,8 @@ class DatabaseConnection:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_sync_records_status ON sync_records(status)"
         )
-        # consumed_run_id 反查索引：加速 clear_task 清消费标记
-        # （UPDATE ... WHERE consumed_run_id IN (...) 否则全表扫；
-        # find_overlaps 走 Python 已加载集合无需索引，见 hy-review20260817 #8）
-        cursor.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sync_records_consumed_run_id "
-            "ON sync_records(consumed_run_id)"
-        )
+        # 消费标记关联表索引已在 _ensure_sync_records_consumed 创建
+        # （idx_sync_records_consumed_run_id → sync_records_consumed(run_id)）
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_trakt_sync_history_user_id ON trakt_sync_history(user_id)"
         )

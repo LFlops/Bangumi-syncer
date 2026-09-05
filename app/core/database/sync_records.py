@@ -548,12 +548,16 @@ class SyncRecordsRepository(BaseRepository):
             where = " WHERE " + " AND ".join(conditions)
             limit_clause = "LIMIT ?" if limit > 0 else ""
             query = f"""
-                SELECT id, timestamp, user_name, title, ori_title, season, episode,
-                       subject_id, episode_id, status, message, source, media_type, bgm_title,
-                       consumed_run_id,run_id, batch_id
-                FROM sync_records
+                SELECT s.id, s.timestamp, s.user_name, s.title, s.ori_title,
+                       s.season, s.episode, s.subject_id, s.episode_id, s.status,
+                       s.message, s.source, s.media_type, s.bgm_title,
+                       s.run_id, s.batch_id,
+                       GROUP_CONCAT(c.run_id) AS consumed_run_ids
+                FROM sync_records s
+                LEFT JOIN sync_records_consumed c ON c.sync_record_id = s.id
                 {where}
-                ORDER BY timestamp DESC
+                GROUP BY s.id
+                ORDER BY s.timestamp DESC
                 {limit_clause}
             """
             if limit > 0:
@@ -575,9 +579,12 @@ class SyncRecordsRepository(BaseRepository):
                     "source": row[11],
                     "media_type": row[12] or "episode",
                     "bgm_title": row[13] or "",
-                    "consumed_run_id": row[14],
-                    "run_id": row[15] or "",
-                    "batch_id": row[16] or "",
+                    "run_id": row[14] or "",
+                    "batch_id": row[15] or "",
+                    # 消费标记多对多（关联表）：逗号分隔 → 去空集合
+                    "consumed_run_ids": (
+                        {x for x in row[16].split(",") if x} if row[16] else set()
+                    ),
                 }
                 for row in cursor.fetchall()
             ]
@@ -620,7 +627,10 @@ class SyncRecordsRepository(BaseRepository):
         """清理超过保留天数的同步记录，返回删除行数。
 
         retention_days <= 0 时不清理（永不清理语义）。
+        关联表 sync_records_consumed 中指向被删记录的孤儿行一并清理
+        （避免表体积膨胀；消费标记随记录删除而失去意义）。
         """
+
         if retention_days <= 0:
             return 0
 
@@ -629,7 +639,13 @@ class SyncRecordsRepository(BaseRepository):
                 "DELETE FROM sync_records WHERE timestamp < datetime('now', ?)",
                 (f"-{retention_days} days",),
             )
-            return cursor.rowcount
+            n1 = cursor.rowcount
+            # 级联清理关联表孤儿行（被删 sync_records 的消费标记）
+            n2 = conn.execute(
+                "DELETE FROM sync_records_consumed "
+                "WHERE sync_record_id NOT IN (SELECT id FROM sync_records)"
+            ).rowcount
+            return n1 + n2
 
         try:
             deleted = self._run_write(_write, error_msg="清理旧同步记录失败")

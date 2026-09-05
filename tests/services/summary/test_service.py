@@ -45,7 +45,7 @@ def _sample_records() -> list[dict]:
             "bgm_title": "葬送的芙莉莲",
             "timestamp": "2026-07-14 20:30:00",
             "media_type": "episode",
-            "consumed_run_id": None,
+            "consumed_run_ids": set(),
         },
         {
             "id": 2,
@@ -58,7 +58,7 @@ def _sample_records() -> list[dict]:
             "bgm_title": "",
             "timestamp": "2026-07-14 21:00:00",
             "media_type": "movie",
-            "consumed_run_id": None,
+            "consumed_run_ids": set(),
         },
     ]
 
@@ -85,7 +85,7 @@ def _summary_record(**overrides) -> SummaryRecord:
         "media_type": "episode",
         "source": "bangumi",
         "status": "success",
-        "consumed_run_id": None,
+        "consumed_run_ids": set(),
     }
     defaults.update(overrides)
     return SummaryRecord(**defaults)
@@ -821,11 +821,10 @@ class TestExecuteJob:
         ):
             mock_memory.recent.return_value = []
             mock_memory.related.return_value = []
+            mock_memory.get_task_run_ids.return_value = set()
+            mock_memory.extract_and_store = AsyncMock()
             await svc.execute_job(config)
 
-        mock_memory.recent.assert_called_once_with(
-            "summary", "summary-test_job", limit=3
-        )
         mock_memory.related.assert_not_called()
 
     async def test_extract_failure_does_not_block_notification(
@@ -912,14 +911,24 @@ class TestExecuteJob:
     async def test_consumed_records_excluded_from_prompt(
         self, temp_dir, reset_singletons
     ):
-        """S2：已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
-        svc, _ = self._svc_with_real_memory(temp_dir)
+        """S2：本任务已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
+        svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
+        # 先写入本任务的记忆条目（run-own 属于本任务），再标记对应记录已消费
+        db.memory.store_and_mark(
+            MemoryEntry(
+                task_type="summary",
+                task_id="summary-test_job",
+                run_id="run-own",
+                summary="昨日看了番剧A",
+            ),
+            [],
+        )
         records = [
             _summary_record(
-                id=1, title="番剧A", bgm_title="番剧A", consumed_run_id="run-abc"
+                id=1, title="番剧A", bgm_title="番剧A", consumed_run_ids={"run-own"}
             ),
             _summary_record(
-                id=2, title="番剧B", bgm_title="番剧B", consumed_run_id=None
+                id=2, title="番剧B", bgm_title="番剧B", consumed_run_ids=set()
             ),
         ]
         config = _make_config(memory_limit=5)
@@ -937,16 +946,64 @@ class TestExecuteJob:
             await svc.execute_job(config)
 
         user_content = mock_client.chat.call_args.args[0][1].content
-        assert "番剧A" not in user_content  # 已消费 → 排除
+        assert "番剧A" not in user_content  # 本任务已消费 → 排除
         assert "番剧B" in user_content  # 未消费 → 保留
 
     @pytest.mark.asyncio
-    async def test_all_consumed_results_in_no_records(self, temp_dir, reset_singletons):
-        """S2b：窗口内全部已消费 → user prompt 记录为空（走"无记录"提示路径）。"""
-        svc, _ = self._svc_with_real_memory(temp_dir)
+    async def test_consumed_by_other_task_kept_in_prompt(
+        self, temp_dir, reset_singletons
+    ):
+        """S2c（跨任务隔离）：记录被其他任务消费（consumed_run_id 非空但不属于
+        本任务）→ 仍保留在 prompt——每日总结消费后年度总结仍可消费。"""
+        svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
+        # 其他任务（summary-yearly）消费了 run-other；本任务无该 run
+        db.memory.store_and_mark(
+            MemoryEntry(
+                task_type="summary",
+                task_id="summary-yearly",
+                run_id="run-other",
+                summary="年度总结",
+            ),
+            [],
+        )
         records = [
-            _summary_record(id=1, consumed_run_id="run-abc"),
-            _summary_record(id=2, consumed_run_id="run-def"),
+            _summary_record(
+                id=1, title="番剧A", bgm_title="番剧A", consumed_run_ids={"run-other"}
+            ),
+        ]
+        config = _make_config(memory_limit=5)
+        _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(records, "2026-07-14", "2026-07-15"),
+            ),
+            _llm_patch,
+            patch("app.services.summary.service.notification_service"),
+        ):
+            await svc.execute_job(config)
+
+        user_content = mock_client.chat.call_args.args[0][1].content
+        assert "番剧A" in user_content  # 其他任务消费 → 本任务保留
+
+    @pytest.mark.asyncio
+    async def test_all_consumed_results_in_no_records(self, temp_dir, reset_singletons):
+        """S2b：窗口内全部被【本任务】消费 → user prompt 记录为空（走"无记录"路径）。"""
+        svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
+        db.memory.store_and_mark(
+            MemoryEntry(
+                task_type="summary",
+                task_id="summary-test_job",
+                run_id="run-own",
+                summary="昨日总结",
+            ),
+            [],
+        )
+        records = [
+            _summary_record(id=1, consumed_run_ids={"run-own"}),
+            _summary_record(id=2, consumed_run_ids={"run-own"}),
         ]
         config = _make_config(memory_limit=5)
         _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
@@ -988,6 +1045,8 @@ class TestExecuteJob:
         ):
             mock_memory.recent.return_value = []
             mock_memory.related.return_value = []
+            mock_memory.get_task_run_ids.return_value = set()
+            mock_memory.extract_and_store = AsyncMock()
             await svc.execute_job(config)
 
         mock_memory.related.assert_called_once_with(
@@ -998,8 +1057,8 @@ class TestExecuteJob:
     async def test_new_records_rendered_normally(self, temp_dir, reset_singletons):
         svc, _ = self._svc_with_real_memory(temp_dir)
         records = [
-            _summary_record(id=1, consumed_run_id=None),
-            _summary_record(id=2, consumed_run_id=None),
+            _summary_record(id=1, consumed_run_ids=set()),
+            _summary_record(id=2, consumed_run_ids=set()),
         ]
         config = _make_config(memory_limit=5)
         _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
@@ -1022,8 +1081,8 @@ class TestExecuteJob:
         """D4 演化：未消费记录正常呈现；已消费记录进摘要记忆而非 prompt。"""
         svc, _ = self._svc_with_real_memory(temp_dir)
         records = [
-            _summary_record(id=1, consumed_run_id=None),
-            _summary_record(id=2, consumed_run_id=None),
+            _summary_record(id=1, consumed_run_ids=set()),
+            _summary_record(id=2, consumed_run_ids=set()),
         ]
         config = _make_config(memory_limit=5)
         _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
@@ -1086,6 +1145,125 @@ class TestRelatedInjection:
         assert ctx.count("芙莉莲近况") == 1  # 双路径命中按 run_id 去重
         mock_memory.recent.assert_called_once()
         mock_memory.related.assert_called_once()
+
+
+class TestIncrementalWindow:
+    """T3 增量窗口：记忆开启时 date_from = 上次总结点（本任务最后一条记忆的
+    created_at 日期）；无历史记忆时回退 lookback_days。"""
+
+    def _svc(self, temp_dir):
+        db = _temp_db(temp_dir)
+        svc = SummaryService()
+        svc.memory = MemoryService(db.memory)
+        return svc, db
+
+    def test_memory_enabled_uses_last_summary_date(self, temp_dir, reset_singletons):
+        """记忆开启 + 有历史记忆 → date_from = 最后一条记忆的日期（非 lookback）。"""
+        svc, db = self._svc(temp_dir)
+        # store_and_mark 的 INSERT 不含 created_at（DB 默认当前时间），
+        # 故用 patch memory.recent 模拟"上次总结点在 2026-07-10"
+        with patch.object(
+            svc.memory,
+            "recent",
+            return_value=[
+                MemoryEntry(
+                    task_type="summary",
+                    task_id="summary-test_job",
+                    run_id="run-1",
+                    summary="昨日总结",
+                    created_at="2026-07-10 21:00:00",
+                )
+            ],
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        # 窗口起点 = 上次总结日期，而非 now-7
+        assert date_from == "2026-07-10"
+        mock_db.get_records_in_date_range.assert_called_once()
+        assert (
+            mock_db.get_records_in_date_range.call_args.kwargs["date_from"]
+            == "2026-07-10"
+        )
+
+    def test_no_memory_falls_back_to_lookback(self, temp_dir, reset_singletons):
+        """记忆开启但无历史 → date_from 回退 lookback_days（incremental 分支）。"""
+        svc, db = self._svc(temp_dir)
+        config = _make_config(memory_limit=5, lookback_days=7)
+
+        with patch("app.services.summary.service.database_manager") as mock_db:
+            mock_db.get_records_in_date_range.return_value = []
+            records, date_from, date_to = svc._query_records(config, incremental=True)
+
+        expected = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        assert date_from == expected
+
+    def test_memory_disabled_ignores_incremental(self, temp_dir, reset_singletons):
+        """memory_limit=0 → 不查历史记忆，窗口 = lookback_days。"""
+        svc, db = self._svc(temp_dir)
+        db.memory.store_and_mark(
+            MemoryEntry(
+                task_type="summary",
+                task_id="summary-test_job",
+                run_id="run-1",
+                summary="昨日总结",
+                created_at="2026-07-10 21:00:00",
+            ),
+            [],
+        )
+        config = _make_config(memory_limit=0, lookback_days=7)
+
+        with patch("app.services.summary.service.database_manager") as mock_db:
+            mock_db.get_records_in_date_range.return_value = []
+            records, date_from, date_to = svc._query_records(config, incremental=True)
+
+        expected = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        assert date_from == expected
+
+    @pytest.mark.asyncio
+    async def test_execute_job_passes_incremental_flag(
+        self, temp_dir, reset_singletons
+    ):
+        """wiring：execute_job 调用 _query_records 时必须传 incremental=True。"""
+        svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
+        config = _make_config(memory_limit=5, lookback_days=7)
+        _llm_patch, mock_client = TestExecuteJob._patch_llm(svc, _mock_chat_response())
+
+        with (
+            patch.object(
+                svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
+            ) as mock_query,
+            _llm_patch,
+            patch("app.services.summary.service.notification_service"),
+        ):
+            await svc.execute_job(config)
+
+        assert mock_query.call_args.kwargs["incremental"] is True
+
+    @pytest.mark.asyncio
+    async def test_preview_does_not_use_incremental(self, temp_dir, reset_singletons):
+        """wiring：generate_summary（预览）调用 _query_records 时 incremental 默认 False。"""
+        svc = SummaryService()
+        config = _make_config(memory_limit=5, lookback_days=7)
+        mock_llm = MagicMock()
+        mock_llm.chat = AsyncMock(return_value=_mock_chat_response())
+
+        with (
+            patch.object(
+                svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
+            ) as mock_query,
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=mock_llm,
+            ),
+        ):
+            await svc.generate_summary(config)
+
+        assert mock_query.call_args.kwargs.get("incremental", False) is False
 
 
 class TestEmptyContentWithModel:

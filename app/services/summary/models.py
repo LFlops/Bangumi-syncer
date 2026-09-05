@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -75,4 +75,6 @@ class SummaryRecord:
     media_type: str
     source: str
     status: str
-    consumed_run_id: str | None = None  # 消费标记（NULL=未消费）
+    consumed_run_ids: set[str] = field(
+        default_factory=set
+    )  # 消费标记（多对多，空集=未消费）
