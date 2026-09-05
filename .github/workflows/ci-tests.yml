@@ -36,6 +36,26 @@ jobs:
           flags: unittests
           name: codecov-umbrella
 
+  mcp_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Sync (mcp_server)
+        run: uv sync --directory mcp_server
+
+      - name: Test (mcp_server)
+        run: uv run --directory mcp_server pytest tests/
+
   build_docker_and_integration_test:
     runs-on: ubuntu-latest
     steps:
