@@ -1,14 +1,14 @@
-"""匹配增强接入 + confirm/reject 联动集成测试（Task T14 / 场景 M1-M4/M11/M12/M12b/M32/M33）
+"""匹配增强接入 + confirm/reject 联动集成测试
 
 覆盖：
-- M1：开关开 + LLM 可用 → 失败落 agent_runs(pending) + trace 补 llm_assist step（persist 前）
-- M2：无候选也落任务
-- M3：开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）
-- M4：LLM 配置缺失 → 不落任务 + 日志含 "LLM 配置缺失"
+- 开关开 + LLM 可用 → 失败落 agent_runs(pending) + trace 补 llm_assist step（persist 前）
+- 无候选也落任务
+- 开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）
+- LLM 配置缺失 → 不落任务 + 日志含 "LLM 配置缺失"
 - 去重：同 key 活跃 → 跳过；failed 且 total_attempts<=10 → 重新入队；>10 → 不重入
-- M11：confirm（从候选列表外确认建议）→ 写映射 + 补发 + mark_applied
-- M12b：无关联 agent_runs（开关关流程）→ confirm/reject no-op 不报错
-- M33：不带 llm_subject_id 的既有 confirm → 原逻辑闭环
+- confirm（从候选列表外确认建议）→ 写映射 + 补发 + mark_applied
+- 无关联 agent_runs（开关关流程）→ confirm/reject no-op 不报错
+- 不带 llm_subject_id 的既有 confirm → 原逻辑闭环
 - API：confirm 端点接收可选 llm_subject_id 并优先使用
 """
 
@@ -63,7 +63,7 @@ def _make_orchestrator() -> SyncOrchestrator:
 
 
 # ----------------------------------------------------------------------
-# M1 / M2 / M3 / M4 + 去重：_handle_match_failure 接入
+# _handle_match_failure 接入 + 去重
 # ----------------------------------------------------------------------
 
 
@@ -74,9 +74,9 @@ def _make_orchestrator() -> SyncOrchestrator:
 def test_handle_match_failure_enqueues_when_enabled(
     mock_db, mock_cfg, mock_notify, with_candidates
 ):
-    """M1/M2：开关开 + LLM 可用 → 落 agent_runs(pending) + trace 含 llm_assist step
+    """开关开 + LLM 可用 → 落 agent_runs(pending) + trace 含 llm_assist step
 
-    无候选（M2）也落任务；trace step 必须在 _persist_sync_record 之前（persist 被
+    无候选也落任务；trace step 必须在 _persist_sync_record 之前（persist 被
     mock，其序列化结果即被视为 persist 时刻的 trace 状态）。
     """
     orch = _make_orchestrator()
@@ -240,7 +240,7 @@ def test_dedup_failed_exceeds_limit_no_requeue(mock_db, mock_cfg, mock_notify, c
 
 
 # ----------------------------------------------------------------------
-# M11 / M12b / M33：confirm / reject 联动
+# confirm / reject 联动
 # ----------------------------------------------------------------------
 
 
@@ -254,7 +254,7 @@ def _patch_db_for_confirm(record: dict, agent_runs: MagicMock) -> MagicMock:
 
 
 def test_confirm_llm_subject_from_outside_marks_applied():
-    """M11：从候选列表外确认建议 → 写映射 + 补发 + agent_runs→applied"""
+    """从候选列表外确认建议 → 写映射 + 补发 + agent_runs→applied"""
     svc = SyncService()
     record = {
         "id": 5,
@@ -292,7 +292,7 @@ def test_confirm_llm_subject_from_outside_marks_applied():
 
 
 def test_confirm_no_linked_run_is_noop():
-    """M12b：无关联 agent_runs（开关关流程）→ confirm 成功但联动 no-op 不报错"""
+    """无关联 agent_runs（开关关流程）→ confirm 成功但联动 no-op 不报错"""
     svc = SyncService()
     record = {
         "id": 6,
@@ -357,7 +357,7 @@ def test_confirm_linked_run_not_succeeded_no_applied():
 
 
 def test_reject_no_linked_run_is_noop():
-    """M12b：无关联 agent_runs → reject 成功但联动 no-op 不报错"""
+    """无关联 agent_runs → reject 成功但联动 no-op 不报错"""
     svc = SyncService()
     record = {
         "id": 8,
@@ -412,7 +412,7 @@ def test_reject_linked_succeeded_marks_rejected():
 
 
 def test_confirm_legacy_without_llm_subject_still_closes():
-    """M33：不带关联 run 的既有 confirm → 原逻辑闭环，向后兼容"""
+    """不带关联 run 的既有 confirm → 原逻辑闭环，向后兼容"""
     svc = SyncService()
     record = {
         "id": 10,

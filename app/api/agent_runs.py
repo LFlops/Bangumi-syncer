@@ -1,5 +1,5 @@
 """
-Agent 追踪查询 API（Task T10 / 场景 M21, M21b）
+Agent 追踪查询 API
 
 提供观测用途的追踪查询端点（仅元数据，不暴露内部重放全文）：
 - ``GET /api/agent/runs/{run_id}``      → 单次会话元数据

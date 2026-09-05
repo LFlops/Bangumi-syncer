@@ -1,4 +1,4 @@
-"""T8 红阶段测试：span 记录器 + 会话增量 + 断点重放（场景 M19/M22/M22b/M23 前置）
+"""span 记录器 + 会话增量 + 断点重放测试
 
 覆盖：
 1. start_span / end_span 写入 agent_steps（字段完整；独立 best-effort 事务，repo 抛错不影响主流程）

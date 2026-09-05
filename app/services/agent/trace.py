@@ -2,21 +2,21 @@
 
 提供：
 - ``start_span`` / ``end_span``：写入 ``agent_steps``（独立 best-effort 事务，失败仅日志），
-  承载可重放会话日志（spec §3.3.2 / D18 / I-1 / I-2）。
+  承载可重放会话日志。
 - ``record_budget_message``：将透明预算消息并入最后一条 ``tool_execute`` 的 ``replay_delta``。
 - ``replay``：从 ``agent_steps`` 按 ``(iteration, sequence)`` 重放会话增量，
-  重建可续跑的 ``messages``（spec §3.5 断点恢复重建规则）。
+  重建可续跑的 ``messages``（断点恢复重建规则）。
 
-replay_delta 写入语义（spec §3.3.2 写入时机表）：
+replay_delta 写入语义：
 - ``llm_chat.end_span``: ``replay_delta = {response: {stop_reason, content, tool_calls}}``
-  （tool_calls 为本轮全部工具调用的聚合——重建一条 assistant 消息的唯一来源，I-1）。
-- ``tool_execute.end_span``: ``replay_delta = {tool_result: {...}}``（仅 tool_result，I-1）。
+  （tool_calls 为本轮全部工具调用的聚合——重建一条 assistant 消息的唯一来源）。
+- ``tool_execute.end_span``: ``replay_delta = {tool_result: {...}}``（仅 tool_result）。
 - 预算消息：由 ``record_budget_message`` 并入同轮最后一个 ``tool_execute`` 的
-  ``replay_delta``（``budget_message`` 字段，I-2）。
+  ``replay_delta``（``budget_message`` 字段）。
 
-职责分离（F2）：``payload_json`` 仅观测摘要（结构化截断 ≤2KB 保 JSON 合法）；
+职责分离：``payload_json`` 仅观测摘要（结构化截断 ≤2KB 保 JSON 合法）；
 ``replay_delta`` 为断点重放增量（完整，超 32KB 标记该 span ``status=error`` 视为不可恢复点）。
-``input_summary`` 仅记录参数名与类型（不记录参数值，G-4）。
+``input_summary`` 仅记录参数名与类型（不记录参数值）。
 """
 
 from __future__ import annotations
@@ -31,11 +31,11 @@ from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 
-# 观测摘要上限（spec §3.3.2：payload_json 截断 ≤2KB）
+# 观测摘要上限（payload_json 截断 ≤2KB）
 MAX_PAYLOAD_JSON_BYTES = 2 * 1024
-# replay_delta 上限（spec：超 32KB 标记该 span status=error，视为不可恢复点）
+# replay_delta 上限（超 32KB 标记该 span status=error，视为不可恢复点）
 MAX_REPLAY_DELTA_BYTES = 32 * 1024
-# input_summary 上限（spec §3.3.2：≤500 字符）
+# input_summary 上限（≤500 字符）
 MAX_INPUT_SUMMARY_CHARS = 500
 
 
@@ -196,7 +196,7 @@ def end_span(
 def record_budget_message(span_id: str, budget_message: str) -> None:
     """将透明预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
 
-    在现有 replay_delta 上追加 ``budget_message`` 字段（I-2）。独立 best-effort 事务。
+    在现有 replay_delta 上追加 ``budget_message`` 字段。独立 best-effort 事务。
     """
     try:
         dbm = get_database_manager()
@@ -292,21 +292,21 @@ def replay(
     seed_builder: Callable[[], list],
     max_iterations: int | None = None,
 ) -> ReplayResult:
-    """按 (iteration, sequence) 重放会话增量，重建可续跑 ``list[Message]``（spec §3.5 / I-1 / I-2）。
+    """按 (iteration, sequence) 重放会话增量，重建可续跑 ``list[Message]``。
 
     ``seed_builder`` 返回种子消息（system + user 列表），由场景层提供
     （llm_assist 从 sync_records 还原），原样保留（调用方应返回 ``Message`` 实例，
     以便整体可直接作为 ``loop.run(seed_messages=...)`` 消费的列表）。
 
-    重建规则（与原执行 ``loop.run`` 完全一致，I-1 逐字节一致）：
+    重建规则（与原执行 ``loop.run`` 完全一致）：
     - 每轮从 ``llm_chat.replay_delta`` 重建**一条** assistant 消息：
       ``Message(role="assistant", content=[ToolUseBlock(...) for tc in tool_calls])``
       （content 为 ``list[ToolUseBlock]``，与原执行对齐）。
     - 逐条追加各 ``tool_execute.replay_delta.tool_result`` 重建的
       ``Message(role="user", content=[ToolResultBlock(...)])``（每条工具结果独立成消息，不合并）。
     - 预算消息：``Message(role="user", content=f"[剩余轮次：N]")``。
-      优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入，I-2）；
-      缺失时按 ``N = max_iterations - executed_iterations`` 计算（修正 H4：用已执行轮数而非
+      优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入）；
+      缺失时按 ``N = max_iterations - executed_iterations`` 计算（用已执行轮数而非
       iteration 索引，避免稀疏 iteration 时算错剩余轮次）。
     - 缺失工具识别（S(tool_calls) - R(已记录 tool_execute)）逻辑不变；命中缺失的该轮
       不追加预算消息、不计入 executed_iterations，交回调用方补执行。
@@ -398,7 +398,7 @@ def replay(
             # 本轮完整执行：计入 executed_iterations 并追加预算消息
             executed_iterations += 1
             if budget_message is None and max_iterations is not None:
-                # 确定性重建预算消息（修正 H4）：用已执行轮数而非 iteration 索引
+                # 确定性重建预算消息：用已执行轮数而非 iteration 索引
                 budget_message = (
                     f"[剩余轮次：{max(0, max_iterations - executed_iterations)}]"
                 )

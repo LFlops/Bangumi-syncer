@@ -1,6 +1,6 @@
-"""T2: Anthropic provider 工具协议测试（app.services.llm.providers.anthropic）。
+"""Anthropic provider 工具协议测试（app.services.llm.providers.anthropic）。
 
-覆盖 §3.2.1 与 Task T2 的红灯场景（M13 + phase2.1 T1/T6）：
+覆盖：
 - 内部 assistant 消息含 ToolUseBlock → wire tool_use block 1:1（多 tool_use 同消息共存）
 - 内部 user 消息含 ToolResultBlock → wire tool_result block
 - tools 参数透传进 body（name/description/input_schema 由调用方构造，provider 仅透传）
@@ -42,7 +42,7 @@ class TestBuildRequestToolUse:
     """_build_request：内部 assistant ToolUseBlock → wire tool_use block。"""
 
     def test_assistant_single_tool_use_block_to_wire_1to1(self):
-        """Scenario M13: 单条 assistant ToolUseBlock 1:1 转为 wire tool_use block。"""
+        """单条 assistant ToolUseBlock 1:1 转为 wire tool_use block。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -71,7 +71,7 @@ class TestBuildRequestToolUse:
         ]
 
     def test_assistant_multiple_tool_use_blocks_same_message(self):
-        """Scenario M13: 一个 assistant 消息内含多个 tool_use block，逐条 1:1 共存、顺序一致。"""
+        """一个 assistant 消息内含多个 tool_use block，逐条 1:1 共存、顺序一致。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -139,7 +139,7 @@ class TestBuildRequestToolResult:
     """_build_request：内部 user ToolResultBlock → wire tool_result block。"""
 
     def test_user_tool_result_block_to_wire(self):
-        """Scenario M13: user 消息含 ToolResultBlock → wire tool_result block（含 is_error）。"""
+        """user 消息含 ToolResultBlock → wire tool_result block（含 is_error）。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -198,7 +198,7 @@ class TestBuildRequestToolsAndToolChoice:
     """_build_request：tools / tool_choice 透传。"""
 
     def test_tools_param_passthrough(self):
-        """Scenario M13: kwargs.tools（调用方构造的 wire dict 列表）透传进 body["tools"]。"""
+        """kwargs.tools（调用方构造的 wire dict 列表）透传进 body["tools"]。"""
         provider = _make_provider()
         tools = [
             {
@@ -216,7 +216,7 @@ class TestBuildRequestToolsAndToolChoice:
         assert body["tools"] == tools
 
     def test_tool_choice_param_passthrough(self):
-        """Scenario M13: kwargs.tool_choice dict 透传进 body["tool_choice"]。"""
+        """kwargs.tool_choice dict 透传进 body["tool_choice"]。"""
         provider = _make_provider()
         tool_choice = {"type": "tool", "name": "submit_suggestion"}
         body = provider._build_request(
@@ -258,7 +258,7 @@ class TestParseResponseToolUse:
     """_parse_response：wire tool_use → ToolUseBlock + stop_reason="tool_use"。"""
 
     def test_parse_response_tool_use_to_block(self):
-        """Scenario M13: wire tool_use block → ToolUseBlock，stop_reason 保留为 tool_use。"""
+        """wire tool_use block → ToolUseBlock，stop_reason 保留为 tool_use。"""
         provider = _make_provider()
         resp = provider._parse_response(
             {
@@ -321,7 +321,7 @@ class TestAnthropicProviderChatTools:
 
     @pytest.mark.asyncio
     async def test_tools_and_tool_choice_sent_in_request(self):
-        """Scenario M13: chat() 把 tools/tool_choice 透传到 /v1/messages 请求体。"""
+        """chat() 把 tools/tool_choice 透传到 /v1/messages 请求体。"""
         from unittest.mock import AsyncMock, Mock, patch
 
         mock_response = Mock()

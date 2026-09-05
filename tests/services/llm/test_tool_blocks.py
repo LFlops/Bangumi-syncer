@@ -1,6 +1,6 @@
-"""T1: ToolUseBlock / ToolResultBlock 数据模型扩展测试（app.services.llm.models）。
+"""ToolUseBlock / ToolResultBlock 数据模型扩展测试（app.services.llm.models）。
 
-覆盖 §3.2.1 与 Task T1 的红灯场景：
+覆盖：
 - ToolUseBlock / ToolResultBlock 创建与序列化
 - ContentBlock union 可承载五种 block（Text/Thinking/Redacted/ToolUse/ToolResult）
 - ChatResponse.blocks 含 tool block 时无损往返

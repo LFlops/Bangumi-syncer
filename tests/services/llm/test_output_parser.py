@@ -1,4 +1,4 @@
-"""app.services.llm.output_parser 测试（Task T5 / J3 / M16 前置）。
+"""app.services.llm.output_parser 测试。
 
 结构化输出解析器：从 LLM 自由文本提取 JSON -> 校验 subject_id/reason ->
 返回 (LLMSuggestion | None, 错误原因)。任何畸形/类型错误都必须以
@@ -9,7 +9,7 @@ from app.services.llm.output_parser import LLMSuggestion, parse_suggestion
 
 
 class TestParseSuggestionSuccess:
-    """正常解析路径（M16）。"""
+    """正常解析路径。"""
 
     def test_pure_json_success(self):
         """纯 JSON 文本可解析为 LLMSuggestion。"""
@@ -124,7 +124,7 @@ class TestParseSuggestionFailure:
         assert err == "subject_id 非法"
 
     def test_reason_too_long(self):
-        """reason 超过 200 字符 -> 拒绝（M15 语义：校验失败 -> no_suggestion）。"""
+        """reason 超过 200 字符 -> 拒绝（校验失败 -> no_suggestion）。"""
         long_reason = "x" * 201
         text = f'{{"subject_id": "123", "reason": "{long_reason}"}}'
         result, err = parse_suggestion(text)

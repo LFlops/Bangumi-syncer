@@ -1,4 +1,4 @@
-"""T11 测试：匹配场景服务 llm_assist（M5/M5b/M15/M24/M25 + 兜底 + 注入防护 + 事务）。
+"""匹配场景服务 llm_assist 测试（无候选全链路 + 兜底 + 注入防护 + 事务）。
 
 使用全局 database_manager（conftest 已重定向到临时 DB）验证落库与状态机；
 LLM 调用、bgm、校验、通知均以 mock 注入，保证单测稳定与行为精确断言。
@@ -224,7 +224,7 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# M24：无候选全链路（LLM 搜索补充 → 建议 → 落库）
+# 无候选全链路（LLM 搜索补充 → 建议 → 落库）
 # ---------------------------------------------------------------------------
 
 
@@ -257,7 +257,7 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# M15：submit_suggestion subject_id 非法 → no_suggestion + last_error
+# submit_suggestion subject_id 非法 → no_suggestion + last_error
 # ---------------------------------------------------------------------------
 
 
@@ -308,7 +308,7 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# M25：工具执行失败（bgm.search 抛错）→ 循环继续 → 最终 no_suggestion
+# 工具执行失败（bgm.search 抛错）→ 循环继续 → 最终 no_suggestion
 # ---------------------------------------------------------------------------
 
 

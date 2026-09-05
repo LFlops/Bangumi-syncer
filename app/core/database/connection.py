@@ -265,7 +265,7 @@ class DatabaseConnection:
     def _ensure_pending_candidates_llm_columns(self, cursor) -> None:
         """旧库迁移：为 pending_candidates 增加 llm_subject_id / llm_reason（AI 推荐字段）。
 
-        承载 LLM 匹配增强给出的建议 subject 与理由（见 spec §3.3.3）。
+        承载 LLM 匹配增强给出的建议 subject 与理由。
         """
         self._ensure_columns(
             cursor,
@@ -595,7 +595,7 @@ class DatabaseConnection:
 
         # Agent 通用会话表：agent_runs（一次会话状态机）+ agent_steps（span 可重放日志）
         # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled/
-        #              applied/rejected（exhausted 仅作 stop_reason，不作 status，见 spec §3.3.1）
+        #              applied/rejected（exhausted 仅作 stop_reason，不作 status）
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

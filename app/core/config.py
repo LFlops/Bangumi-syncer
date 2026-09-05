@@ -641,7 +641,7 @@ class ConfigManager:
 
         上游调度器/编排曾各自直接 ``get("sync", "llm_match_*", fallback=...)``；
         本方法将其正式化为单一读取入口，保证默认值一致，并供
-        ``GET /api/sync/config`` 复用默认值（T16 / M18a）。
+        ``GET /api/sync/config`` 复用默认值。
 
         返回字段：
         - llm_match_assist (bool, 默认 false)

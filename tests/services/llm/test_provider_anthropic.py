@@ -112,7 +112,7 @@ class TestAnthropicProviderInit:
 
 
 # ===================================================================
-# Feature 1: 请求构建
+# 请求构建
 # ===================================================================
 
 
@@ -120,7 +120,7 @@ class TestBuildRequest:
     """_build_request 纯函数测试。"""
 
     def test_text_message_wire_format(self):
-        """Scenario 1.1: 纯文本请求符合 Messages API 格式。"""
+        """纯文本请求符合 Messages API 格式。"""
         provider = _make_provider()
         body = provider._build_request([Message(role="user", content="Hello")])
         assert body["model"] == "claude-sonnet-4-6"
@@ -133,7 +133,7 @@ class TestBuildRequest:
         assert "thinking" not in body
 
     def test_temperature_kwargs_override(self):
-        """Scenario 1.1: temperature kwargs 覆盖配置值。"""
+        """temperature kwargs 覆盖配置值。"""
         provider = _make_provider()
         body = provider._build_request(
             [Message(role="user", content="Hello")], temperature=0.3
@@ -141,7 +141,7 @@ class TestBuildRequest:
         assert body["temperature"] == 0.3
 
     def test_system_prompt_top_level(self):
-        """Scenario 1.2: system prompt 提升为顶层参数。"""
+        """system prompt 提升为顶层参数。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -153,7 +153,7 @@ class TestBuildRequest:
         assert all(m["role"] != "system" for m in body["messages"])
 
     def test_multiple_system_messages_joined(self):
-        """Scenario 1.3: 多条 system 消息用 \\n\\n 合并。"""
+        """多条 system 消息用 \\n\\n 合并。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -165,7 +165,7 @@ class TestBuildRequest:
         assert body["system"] == "规则A\n\n规则B"
 
     def test_single_system_message_unchanged(self):
-        """Scenario 1.3: 单条 system 消息原样传递，不合并不加分隔符。"""
+        """单条 system 消息原样传递，不合并不加分隔符。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -204,7 +204,7 @@ class TestBuildRequest:
         assert body["system"] == "规则A"
 
     def test_thinking_level_medium_maps_budget(self):
-        """Scenario 1.4: thinking_level=medium 映射 budget_tokens=4096，
+        """thinking_level=medium 映射 budget_tokens=4096，
         max_tokens 自动抬升到 budget + 余量，temperature 强制为 1。"""
         provider = _make_provider(thinking_level="medium")
         body = provider._build_request([Message(role="user", content="Q")])
@@ -218,7 +218,7 @@ class TestBuildRequest:
         [("low", 2048), ("medium", 4096), ("high", 8192)],
     )
     def test_thinking_max_tokens_raised_above_budget(self, level, budget):
-        """Scenario 1.4: 开启思考时 max_tokens 自动抬升至 budget + 余量。
+        """开启思考时 max_tokens 自动抬升至 budget + 余量。
 
         默认 max_tokens=2000 小于全部三档 budget，若不抬升 Anthropic API
         会以 budget_tokens < max_tokens 约束返回 400。
@@ -242,7 +242,7 @@ class TestBuildRequest:
         assert body["max_tokens"] == 4096 + 1024
 
     def test_thinking_level_high_kwargs_override(self):
-        """Scenario 1.4/1.6: kwargs thinking_level=high 覆盖全局。"""
+        """kwargs thinking_level=high 覆盖全局。"""
         provider = _make_provider(thinking_level="off")
         body = provider._build_request(
             [Message(role="user", content="Q")], thinking_level="high"
@@ -252,21 +252,21 @@ class TestBuildRequest:
         assert body["temperature"] == 1
 
     def test_thinking_level_off_no_thinking(self):
-        """Scenario 1.5: thinking_level=off 不传 thinking，temperature 保持配置值。"""
+        """thinking_level=off 不传 thinking，temperature 保持配置值。"""
         provider = _make_provider(thinking_level="off")
         body = provider._build_request([Message(role="user", content="Q")])
         assert "thinking" not in body
         assert body["temperature"] == 0.7
 
     def test_thinking_level_default_off(self):
-        """Scenario 1.5: 未配置 thinking_level（缺省 off）时行为一致。"""
+        """未配置 thinking_level（缺省 off）时行为一致。"""
         provider = _make_provider()
         body = provider._build_request([Message(role="user", content="Q")])
         assert "thinking" not in body
         assert body["temperature"] == 0.7
 
     def test_per_call_override_global_default(self):
-        """Scenario 1.6: per-call 覆盖全局默认，未传 kwargs 仍走全局。"""
+        """per-call 覆盖全局默认，未传 kwargs 仍走全局。"""
         provider = _make_provider(thinking_level="off")
         body_override = provider._build_request(
             [Message(role="user", content="Q")], thinking_level="high"
@@ -277,7 +277,7 @@ class TestBuildRequest:
         assert "thinking" not in body_default
 
     def test_haiku_model_thinking_degraded(self):
-        """Scenario 1.7: claude-haiku 模型 thinking 降级为 off。"""
+        """claude-haiku 模型 thinking 降级为 off。"""
         provider = _make_provider(thinking_level="medium")
         body = provider._build_request(
             [Message(role="user", content="Q")],
@@ -287,7 +287,7 @@ class TestBuildRequest:
         assert body["temperature"] == 0.7
 
     def test_thinking_enabled_unknown_model_ok(self):
-        """Scenario 1.7: 未知模型按支持处理。"""
+        """未知模型按支持处理。"""
         provider = _make_provider(thinking_level="medium")
         assert provider._thinking_enabled("medium", "unknown-model") == 4096
         assert provider._thinking_enabled("off", "claude-sonnet-4-6") == 0
@@ -295,7 +295,7 @@ class TestBuildRequest:
 
 
 # ===================================================================
-# Feature 2: 响应解析
+# 响应解析
 # ===================================================================
 
 
@@ -303,7 +303,7 @@ class TestParseResponse:
     """_parse_response 纯函数测试。"""
 
     def test_text_response(self):
-        """Scenario 2.1: 纯文本响应解析。"""
+        """纯文本响应解析。"""
         provider = _make_provider()
         resp = provider._parse_response(
             {
@@ -324,7 +324,7 @@ class TestParseResponse:
         assert resp.usage.total_tokens == 30
 
     def test_thinking_block_not_in_content(self):
-        """Scenario 2.2: thinking block 解析但不进入 content。"""
+        """thinking block 解析但不进入 content。"""
         provider = _make_provider()
         resp = provider._parse_response(
             {
@@ -352,7 +352,7 @@ class TestParseResponse:
         assert resp.blocks[0].signature == "sig1"
 
     def test_redacted_thinking_block(self):
-        """Scenario 2.3: redacted_thinking block 容错解析。"""
+        """redacted_thinking block 容错解析。"""
         provider = _make_provider()
         resp = provider._parse_response(
             {
@@ -364,7 +364,7 @@ class TestParseResponse:
         assert isinstance(resp.blocks[0], RedactedThinkingBlock)
 
     def test_unknown_block_type_skipped(self):
-        """Scenario 2.4: 真正未知 block 类型跳过不崩溃，content 只取 text（tool_use 已被正式解析，不在此列）。"""
+        """真正未知 block 类型跳过不崩溃，content 只取 text（tool_use 已被正式解析，不在此列）。"""
         provider = _make_provider()
         with patch("app.services.llm.providers.anthropic.logger") as mock_log:
             resp = provider._parse_response(
@@ -409,7 +409,7 @@ class TestAnthropicProviderChat:
 
     @pytest.mark.asyncio
     async def test_request_format(self):
-        """Scenario 1.1: 发送到 /v1/messages 的请求格式正确。"""
+        """发送到 /v1/messages 的请求格式正确。"""
         mock_client = _make_mock_client(
             json_body={
                 "content": [{"type": "text", "text": "Hello, world!"}],
@@ -468,7 +468,7 @@ class TestAnthropicProviderChat:
 
     @pytest.mark.asyncio
     async def test_normal_response_parsing(self):
-        """Scenario 2.1: chat() 正常响应解析。"""
+        """chat() 正常响应解析。"""
         mock_client = _make_mock_client(
             json_body={
                 "content": [{"type": "text", "text": "The answer is 42."}],
@@ -521,7 +521,7 @@ class TestAnthropicProviderChat:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [401, 429, 500])
     async def test_http_error_handling(self, status_code):
-        """Scenario 2.5: HTTP 错误抛出 httpx.HTTPStatusError。"""
+        """HTTP 错误抛出 httpx.HTTPStatusError。"""
         mock_client = _make_mock_client(
             status_code=status_code,
             raise_for_status_side_effect=httpx.HTTPStatusError(

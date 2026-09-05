@@ -962,12 +962,12 @@ async def test_refresh_webhook_key_exception(app_with_auth, mock_config_manager)
             assert response.status_code == 500
 
 
-# ========== T16：[sync] llm_match_* 配置读取 + 保存校验 + llm_available ==========
+# ========== [sync] llm_match_* 配置读取 + 保存校验 + llm_available ==========
 
 
 @pytest.fixture
 def mock_sync_cm():
-    """可控 config_manager：用于 T16 /api/sync/config 与配置保存校验测试。"""
+    """可控 config_manager：用于 /api/sync/config 与配置保存校验测试。"""
     with patch("app.api.config.config_manager") as mock_cm:
         mock_cm.active_config_path = "/tmp/test_config.ini"
         mock_cm.get_config_parser.return_value = MagicMock()
@@ -985,7 +985,7 @@ def mock_sync_cm():
 async def test_get_sync_config_llm_available_false_when_llm_not_configured(
     app_with_auth, mock_sync_cm
 ):
-    """M18a：LLM 未配置时 GET /api/sync/config 返回 llm_available=false。"""
+    """LLM 未配置时 GET /api/sync/config 返回 llm_available=false。"""
     mock_sync_cm.get_sync_llm_match_config.return_value = {
         "llm_match_assist": False,
         "llm_match_cron": "*/1 * * * *",
@@ -1048,7 +1048,7 @@ async def test_get_sync_config_llm_available_true_when_llm_configured(
 async def test_update_config_rejects_assist_enabled_without_llm_key(
     app_with_auth, mock_sync_cm
 ):
-    """M18a：开启 llm_match_assist 且 LLM 未配置 → 拒绝 + 原因"需先配置 LLM"。"""
+    """开启 llm_match_assist 且 LLM 未配置 → 拒绝 + 原因"需先配置 LLM"。"""
     mock_sync_cm.get_llm_config.return_value = {"api_key": ""}
 
     async with AsyncClient(

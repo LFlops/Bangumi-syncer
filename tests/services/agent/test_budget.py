@@ -1,4 +1,4 @@
-"""TDD 红阶段：IterationStrategy 预算策略注册表测试（场景 M27）。
+"""IterationStrategy 预算策略注册表测试。
 
 覆盖：
 - MatchIterationStrategy 预设 off=1/low=2/medium=3/high=5，未知 level 兜底 3

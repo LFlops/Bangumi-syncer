@@ -1,10 +1,10 @@
-"""T18：配置页「匹配增强（LLM）」开关条件渲染 —— 渲染层测试。
+"""配置页「匹配增强（LLM）」开关条件渲染 —— 渲染层测试。
 
-覆盖 M18b 中"服务端渲染产出开关与提示 DOM"的部分；客户端条件显隐逻辑
+覆盖"服务端渲染产出开关与提示 DOM"的部分；客户端条件显隐逻辑
 （llm_available 决策）由 tests/e2e/test_config_match_assist.py 的 Playwright
 用例覆盖（需要浏览器，CI 执行），此处不重复。
 
-验证目标（对应 T18 任务）：
+验证目标：
 - 同步配置 section 增加「匹配增强（LLM）」开关（checkbox，name=sync.llm_match_assist）
 - 提供「需先配置 LLM」提示元素的 DOM 骨架（显隐由 JS 控制）
 """

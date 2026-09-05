@@ -1,13 +1,13 @@
-"""TDD 红阶段：轻量循环 ``app/services/agent/loop.py``（场景 M6/M7/M26/M28 + 分段并行 + 终止 + 预算）。
+"""轻量循环 ``app/services/agent/loop.py`` 测试（分段并行 + 终止 + 预算）。
 
-覆盖（spec §3.2.4）：
-- end_turn / 空响应（无 tool_calls）→ stop_reason=end_turn（M6）
-- assistant 聚合消息先于 tool_result（协议顺序，F1 修正）
-- submit_suggestion 捕获即 break（stop_reason=submit_suggestion），同轮其他工具不执行（M7 终止工具优先）
+覆盖：
+- end_turn / 空响应（无 tool_calls）→ stop_reason=end_turn
+- assistant 聚合消息先于 tool_result（协议顺序）
+- submit_suggestion 捕获即 break（stop_reason=submit_suggestion），同轮其他工具不执行（终止工具优先）
 - 分段并行：循环将整批 tool_calls 一次性交给注入的 tool_calls_fn（execute_batch 内部做 gather/串行）
-- 透明预算：每轮追加 ``[剩余轮次：N]``；remaining==0 的末轮 tool_choice=terminal（I-4）
+- 透明预算：每轮追加 ``[剩余轮次：N]``；remaining==0 的末轮 tool_choice=terminal
 - 畸形 tool_use（execute_batch 返回 is_error 的 ToolResultBlock）→ 循环继续不崩溃
-- max_iterations 耗尽 → stop_reason=exhausted + last_response（M26）
+- max_iterations 耗尽 → stop_reason=exhausted + last_response
 - span 钩子：span_recorder 在每轮 chat 前后被调用（start/end），None 时跳过
 - 不直接依赖 LLMClient：LLM 调用经注入的 chat_fn（可 mock）
 """
@@ -520,7 +520,7 @@ async def test_span_recorder_none_is_noop():
 
 
 # ---------------------------------------------------------------------------
-# 10. F1 / M19：每轮 LLM(llm_chat) + 每次工具(tool_execute) 各一条 span
+# 10. 每轮 LLM(llm_chat) + 每次工具(tool_execute) 各一条 span
 # ---------------------------------------------------------------------------
 
 
@@ -601,7 +601,7 @@ async def test_tool_execute_span_per_tool_m19():
 
     assert result.stop_reason == "exhausted"
     names = [s["name"] for s in recorder.spans]
-    # M19：每轮 LLM + 每次工具各一条 span
+    # 每轮 LLM + 每次工具各一条 span
     assert names.count("llm_chat") == 2
     assert names.count("tool_execute") == 3
     assert len(recorder.spans) == 5
@@ -658,7 +658,7 @@ async def test_tool_execute_replay_delta_and_budget_target():
         assert "tool_result" in delta, delta
         tr = delta["tool_result"]
         assert set(tr.keys()) >= {"tool_use_id", "content", "is_error"}
-        # input_summary 仅记录参数名与类型（G-4：不记录参数值）
+        # input_summary 仅记录参数名与类型（不记录参数值）
         summary = kw.get("input_summary", "")
         assert "title" in summary or "subject_id" in summary
         assert "x" not in summary and "123" not in summary

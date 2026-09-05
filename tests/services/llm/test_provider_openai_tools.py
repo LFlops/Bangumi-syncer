@@ -1,4 +1,4 @@
-"""OpenAI 兼容 provider 工具协议测试（Task T3：M14 + phase2.1 T3/T4/T5/T7）。
+"""OpenAI 兼容 provider 工具协议测试。
 
 覆盖 _build_request / _parse_response 的 tool 拆并与 tools/tool_choice 透传，
 以及 wire→内部历史消息合并。
@@ -150,7 +150,7 @@ class TestOpenAICompatToolsBuildRequest:
         assert body["tool_choice"] == tool_choice
 
     def test_cache_control_not_in_body(self):
-        """F17：cache_control 是 Anthropic 专属参数，OpenAI 请求体不得包含。"""
+        """cache_control 是 Anthropic 专属参数，OpenAI 请求体不得包含。"""
         provider = self._provider()
         body = provider._build_request(
             [Message(role="user", content="Q")],
@@ -253,7 +253,7 @@ class TestOpenAICompatToolsParseResponse:
         assert resp.blocks[1].input == {}
 
     def test_finish_reason_stop_unchanged(self):
-        """非 tool_calls 的 finish_reason 保持原值（与现有 M10 行为一致）。"""
+        """非 tool_calls 的 finish_reason 保持原值（与 OpenAI 映射行为一致）。"""
         provider = self._provider()
         resp = provider._parse_response(
             {

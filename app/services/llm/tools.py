@@ -1,17 +1,18 @@
-"""Phase 3 通用工具注册表与执行器（spec §3.2.2，场景 M29 / M29b）。
+"""通用工具注册表与执行器。
 
 提供：
-- ``ToolDefinition``：工具元信息（含 access 枚举与 readonly 推导，F16）
+- ``ToolDefinition``：工具元信息（含 access 枚举与 readonly 推导）
 - ``ToolRegistry``：注册 / 执行 / JSON Schema 轻量校验 / 分段并行批量执行
 - 模块级单例 ``get_tool_registry()`` / ``reset_tool_registry()``
 
 零新增依赖：JSON Schema 校验使用手写轻量实现（必填字段、类型、pattern、maxLength），
-不引入 ``jsonschema``（见任务零依赖约束）。
+不引入 ``jsonschema``。
 """
 
 import asyncio
 import logging
 import re
+from collections import UserDict
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional
 
@@ -40,7 +41,7 @@ class ToolError(Exception):
 class TerminalCapture:
     """终止性工具（access=terminal）的捕获结果：仅记录参数，不执行 handler。
 
-    由循环收到即 break（F16 / spec §3.2.4 ②终止工具优先）。
+    由循环收到即 break（终止工具优先）。
     """
 
     name: str
@@ -52,7 +53,7 @@ class ToolDefinition:
     """单一工具定义。
 
     - ``access``：read（只读）/ write（写，执行前审计）/ terminal（终止性，仅捕获参数）
-    - ``readonly``：仅代码层面属性，决定循环的分段并行策略；不序列化进 tools schema（F16）
+    - ``readonly``：仅代码层面属性，决定循环的分段并行策略；不序列化进 tools schema
       默认由 ``access`` 推导（read→True；write/terminal→False），注册时可显式覆盖。
     - ``parameters``：OpenAI function calling 标准的 JSON Schema
     """
@@ -71,7 +72,7 @@ class ToolDefinition:
     def to_schema(self) -> dict:
         """供 provider ``tools`` 参数的 schema：仅 name/description/parameters。
 
-        readonly / access 不序列化（LLM 不可见，天然防诱导，F16）。
+        readonly / access 不序列化（LLM 不可见，天然防诱导）。
         """
         return {
             "name": self.name,
@@ -80,22 +81,32 @@ class ToolDefinition:
         }
 
 
-class BatchResults(dict):
+class BatchResults(UserDict):
     """批量执行结果：``ordered`` 独立槽位 + 兼容的 ``dict[tool_use_id, result]`` 视图。
 
     - ``ordered``：``[(tool_use_id, result), ...]``，与传入 ``tool_calls`` 一一对应
       （长度与顺序一致），消费方（loop.py）按槽位回填 tool_result，保证每条 tool_use
       都有且仅有一条对应结果
     - dict 视图：同一 ``tool_use_id`` 重复出现时保留**首个**结果（真实执行结果不会被
-      后续 duplicate 错误块覆盖）
+      后续 duplicate 错误块覆盖）。该 first-wins 契约在**任何赋值路径**下成立：构造、
+      ``[]`` 赋值、``update`` 均触发 ``__setitem__``；对已存在 key 的再次赋值被拒绝并打
+      warning 日志（避免覆盖契约被静默破坏的悬垂分支）。
     """
 
     def __init__(self, ordered: Optional[list[tuple[str, Any]]] = None) -> None:
         self.ordered: list[tuple[str, Any]] = list(ordered or [])
-        mapping: dict[str, Any] = {}
+        super().__init__()
         for tool_use_id, result in self.ordered:
-            mapping.setdefault(tool_use_id, result)
-        super().__init__(mapping)
+            self.setdefault(tool_use_id, result)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        # first-wins：已存在的 tool_use_id 拒绝覆盖，并打 warning 暴露该非预期路径
+        if key in self:
+            logger.warning(
+                "BatchResults 试图覆盖已存在的 tool_use_id=%r，保留首个结果", key
+            )
+            return
+        super().__setitem__(key, value)
 
 
 class ToolRegistry:
@@ -212,7 +223,7 @@ class ToolRegistry:
     # -- 批量分段并行执行 ---------------------------------------------------
 
     async def execute_batch(self, tool_calls: list[ToolUseBlock]) -> "BatchResults":
-        """分段并行批量执行（spec §3.2.2 / §3.2.4 ③）。
+        """分段并行批量执行。
 
         - 按原始顺序扫描：连续 readonly 段 ``asyncio.gather`` 并行（保序返回）
         - 非 readonly（write / terminal）单独串行，相对顺序保持
@@ -223,7 +234,7 @@ class ToolRegistry:
           - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
           - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
             槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
-            （F10/M26；独立槽位避免 dup 错误块覆盖首个真实结果）
+            （独立槽位避免 dup 错误块覆盖首个真实结果）
         """
         n = len(tool_calls)
         slots: list[Any] = [None] * n
@@ -231,7 +242,7 @@ class ToolRegistry:
         i = 0
         while i < n:
             tc = tool_calls[i]
-            # 重复 tool_use_id：不执行 handler，本槽位回填错误块（F10/M26）
+            # 重复 tool_use_id：不执行 handler，本槽位回填错误块
             if tc.id in seen_ids:
                 slots[i] = self._duplicate_block(tc.id)
                 i += 1
@@ -260,7 +271,7 @@ class ToolRegistry:
 
     @staticmethod
     def _duplicate_block(tool_use_id: str) -> ToolResultBlock:
-        """重复 tool_use_id 的占位错误块（不执行 handler，F10/M26）。"""
+        """重复 tool_use_id 的占位错误块（不执行 handler）。"""
         return ToolResultBlock(
             tool_use_id=tool_use_id,
             content="duplicate tool_use_id",

@@ -69,7 +69,7 @@ class SummaryService:
         return get_llm_client()
 
     # ------------------------------------------------------------------
-    # 查询与构建（Phase 2.0.2 拆解，execute_job / generate_summary 共用）
+    # 查询与构建（execute_job / generate_summary 共用）
     # ------------------------------------------------------------------
 
     def _query_records(
@@ -309,7 +309,7 @@ class SummaryService:
         date_to: str,
     ) -> None:
         """空内容→失败通知 / 正常→成功通知（保持既有失败语义）。"""
-        # H1 修正：provider 空内容时 model 可能仍非空，仅以 content 判定失败
+        # provider 空内容时 model 可能仍非空，仅以 content 判定失败
         # （空 choices + model 名 会误走成功分支、吞掉失败通知）
         if not response.content:
             summary_text = (

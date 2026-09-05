@@ -1,7 +1,7 @@
-"""T4：工具注册表与执行器（M29 / M29b）单元测试。
+"""工具注册表与执行器单元测试。
 
 覆盖：
-- ToolDefinition 的 readonly 推导与 to_schema 序列化（F16）
+- ToolDefinition 的 readonly 推导与 to_schema 序列化
 - ToolRegistry.register / get / execute 的注册、审计、terminal 捕获、超时、JSON Schema 校验
 - execute_batch 的分段并行（连续 readonly 段 gather 并行、非只读串行、保序）与异常统一包装
 """
@@ -84,7 +84,7 @@ def test_tool_definition_readonly_explicit_override():
 
 
 # ---------------------------------------------------------------------------
-# ToolDefinition：to_schema 不序列化 readonly / access（F16）
+# ToolDefinition：to_schema 不序列化 readonly / access
 # ---------------------------------------------------------------------------
 
 
@@ -436,7 +436,7 @@ async def test_execute_batch_preserves_order_with_write_in_middle():
 
 
 # ---------------------------------------------------------------------------
-# execute_batch：工具异常 → is_error=True 的 ToolResultBlock（F9/F10）
+# execute_batch：工具异常 → is_error=True 的 ToolResultBlock
 # ---------------------------------------------------------------------------
 
 
@@ -480,7 +480,7 @@ async def test_execute_batch_unknown_tool_wrapped_as_error_block():
 
 
 # ---------------------------------------------------------------------------
-# execute_batch：重复 tool_use_id（F10 / M26 / G2）
+# execute_batch：重复 tool_use_id
 #   重复 id 仅执行第一个；每个 tool_call 有独立结果槽位（ordered）：
 #   首个保留真实结果，第二及以后为 duplicate 错误块（不覆盖首个）
 # ---------------------------------------------------------------------------
@@ -604,6 +604,49 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     assert slots[2][1].content == "duplicate tool_use_id"
     # dict 视图保留首个真实结果
     assert results["dup"].is_error is False
+
+
+# ---------------------------------------------------------------------------
+# BatchResults：first-wins 契约 + 覆盖拒绝 warning（UserDict）
+# ---------------------------------------------------------------------------
+
+
+def test_batch_results_construct_keeps_first_result():
+    from app.services.llm.tools import BatchResults
+
+    r1 = ToolResultBlock(tool_use_id="dup", content="real", is_error=False)
+    r2 = ToolResultBlock(tool_use_id="dup", content="dup", is_error=True)
+    results = BatchResults([("dup", r1), ("dup", r2)])
+    assert results["dup"] is r1
+
+
+def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
+    from app.services.llm.tools import BatchResults
+
+    r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
+    r2 = ToolResultBlock(tool_use_id="a", content="second", is_error=False)
+    results = BatchResults([("a", r1)])
+
+    with caplog.at_level(logging.WARNING, logger="app.services.llm.tools"):
+        results["a"] = r2  # 试图覆盖已存在 key
+        results.update({"a": r2})  # update 同样触发 __setitem__
+
+    # first-wins：两次覆盖均被拒绝，仍保留首个结果
+    assert results["a"] is r1
+    # 覆盖路径被 warning 日志显式暴露（非悬垂静默分支）
+    warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warns) == 2
+    assert all("覆盖已存在的 tool_use_id" in w.getMessage() for w in warns)
+
+
+def test_batch_results_setitem_allows_new_key():
+    from app.services.llm.tools import BatchResults
+
+    r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
+    r2 = ToolResultBlock(tool_use_id="b", content="new", is_error=False)
+    results = BatchResults([("a", r1)])
+    results["b"] = r2  # 新 key 正常写入
+    assert results["b"] is r2
 
 
 # ---------------------------------------------------------------------------

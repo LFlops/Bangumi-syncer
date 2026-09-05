@@ -190,7 +190,7 @@ class AnthropicProvider(BaseProvider):
     def _system_text(self, content: str | list[ContentBlock]) -> str:
         """提取 system 消息文本：str 直接用，list 取 text block 拼接（其余类型跳过）。
 
-        多块拼接与多条 system 消息的合并（\n\n）保持同一分隔语义，避免 Phase 2
+        多块拼接与多条 system 消息的合并（\n\n）保持同一分隔语义，避免
         记忆注入产出多块 system 时与多条 system 消息行为不一致。
         """
         if isinstance(content, str):
@@ -208,7 +208,7 @@ class AnthropicProvider(BaseProvider):
     def _to_wire_block(self, block: ContentBlock) -> dict:
         """内部 content block → Anthropic wire content block。
 
-        工具协议（Phase 3 / §3.2.1）：
+        工具协议：
         - ToolUseBlock → {"type": "tool_use", "id", "name", "input"}（assistant 消息，1:1）
         - ToolResultBlock → {"type": "tool_result", "tool_use_id", "content", "is_error"}（user 消息）
         其余类型沿用 model_dump（exclude_none）保持向后行为一致。block 若携带
@@ -250,7 +250,7 @@ class AnthropicProvider(BaseProvider):
             elif btype == "redacted_thinking":
                 blocks.append(RedactedThinkingBlock(data=block.get("data", "")))
             elif btype == "tool_use":
-                # 工具调用请求块（Phase 3 / §3.2.1）：转为内部 ToolUseBlock，
+                # 工具调用请求块：转为内部 ToolUseBlock，
                 # stop_reason 为 "tool_use" 时由调用方驱动 agent 循环执行工具。
                 blocks.append(
                     ToolUseBlock(

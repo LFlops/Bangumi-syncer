@@ -152,7 +152,7 @@ class OpenAICompatProvider(BaseProvider):
         )
         if effort is not None:
             body["reasoning_effort"] = effort
-            # H3：o 系列推理模型拒绝非 1 的 temperature（硬 400），
+            # o 系列推理模型拒绝非 1 的 temperature（硬 400），
             # 与 Anthropic thinking 开启时的处理对齐（anthropic.py 强制 1）
             body["temperature"] = 1
 
@@ -161,7 +161,7 @@ class OpenAICompatProvider(BaseProvider):
             body["tools"] = kwargs["tools"]
         if "tool_choice" in kwargs:
             body["tool_choice"] = kwargs["tool_choice"]
-        # F17：cache_control 是 Anthropic 专属参数，OpenAI 无此字段——忽略不发送，
+        # cache_control 是 Anthropic 专属参数，OpenAI 无此字段——忽略不发送，
         # 即便调用方误传也不得进入请求体（否则部分端点报错）
         body.pop("cache_control", None)
         return body
@@ -171,7 +171,7 @@ class OpenAICompatProvider(BaseProvider):
 
         content 为 list[ContentBlock] 时取 text block 拼接（与 Anthropic 侧
         _system_text 同一分隔语义）；thinking/tool 等 block 不适用于当前端点，
-        跳过（工具协议见 _to_wire_messages，Phase 3）。
+        跳过（工具协议见 _to_wire_messages）。
         """
         if isinstance(m.content, str):
             return {"role": m.role, "content": m.content}
@@ -247,7 +247,7 @@ class OpenAICompatProvider(BaseProvider):
         # 误中导致向不支持的端点发送未知参数。OpenAI 对未知参数的行为因 API 版本
         # 而异，不冒险传给非 o 系列。
         if not re.match(r"^o\d", model):
-            # L6：配置/模型不匹配是静态事实，warning 刷屏无益——降为 debug
+            # 配置/模型不匹配是静态事实，warning 刷屏无益——降为 debug
             # （用户可通过 stats/日志在调优期定位）
             logger.debug(
                 f"model {model} 非 o 系列不支持 reasoning_effort，"
@@ -262,7 +262,7 @@ class OpenAICompatProvider(BaseProvider):
         message = choice.get("message", {})
         content = message.get("content")
         refusal = message.get("refusal")
-        # M10：finish_reason → stop_reason（与 Anthropic 对齐，P4 判断 max_tokens 截断用）；
+        # finish_reason → stop_reason（与 Anthropic 对齐，供 max_tokens 截断判断用）；
         # "tool_calls" 统一映射为内部 "tool_use"
         finish_reason = choice.get("finish_reason") or ""
         stop_reason = "tool_use" if finish_reason == "tool_calls" else finish_reason

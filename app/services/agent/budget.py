@@ -1,9 +1,9 @@
-"""预算策略：IterationStrategy 注册表（Phase 4 完整 budget.py 的前身）。
+"""预算策略：IterationStrategy 注册表。
 
 轻量策略模式：每个 task_type 注册一个「思考强度 → 轮次上限」的映射，
 通用 Agent 骨架（loop.py）只消费计算好的 max_iterations，不关心映射来源。
 
-优先级（定稿，见 specs/agent-phase3-match.md §3.2.5）：
+优先级：
     1. config_override（[sync] llm_match_max_iterations 显式整体覆盖，最高）
     2. task_type 对应策略映射
     3. 默认兜底 {"off":1, "low":2, "medium":3, "high":5}
@@ -62,7 +62,7 @@ def get_max_iterations(
 
 
 def register_defaults() -> None:
-    """注册骨架内置默认策略（幂等，供 Phase 4 扩展或测试显式调用）。"""
+    """注册骨架内置默认策略（幂等，供后续扩展或测试显式调用）。"""
     register_iteration_strategy("match", MatchIterationStrategy())
 
 

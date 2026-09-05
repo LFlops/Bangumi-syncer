@@ -4,7 +4,7 @@
 - agent_runs：一次会话（pending -> processing -> succeeded / no_suggestion / failed ...）
 - agent_steps：每轮 LLM 调用 / 每次工具执行的 span（按 iteration, sequence 排序）
 
-关键并发与守卫语义（见 spec 3.3.1 / 3.4 / D13 / D14 / F3 / F6）：
+关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - mark_applied / mark_rejected：仅当 status='succeeded' 可流转（WHERE 守卫）
 - increment_attempts：调度轮次失败计数，>=3 转 failed
@@ -215,7 +215,7 @@ class AgentRunsRepository(BaseRepository):
         )
 
     def refresh_started_at(self, run_id: str) -> bool:
-        """恢复扫描时刷新 started_at=now()（仅 processing 态有效，D18/B-3）。
+        """恢复扫描时刷新 started_at=now()（仅 processing 态有效）。
 
         防止下一轮重复恢复同一崩溃遗留 run；行数=0（非 processing）返回 False。
         """

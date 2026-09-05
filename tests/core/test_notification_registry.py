@@ -184,7 +184,7 @@ class TestAiringToday:
 
 
 class TestPendingCandidateInAppMapping:
-    """pending_candidate 登记站内信映射（T15 / M17）"""
+    """pending_candidate 登记站内信映射"""
 
     def test_pending_candidate_has_match_pending_in_app_type(self):
         meta = get_type_meta("pending_candidate")
@@ -207,7 +207,7 @@ class TestPendingCandidateInAppMapping:
 
 
 class TestPendingCandidateInAppBody:
-    """站内信正文：AI 标识前缀 + 转义（T15 / M17）"""
+    """站内信正文：AI 标识前缀 + 转义"""
 
     def test_is_llm_suggestion_true_adds_prefix_and_reason(self):
         svc, fake_db = _make_service()

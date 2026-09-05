@@ -656,7 +656,7 @@ class TestExecuteJob:
         data = mock_ns.notify.call_args.kwargs
         assert data["tokens_used"] == 0
 
-    # ── 记忆注入（Phase 2.0.2）──────────────────────────────────────
+    # ── 记忆注入 ──────────────────────────────────────
 
     @staticmethod
     def _svc_with_real_memory(temp_dir, job_name="test_job"):
@@ -1089,7 +1089,7 @@ class TestRelatedInjection:
 
 
 class TestEmptyContentWithModel:
-    """H1：空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
+    """空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
 
     @pytest.mark.asyncio
     async def test_empty_content_with_model_name_sends_failure(
@@ -1114,7 +1114,7 @@ class TestEmptyContentWithModel:
 
 
 class TestRelatedIndependentOfMemoryLimit:
-    """M1：related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
+    """related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
 
     @pytest.mark.asyncio
     async def test_related_works_when_memory_limit_zero(

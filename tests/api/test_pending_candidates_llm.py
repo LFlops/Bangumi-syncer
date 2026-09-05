@@ -1,4 +1,4 @@
-"""待确认候选 API 的 LLM / agent_run 字段测试（Task T17 / 场景 M31 后端部分）
+"""待确认候选 API 的 LLM / agent_run 字段测试。
 
 覆盖：
 - 列表 / 详情 / 按 sync_record_id 查询 均返回 llm_subject_id、llm_reason、agent_run_status、agent_run_id

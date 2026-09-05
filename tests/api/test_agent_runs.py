@@ -1,5 +1,5 @@
 """
-Agent 追踪 API 测试（Task T10 / 场景 M21, M21b）
+Agent 追踪 API 测试
 
 覆盖：
 - 未认证请求 → 401

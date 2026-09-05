@@ -1,4 +1,4 @@
-"""T18：「匹配增强（LLM）」开关条件渲染 E2E（M18b）。
+"""「匹配增强（LLM）」开关条件渲染 E2E。
 
 依赖浏览器，CI 执行；本地无浏览器时由 tests/api/test_config_match_assist.py
 的渲染测试 + 手测清单覆盖。
@@ -23,7 +23,7 @@ def _open_config_page(page, base_url: str):
 
 
 def test_match_assist_switch_hidden_when_llm_not_configured(authed_page, base_url: str):
-    """M18b：LLM 未配置 → 开关不显示 + 提示「需先配置 LLM」。"""
+    """LLM 未配置 → 开关不显示 + 提示「需先配置 LLM」。"""
     page = authed_page
     _open_config_page(page, base_url)
 
@@ -43,7 +43,7 @@ def test_match_assist_switch_hidden_when_llm_not_configured(authed_page, base_ur
 
 
 def test_match_assist_switch_visible_when_llm_configured(authed_page, base_url: str):
-    """M18b：LLM 已配置 → 开关显示；保存生效（sync.llm_match_assist 写入）。"""
+    """LLM 已配置 → 开关显示；保存生效（sync.llm_match_assist 写入）。"""
     page = authed_page
 
     # 自行配置 LLM（写入 api_key），使 llm_available=true

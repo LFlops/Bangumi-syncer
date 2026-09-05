@@ -155,7 +155,7 @@ async def get_config(
 async def get_sync_config(
     request: Request, current_user: dict = Depends(get_current_user_flexible)
 ) -> dict[str, Any]:
-    """获取 [sync] 段 LLM 匹配增强配置 + llm_available 标志（M18a）。
+    """获取 [sync] 段 LLM 匹配增强配置 + llm_available 标志。
 
     - llm_available：LLM api_key 是否非空（true=已配置）。
     - llm_api_key_masked：按 app/api/llm.py 的脱敏方式返回掩码值（不泄露明文）。
@@ -264,8 +264,8 @@ async def update_config(
         # 遗留单用户段 [bangumi] 账号字段已迁移到 DB，忽略前端回写避免与 DB 真相源分裂
         data.pop("bangumi", None)
 
-        # ── M18a：开启 llm_match_assist 时校验 LLM api_key 已配置 ──
-        # 拒绝原因须为"需先配置 LLM"（M18a 场景）。HTTPException 需透传，
+        # ── 开启 llm_match_assist 时校验 LLM api_key 已配置 ──
+        # 拒绝原因须为"需先配置 LLM"。HTTPException 需透传，
         # 不能被下方 except Exception 吞掉成 500。
         if _llm_match_assist_will_be_enabled(data) and not (
             _effective_llm_api_key_nonempty(data)

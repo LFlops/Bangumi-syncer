@@ -64,7 +64,7 @@ class ToolResultBlock(BaseModel):
     is_error: bool = False
 
 
-# 向后兼容：Text/Thinking/Redacted 现有行为不变；Phase 3 扩展追加
+# 向后兼容：Text/Thinking/Redacted 现有行为不变；扩展追加
 # ToolUse/ToolResult 两类工具协议块。
 ContentBlock = Union[
     TextBlock,
@@ -97,7 +97,7 @@ class ChatResponse(BaseModel):
     """聊天补全请求的响应。
 
     content 为纯文本（无 tool call 时），旧代码照常用；blocks 携带完整内容块
-    （含 thinking），供 Phase 3 的 agent 循环消费；stop_reason 为统一结束原因
+    （含 thinking），供 agent 循环消费；stop_reason 为统一结束原因
     （end_turn / tool_use / max_tokens）。
     """
 

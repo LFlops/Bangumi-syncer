@@ -14,7 +14,7 @@ from app.services.llm.models import (
 
 
 class TestContentBlock:
-    """ContentBlock 构造与校验（Scenario 3.1）。"""
+    """ContentBlock 构造与校验。"""
 
     def test_text_block(self):
         b = TextBlock(text="hi")
@@ -46,7 +46,7 @@ class TestContentBlock:
     def test_unknown_block_type_not_in_union(self):
         """Union 仅接受已知 block 类型。
 
-        Phase 3（T1/§3.2.1）已将 tool_use / tool_result 纳入 ContentBlock，
+        tool_use / tool_result 已被纳入 ContentBlock，
         故这两个类型现在可被 Message 正常解析；真正未知的 block type 仍抛
         ValidationError（向后强约束）。
         """
@@ -118,7 +118,7 @@ class TestMessage:
         assert msg.content == ""
 
     def test_message_content_blocks(self):
-        """Scenario 3.2: 新用法——content 为 list[ContentBlock]。"""
+        """新用法——content 为 list[ContentBlock]。"""
         msg = Message(role="assistant", content=[TextBlock(text="hi")])
         assert isinstance(msg.content, list)
         block = msg.content[0]
@@ -126,7 +126,7 @@ class TestMessage:
         assert block.text == "hi"
 
     def test_message_str_backward_compat(self):
-        """Scenario 3.2: 旧用法——content 为 str。"""
+        """旧用法——content 为 str。"""
         msg = Message(role="user", content="纯文本")
         assert isinstance(msg.content, str)
         assert msg.content == "纯文本"

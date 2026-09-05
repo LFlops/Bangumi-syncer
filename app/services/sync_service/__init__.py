@@ -532,7 +532,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         return True, "已忽略"
 
     # ------------------------------------------------------------------
-    # 候选确认/忽略与 agent_runs 状态机联动（T14，守卫见 spec §3.4）
+    # 候选确认/忽略与 agent_runs 状态机联动
     # ------------------------------------------------------------------
 
     def _linkage_mark_applied(self, sync_record_id: int) -> None:

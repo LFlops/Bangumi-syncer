@@ -1,16 +1,16 @@
-"""LLM 匹配增强调度器（spec §3.6 / Task T12，场景 M8/M9/M10 + 恢复 + 去重 + 清理）
+"""LLM 匹配增强调度器。
 
 继承 BaseScheduler，同构 bangumi_replay_scheduler，按 ``[sync] llm_match_cron``
 （默认 ``*/1 * * * *``）定时轮询 agent_runs 处理 match 任务。
 
-每轮顺序（串行处理，F3/R40）：
+每轮顺序（串行处理）：
 1. **清理**：终态且 ended_at 超保留期 → 先删 agent_steps 再删 agent_runs（级联）+ 日志
-2. **恢复扫描（D18）**：``processing`` 且 started_at 超时的遗留 run → 刷新 started_at
+2. **恢复扫描**：``processing`` 且 started_at 超时的遗留 run → 刷新 started_at
    → sync_record 缺失则 mark_failed；否则重建种子 + 重放 replay_delta → 续跑 loop
 3. **正常处理**：逐条原子拾取（由 llm_assist.run 内部 atomic_claim 负责）→
    调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
 
-去重落在落任务入口（T14 的 _handle_match_failure），本调度器只处理已存在任务。
+去重落在落任务入口（sync_service 的 _handle_match_failure），本调度器只处理已存在任务。
 幂等：恢复中崩溃 → 下次再扫（list_stale_processing 按 started_at 超时判定）。
 """
 
@@ -25,7 +25,7 @@ from app.services.base.scheduler import BaseScheduler
 from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
 
-# G5：非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
+# 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
 _SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
 
@@ -56,7 +56,7 @@ class LlmMatchScheduler(BaseScheduler):
     DEFAULT_CRON = "*/1 * * * *"  # 每 60s
     DRIVER_NAME = "LlmMatch"
 
-    # 每轮最多处理 N 条 pending，防堆积（F3/R40）
+    # 每轮最多处理 N 条 pending，防堆积
     BATCH_SIZE = 5
 
     # ------------------------------------------------------------------
@@ -108,7 +108,7 @@ class LlmMatchScheduler(BaseScheduler):
         if deleted and deleted > 0:
             logger.info(f"🤖 清理终态过期 agent_run {deleted} 条")
 
-        # 2. 恢复扫描（D18）
+        # 2. 恢复扫描
         recovery_timeout = _cfg_int(
             config_manager.get("sync", "llm_match_recovery_timeout_s", fallback=120),
             120,
@@ -141,7 +141,7 @@ class LlmMatchScheduler(BaseScheduler):
     # ------------------------------------------------------------------
 
     async def _recover_run(self, run: dict) -> None:
-        """恢复单条崩溃遗留的 processing run（D18）。
+        """恢复单条崩溃遗留的 processing run。
 
         1. 刷新 started_at（防下一轮重复恢复）
         2. sync_record 缺失 → mark_failed(error)
@@ -164,7 +164,7 @@ class LlmMatchScheduler(BaseScheduler):
         await self._continue_replay(run, sync_record)
 
     async def _continue_replay(self, run: dict, sync_record: dict) -> None:
-        """断点恢复续跑（简化版，spec §3.6 / I-2）。
+        """断点恢复续跑。
 
         重建种子消息 → trace.replay 重建可续跑消息列表 + 终局响应：
         - ``last_response`` 为 None → 全部轮次已完整记录 → 以剩余轮次续跑通用循环

@@ -429,7 +429,7 @@ smtp_server = smtp.example.com
 
 
 class TestSyncLlmMatchConfig:
-    """[sync] 段 llm_match_* 键读取（含默认值），T16 正式化。
+    """[sync] 段 llm_match_* 键读取（含默认值）。
 
     上游调度器/编排已直接 get 这些键；本方法集中默认值供 API 复用。
     """

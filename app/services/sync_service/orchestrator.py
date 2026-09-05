@@ -356,7 +356,7 @@ class SyncOrchestrator:
             trace.final_message = "未找到匹配的番剧"
         trace.finish()
 
-        # ===== 匹配增强接入（T14）：开关开 + LLM 可用时提交 AI 评估任务 =====
+        # ===== 匹配增强接入：开关开 + LLM 可用时提交 AI 评估任务 =====
         # 决定前先读取开关与 LLM 配置；trace step 必须在 _persist_sync_record
         # 之前追加（trace 入库后不可改），LLM 评估结论异步承载于 agent_runs。
         assist_enabled = self._match_assist_enabled()
@@ -406,7 +406,7 @@ class SyncOrchestrator:
         return SyncResponse(status="error", message="未找到匹配的番剧")
 
     # ------------------------------------------------------------------
-    # 匹配增强接入辅助（T14）：开关/配置判定 + 任务去重落库
+    # 匹配增强接入辅助：开关/配置判定 + 任务去重落库
     # ------------------------------------------------------------------
 
     def _match_assist_enabled(self) -> bool:
