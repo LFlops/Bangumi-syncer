@@ -911,7 +911,12 @@ class TestExecuteJob:
     async def test_consumed_records_excluded_from_prompt(
         self, temp_dir, reset_singletons
     ):
-        """S2：本任务已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
+        """S2：本任务已消费记录不进观影明细区（信息由摘要承继）；未消费记录正常。
+
+        历史素材（head 行为）作为背景附在 user 消息末尾的
+        `## 历史执行上下文` 小节，因此仅断言**明细区**不含已消费记录，
+        记忆素材本身允许出现该标题。
+        """
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         # 先写入本任务的记忆条目（run-own 属于本任务），再标记对应记录已消费
         db.memory.store_and_mark(
@@ -946,8 +951,12 @@ class TestExecuteJob:
             await svc.execute_job(config)
 
         user_content = mock_client.chat.call_args.args[0][1].content
-        assert "番剧A" not in user_content  # 本任务已消费 → 排除
-        assert "番剧B" in user_content  # 未消费 → 保留
+        # 明细区（`## 历史执行上下文` 之前）不含已消费记录、含未消费记录
+        detail_zone, _, memory_zone = user_content.partition("## 历史执行上下文")
+        assert "番剧A" not in detail_zone  # 本任务已消费 → 从明细排除
+        assert "番剧B" in detail_zone  # 未消费 → 保留在明细
+        # 记忆素材区：历史摘要作为背景附在 user 末尾（head 行为），可含该标题
+        assert "昨日看了番剧A" in memory_zone
 
     @pytest.mark.asyncio
     async def test_consumed_by_other_task_kept_in_prompt(
