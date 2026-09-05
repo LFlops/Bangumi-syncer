@@ -29,6 +29,8 @@ from .api.inbox import router as inbox_router
 from .api.llm import router as llm_router
 from .api.logs import router as logs_router
 from .api.mappings import router as mappings_router
+from .api.mcp_config import router as mcp_config_router
+from .api.mcp_logs import router as mcp_logs_router
 from .api.notification import router as notification_router
 from .api.pages import router as pages_router
 from .api.proxy import router as proxy_router
@@ -45,6 +47,7 @@ from .core.background_tasks import (
 from .core.config import config_manager
 from .core.database import database_manager
 from .core.logging import log_request_id, logger
+from .core.mcp_auth import PublicKeyNotFoundError, load_public_key
 from .core.public_url import get_public_base_path
 from .core.scheduler_registry import scheduler_registry
 from .core.startup_info import startup_info
@@ -52,6 +55,15 @@ from .services.feiniu.sync_service import ensure_feiniu_startup_watermark
 from .services.mapping_service import mapping_service
 from .services.scheduler_bootstrap import register_all as register_schedulers
 from .services.sync_service import sync_service
+
+# MCP 内部 API 公钥默认路径（可通过环境变量 MCP_PUBLIC_KEY_PATH 覆盖）
+_DEFAULT_MCP_PUBLIC_KEY_PATH: str = "/mcp_auth/mcp_public.pem"
+
+
+def _get_mcp_public_key_path() -> str:
+    """读取 MCP 公钥路径：优先环境变量 MCP_PUBLIC_KEY_PATH，否则默认共享卷位置。"""
+    return os.environ.get("MCP_PUBLIC_KEY_PATH", _DEFAULT_MCP_PUBLIC_KEY_PATH)
+
 
 # 创建FastAPI应用（root_path 便于反代子路径下 OpenAPI 等）
 _app_kw: dict = {
@@ -97,6 +109,27 @@ async def lifespan(app: FastAPI):
         ensure_feiniu_startup_watermark()
     except Exception as e:
         logger.debug(f"飞牛启动水位检查: {e}")
+
+    # 加载 MCP 公钥（共享卷 mcp_public.pem），缺失时不阻断主服务启动
+    mcp_public_key_path = _get_mcp_public_key_path()
+    try:
+        load_public_key(mcp_public_key_path)
+        logger.info(f"MCP 公钥加载成功: {mcp_public_key_path}")
+    except PublicKeyNotFoundError:
+        logger.warning(
+            f"MCP 公钥未找到（{mcp_public_key_path}），MCP 内部 API 暂不可用，"
+            "请确认 mcp_server 已运行并写入共享卷"
+        )
+    except Exception as e:
+        logger.warning(f"MCP 公钥加载失败（不影响主流程）: {e}")
+
+    # 将可配置的公钥路径同步到 deps 模块（保持单一配置源）
+    try:
+        from .api import deps
+
+        deps._MCP_PUBLIC_KEY_PATH = mcp_public_key_path
+    except Exception as e:
+        logger.warning(f"同步 MCP 公钥路径到 deps 模块失败: {e}")
 
     # 清理超过保留天数的同步记录，控制数据库体积
     try:
@@ -203,6 +236,8 @@ app.include_router(config_router)
 app.include_router(bgm_poster_router)
 app.include_router(mappings_router)
 app.include_router(logs_router)
+app.include_router(mcp_logs_router)
+app.include_router(mcp_config_router)
 app.include_router(pages_router)
 app.include_router(health_router)
 app.include_router(app_release_router)
