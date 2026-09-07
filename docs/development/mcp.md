@@ -100,13 +100,13 @@ JWT claims：
 
 ```python
 {
-    "sub": "admin",          # 用户名
-    "scope": "read write",   # 权限范围
+    "sub": "admin",  # 用户名
+    "scope": "read write",  # 权限范围
     "iss": "http://localhost:3000",
     "aud": "bs",
     "iat": 1700000000,
     "exp": 1700003600,
-    "jti": "..."             # 唯一标识
+    "jti": "...",  # 唯一标识
 }
 ```
 
@@ -139,9 +139,12 @@ JWT claims：
 @router.get("/api/mcp/logs")
 async def get_logs(user=Depends(get_mcp_client())): ...
 
+
 # 需要 write scope
 @router.post("/api/mcp/config/update")
-async def update_config(payload, user=Depends(get_mcp_client(require_scope="write"))): ...
+async def update_config(
+    payload, user=Depends(get_mcp_client(require_scope="write"))
+): ...
 ```
 
 返回值：`{"username": "admin", "scope": ["read", "write"], "mcp": True}`
@@ -238,7 +241,9 @@ BS 侧的 MCP 相关测试（`tests/api/` 下）使用标准模式：
 
 ```python
 app.dependency_overrides[get_mcp_client()] = lambda: {
-    "username": "test", "scope": ["read", "write"], "mcp": True
+    "username": "test",
+    "scope": ["read", "write"],
+    "mcp": True,
 }
 ```
 
