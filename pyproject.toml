@@ -1,12 +1,13 @@
 [project]
 name = "bangumi-syncer"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
     "APScheduler>=3.10.0",
     "bleach>=6.2.0",
     "cryptography>=42.0.0",
-    "fastapi>=0.126.0",
+    "fastapi>=0.133.0",
+    "fastmcp>=4.0.3",
     "httpx>=0.25.0",
     "ijson>=3.4.0.post0",
     "jinja2>=3.1.6",
@@ -37,7 +38,7 @@ dev = [
 
 [tool.ruff]
 # 设定目标 Python 版本
-target-version = "py39"
+target-version = "py310"
 line-length = 88
 
 [tool.ruff.lint]
