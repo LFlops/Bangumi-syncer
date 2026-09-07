@@ -6,7 +6,7 @@ import asyncio
 import os
 import re
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -23,7 +23,7 @@ _LOG_TIMESTAMP_RE = re.compile(r"^\[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
 
 
-def _parse_log_timestamp(line: str) -> Optional[datetime]:
+def _parse_log_timestamp(line: str) -> datetime | None:
     """解析日志行中的时间戳；无法解析返回 None。"""
     m = _LOG_TIMESTAMP_RE.match(line)
     if not m:
@@ -59,8 +59,8 @@ def _parse_iso_datetime(value: str) -> datetime:
 
 def _filter_by_time_range(
     content: str,
-    since: Optional[datetime],
-    until: Optional[datetime],
+    since: datetime | None,
+    until: datetime | None,
 ) -> str:
     """按时间范围过滤日志内容行。"""
     if since is None and until is None:
@@ -82,11 +82,11 @@ def _filter_by_time_range(
 
 @router.get("/logs")
 async def get_mcp_logs(
-    level: Optional[str] = None,
+    level: str | None = None,
     limit: int = Query(50, ge=1, le=10000),
-    search: Optional[str] = None,
-    since: Optional[str] = None,
-    until: Optional[str] = None,
+    search: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
     current_user: dict = Depends(get_mcp_client()),
 ) -> dict[str, Any]:
     """MCP 内部 API：获取日志内容，支持级别过滤与时间范围过滤。"""
@@ -103,8 +103,8 @@ async def get_mcp_logs(
         level = level_upper
 
     # 验证并解析时间范围
-    since_dt: Optional[datetime] = None
-    until_dt: Optional[datetime] = None
+    since_dt: datetime | None = None
+    until_dt: datetime | None = None
 
     if since is not None:
         try:

@@ -16,9 +16,7 @@
         })();
         </script>
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>
-            {% block title %}Bangumi Syncer{% endblock %}
-        </title>
+        <title>{% block title %}Bangumi Syncer{% endblock %}</title>
         <link href="{{ '/static/css/bootstrap.min.css' | static_v }}"
               rel="stylesheet">
         <link href="{{ '/static/css/bootstrap-icons.css' | static_v }}"
@@ -260,7 +258,7 @@
                         </h1>
                         <div class="btn-toolbar mb-2 mb-md-0 align-items-center gap-2 flex-wrap flex-md-nowrap">
                             <!-- 主题切换（仅仪表盘页面） -->
-                            {% if request.url.path == '/dashboard' or request.url.path.endswith('/dashboard') %}
+                            {% if request.url.path == "/dashboard" or request.url.path.endswith("/dashboard") %}
                                 <div class="header-theme-switcher" id="headerThemeSwitcher">
                                     <button class="theme-toggle-capsule"
                                             id="themeToggleCapsule"
@@ -592,7 +590,6 @@
             themeManager.onChange(updateThemeToggleUI);
         });
         </script>
-        {% block scripts %}
-        {% endblock %}
+        {% block scripts %}{% endblock %}
     </body>
 </html>

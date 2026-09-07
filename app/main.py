@@ -12,6 +12,7 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
+from fastmcp.utilities.lifespan import combine_lifespans
 
 from .api.airing_calendar import router as airing_calendar_router
 from .api.app_release import router as app_release_router
@@ -51,6 +52,7 @@ from .core.mcp_auth import PublicKeyNotFoundError, load_public_key
 from .core.public_url import get_public_base_path
 from .core.scheduler_registry import scheduler_registry
 from .core.startup_info import startup_info
+from .mcp.server import mcp_app
 from .services.feiniu.sync_service import ensure_feiniu_startup_watermark
 from .services.mapping_service import mapping_service
 from .services.scheduler_bootstrap import register_all as register_schedulers
@@ -186,7 +188,9 @@ async def lifespan(app: FastAPI):
         logger.error(f"关闭数据库连接失败: {e}")
 
 
-app = FastAPI(**_app_kw, lifespan=lifespan)
+# 合并 MCP lifespan（FastMCP 内部资源启停）到主应用 lifespan
+_app_kw["lifespan"] = combine_lifespans(lifespan, mcp_app.lifespan)
+app = FastAPI(**_app_kw)
 
 
 # X-Request-ID 透传/生成规则：仅接受可见 ASCII 标点类安全字符，
@@ -255,6 +259,35 @@ app.include_router(bangumi_archive_router)
 app.include_router(bangumi_oauth_router)
 app.include_router(bangumi_replay_router)
 app.include_router(airing_calendar_router)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 路由扁平化（兼容 Starlette >= 0.53 的 _IncludedRouter 内部结构）
+# Starlette 新版将 include_router 的 APIRouter 包装为 _IncludedRouter，
+# 导致 app.routes 不再直接暴露子路由（影响依赖 app.routes 的现有测试）。
+# 此处手动展开 _IncludedRouter，恢复扁平路由列表。
+# ─────────────────────────────────────────────────────────────────────────
+_flattened: list = []
+for _iroute in app.router.routes:
+    if type(_iroute).__name__ == "_IncludedRouter":
+        _flattened.extend(_iroute.original_router.routes)
+    else:
+        _flattened.append(_iroute)
+app.router.routes = _flattened
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FastMCP 路由手动注册（S1 Spike 结论：不能 app.mount("/mcp", mcp_app)，
+# 否则 /.well-known/*、/authorize、/token 会错位到 /mcp/ 下，违反 RFC 8414）
+# 遍历 mcp_app.routes 手动添加到 FastAPI router，保持原始路径：
+#   /.well-known/*  → 根路径（OAuth discovery）
+#   /authorize      → 根路径（授权端点）
+#   /token          → 根路径（令牌端点）
+#   /mcp            → /mcp（工具端点）
+# ─────────────────────────────────────────────────────────────────────────
+for _mcp_route in mcp_app.routes:
+    if hasattr(_mcp_route, "path"):
+        app.router.routes.append(_mcp_route)
 
 
 # ─────────────────────────────────────────────────────────────────────────
