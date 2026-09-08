@@ -18,13 +18,14 @@ import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import jwt
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastmcp.server.auth import OAuthProvider
 from fastmcp.server.auth.cimd import CIMDClientManager
+from fastmcp.server.auth.redirect_validation import is_loopback_host
 from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import (
     AccessToken,
@@ -186,8 +187,9 @@ class BangumiOAuthProvider(OAuthProvider):
     ) -> None:
         super().__init__(
             base_url=base_url,
+            issuer_url=issuer,
             client_registration_options=client_registration_options
-            or ClientRegistrationOptions(enabled=True),
+            or ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"]),
             revocation_options=revocation_options or RevocationOptions(enabled=True),
         )
         self.rsa_manager = rsa_manager
@@ -206,6 +208,7 @@ class BangumiOAuthProvider(OAuthProvider):
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
         self._pending_auths: dict[str, dict[str, Any]] = {}
+        self._revoked_tokens: set[str] = set()
 
         # CIMD manager with default scope injection
         self.cimd = CIMDClientManager(
@@ -298,18 +301,34 @@ class BangumiOAuthProvider(OAuthProvider):
 
         # Validate redirect_uri
         redirect_uri_str = str(params.redirect_uri)
-        if not params.redirect_uri_provided_explicitly:
-            # If not explicitly provided, we can use the registered one
-            pass
-        elif client_id in self._clients:
-            registered_client = self._clients[client_id]
-            allowed_uris = [str(u) for u in (registered_client.redirect_uris or [])]
-            if allowed_uris and redirect_uri_str not in allowed_uris:
-                # Check prefix match (for loopback URIs with ports)
-                matched = any(
-                    redirect_uri_str.startswith(uri.rstrip("/")) for uri in allowed_uris
-                )
-                if not matched:
+        if params.redirect_uri_provided_explicitly:
+            if self.cimd.is_cimd_client_id(client_id):
+                # P0-1: CIMD clients MUST have redirect_uri validated against
+                # their CIMD document's redirect_uris via component-level matching
+                cimd_client = await self.cimd.get_client(client_id)
+                if (
+                    cimd_client is not None
+                    and hasattr(cimd_client, "cimd_document")
+                    and cimd_client.cimd_document is not None
+                ):
+                    # validate_redirect_uri lives on CIMDFetcher (self.cimd._fetcher)
+                    if not self.cimd._fetcher.validate_redirect_uri(
+                        cimd_client.cimd_document, redirect_uri_str
+                    ):
+                        raise ValueError(
+                            f"redirect_uri mismatch: {redirect_uri_str} not in CIMD document redirect_uris"
+                        )
+                else:
+                    raise ValueError(
+                        f"redirect_uri validation failed: cannot resolve CIMD document for {client_id}"
+                    )
+            elif client_id in self._clients:
+                # P0-2: DCR clients use component-level exact matching
+                registered_client = self._clients[client_id]
+                allowed_uris = [str(u) for u in (registered_client.redirect_uris or [])]
+                if allowed_uris and not self._matches_redirect_uri(
+                    redirect_uri_str, allowed_uris
+                ):
                     raise ValueError(
                         f"redirect_uri mismatch: {redirect_uri_str} not in registered URIs"
                     )
@@ -331,6 +350,33 @@ class BangumiOAuthProvider(OAuthProvider):
             "created_at": time.time(),
         }
         return f"/consent?request_token={request_token}"
+
+    @staticmethod
+    def _matches_redirect_uri(redirect_uri: str, allowed_uris: list[str]) -> bool:
+        """Component-level exact matching for redirect URIs.
+
+        Compares (scheme, netloc, path) components. For loopback hosts
+        (localhost/127.0.0.1), port flexibility is allowed per RFC 8252 §7.3.
+        """
+        parsed = urlsplit(redirect_uri)
+        for allowed in allowed_uris:
+            allowed_parsed = urlsplit(allowed)
+            # Scheme must match exactly
+            if parsed.scheme != allowed_parsed.scheme:
+                continue
+            # Path must match exactly
+            if parsed.path.rstrip("/") != allowed_parsed.path.rstrip("/"):
+                continue
+            # Host must match exactly
+            if parsed.hostname != allowed_parsed.hostname:
+                continue
+            # Port: allow flexibility only for loopback hosts
+            if is_loopback_host(parsed.hostname):
+                return True
+            # Non-loopback: port must match exactly
+            if parsed.port == allowed_parsed.port:
+                return True
+        return False
 
     async def load_authorization_code(
         self,
@@ -395,9 +441,17 @@ class BangumiOAuthProvider(OAuthProvider):
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Verify JWT access token and return AccessToken."""
+        """Verify JWT access token and return AccessToken.
+
+        Also checks the token's jti against the revocation set (P1-2).
+        """
         claims = self.rsa_manager.verify_jwt(token, audience=self.audience)
         if claims is None:
+            return None
+
+        # P1-2: Check if this token has been revoked
+        jti = claims.get("jti")
+        if jti and jti in self._revoked_tokens:
             return None
 
         return AccessToken(
@@ -457,9 +511,17 @@ class BangumiOAuthProvider(OAuthProvider):
         self,
         token: AccessToken | RefreshToken,
     ) -> None:
-        """Revoke an access or refresh token."""
-        # Remove from refresh tokens store
-        if isinstance(token, RefreshToken):
+        """Revoke an access or refresh token.
+
+        For AccessToken: records the jti in the revocation set (P1-2).
+        For RefreshToken: removes from the refresh tokens store.
+        """
+        if isinstance(token, AccessToken):
+            # P1-2: Record jti in revocation set so verify_token rejects it
+            jti = token.claims.get("jti")
+            if jti:
+                self._revoked_tokens.add(jti)
+        elif isinstance(token, RefreshToken):
             self._refresh_tokens.pop(token.token, None)
 
     # ------------------------------------------------------------------
@@ -628,7 +690,9 @@ def create_auth_server(
         token_expiry_seconds=token_expiry_seconds,
         auth_enabled=auth_enabled,
         auth_username=auth_username,
-        client_registration_options=ClientRegistrationOptions(enabled=True),
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=["read", "write"]
+        ),
         revocation_options=RevocationOptions(enabled=True),
     )
 

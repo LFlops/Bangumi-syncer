@@ -3,6 +3,7 @@
 """
 
 import os
+import tempfile
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
@@ -16,11 +17,14 @@ security = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
 # MCP 内部 API 鉴权配置（可通过 monkeypatch/测试注入覆盖）
+# 公钥默认路径与 app/mcp/server.py 一致（/tmp/mcp_public.pem）
 # ---------------------------------------------------------------------------
 
-_MCP_PUBLIC_KEY_PATH: str = "/mcp_auth/mcp_public.pem"
+_MCP_PUBLIC_KEY_PATH: str = os.environ.get(
+    "MCP_RSA_PUBLIC_KEY", os.path.join(tempfile.gettempdir(), "mcp_public.pem")
+)
 _MCP_AUDIENCE: str = "bs"
-_MCP_ISSUER: str = os.environ.get("MCP_ISSUER", "http://localhost:3000")
+_MCP_ISSUER: str = os.environ.get("MCP_ISSUER", "http://localhost:8000")
 
 
 def _split_scope(scope_claim: Any) -> list[str]:
