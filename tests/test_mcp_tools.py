@@ -33,22 +33,33 @@ SAMPLE_LOG = (
 class TestGetLogs:
     """get_logs 工具：参数透传、时间过滤、文件缺失返回空。"""
 
+    @staticmethod
+    def _make_read_token():
+        """创建含 read scope 的 mock token。"""
+        mock_token = MagicMock()
+        mock_token.scopes = ["read"]
+        return mock_token
+
     @pytest.mark.asyncio
     async def test_get_logs_无参数_返回成功包络(self):
         """无参数调用 → 返回 success 包络，content 存在。"""
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/fake/app.log"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=True):
-                with patch("app.mcp.tools.os.stat") as mock_stat:
-                    mock_stat.return_value = MagicMock(
-                        st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
-                    )
-                    with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
-                        result = await tools.get_logs()
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
+                        )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs()
 
         assert result["status"] == "success"
         assert "content" in result["data"]
@@ -60,16 +71,20 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/fake/app.log"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=True):
-                with patch("app.mcp.tools.os.stat") as mock_stat:
-                    mock_stat.return_value = MagicMock(
-                        st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
-                    )
-                    with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
-                        result = await tools.get_logs(level="ERROR")
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
+                        )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs(level="ERROR")
 
         content = result["data"]["content"]
         assert "ERROR" in content
@@ -82,19 +97,23 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/fake/app.log"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=True):
-                with patch("app.mcp.tools.os.stat") as mock_stat:
-                    mock_stat.return_value = MagicMock(
-                        st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
-                    )
-                    with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
-                        result = await tools.get_logs(
-                            since="2026-09-03T11:00:00",
-                            until="2026-09-03T13:00:00",
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
                         )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs(
+                                since="2026-09-03T11:00:00",
+                                until="2026-09-03T13:00:00",
+                            )
 
         content = result["data"]["content"]
         assert "数据库连接失败" in content
@@ -108,10 +127,14 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=None,
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            result = await tools.get_logs()
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=None,
+            ):
+                result = await tools.get_logs()
 
         assert result["status"] == "success"
         assert result["data"]["content"] == ""
@@ -123,11 +146,15 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/nonexistent/log.txt"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=False):
-                result = await tools.get_logs()
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/nonexistent/log.txt"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=False):
+                    result = await tools.get_logs()
 
         assert result["status"] == "success"
         assert result["data"]["content"] == ""
@@ -139,16 +166,20 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/fake/app.log"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=True):
-                with patch("app.mcp.tools.os.stat") as mock_stat:
-                    mock_stat.return_value = MagicMock(
-                        st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
-                    )
-                    with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
-                        result = await tools.get_logs(search="数据库")
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
+                        )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs(search="数据库")
 
         content = result["data"]["content"]
         assert "数据库连接失败" in content
@@ -162,20 +193,55 @@ class TestGetLogs:
         from app.mcp import tools
 
         with patch(
-            "app.mcp.tools.resolved_dev_log_file_path",
-            return_value=Path("/secret/path/app.log"),
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
         ):
-            with patch("app.mcp.tools.os.path.exists", return_value=True):
-                with patch(
-                    "app.mcp.tools._dispatch_read_log",
-                    new=AsyncMock(
-                        side_effect=Exception("/secret/path/app.log: permission denied")
-                    ),
-                ):
-                    with pytest.raises(Exception) as exc_info:
-                        await tools.get_logs()
-                        assert "/secret/path" not in str(exc_info.value)
-                        assert "permission denied" not in str(exc_info.value)
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/secret/path/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch(
+                        "app.mcp.tools._dispatch_read_log",
+                        new=AsyncMock(
+                            side_effect=Exception(
+                                "/secret/path/app.log: permission denied"
+                            )
+                        ),
+                    ):
+                        with pytest.raises(Exception) as exc_info:
+                            await tools.get_logs()
+                            assert "/secret/path" not in str(exc_info.value)
+                            assert "permission denied" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_无token_拒绝(self):
+        """无 access token 时 get_logs 应被拒绝（ToolError）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch("app.mcp.tools.get_access_token", return_value=None):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs()
+
+        assert "read" in str(exc_info.value).lower() or "令牌" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_无read_scope_拒绝(self):
+        """无 read scope 时 get_logs 应被拒绝（ToolError）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_token = MagicMock()
+        mock_token.scopes = ["write"]
+
+        with patch("app.mcp.tools.get_access_token", return_value=mock_token):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs()
+
+        assert "read" in str(exc_info.value).lower() or "权限" in str(exc_info.value)
 
 
 # ===========================================================================
@@ -185,6 +251,13 @@ class TestGetLogs:
 
 class TestGetCurrentConfig:
     """get_current_config 工具：脱敏生效。"""
+
+    @staticmethod
+    def _make_read_token():
+        """创建含 read scope 的 mock token。"""
+        mock_token = MagicMock()
+        mock_token.scopes = ["read"]
+        return mock_token
 
     @pytest.mark.asyncio
     async def test_get_current_config_返回成功包络(self):
@@ -196,8 +269,12 @@ class TestGetCurrentConfig:
             "sync": {"match_confidence_threshold": 0.6},
         }
 
-        with patch("app.mcp.tools.config_manager", mock_cm):
-            result = await tools.get_current_config()
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                result = await tools.get_current_config()
 
         assert result["status"] == "success"
         assert "data" in result
@@ -223,8 +300,12 @@ class TestGetCurrentConfig:
             },
         }
 
-        with patch("app.mcp.tools.config_manager", mock_cm):
-            result = await tools.get_current_config()
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                result = await tools.get_current_config()
 
         data = result["data"]
         # 敏感字段 → 掩码
@@ -243,10 +324,43 @@ class TestGetCurrentConfig:
         mock_cm = MagicMock()
         mock_cm.get_all_config.return_value = {}
 
-        with patch("app.mcp.tools.config_manager", mock_cm):
-            await tools.get_current_config()
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                await tools.get_current_config()
 
         mock_cm.get_all_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_get_current_config_无token_拒绝(self):
+        """无 access token 时 get_current_config 应被拒绝（ToolError）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch("app.mcp.tools.get_access_token", return_value=None):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_current_config()
+
+        assert "read" in str(exc_info.value).lower() or "令牌" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_current_config_无read_scope_拒绝(self):
+        """无 read scope 时 get_current_config 应被拒绝（ToolError）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_token = MagicMock()
+        mock_token.scopes = ["write"]
+
+        with patch("app.mcp.tools.get_access_token", return_value=mock_token):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_current_config()
+
+        assert "read" in str(exc_info.value).lower() or "权限" in str(exc_info.value)
 
 
 # ===========================================================================

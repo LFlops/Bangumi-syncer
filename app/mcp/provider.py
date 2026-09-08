@@ -32,6 +32,7 @@ from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     RefreshToken,
+    RegistrationError,
 )
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
@@ -199,8 +200,8 @@ class BangumiOAuthProvider(OAuthProvider):
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
 
-        # Default scopes for issued tokens
-        self._default_scopes = ["read", "write"]
+        # Default scopes for issued tokens：客户端不请求 scope 时只给 read（不再 read write）
+        self._default_scopes = ["read"]
         self.MAX_CLIENTS = MAX_CLIENTS
 
         # In-memory stores
@@ -276,7 +277,7 @@ class BangumiOAuthProvider(OAuthProvider):
             client_info.scope = " ".join(self._default_scopes)
         # Enforce max client limit
         if len(self._clients) >= self.MAX_CLIENTS:
-            raise RuntimeError(
+            raise RegistrationError(
                 f"Client registration limit reached ({self.MAX_CLIENTS}). "
                 "Cannot register new clients."
             )
@@ -391,8 +392,13 @@ class BangumiOAuthProvider(OAuthProvider):
         subject: str,
         scopes: list[str],
         resource: str | None = None,
+        client_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
-        """Build JWT claims and sign. Returns (claims, access_token)."""
+        """Build JWT claims and sign. Returns (claims, access_token).
+
+        client_id 写入 JWT claims，使 load_access_token 可回填到 AccessToken.client_id，
+        从而让 SDK RevocationHandler 的 ``token.client_id == client.client_id`` 门槛成立。
+        """
         now = int(time.time())
         expires_at = now + self.token_expiry_seconds
         claims: dict[str, Any] = {
@@ -405,6 +411,8 @@ class BangumiOAuthProvider(OAuthProvider):
         }
         if resource:
             claims["resource"] = resource
+        if client_id:
+            claims["client_id"] = client_id
         return claims, self.rsa_manager.sign_jwt(claims)
 
     async def exchange_authorization_code(
@@ -417,6 +425,7 @@ class BangumiOAuthProvider(OAuthProvider):
             subject=authorization_code.subject or self.auth_username,
             scopes=authorization_code.scopes,
             resource=authorization_code.resource,
+            client_id=client.client_id,
         )
         refresh_token_str = secrets.token_urlsafe(32)
 
@@ -456,7 +465,7 @@ class BangumiOAuthProvider(OAuthProvider):
 
         return AccessToken(
             token=token,
-            client_id="",
+            client_id=claims.get("client_id", ""),
             scopes=claims.get("scope", "").split(),
             expires_at=claims.get("exp"),
             subject=claims.get("sub"),
@@ -484,6 +493,7 @@ class BangumiOAuthProvider(OAuthProvider):
         _, access_token = self._build_jwt_claims(
             subject=refresh_token.subject or self.auth_username,
             scopes=scopes,
+            client_id=client.client_id,
         )
 
         # Rotate refresh token (new one)

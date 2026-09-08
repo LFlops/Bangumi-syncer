@@ -373,13 +373,14 @@ class TestFullOAuthFlowWithToolCall:
         # Steps 1-7: OAuth 流程（同步 TestClient 处理重定向/表单）
         client = self._make_test_client(server_app)
 
-        # Step 1: DCR 注册客户端
+        # Step 1: DCR 注册客户端（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
                 "redirect_uris": ["http://localhost/callback"],
                 "grant_types": ["authorization_code"],
                 "token_endpoint_auth_method": "none",
+                "scope": "read write",
             },
         )
         assert reg_response.status_code == 201
@@ -457,9 +458,14 @@ class TestFullOAuthFlowWithToolCall:
         assert "write" in loaded_token.scopes
 
         # Step 9: 直接调用工具函数（验证工具在 server 注册后可正常执行）
+        from unittest.mock import MagicMock, patch
+
         from app.mcp.tools import get_current_config
 
-        result = await get_current_config()
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        with patch("app.mcp.tools.get_access_token", return_value=mock_token):
+            result = await get_current_config()
         assert result["status"] == "success"
         assert "data" in result
 
@@ -505,13 +511,14 @@ class TestRealHttpEndToEnd:
 
     def _do_full_oauth_flow(self, client) -> str:
         """执行完整 OAuth 流程，返回 access_token。"""
-        # Step 1: DCR
+        # Step 1: DCR（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
                 "redirect_uris": ["http://localhost/callback"],
                 "grant_types": ["authorization_code"],
                 "token_endpoint_auth_method": "none",
+                "scope": "read write",
             },
         )
         assert reg_response.status_code == 201
@@ -793,3 +800,145 @@ class TestProductionConsentRoute:
             f"/consent 路由应存在，实际状态码: {response.status_code}"
         )
         assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# S2: JWT 含 client_id → /revoke 生产路径可触发
+# ---------------------------------------------------------------------------
+
+
+class TestRevocationFlow:
+    """验证 access_token 的 client_id 写入 JWT claims，/revoke 可触发。"""
+
+    @pytest.fixture
+    def tmp_keys(self, tmp_path):
+        return {
+            "private": str(tmp_path / "private.pem"),
+            "public": str(tmp_path / "public.pem"),
+        }
+
+    @pytest.fixture
+    def server_app(self, tmp_keys):
+        return _create_test_server_with_tools(
+            private_key_path=tmp_keys["private"],
+            public_key_path=tmp_keys["public"],
+            issuer="http://localhost:8000",
+            audience="bangumi-syncer",
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+    def _make_test_client(self, app):
+        return TestClient(app, raise_server_exceptions=False)
+
+    def _do_full_oauth_flow(self, client) -> tuple[str, str]:
+        """执行完整 OAuth 流程，返回 (access_token, client_id)。"""
+        # 显式注册 read write scope，因默认 scope 已改为 read
+        reg_response = client.post(
+            "/register",
+            json={
+                "redirect_uris": ["http://localhost/callback"],
+                "grant_types": ["authorization_code"],
+                "token_endpoint_auth_method": "none",
+                "scope": "read write",
+            },
+        )
+        assert reg_response.status_code == 201
+        client_id = reg_response.json()["client_id"]
+
+        code_verifier = secrets.token_urlsafe(32)
+        code_challenge = _make_code_challenge_b64(code_verifier)
+        auth_response = client.get(
+            "/authorize",
+            params={
+                "client_id": client_id,
+                "redirect_uri": "http://localhost/callback",
+                "response_type": "code",
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "scope": "read write",
+                "state": "test-state",
+            },
+            follow_redirects=False,
+        )
+        assert auth_response.status_code == 302
+        consent_url = auth_response.headers["location"]
+
+        consent_get = client.get(consent_url)
+        assert consent_get.status_code == 200
+        csrf_token = _extract_csrf_token(consent_get.text)
+
+        parsed = urlparse(consent_url)
+        request_token = parse_qs(parsed.query)["request_token"][0]
+
+        consent_post = client.post(
+            "/consent",
+            data={
+                "action": "allow",
+                "request_token": request_token,
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_post.status_code == 302
+        redirect_url = consent_post.headers["location"]
+        code = parse_qs(urlparse(redirect_url).query)["code"][0]
+
+        token_response = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost/callback",
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+            },
+        )
+        assert token_response.status_code == 200
+        return token_response.json()["access_token"], client_id
+
+    @pytest.mark.asyncio
+    async def test_access_token_的_client_id_与注册客户端一致(self, server_app):
+        """load_access_token 返回的 client_id 应等于注册时的 client_id。"""
+        client = self._make_test_client(server_app)
+        access_token, client_id = self._do_full_oauth_flow(client)
+
+        provider = server_app.state.provider
+        loaded_token = await provider.load_access_token(access_token)
+        assert loaded_token is not None
+        assert loaded_token.client_id == client_id, (
+            f"access_token.client_id 应等于注册 client_id {client_id}，"
+            f"实际: {loaded_token.client_id!r}"
+        )
+
+    def test_revoke_access_token_后_调用工具返回401(self, server_app):
+        """撤销 access_token 后，用该 token 调用 /mcp 工具应返回 401。"""
+        with self._make_test_client(server_app) as client:
+            access_token, client_id = self._do_full_oauth_flow(client)
+
+            # 撤销前：token 应有效
+            provider = server_app.state.provider
+            import asyncio
+
+            loaded = asyncio.run(provider.load_access_token(access_token))
+            assert loaded is not None
+
+            # 调用 /revoke 撤销 access_token
+            revoke_response = client.post(
+                "/revoke",
+                data={
+                    "token": access_token,
+                    "client_id": client_id,
+                    "client_secret": "",
+                },
+            )
+            assert revoke_response.status_code == 200, (
+                f"/revoke 应返回 200，实际: {revoke_response.status_code}, "
+                f"body: {revoke_response.text}"
+            )
+
+            # 撤销后：token 应无效
+            loaded_after = asyncio.run(provider.load_access_token(access_token))
+            assert loaded_after is None, (
+                "撤销后的 access_token 应无法通过 load_access_token 验签"
+            )

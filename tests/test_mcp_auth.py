@@ -274,7 +274,7 @@ class TestOAuthProviderUnit:
             token_endpoint_auth_method="none",
         )
         await provider.register_client(client_info)
-        assert client_info.scope == "read write"
+        assert client_info.scope == "read"
 
     @pytest.mark.asyncio
     async def test_register_client_generates_client_id_if_missing(self, provider):
@@ -329,7 +329,9 @@ class TestOAuthProviderUnit:
             await provider.register_client(client_info)
 
             # Second should fail
-            with pytest.raises(RuntimeError, match="limit"):
+            from mcp.server.auth.provider import RegistrationError
+
+            with pytest.raises(RegistrationError, match="limit"):
                 client_info2 = OAuthClientInformationFull(
                     client_id="second-client",
                     redirect_uris=[AnyHttpUrl("http://localhost/callback")],
@@ -882,11 +884,11 @@ class TestCIMDIntegration:
         )
 
         # Default scope should be injected
-        assert mock_client.scope == "read write"
+        assert mock_client.scope == "read"
 
     def test_cimd_default_scope_configuration(self, provider):
         """CIMDClientManager should be configured with default scope."""
-        assert provider.cimd.default_scope == "read write"
+        assert provider.cimd.default_scope == "read"
 
 
 # ---------------------------------------------------------------------------
@@ -1036,13 +1038,14 @@ class TestOAuthFullFlow:
         """Full OAuth flow with auth.enabled=False: authorize → consent → token."""
         client = self._make_test_client(server_app_auth_disabled)
 
-        # Step 1: DCR
+        # Step 1: DCR（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
                 "redirect_uris": ["http://localhost/callback"],
                 "grant_types": ["authorization_code"],
                 "token_endpoint_auth_method": "none",
+                "scope": "read write",
             },
         )
         assert reg_response.status_code == 201
@@ -1474,13 +1477,14 @@ class TestOAuthFullFlow:
         with TestClient(
             server_app_auth_enabled, raise_server_exceptions=False
         ) as client:
-            # DCR
+            # DCR（显式注册 read write scope，因默认 scope 已改为 read）
             reg_response = client.post(
                 "/register",
                 json={
                     "redirect_uris": ["http://localhost/callback"],
                     "grant_types": ["authorization_code"],
                     "token_endpoint_auth_method": "none",
+                    "scope": "read write",
                 },
             )
             assert reg_response.status_code == 201
