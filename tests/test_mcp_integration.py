@@ -183,7 +183,103 @@ class TestListTools:
 
 
 # ---------------------------------------------------------------------------
-# 2. 未认证调工具 → 401
+# 2. 配置接线：auth_enabled/base_url/auth_username 从 BS 配置读取
+# ---------------------------------------------------------------------------
+
+
+class TestProviderConfigWiring:
+    """验证 _create_provider 从 BS 配置读取 auth_enabled/auth_username/base_url。"""
+
+    def test_auth_enabled_从security_manager读取(self, monkeypatch):
+        """provider.auth_enabled 应跟随 security_manager.get_auth_config()["enabled"]。"""
+        from app.mcp import server
+
+        # Mock security_manager.get_auth_config
+        monkeypatch.setattr(
+            "app.mcp.server.security_manager.get_auth_config",
+            lambda: {
+                "enabled": True,
+                "username": "testuser",
+                "password": "hashed",
+                "session_timeout": 3600,
+                "secret_key": "key",
+                "https_only": False,
+                "max_login_attempts": 5,
+                "lockout_duration": 900,
+                "webhook_key": "",
+                "webhook_auth_enabled": False,
+            },
+        )
+        # Mock config_manager.get for base_url fallback
+        monkeypatch.setattr(
+            "app.mcp.server.config_manager.get",
+            lambda section, key, fallback="": fallback,
+        )
+
+        provider = server._create_provider(base_url="http://localhost:8000")
+        assert provider.auth_enabled is True
+        assert provider.auth_username == "testuser"
+
+    def test_auth_disabled_从security_manager读取(self, monkeypatch):
+        """auth.enabled=False 时 provider.auth_enabled 应为 False。"""
+        from app.mcp import server
+
+        monkeypatch.setattr(
+            "app.mcp.server.security_manager.get_auth_config",
+            lambda: {
+                "enabled": False,
+                "username": "admin",
+                "password": "hashed",
+                "session_timeout": 3600,
+                "secret_key": "key",
+                "https_only": False,
+                "max_login_attempts": 5,
+                "lockout_duration": 900,
+                "webhook_key": "",
+                "webhook_auth_enabled": False,
+            },
+        )
+        monkeypatch.setattr(
+            "app.mcp.server.config_manager.get",
+            lambda section, key, fallback="": fallback,
+        )
+
+        provider = server._create_provider(base_url="http://localhost:8000")
+        assert provider.auth_enabled is False
+
+    def test_base_url_优先环境变量MCP_BASE_URL(self, monkeypatch):
+        """MCP_BASE_URL 环境变量应优先作为 base_url/issuer。"""
+        from app.mcp import server
+
+        monkeypatch.setenv("MCP_BASE_URL", "https://example.com")
+        monkeypatch.setattr(
+            "app.mcp.server.security_manager.get_auth_config",
+            lambda: {
+                "enabled": False,
+                "username": "admin",
+                "password": "hashed",
+                "session_timeout": 3600,
+                "secret_key": "key",
+                "https_only": False,
+                "max_login_attempts": 5,
+                "lockout_duration": 900,
+                "webhook_key": "",
+                "webhook_auth_enabled": False,
+            },
+        )
+        monkeypatch.setattr(
+            "app.mcp.server.config_manager.get",
+            lambda section, key, fallback="": fallback,
+        )
+
+        provider = server._create_provider()
+        # AnyHttpUrl 标准化为带尾斜杠
+        assert str(provider.base_url).rstrip("/") == "https://example.com"
+        assert str(provider.issuer).rstrip("/") == "https://example.com"
+
+
+# ---------------------------------------------------------------------------
+# 3. 未认证调工具 → 401
 # ---------------------------------------------------------------------------
 
 
@@ -369,6 +465,252 @@ class TestFullOAuthFlowWithToolCall:
 
 
 # ---------------------------------------------------------------------------
+# 3b. 真实 HTTP 端到端：获取 token → AsyncClient 携带 Bearer 调用 /mcp
+# ---------------------------------------------------------------------------
+
+
+class TestRealHttpEndToEnd:
+    """真实 HTTP 端到端测试：获取 access_token 后通过 TestClient 调用 /mcp。
+
+    覆盖评审 A#6：验证 auth middleware → 工具完整路径。
+
+    注意：MCP /mcp 端点需要 FastMCP 内部 session manager（通过 lifespan 初始化），
+    因此使用 TestClient 作为上下文管理器（运行 lifespan），而非 ASGITransport。
+    Streamable HTTP 协议需要先发送 initialize 请求获取 session ID，
+    后续请求携带 Mcp-Session-Id header。
+    """
+
+    @pytest.fixture
+    def tmp_keys(self, tmp_path):
+        """Create temporary key files."""
+        return {
+            "private": str(tmp_path / "private.pem"),
+            "public": str(tmp_path / "public.pem"),
+        }
+
+    @pytest.fixture
+    def server_app(self, tmp_keys):
+        """Create a test server with auth.enabled=False and tools registered."""
+        return _create_test_server_with_tools(
+            private_key_path=tmp_keys["private"],
+            public_key_path=tmp_keys["public"],
+            issuer="http://localhost:8000",
+            audience="bangumi-syncer",
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+    def _make_test_client(self, app):
+        return TestClient(app, raise_server_exceptions=False)
+
+    def _do_full_oauth_flow(self, client) -> str:
+        """执行完整 OAuth 流程，返回 access_token。"""
+        # Step 1: DCR
+        reg_response = client.post(
+            "/register",
+            json={
+                "redirect_uris": ["http://localhost/callback"],
+                "grant_types": ["authorization_code"],
+                "token_endpoint_auth_method": "none",
+            },
+        )
+        assert reg_response.status_code == 201
+        client_id = reg_response.json()["client_id"]
+
+        # Step 2: Authorize
+        code_verifier = secrets.token_urlsafe(32)
+        code_challenge = _make_code_challenge_b64(code_verifier)
+        auth_response = client.get(
+            "/authorize",
+            params={
+                "client_id": client_id,
+                "redirect_uri": "http://localhost/callback",
+                "response_type": "code",
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "scope": "read write",
+                "state": "test-state",
+            },
+            follow_redirects=False,
+        )
+        assert auth_response.status_code == 302
+        consent_url = auth_response.headers["location"]
+
+        # Step 3: Get consent form
+        consent_get = client.get(consent_url)
+        assert consent_get.status_code == 200
+        csrf_token = _extract_csrf_token(consent_get.text)
+
+        # Step 4: Parse request_token
+        parsed = urlparse(consent_url)
+        request_token = parse_qs(parsed.query)["request_token"][0]
+
+        # Step 5: Consent allow
+        consent_post = client.post(
+            "/consent",
+            data={
+                "action": "allow",
+                "request_token": request_token,
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_post.status_code == 302
+        redirect_url = consent_post.headers["location"]
+        code = parse_qs(urlparse(redirect_url).query)["code"][0]
+
+        # Step 6: Token exchange
+        token_response = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost/callback",
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+            },
+        )
+        assert token_response.status_code == 200
+        return token_response.json()["access_token"]
+
+    def _initialize_session(self, client, access_token: str) -> str:
+        """发送 initialize 请求，返回 session ID。"""
+        init_response = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "id": 0,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-client", "version": "1.0"},
+                },
+            },
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        assert init_response.status_code == 200, (
+            f"initialize 应返回 200，实际: {init_response.status_code}"
+        )
+        session_id = init_response.headers.get("mcp-session-id")
+        assert session_id is not None, "initialize 响应应包含 mcp-session-id"
+        return session_id
+
+    def test_获取token后_真实HTTP调用list_tools成功(self, server_app):
+        """获取 access_token 后，TestClient 携带 Bearer 调用 /mcp list_tools 应成功。"""
+        with self._make_test_client(server_app) as client:
+            # OAuth 流程获取 token
+            access_token = self._do_full_oauth_flow(client)
+
+            # 初始化 session
+            session_id = self._initialize_session(client, access_token)
+
+            # 调用 tools/list
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "tools/list",
+                    "params": {},
+                },
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Mcp-Session-Id": session_id,
+                },
+            )
+
+        assert response.status_code == 200, (
+            f"真实 HTTP 调用应返回 200，实际: {response.status_code}, body: {response.text[:200]}"
+        )
+        # Streamable HTTP 返回 SSE 格式，需要解析
+        body = response.text
+        assert "tools" in body
+        data_line = [line for line in body.split("\n") if line.startswith("data: ")]
+        assert len(data_line) > 0
+        import json as _json
+
+        data = _json.loads(data_line[0].removeprefix("data: "))
+        assert "result" in data
+        tool_names = [t["name"] for t in data["result"]["tools"]]
+        assert "get_current_config" in tool_names
+        assert "get_logs" in tool_names
+        assert "update_config" in tool_names
+
+    def test_获取token后_真实HTTP调用tools_call成功(self, server_app):
+        """获取 access_token 后，TestClient 携带 Bearer 调用 /mcp tools/call 应成功。"""
+        with self._make_test_client(server_app) as client:
+            # OAuth 流程获取 token
+            access_token = self._do_full_oauth_flow(client)
+
+            # 初始化 session
+            session_id = self._initialize_session(client, access_token)
+
+            # 调用 tools/call
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "get_current_config", "arguments": {}},
+                },
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Mcp-Session-Id": session_id,
+                },
+            )
+
+        assert response.status_code == 200, (
+            f"真实 HTTP 调用应返回 200，实际: {response.status_code}, body: {response.text[:200]}"
+        )
+        # 解析 SSE 响应
+        body = response.text
+        data_line = [line for line in body.split("\n") if line.startswith("data: ")]
+        assert len(data_line) > 0
+        import json as _json
+
+        data = _json.loads(data_line[0].removeprefix("data: "))
+        assert "result" in data
+        content = data["result"].get("content", [])
+        assert len(content) > 0
+        tool_result = _json.loads(content[0]["text"])
+        assert tool_result["status"] == "success"
+        assert "data" in tool_result
+
+    def test_真实HTTP_无token调用工具返回401(self, server_app):
+        """未携带 Bearer Token 调用 /mcp 应返回 401。"""
+        with self._make_test_client(server_app) as client:
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/call",
+                    "params": {"name": "get_current_config", "arguments": {}},
+                },
+            )
+
+        assert response.status_code == 401
+
+    def test_真实HTTP_无效token调用工具返回401(self, server_app):
+        """携带无效 Bearer Token 调用 /mcp 应返回 401。"""
+        with self._make_test_client(server_app) as client:
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {"name": "get_current_config", "arguments": {}},
+                },
+                headers={"Authorization": "Bearer invalid.token.here"},
+            )
+
+        assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
 # 4. /.well-known 端点含 client_id_metadata_document_supported: true
 # ---------------------------------------------------------------------------
 
@@ -418,3 +760,36 @@ class TestWellKnownEndpoints:
             response = await client.get("/.well-known/oauth-protected-resource/mcp")
 
         assert response.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# 5. 生产装配注册 /consent 路由
+# ---------------------------------------------------------------------------
+
+
+class TestProductionConsentRoute:
+    """验证生产装配 create_mcp_app() 注册了 /consent 路由。"""
+
+    def test_create_mcp_app_注册consent路由(self):
+        """create_mcp_app() 返回的 app 应包含 /consent 路由。"""
+        from app.mcp.server import create_mcp_app
+
+        app = create_mcp_app()
+        paths = [r.path for r in app.routes if hasattr(r, "path")]
+        assert "/consent" in paths, f"生产装配应注册 /consent 路由，实际路径: {paths}"
+
+    @pytest.mark.asyncio
+    async def test_consent路由_GET_返回200或400(self):
+        """GET /consent 在生产装配上应可达（非 404）。"""
+        from app.mcp.server import create_mcp_app
+
+        app = create_mcp_app()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # 无 request_token → 400，但路由存在
+            response = await client.get("/consent")
+
+        assert response.status_code != 404, (
+            f"/consent 路由应存在，实际状态码: {response.status_code}"
+        )
+        assert response.status_code == 400

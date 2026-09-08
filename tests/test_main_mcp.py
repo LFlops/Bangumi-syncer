@@ -9,6 +9,8 @@ main.py MCP 集成测试
 5. 公钥路径可配：MCP_PUBLIC_KEY_PATH 环境变量覆盖默认路径
 """
 
+import os
+import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -188,12 +190,14 @@ class TestPublicKeyPathConfigurable:
         assert _get_mcp_public_key_path() == custom_path
 
     def test_default_path_when_env_not_set(self, monkeypatch):
-        """未设置 MCP_PUBLIC_KEY_PATH 时使用默认路径。"""
+        """未设置 MCP_PUBLIC_KEY_PATH 时使用默认路径（与 server.py 一致：tempdir/mcp_public.pem）。"""
         monkeypatch.delenv("MCP_PUBLIC_KEY_PATH", raising=False)
+        monkeypatch.delenv("MCP_RSA_PUBLIC_KEY", raising=False)
 
         from app.main import _get_mcp_public_key_path
 
-        assert _get_mcp_public_key_path() == "/mcp_auth/mcp_public.pem"
+        expected = os.path.join(tempfile.gettempdir(), "mcp_public.pem")
+        assert _get_mcp_public_key_path() == expected
 
     @pytest.mark.asyncio
     async def test_lifespan_syncs_custom_path_to_deps(self, monkeypatch):

@@ -5,6 +5,7 @@
 import asyncio
 import os
 import re
+import tempfile
 import urllib.parse
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -58,12 +59,15 @@ from .services.mapping_service import mapping_service
 from .services.scheduler_bootstrap import register_all as register_schedulers
 from .services.sync_service import sync_service
 
-# MCP 内部 API 公钥默认路径（可通过环境变量 MCP_PUBLIC_KEY_PATH 覆盖）
-_DEFAULT_MCP_PUBLIC_KEY_PATH: str = "/mcp_auth/mcp_public.pem"
+# MCP 公钥默认路径（与 app/mcp/server.py 一致：/tmp/mcp_public.pem）
+# 可通过环境变量 MCP_PUBLIC_KEY_PATH 或 MCP_RSA_PUBLIC_KEY 覆盖
+_DEFAULT_MCP_PUBLIC_KEY_PATH: str = os.environ.get(
+    "MCP_RSA_PUBLIC_KEY", os.path.join(tempfile.gettempdir(), "mcp_public.pem")
+)
 
 
 def _get_mcp_public_key_path() -> str:
-    """读取 MCP 公钥路径：优先环境变量 MCP_PUBLIC_KEY_PATH，否则默认共享卷位置。"""
+    """读取 MCP 公钥路径：优先 MCP_PUBLIC_KEY_PATH > MCP_RSA_PUBLIC_KEY > 默认值。"""
     return os.environ.get("MCP_PUBLIC_KEY_PATH", _DEFAULT_MCP_PUBLIC_KEY_PATH)
 
 
@@ -120,7 +124,7 @@ async def lifespan(app: FastAPI):
     except PublicKeyNotFoundError:
         logger.warning(
             f"MCP 公钥未找到（{mcp_public_key_path}），MCP 内部 API 暂不可用，"
-            "请确认 mcp_server 已运行并写入共享卷"
+            "请检查 RSA 密钥配置（MCP_RSA_PUBLIC_KEY 环境变量或默认路径）"
         )
     except Exception as e:
         logger.warning(f"MCP 公钥加载失败（不影响主流程）: {e}")

@@ -1705,3 +1705,204 @@ class TestDCRFallback:
         # Should succeed (empty list is valid)
         retrieved = await provider.get_client("test-client")
         assert retrieved is not None
+
+
+# ---------------------------------------------------------------------------
+# Security Fix Tests (Roundtable Review)
+# ---------------------------------------------------------------------------
+
+
+class TestSecurityFixes:
+    """Tests for P0/P1/P2 security fixes from roundtable review."""
+
+    @pytest.fixture
+    def rsa_manager(self, tmp_path):
+        from app.mcp.provider import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+        return manager
+
+    @pytest.fixture
+    def provider(self, rsa_manager):
+        from app.mcp.provider import BangumiOAuthProvider
+
+        return BangumiOAuthProvider(
+            base_url="http://localhost:8000",
+            rsa_manager=rsa_manager,
+            issuer="http://localhost:8000",
+            audience="bs",
+            token_expiry_seconds=3600,
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+    # --- P0-1: CIMD redirect_uri validation ---
+
+    @pytest.mark.asyncio
+    async def test_cimd_authorize_rejects_malicious_redirect_uri(self, provider):
+        """CIMD client with malicious redirect_uri should be rejected (P0-1)."""
+        from fastmcp.server.auth.cimd import CIMDDocument
+        from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
+        from mcp.server.auth.provider import AuthorizationParams
+        from pydantic import AnyHttpUrl
+
+        # Create a CIMD client with a known redirect_uri
+        cimd_doc = CIMDDocument(
+            client_id=AnyHttpUrl("https://claude.ai/oauth/claude-code-client-metadata"),
+            client_name="Claude Code",
+            redirect_uris=["http://localhost/callback"],
+            token_endpoint_auth_method="none",
+            grant_types=["authorization_code", "refresh_token"],
+        )
+        mock_client = ProxyDCRClient(
+            client_id="https://claude.ai/oauth/claude-code-client-metadata",
+            client_secret=None,
+            redirect_uris=None,
+            grant_types=cimd_doc.grant_types,
+            scope="read write",
+            token_endpoint_auth_method=cimd_doc.token_endpoint_auth_method,
+            allowed_redirect_uri_patterns=None,
+            client_name=cimd_doc.client_name,
+            cimd_document=cimd_doc,
+            cimd_fetched_at=time.time(),
+        )
+
+        # Mock CIMD get_client to return our mock
+        async def mock_get_client(url):
+            return mock_client
+
+        provider.cimd.get_client = mock_get_client
+
+        # Try authorize with attacker-controlled redirect_uri
+        params = AuthorizationParams(
+            state="test-state",
+            scopes=["read", "write"],
+            code_challenge="challenge123",
+            redirect_uri=AnyHttpUrl("https://attacker.com/steal"),
+            redirect_uri_provided_explicitly=True,
+        )
+
+        with pytest.raises(ValueError, match="redirect_uri"):
+            await provider.authorize(mock_client, params)
+
+    # --- P0-2: DCR prefix bypass ---
+
+    @pytest.mark.asyncio
+    async def test_dcr_authorize_rejects_prefix_bypass_subdomain(self, provider):
+        """DCR client redirect_uri prefix bypass via subdomain should be rejected (P0-2)."""
+        from mcp.server.auth.provider import AuthorizationParams
+        from mcp.shared.auth import OAuthClientInformationFull
+        from pydantic import AnyHttpUrl
+
+        client_info = OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyHttpUrl("https://app.example.com/cb")],
+            grant_types=["authorization_code"],
+            token_endpoint_auth_method="none",
+        )
+        await provider.register_client(client_info)
+
+        # Attack: cb.attacker.com matches startswith("...example.com/cb") but is different host
+        params = AuthorizationParams(
+            state=None,
+            scopes=["read"],
+            code_challenge="challenge123",
+            redirect_uri=AnyHttpUrl("https://app.example.com/cb.attacker.com/x"),
+            redirect_uri_provided_explicitly=True,
+        )
+
+        with pytest.raises(ValueError, match="redirect_uri"):
+            await provider.authorize(client_info, params)
+
+    @pytest.mark.asyncio
+    async def test_dcr_authorize_rejects_prefix_bypass_dot_segments(self, provider):
+        """DCR client redirect_uri bypass via dot-segments should be rejected (P0-2)."""
+        from mcp.server.auth.provider import AuthorizationParams
+        from mcp.shared.auth import OAuthClientInformationFull
+        from pydantic import AnyHttpUrl
+
+        client_info = OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyHttpUrl("https://app.example.com/cb")],
+            grant_types=["authorization_code"],
+            token_endpoint_auth_method="none",
+        )
+        await provider.register_client(client_info)
+
+        # Attack: path traversal via dot-segments
+        params = AuthorizationParams(
+            state=None,
+            scopes=["read"],
+            code_challenge="challenge123",
+            redirect_uri=AnyHttpUrl("https://app.example.com/cb/../evil"),
+            redirect_uri_provided_explicitly=True,
+        )
+
+        with pytest.raises(ValueError, match="redirect_uri"):
+            await provider.authorize(client_info, params)
+
+    # --- P1-1: issuer_url ---
+
+    def test_metadata_issuer_matches_jwt_iss(self, provider):
+        """Metadata issuer should match JWT iss claim (P1-1)."""
+        from starlette.testclient import TestClient
+
+        # Create a full server to test metadata
+        from app.mcp.provider import create_auth_server
+
+        app = create_auth_server(
+            private_key_path=provider.rsa_manager.private_key_path,
+            public_key_path=provider.rsa_manager.public_key_path,
+            issuer="http://localhost:8000",
+            audience="bs",
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.get("/.well-known/oauth-authorization-server")
+        assert response.status_code == 200
+        metadata = response.json()
+        # issuer in metadata should match the configured issuer
+        assert metadata["issuer"] in ("http://localhost:8000", "http://localhost:8000/")
+
+    # --- P1-2: revoke access token ---
+
+    @pytest.mark.asyncio
+    async def test_revoke_access_token_invalidates_it(self, provider):
+        """Revoking an access token should make load_access_token return None (P1-2)."""
+        from mcp.server.auth.provider import AccessToken
+
+        # Create a valid access token
+        claims = {
+            "sub": "user1",
+            "scope": "read write",
+            "iss": "http://localhost:8000",
+            "aud": "bs",
+            "exp": int(time.time()) + 3600,
+            "iat": int(time.time()),
+        }
+        token_str = provider.rsa_manager.sign_jwt(claims)
+
+        # Load it first to confirm it's valid
+        access_token = await provider.load_access_token(token_str)
+        assert access_token is not None
+        assert isinstance(access_token, AccessToken)
+
+        # Revoke it
+        await provider.revoke_token(access_token)
+
+        # After revocation, load_access_token should return None
+        result = await provider.load_access_token(token_str)
+        assert result is None
+
+    # --- P2: valid_scopes ---
+
+    def test_client_registration_options_has_valid_scopes(self, provider):
+        """ClientRegistrationOptions should declare valid_scopes (P2)."""
+        assert provider.client_registration_options is not None
+        assert provider.client_registration_options.valid_scopes == ["read", "write"]

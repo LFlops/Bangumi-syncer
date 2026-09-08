@@ -10,6 +10,7 @@ import os
 from typing import Any
 
 from fastmcp.exceptions import ToolError
+from fastmcp.server.dependencies import get_access_token
 
 from app.api.logs import _read_log_file
 from app.api.mcp_config import _is_valid_section, _mask_sensitive
@@ -151,6 +152,18 @@ async def update_config(
     Raises:
         ToolError: 非法段名或 auth 段拒绝。
     """
+    # scope 校验：update_config 要求 write 权限
+    token = get_access_token()
+    if token is None:
+        raise ToolError(
+            "未找到访问令牌，无法修改配置。请提供含 write 权限的 access token。"
+        )
+    scopes = getattr(token, "scopes", [])
+    if "write" not in scopes:
+        raise ToolError(
+            f"权限不足：update_config 需要 write scope，当前 scope: {scopes}"
+        )
+
     # 归一化段名：下划线 → 连字符
     normalized = section.replace("_", "-")
 
@@ -167,6 +180,30 @@ async def update_config(
         raise ToolError(
             f"未知配置段: {section}。合法段包括: {', '.join(sorted(valid_names))}"
         )
+
+    # 校验 key 合法性：非多实例段必须在 schema 字段列表中
+    from app.core.config_schema import SECTIONS, multi_instance_prefixes
+
+    _section_meta = SECTIONS.get(normalized)
+    if _section_meta is None:
+        # 多实例段（notify-webhook-1 等）：前缀匹配父段
+        for prefix in multi_instance_prefixes():
+            if normalized.startswith(f"{prefix}-"):
+                _section_meta = SECTIONS.get(prefix)
+                break
+
+    if _section_meta is not None and _section_meta.fields:
+        valid_keys = {f.name for f in _section_meta.fields}
+        if key not in valid_keys:
+            raise ToolError(
+                f"非法配置键: {key}。段 {normalized} 的合法键包括: "
+                f"{', '.join(sorted(valid_keys))}"
+            )
+
+    # 校验 value 长度上限（防止 INI 膨胀）
+    _MAX_VALUE_LENGTH = 10000
+    if isinstance(value, str) and len(value) > _MAX_VALUE_LENGTH:
+        raise ToolError(f"配置值长度超限: {len(value)} > {_MAX_VALUE_LENGTH}")
 
     config_manager.set_config(normalized, key, value)
 
