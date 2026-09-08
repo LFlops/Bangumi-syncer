@@ -17,130 +17,60 @@ Bangumi-syncer 提供 **MCP（Model Context Protocol）** 服务，让 AI 助手
 
 ## 架构概述
 
-MCP 采用双服务架构：
+MCP 采用**嵌入式架构**（FastMCP 4 直接嵌入 BS 进程）：
 
 ```
-┌─────────────────┐         OAuth 2.1          ┌─────────────────┐
-│   AI 助手        │ ◄──────────────────────────► │   mcp_server     │
-│ (Claude Desktop │    Streamable HTTP :3000     │  (Sidecar)       │
-│  / OpenCode)    │                              │                  │
-└─────────────────┘                              └────────┬─────────┘
-                                                          │
-                                                          │ HTTP :8000
-                                                          │ (Bearer JWT)
-                                                          ▼
-                                                 ┌─────────────────┐
-                                                 │   BS (FastAPI)   │
-                                                 │   主程序 :8000    │
-                                                 │                  │
-                                                 │  /api/mcp/*      │
-                                                 │  内部 API        │
-                                                 └─────────────────┘
+┌─────────────────┐         OAuth 2.1          ┌─────────────────────────────┐
+│   AI 助手        │ ◄──────────────────────────► │   BS (FastAPI) :8000        │
+│ (Claude Desktop │    Streamable HTTP           │                             │
+│  / OpenCode)    │    /mcp（工具端点）            │  内置 FastMCP 服务           │
+│                 │                              │  - 3 个工具（get_logs/       │
+│                 │                              │    get_current_config/       │
+│                 │                              │    update_config）           │
+│                 │                              │  - OAuth 2.1 授权服务器       │
+│                 │                              │  - RSA 密钥本地生成           │
+└─────────────────┘                              └─────────────────────────────┘
 ```
 
 | 组件 | 说明 |
-| --- | --- |
-| **BS（FastAPI）** | 主程序，端口 8000，提供 `/api/mcp/*` 内部 API |
-| **mcp_server（Sidecar）** | MCP 服务进程，端口 3000，暴露 3 个工具，OAuth 2.1 授权服务器 |
-| **共享卷** | mcp_server 写入 RSA 公钥，BS 读取公钥验签（bind mount 共享同一宿主机目录） |
+| --- | --- | --- | --- |
+| **BS（FastAPI）** | 主程序，端口 8000，内置 FastMCP 服务（工具 + OAuth AS） |
+| **RSA 密钥** | 本地生成（RS256），私钥仅存于 BS 进程内存与本地磁盘，公钥用于验签 JWT |
+
+::: tip 嵌入式优势
+FastMCP 直接嵌入 BS 进程，工具函数调用同进程业务层（无需 HTTP），部署更简单（单进程、单端口），无需 Sidecar 与共享卷。
+:::
 
 ::: warning 内部 API 不暴露公网
-`/api/mcp/*` 是内部 API，仅供 mcp_server 调用。公网访问 BS 时无法直接访问这些端点（需要有效的 JWT），mcp_server 是唯一入口。
+`/api/mcp/*` 是内部 API，工具函数直接调用同进程业务层。公网访问 BS 时需要有效的 JWT 才能调用 MCP 工具。
 :::
 
 ## 部署前提
 
-### 1. 运行 mcp_server
+### 1. 运行 BS（含内置 MCP）
 
-mcp_server 是独立 Python 包，可通过以下方式运行：
-
-**方式一：直接运行**
+MCP 服务已嵌入 BS 进程，启动 BS 即可使用：
 
 ```bash
-cd mcp_server
-uv sync
-python -m mcp_server.server
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-**方式二：Docker 镜像**
+Docker 部署同理，单容器即可。
 
-```bash
-docker build -t bangumi-syncer-mcp -f mcp_server/Dockerfile mcp_server/
-```
-
-Dockerfile 已内置默认环境变量：
-
-```dockerfile
-ENV BS_BASE_URL=http://bs:8000 \
-    MCP_HOST=0.0.0.0 \
-    MCP_PORT=3000
-```
-
-### 2. 共享卷挂载（公钥交换）
-
-mcp_server 启动时生成 RSA 密钥对（RS256），BS 需要读取公钥来验签 JWT。两侧通过 **bind mount** 共享同一宿主机目录，但**仅共享公钥**，私钥留在容器本地目录、永不挂载：
-
-| 组件 | 容器内路径 | 说明 |
-| --- | --- | --- |
-| mcp_server 写入 | `/app/keys/mcp_public.pem` | 公钥（BS 侧读取，落入共享卷） |
-| mcp_server 写入 | `/app/keys-private/mcp_private.pem` | 私钥（**仅 mcp_server 持有，不落共享卷**） |
-| BS 读取 | `/mcp_auth/mcp_public.pem` | 公钥验签 JWT（只读挂载共享卷） |
-
-::: warning 私钥隔离
-私钥默认写入 `/app/keys-private/mcp_private.pem`（容器本地目录，**不挂载**）。共享卷 `mcp_keys` 仅包含公钥 `mcp_public.pem`，即使卷被泄露也不会导致 Token 被伪造（签名需要私钥）。
-:::
-
-**Docker Compose 示例**：
-
-```yaml
-services:
-  bs:
-    image: bangumi-syncer
-    volumes:
-      - mcp_keys:/mcp_auth:ro          # 只读挂载公钥
-    environment:
-      - MCP_PUBLIC_KEY_PATH=/mcp_auth/mcp_public.pem
-
-  mcp_server:
-    image: bangumi-syncer-mcp
-    volumes:
-      - mcp_keys:/app/keys             # 读写挂载公钥目录（仅公钥落共享卷）
-    environment:
-      - MCP_PRIVATE_KEY_PATH=/app/keys-private/mcp_private.pem  # 私钥留在容器本地
-      - MCP_PUBLIC_KEY_PATH=/app/keys/mcp_public.pem            # 公钥写入共享卷
-
-volumes:
-  mcp_keys:                            # 共享卷，仅包含公钥 mcp_public.pem
-```
-
-::: tip 路径映射说明
-上例中 `mcp_keys` 卷在两侧分别挂载到不同路径，但**宿主机目录是同一个**。mcp_server 写入 `/app/keys/mcp_public.pem` 后，BS 从 `/mcp_auth/mcp_public.pem` 即可读到（两侧文件名统一为 `mcp_public.pem`）。
-
-私钥通过 `MCP_PRIVATE_KEY_PATH` 指向容器本地路径 `/app/keys-private/mcp_private.pem`，该目录不挂载，私钥永远不会离开 mcp_server 容器。
-:::
-
-### 3. 环境变量
-
-**mcp_server 侧**：
+### 2. 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `BS_BASE_URL` | `http://bs:8000` | BS 主程序的访问地址（容器内网） |
-| `BS_PUBLIC_URL` | 未设置 | 浏览器可访问的 BS 地址（用于登录跳转，未配置时 fallback 到 `BS_BASE_URL`） |
-| `MCP_PORT` | `3000` | mcp_server 监听端口 |
-| `MCP_HOST` | `0.0.0.0` | mcp_server 监听地址 |
-| `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
-| `MCP_PRIVATE_KEY_PATH` | `/app/keys-private/mcp_private.pem` | RSA 私钥路径（容器本地，不落共享卷） |
-| `MCP_PUBLIC_KEY_PATH` | `/app/keys/mcp_public.pem` | RSA 公钥路径 |
+| `MCP_RSA_PRIVATE_KEY` | `/tmp/mcp_private.pem` | RSA 私钥路径（本地磁盘，仅 BS 持有） |
+| `MCP_RSA_PUBLIC_KEY` | `/tmp/mcp_public.pem` | RSA 公钥路径（本地生成，用于验签 JWT） |
 | `MCP_TOKEN_EXPIRY_SECONDS` | `3600` | JWT 有效期（秒） |
-| `MCP_ISSUER` | `http://localhost:3000` | OAuth Issuer URL |
-| `MCP_AUDIENCE` | `bs` | JWT audience |
+| `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
+| `MCP_ISSUER` | `http://localhost:8000` | OAuth Issuer URL（同 BS base_url） |
+| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience |
 
-**BS 侧**：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `MCP_PUBLIC_KEY_PATH` | `/mcp_auth/mcp_public.pem` | 公钥文件路径，用于验签 JWT |
+::: tip RSA 密钥
+BS 启动时自动生成 RSA 密钥对（RS256），私钥仅存于本地磁盘（`MCP_RSA_PRIVATE_KEY`），公钥用于验签 JWT。无需共享卷或 Sidecar。
+:::
 
 ## OAuth 授权流程
 
@@ -180,14 +110,14 @@ mcp_server 实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确�
 {
   "mcpServers": {
     "bangumi-syncer": {
-      "url": "http://localhost:3000/mcp"
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
 ```
 
 ::: tip 远程连接
-如果 mcp_server 运行在远程主机上，将 `localhost` 替换为实际主机地址。确保 AI 助手能访问该地址。
+如果 BS 运行在远程主机上，将 `localhost` 替换为实际主机地址。确保 AI 助手能访问该地址。
 :::
 
 配置后重启 Claude Desktop，首次连接会触发 OAuth 授权流程（浏览器弹出 consent 页）。
@@ -201,7 +131,7 @@ mcp_server 实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确�
   "mcp": {
     "bangumi-syncer": {
       "type": "remote",
-      "url": "http://localhost:3000/mcp",
+      "url": "http://localhost:8000/mcp",
       "oauth": true
     }
   }
@@ -211,7 +141,7 @@ mcp_server 实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确�
 | 字段 | 说明 |
 | --- | --- |
 | `type` | `"remote"` 表示远程 MCP 服务 |
-| `url` | mcp_server 的 Streamable HTTP 端点 |
+| `url` | BS 的 MCP Streamable HTTP 端点（端口 8000） |
 | `oauth` | `true` 表示启用 OAuth 授权 |
 
 ## 工具说明
@@ -267,15 +197,15 @@ BS 额外提供 `GET /api/mcp/config/schema` 端点，可获取配置段的元�
 | 方面 | 说明 |
 | --- | --- |
 | **无静态 Token** | 不使用固定 API Key，JWT 短期有效（默认 1 小时），Refresh Token 可吊销 |
-| **私钥隔离** | RSA 私钥仅存在于 mcp_server 进程内存与存储目录，BS 只持有公钥 |
+| **私钥隔离** | RSA 私钥仅存在于 BS 进程内存与本地磁盘 |
 | **公钥非机密** | 公钥用于验签 JWT，泄露不会导致 Token 被伪造（签名需要私钥） |
-| **内部 API 不暴露公网** | `/api/mcp/*` 需要有效 JWT 才能访问，mcp_server 是唯一入口 |
-| **Scope 分离** | Token 带 `read` / `write`  scope，读操作不要求 write 权限 |
+| **工具端点受保护** | `/mcp` 需要有效 JWT 才能调用工具 |
+| **Scope 分离** | Token 带 `read` / `write` scope，读操作不要求 write 权限 |
 | **Consent 确认** | 每次新客户端授权都需用户点击 Allow，防止未授权访问 |
 
 ::: tip 部署建议
-- 将 mcp_server 与 BS 部署在同一内网或 Docker 网络中
-- 避免将 mcp_server 端口（3000）直接暴露到公网
+- BS 单进程部署（端口 8000），无需 Sidecar
+- 避免将 BS 端口直接暴露到公网
 - 如需公网访问，建议通过 VPN 或反向代理 + TLS 保护
 :::
 
@@ -285,8 +215,8 @@ BS 额外提供 `GET /api/mcp/config/schema` 端点，可获取配置段的元�
 
 ```
 你是 bangumi-syncer 的配置助手。请帮我完成 MCP 接入配置：
-1. 阅读 docs/config/mcp.md，确认 BS 与 mcp_server 双服务已运行、公钥已分发。
-2. 将 mcp_server 注册到 opencode.json（type: remote + oauth）或 Claude Desktop。
+1. 阅读 docs/config/mcp.md，确认 BS 已运行（端口 8000，内置 MCP 服务）。
+2. 将 BS 的 MCP 端点注册到 opencode.json（type: remote + oauth）或 Claude Desktop。
 3. 确认 auth.enabled 状态：开启则 OAuth 需登录，关闭则跳过登录但仍需 consent 授权。
 4. 验证 get_logs / get_current_config 可用，并演示 update_config。
 请只执行只读与配置类操作，不要改动同步数据。
