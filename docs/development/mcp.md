@@ -241,4 +241,4 @@ BS 单容器部署，内置 MCP 服务。
 | `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
 | `MCP_TOKEN_EXPIRY_SECONDS` | `3600` | JWT 有效期 |
 | `MCP_ISSUER` | `http://localhost:8000` | OAuth issuer |
-| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience |
+| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience（已统一为 `bangumi-syncer`，不再有 `bs` 死路由） |

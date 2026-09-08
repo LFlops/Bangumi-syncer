@@ -2,111 +2,15 @@
 依赖注入模块
 """
 
-import os
-import tempfile
 from typing import Any
 
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from ..core.mcp_auth import PublicKeyNotFoundError, load_public_key, verify_jwt
 from ..core.security import security_manager
 
 # Bearer token认证
 security = HTTPBearer(auto_error=False)
-
-# ---------------------------------------------------------------------------
-# MCP 内部 API 鉴权配置（可通过 monkeypatch/测试注入覆盖）
-# 公钥默认路径与 app/mcp/server.py 一致（/tmp/mcp_public.pem）
-# ---------------------------------------------------------------------------
-
-_MCP_PUBLIC_KEY_PATH: str = os.environ.get(
-    "MCP_RSA_PUBLIC_KEY", os.path.join(tempfile.gettempdir(), "mcp_public.pem")
-)
-_MCP_AUDIENCE: str = "bs"
-_MCP_ISSUER: str = os.environ.get("MCP_ISSUER", "http://localhost:8000")
-
-
-def _split_scope(scope_claim: Any) -> list[str]:
-    """将 JWT scope claim（空格分隔字符串或 list）拆分为 list。"""
-    if isinstance(scope_claim, list):
-        return scope_claim
-    if isinstance(scope_claim, str):
-        return scope_claim.split()
-    return []
-
-
-def get_mcp_client(
-    require_scope: str = "",
-):
-    """返回一个 FastAPI 依赖函数，对 MCP 内部 API 进行 JWT 鉴权。
-
-    用法::
-
-        @app.get("/api/mcp/endpoint")
-        async def handler(user=Depends(get_mcp_client())):
-            ...
-
-        @app.post("/api/mcp/endpoint")
-        async def handler(user=Depends(get_mcp_client(require_scope="write"))):
-            ...
-
-    返回:
-        dict: {"username": <sub>, "scope": [...], "mcp": True}
-    """
-
-    async def _dependency(
-        credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    ) -> dict[str, Any]:
-        if not credentials:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="未提供认证令牌",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        token = credentials.credentials
-
-        # 预加载公钥：让 PublicKeyNotFoundError 直接抛出（503），
-        # 而非被 verify_jwt 内部吞掉后统一返回 None。
-        try:
-            load_public_key(_MCP_PUBLIC_KEY_PATH)
-        except PublicKeyNotFoundError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="MCP 公钥不可用，请联系运维检查服务配置",
-            )
-
-        claims = verify_jwt(
-            token,
-            public_key_path=_MCP_PUBLIC_KEY_PATH,
-            audience=_MCP_AUDIENCE,
-            issuer=_MCP_ISSUER,
-        )
-
-        if claims is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="无效的认证令牌",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-
-        scope_list = _split_scope(claims.get("scope", ""))
-
-        # scope 校验
-        if require_scope and require_scope not in scope_list:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"缺少所需权限: {require_scope}",
-            )
-
-        return {
-            "username": claims.get("sub", ""),
-            "scope": scope_list,
-            "mcp": True,
-        }
-
-    return _dependency
 
 
 def get_current_user(

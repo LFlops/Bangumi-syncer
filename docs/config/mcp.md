@@ -41,8 +41,8 @@ MCP 采用**嵌入式架构**（FastMCP 4 直接嵌入 BS 进程）：
 FastMCP 直接嵌入 BS 进程，工具函数调用同进程业务层（无需 HTTP），部署更简单（单进程、单端口），无需 Sidecar 与共享卷。
 :::
 
-::: warning 内部 API 不暴露公网
-`/api/mcp/*` 是内部 API，工具函数直接调用同进程业务层。公网访问 BS 时需要有效的 JWT 才能调用 MCP 工具。
+::: warning 工具函数直接嵌入进程
+MCP 工具函数直接调用同进程业务层（无需 HTTP），通过 FastMCP `/mcp` 端点暴露。公网访问需要有效的 JWT（通过 OAuth 授权流程获取）。
 :::
 
 ## 部署前提
@@ -66,7 +66,7 @@ Docker 部署同理，单容器即可。
 | `MCP_TOKEN_EXPIRY_SECONDS` | `3600` | JWT 有效期（秒） |
 | `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
 | `MCP_ISSUER` | `http://localhost:8000` | OAuth Issuer URL（同 BS base_url） |
-| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience |
+| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience（已统一为 `bangumi-syncer`，不再有 `bs` 死路由） |
 
 ::: tip RSA 密钥
 BS 启动时自动生成 RSA 密钥对（RS256），私钥仅存于本地磁盘（`MCP_RSA_PRIVATE_KEY`），公钥用于验签 JWT。无需共享卷或 Sidecar。
@@ -160,19 +160,11 @@ mcp_server 提供 3 个工具，AI 助手通过它们与 BS 交互：
 | `since` | string | 否 | 起始时间（ISO 格式，如 `2026-09-01T10:00:00`）。带时区输入按服务器本地时间对齐（不换算，直接丢弃时区偏移） |
 | `until` | string | 否 | 结束时间（ISO 格式）。带时区输入按服务器本地时间对齐（不换算，直接丢弃时区偏移） |
 
-**内部端点**：`GET /api/mcp/logs`
-
 ### get_current_config — 查看配置
 
 获取 BS 全量配置，敏感字段（如密码、Token）已自动脱敏（显示为 `***`）。
 
 **无参数**。
-
-**内部端点**：`GET /api/mcp/config`
-
-::: tip 查看 schema
-BS 额外提供 `GET /api/mcp/config/schema` 端点，可获取配置段的元数据（字段类型、可选值等），便于 AI 助手理解配置结构。
-:::
 
 ### update_config — 修改配置
 
@@ -183,8 +175,6 @@ BS 额外提供 `GET /api/mcp/config/schema` 端点，可获取配置段的元�
 | `section` | string | 是 | 配置段名（如 `sync`、`auth`、`dev`） |
 | `key` | string | 是 | 配置键名（如 `log_level`、`enabled`） |
 | `value` | string | 是 | 配置值（字符串形式） |
-
-**内部端点**：`POST /api/mcp/config/update`
 
 ::: warning 配置回滚
 `update_config` 直接生效，不会自动创建备份。如需回滚：

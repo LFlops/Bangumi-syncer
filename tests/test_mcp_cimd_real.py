@@ -519,4 +519,4 @@ class TestCIMDProviderIntegration:
             result = await provider.get_client(CIMD_URL)
 
         assert result is not None
-        assert result.scope == "read write"
+        assert result.scope == "read"
