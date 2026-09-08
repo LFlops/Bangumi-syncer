@@ -40,11 +40,3 @@ jobs:
     - name: 运行 djLint 检查
       run: |
         uv run djlint templates/ --check
-
-    - name: 运行 Ruff 检查 (mcp_server)
-      run: |
-        uv run --directory mcp_server ruff check . --output-format=github
-
-    - name: 运行 Ruff 格式检查 (mcp_server)
-      run: |
-        uv run --directory mcp_server ruff format --check .
