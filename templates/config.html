@@ -74,22 +74,22 @@
                 {% include "config/_sync.html" %}
                 {% include "config/_blocked_keywords.html" %}
                 {% include
-                    "config/_bangumi_account.html" %}
+                "config/_bangumi_account.html" %}
                 {% include "config/_multi_user.html" %}
                 {% include "config/_bangumi_oauth.html" %}
                 {% include "config/_advanced.html" %}
                 {% include "config/_auth.html" %}
                 {%
-                    include "config/_bangumi_data.html" %}
+                include "config/_bangumi_data.html" %}
                 {% include "config/_llm.html" %}
                 {%
-                    include "config/_summary.html" %}
+                include "config/_summary.html" %}
                 {% include "config/_notify.html" %}
                 {%
-                    include "config/_feiniu.html" %}
+                include "config/_feiniu.html" %}
                 {% include "config/_fongmi.html" %}
                 {%
-                    include "config/_bangumi_archive.html" %}
+                include "config/_bangumi_archive.html" %}
             </form>
             <!-- 小屏（lg 以下）操作按钮 fallback -->
             <div class="card mb-4 d-lg-none">
@@ -2790,9 +2790,7 @@
                                         <button type="button" class="btn btn-primary" onclick="saveWebhookInline()">
                                             <i class="bi bi-save me-1"></i>保存
                                         </button>
-                                        <button type="button"
-                                                class="btn btn-secondary"
-                                                onclick="hideWebhookEditor()">取消</button>
+                                        <button type="button" class="btn btn-secondary" onclick="hideWebhookEditor()">取消</button>
                                     </div>
                                 </form>
                             </div>
@@ -2959,9 +2957,7 @@
                                         <button type="button" class="btn btn-primary" onclick="saveEmailInline()">
                                             <i class="bi bi-save me-1"></i>保存
                                         </button>
-                                        <button type="button"
-                                                class="btn btn-secondary"
-                                                onclick="hideEmailEditor()">取消</button>
+                                        <button type="button" class="btn btn-secondary" onclick="hideEmailEditor()">取消</button>
                                     </div>
                                 </form>
                             </div>
@@ -2994,8 +2990,7 @@
                                                    type="checkbox"
                                                    id="inline-wecom-enabled"
                                                    checked />
-                                            <label class="form-check-label fw-semibold"
-                                                   for="inline-wecom-enabled">启用此配置</label>
+                                            <label class="form-check-label fw-semibold" for="inline-wecom-enabled">启用此配置</label>
                                         </div>
                                     </div>
                                     <div class="mb-3">
@@ -3030,9 +3025,7 @@
                                         <button type="button" class="btn btn-primary" onclick="saveWeComInline()">
                                             <i class="bi bi-save me-1"></i>保存
                                         </button>
-                                        <button type="button"
-                                                class="btn btn-secondary"
-                                                onclick="hideWeComEditor()">取消</button>
+                                        <button type="button" class="btn btn-secondary" onclick="hideWeComEditor()">取消</button>
                                     </div>
                                 </form>
                             </div>
@@ -3065,8 +3058,7 @@
                                                    type="checkbox"
                                                    id="inline-dingtalk-enabled"
                                                    checked />
-                                            <label class="form-check-label fw-semibold"
-                                                   for="inline-dingtalk-enabled">启用此配置</label>
+                                            <label class="form-check-label fw-semibold" for="inline-dingtalk-enabled">启用此配置</label>
                                         </div>
                                     </div>
                                     <div class="mb-3">
@@ -3081,16 +3073,14 @@
                                         <div class="form-text">支持直接填写token或完整的Webhook URL</div>
                                     </div>
                                     <div class="mb-3">
-                                        <label for="inline-dingtalk-secret"
-                                               class="form-label fw-semibold">Secret（可选）</label>
+                                        <label for="inline-dingtalk-secret" class="form-label fw-semibold">Secret（可选）</label>
                                         <input type="password"
                                                class="form-control"
                                                id="inline-dingtalk-secret"
                                                placeholder="加签密钥，留空不启用签名" />
                                     </div>
                                     <div class="mb-3">
-                                        <label for="inline-dingtalk-msg-type"
-                                               class="form-label fw-semibold">消息类型</label>
+                                        <label for="inline-dingtalk-msg-type" class="form-label fw-semibold">消息类型</label>
                                         <select class="form-select" id="inline-dingtalk-msg-type">
                                             <option value="text">文本</option>
                                             <option value="markdown">Markdown</option>
