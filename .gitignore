@@ -191,3 +191,5 @@ rrr/mcp_server
 
 # 旧 MCP Sidecar 目录（嵌入后保留为历史参考，不纳入分发）
 /mcp_server/
+/specs/
+/spike_demo/
