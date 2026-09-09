@@ -617,7 +617,6 @@ class ConfigManager:
             "max_tokens": 2000,
             "temperature": 0.7,
             "timeout": 60,
-            "thinking_level": "off",
             "retention_days": 365,
         }
         raw = self.get_section(LLM_SECTION, {})
@@ -625,8 +624,6 @@ class ConfigManager:
         # 空字符串会覆盖默认值（{**defaults, **raw} 语义），对关键枚举字段兜底
         if not merged.get("provider"):
             merged["provider"] = "openai_compat"
-        if not merged.get("thinking_level"):
-            merged["thinking_level"] = "off"
         # 确保类型正确（使用 is not None 以允许 0 等 falsy 值）
         if merged.get("max_tokens") is not None:
             merged["max_tokens"] = int(merged["max_tokens"])
@@ -759,7 +756,10 @@ class ConfigManager:
         "max_records",
         "memory_limit",
         "related_limit",
+        "thinking_level",
     )
+
+    _VALID_THINKING_LEVELS = frozenset({"off", "low", "medium", "high"})
 
     def get_summary_configs(self) -> list[dict[str, Any]]:
         """获取所有 summary 配置节，按名称排序。"""
@@ -769,6 +769,12 @@ class ConfigManager:
             if section_name.startswith("summary-"):
                 section_config = self.get_section(section_name)
                 section_config["name"] = section_name[len("summary-") :]
+                # 容错：先归一化（去空格+小写），非法才回落默认值
+                _raw = str(section_config.get("thinking_level", "")).strip().lower()
+                if _raw not in self._VALID_THINKING_LEVELS:
+                    section_config["thinking_level"] = "off"
+                else:
+                    section_config["thinking_level"] = _raw
                 configs.append(section_config)
         configs.sort(key=lambda x: x.get("name", ""))
         return configs

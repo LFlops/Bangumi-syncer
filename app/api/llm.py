@@ -36,7 +36,6 @@ async def get_llm_config(_=Depends(get_current_user_flexible)):
         temperature=cfg.get("temperature", 0.7),
         timeout=cfg.get("timeout", 60),
         provider=cfg.get("provider", "openai_compat"),
-        thinking_level=cfg.get("thinking_level", "off"),
     )
 
 

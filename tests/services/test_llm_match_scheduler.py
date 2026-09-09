@@ -868,7 +868,9 @@ def test_recover_end_to_end_no_double_llm_call_m22(monkeypatch):
     # 共享 chat spy：首次（崩溃前）返回 tool_use，恢复时返回 end_turn → 累计 2 次
     spy_calls = {"n": 0}
 
-    async def _chat(messages, *, tools=None, tool_choice=None, job_name=None):
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
         spy_calls["n"] += 1
         if spy_calls["n"] == 1:
             return ChatResponse(

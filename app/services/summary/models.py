@@ -27,6 +27,7 @@ class SummaryJobConfig:
     # >0 注入最近 N 条摘要 + 已消费记录排除（信息由摘要承继）。
     memory_limit: int = 0  # 0=关；1–1000=注入最近 N 条摘要（对齐 prune 上限）
     related_limit: int = 0  # 0=关；1–1000=同剧关联最近 N 条（日期倒序）
+    thinking_level: str = "off"  # off | low | medium | high
 
     @classmethod
     def from_config_dict(cls, data: dict) -> SummaryJobConfig:
@@ -46,6 +47,12 @@ class SummaryJobConfig:
             except (TypeError, ValueError):
                 return default
 
+        def _thinking_level(key: str) -> str:
+            """校验 thinking_level 取值，非法回落 'off'。"""
+            valid = ("off", "low", "medium", "high")
+            value = str(data.get(key, "off")).strip().lower()
+            return value if value in valid else "off"
+
         return cls(
             name=str(data.get("name", "")),
             enabled=data.get("enabled", True)
@@ -58,6 +65,7 @@ class SummaryJobConfig:
             max_records=_int("max_records", -1),
             memory_limit=_limit("memory_limit"),
             related_limit=_limit("related_limit"),
+            thinking_level=_thinking_level("thinking_level"),
         )
 
 

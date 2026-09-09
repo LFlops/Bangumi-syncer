@@ -910,3 +910,144 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
     assert captured["in_tx_calls"] == 0, "事务内不应发起 HTTP(bgm.get_subject)"
     # 事务外应预取恰好一次标题
     assert bgm.get_subject.call_count == 1, "应在事务外预取一次标题"
+
+
+# ---------------------------------------------------------------------------
+# 思考开关透传：llm_match_thinking_level 应同时透传到 client.chat 调用
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
+    """场景1：run(thinking_level="medium") 使用默认 chat_fn 时，client.chat 收到 thinking_level='medium'。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    # Mock LLMClient：chat 返回 end_turn 使循环立即结束
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=ChatResponse(content="", stop_reason="end_turn")
+    )
+
+    # get_llm_client 在 _build_default_chat_fn 内部局部导入，需 patch 源模块
+    # 不 mock loop_run：让真实循环执行，验证默认 chat_fn 确实调用 client.chat
+    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+        run_id = "run-think-medium"
+        sr_id = 80
+        database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+        await llm_assist.run(
+            run_id,
+            sync_record=_make_sync_record(sync_record_id=sr_id),
+            bgm=_make_bgm(),
+            thinking_level="medium",
+        )
+
+    # client.chat 应被调用，且收到 thinking_level="medium"
+    assert mock_client.chat.called, "默认 chat_fn 应调用 client.chat"
+    _, kwargs = mock_client.chat.call_args
+    assert kwargs.get("thinking_level") == "medium", (
+        f"client.chat 应收到 thinking_level='medium'，实际 kwargs={kwargs}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
+    """场景2：run(thinking_level="high") → loop_run 收到 max_iterations=5。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.services.agent.loop import RunResult
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=ChatResponse(content="", stop_reason="end_turn")
+    )
+
+    # 捕获 loop_run 收到的实参
+    captured = {}
+
+    async def _fake_loop_run(**kwargs):
+        captured.update(kwargs)
+        return RunResult(stop_reason="end_turn")
+
+    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop_run)
+
+    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+        run_id = "run-think-high"
+        sr_id = 81
+        database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+        await llm_assist.run(
+            run_id,
+            sync_record=_make_sync_record(sync_record_id=sr_id),
+            bgm=_make_bgm(),
+            thinking_level="high",
+        )
+
+    # 验证 max_iterations 直接传入 loop_run：high → 5
+    assert captured.get("max_iterations") == 5, (
+        f"loop_run 应收到 max_iterations=5，实际 captured={captured}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
+    """场景3：run(thinking_level="off") → client.chat 收到 thinking_level='off'。"""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    mock_client = MagicMock()
+    mock_client.chat = AsyncMock(
+        return_value=ChatResponse(content="", stop_reason="end_turn")
+    )
+
+    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+        run_id = "run-think-off"
+        sr_id = 82
+        database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+        await llm_assist.run(
+            run_id,
+            sync_record=_make_sync_record(sync_record_id=sr_id),
+            bgm=_make_bgm(),
+            thinking_level="off",
+        )
+
+    assert mock_client.chat.called, "默认 chat_fn 应调用 client.chat"
+    _, kwargs = mock_client.chat.call_args
+    assert kwargs.get("thinking_level") == "off", (
+        f"client.chat 应收到 thinking_level='off'，实际 kwargs={kwargs}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
+    """场景4：显式传入 chat_fn 时，不调用 get_llm_client，chat_fn 不被包装/改签名。"""
+    from unittest.mock import MagicMock, patch
+
+    mock_client = MagicMock()
+
+    custom_called = {}
+
+    async def custom_chat_fn(messages, *, tools=None, tool_choice=None):
+        custom_called["invoked"] = True
+        custom_called["tools"] = tools
+        custom_called["tool_choice"] = tool_choice
+        return ChatResponse(content="", stop_reason="end_turn")
+
+    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+        run_id = "run-custom-chatfn"
+        sr_id = 83
+        database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+        await llm_assist.run(
+            run_id,
+            sync_record=_make_sync_record(sync_record_id=sr_id),
+            bgm=_make_bgm(),
+            thinking_level="medium",
+            chat_fn=custom_chat_fn,
+        )
+
+    # 自定义 chat_fn 应被直接调用
+    assert custom_called.get("invoked") is True, "自定义 chat_fn 应被调用"
+    # get_llm_client 不应被触发（默认 chat_fn 未构建）
+    assert not mock_client.chat.called, (
+        "注入自定义 chat_fn 时不应调用 get_llm_client().chat"
+    )
+    # 签名保持不变：tools / tool_choice 以关键字参数传入
+    assert "tools" in custom_called
+    assert "tool_choice" in custom_called

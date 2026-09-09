@@ -316,6 +316,7 @@ SECTIONS: dict[str, SectionMeta] = {
         order=600,
         is_multi_instance=True,
         # summary 调度器为 instance 类型，配置联动由 summary_jobs API 直调
+        fields=(FieldMeta(name="thinking_level", default="off"),),
     ),
     "llm": SectionMeta(
         name="llm",
@@ -327,7 +328,6 @@ SECTIONS: dict[str, SectionMeta] = {
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),
             FieldMeta(name="timeout", default=60),
-            FieldMeta(name="thinking_level", default="off"),
         ),
     ),
     # ── 调度器全局（order 900）──

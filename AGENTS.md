@@ -78,3 +78,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 ## PR 与提交前自检
 
 推送或打开 PR 前建议至少执行上文 **Ruff + pytest**（若改模板则加 **djlint**）。**若改运行时依赖**，在 `uv lock` 后按上文单独一节执行 **`uv export` 并提交 `requirements.txt`**。单个 PR 尽量聚焦单一目的，便于审查与回滚。
+
+## 评审复盘沉淀（2026-09-09，思考强度配置拆分）
+
+圆桌验收高频问题与规避规则，规划与编码时直接遵守：
+
+- **配置类参数函数禁用默认值兜底**：带默认值参数会掩盖"调用方必须显式传配置值"的契约。反面案例：`_build_default_chat_fn(thinking_level="medium")` 导致 `_continue_replay` 漏传后静默回退 medium（P0，见 `remain/llm_match_replay_thinking_level.md`）。配置值一律必填，由调用方显式传入。
+- **删除全局配置项时必须全链路排查间接消费点**：不只删 schema/API/UI，还要 grep 所有消费点（含 replay/恢复等次要路径、`config.example.ini`、specs/ 手工测试文档）。本次 replay 路径正是因此遗漏。
+- **配置值解析统一归一化**：从 ini/用户输入读取枚举值，先 `str(v).strip().lower()` 再校验，回落默认值；禁止在同一语义上出现"一层归一、一层严格比对"的分层不一致。
+- **测试断言禁止恒真写法**：`assert not hasattr(x, "f") or x.f is None` 这类 `or` 后半句恒真；对"字段已删除"应断言 `f not in Model.model_fields`。验证传参用 monkeypatch 捕获实参，不要只调被测函数内部的 helper 间接断言。
+- **多任务并行改同一文件需在规划期建依赖边**：本轮 `templates/config.html`、`app/core/config.py` 均因先串行后才避免了写冲突。

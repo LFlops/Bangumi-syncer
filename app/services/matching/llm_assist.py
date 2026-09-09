@@ -619,15 +619,23 @@ def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None
     return value
 
 
-def _build_default_chat_fn():
-    """构造默认 chat_fn：包装 LLMClient.chat（job_name='llm_match' 归属用量）。"""
+def _build_default_chat_fn(thinking_level: str = "medium"):
+    """构造默认 chat_fn：包装 LLMClient.chat（job_name='llm_match' 归属用量）。
+
+    ``thinking_level`` 由调用方（run）传入，透传到 provider 层，使 match 的 LLM
+    请求按自身思考强度工作（而非使用全局 [llm] thinking_level 默认值）。
+    """
     from app.services.llm import get_llm_client
 
     client = get_llm_client()
 
     async def chat_fn(messages, *, tools=None, tool_choice=None):
         return await client.chat(
-            messages, tools=tools, tool_choice=tool_choice, job_name="llm_match"
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            job_name="llm_match",
+            thinking_level=thinking_level,
         )
 
     return chat_fn
@@ -680,7 +688,7 @@ async def run(
     )
 
     if chat_fn is None:
-        chat_fn = _build_default_chat_fn()
+        chat_fn = _build_default_chat_fn(thinking_level)
 
     # LLM 调用异常（chat_fn 抛错）→ 累加 attempts，达 3 → failed
     try:

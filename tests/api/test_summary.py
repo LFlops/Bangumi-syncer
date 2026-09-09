@@ -34,7 +34,8 @@ class TestLLMConfigResponse:
         assert model.temperature == 0.7
         assert model.timeout == 60
         assert model.provider == "openai_compat"
-        assert model.thinking_level == "off"
+        # thinking_level 字段已移除
+        assert not hasattr(model, "thinking_level")
 
     def test_override_values(self):
         """验证显式字段值可被接受。"""
@@ -101,11 +102,10 @@ class TestLLMConfigUpdate:
         assert data["model"] == "gpt-4"
         assert "api_base" not in data
 
-    def test_valid_enum_values_accepted(self):
-        """provider / thinking_level 的合法枚举值可被接受。"""
-        model = LLMConfigUpdate(provider="anthropic_compat", thinking_level="high")
+    def test_valid_provider_accepted(self):
+        """provider 的合法枚举值可被接受。"""
+        model = LLMConfigUpdate(provider="anthropic_compat")
         assert model.provider == "anthropic_compat"
-        assert model.thinking_level == "high"
 
     def test_invalid_provider_rejected(self):
         """非法 provider 在模型层抛 ValidationError。"""
@@ -114,12 +114,13 @@ class TestLLMConfigUpdate:
         with pytest.raises(ValidationError):
             LLMConfigUpdate(provider="banana")
 
-    def test_invalid_thinking_level_rejected(self):
-        """非法 thinking_level 在模型层抛 ValidationError（不静默兜底为 off）。"""
-        from pydantic import ValidationError
-
-        with pytest.raises(ValidationError):
-            LLMConfigUpdate(thinking_level="banana")
+    def test_thinking_level_field_removed(self):
+        """thinking_level 字段已从 LLMConfigUpdate 模型移除。"""
+        model = LLMConfigUpdate(model="gpt-4")
+        data = model.model_dump(exclude_none=True)
+        assert "thinking_level" not in data
+        # 模型 schema 中不应定义该字段
+        assert "thinking_level" not in LLMConfigUpdate.model_fields
 
 
 # ========== LLMTestResponse ==========
@@ -210,6 +211,21 @@ class TestSummaryJobCreate:
         assert model.memory_limit == 0
         assert model.related_limit == 1000
 
+    def test_thinking_level_default_is_off(self):
+        """创建任务未指定 thinking_level 时默认值为 off。"""
+        model = SummaryJobCreate()
+        assert model.thinking_level == "off"
+
+    def test_thinking_level_high_accepted(self):
+        """合法的 thinking_level 值可被接受。"""
+        model = SummaryJobCreate(thinking_level="high")
+        assert model.thinking_level == "high"
+
+    def test_thinking_level_invalid_rejected(self):
+        """非法 thinking_level 值在模型层抛 ValidationError。"""
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(thinking_level="turbo")
+
 
 # ========== SummaryJobUpdate ==========
 
@@ -277,6 +293,21 @@ class TestSummaryJobUpdate:
         model = SummaryJobUpdate(memory_limit=0, related_limit=1000)
         assert model.memory_limit == 0
         assert model.related_limit == 1000
+
+    def test_thinking_level_default_is_none(self):
+        """更新时不传 thinking_level 默认为 None（表示不修改）。"""
+        model = SummaryJobUpdate()
+        assert model.thinking_level is None
+
+    def test_thinking_level_low_accepted(self):
+        """合法的 thinking_level 值可被接受。"""
+        model = SummaryJobUpdate(thinking_level="low")
+        assert model.thinking_level == "low"
+
+    def test_thinking_level_invalid_rejected(self):
+        """非法 thinking_level 值在模型层抛 ValidationError。"""
+        with pytest.raises(ValidationError):
+            SummaryJobUpdate(thinking_level="turbo")
 
 
 # ========== SummaryJobResponse ==========
@@ -433,6 +464,46 @@ class TestSummaryJobResponse:
         assert model.lookback_days == 1  # 默认 1
         assert model.max_records == -1  # 默认 -1（不限制）
 
+    def test_thinking_level_default_is_off(self):
+        """SummaryJobResponse 默认 thinking_level 为 off。"""
+        model = SummaryJobResponse(
+            name="Test",
+            cron="0 21 * * *",
+            lookback_days=1,
+            user_name="",
+            system_prompt="",
+            max_records=200,
+            enabled=True,
+        )
+        assert model.thinking_level == "off"
+
+    def test_from_config_dict_reads_thinking_level(self):
+        """from_config_dict 从字典读取 thinking_level。"""
+        data = {
+            "name": "Test",
+            "thinking_level": "high",
+        }
+        model = SummaryJobResponse.from_config_dict(data)
+        assert model.thinking_level == "high"
+
+    def test_from_config_dict_thinking_level_missing_defaults_off(self):
+        """from_config_dict 缺少 thinking_level 时默认 off。"""
+        data = {"name": "Test"}
+        model = SummaryJobResponse.from_config_dict(data)
+        assert model.thinking_level == "off"
+
+    def test_from_config_dict_thinking_level_case_insensitive(self):
+        """from_config_dict 大写 'HIGH' 归一化为 'high'。"""
+        data = {"name": "Test", "thinking_level": "HIGH"}
+        model = SummaryJobResponse.from_config_dict(data)
+        assert model.thinking_level == "high"
+
+    def test_from_config_dict_thinking_level_invalid_falls_back(self):
+        """from_config_dict 非法值 'turbo' 回落 'off'。"""
+        data = {"name": "Test", "thinking_level": "turbo"}
+        model = SummaryJobResponse.from_config_dict(data)
+        assert model.thinking_level == "off"
+
 
 # ========== SummaryJobTestResponse ==========
 
@@ -570,8 +641,8 @@ class TestGetLLMConfig:
                 assert response.json()["api_key"] == ""
 
     @pytest.mark.asyncio
-    async def test_returns_provider_and_thinking_level(self):
-        """Scenario 6.2: GET /llm 返回 provider 与 thinking_level。"""
+    async def test_returns_config_without_thinking_level(self):
+        """BDD 场景1: GET /api/llm/conf 响应不含 thinking_level 键。"""
         from httpx import ASGITransport, AsyncClient
 
         app = self._create_test_app()
@@ -584,7 +655,6 @@ class TestGetLLMConfig:
                 "temperature": 0.7,
                 "timeout": 60,
                 "provider": "anthropic_compat",
-                "thinking_level": "high",
             }
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -592,11 +662,12 @@ class TestGetLLMConfig:
                 response = await client.get("/api/llm/conf")
                 data = response.json()
                 assert data["provider"] == "anthropic_compat"
-                assert data["thinking_level"] == "high"
+                # 响应中不应包含 thinking_level 键
+                assert "thinking_level" not in data
 
     @pytest.mark.asyncio
-    async def test_returns_thinking_level_default(self):
-        """Scenario 6.3: 未配置 provider/thinking_level 时返回缺省值。"""
+    async def test_returns_provider_default_openai_compat(self):
+        """未配置 provider 时返回缺省值 openai_compat。"""
         from httpx import ASGITransport, AsyncClient
 
         app = self._create_test_app()
@@ -615,7 +686,7 @@ class TestGetLLMConfig:
                 response = await client.get("/api/llm/conf")
                 data = response.json()
                 assert data["provider"] == "openai_compat"
-                assert data["thinking_level"] == "off"
+                assert "thinking_level" not in data
 
     def _create_test_app(self):
         """创建一个带有认证覆盖的 FastAPI 测试应用。"""
@@ -671,8 +742,8 @@ class TestUpdateLLMConfig:
                 mock_cm.reload_config.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_updates_provider_and_thinking_level(self):
-        """Scenario 6.1: PUT 保存 provider 与 thinking_level。"""
+    async def test_updates_provider(self):
+        """PUT 保存 provider。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
@@ -691,19 +762,50 @@ class TestUpdateLLMConfig:
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
-                payload = {"provider": "anthropic_compat", "thinking_level": "medium"}
+                payload = {"provider": "anthropic_compat"}
                 response = await client.put("/api/llm/conf", json=payload)
                 assert response.status_code == 200
                 assert response.json()["status"] == "success"
 
-                assert mock_cm.set_config.call_count == 2
+                assert mock_cm.set_config.call_count == 1
                 options = [c.args[1] for c in mock_cm.set_config.call_args_list]
-                assert set(options) == {"provider", "thinking_level"}
+                assert set(options) == {"provider"}
                 # 均写入 [llm] 段
                 assert all(
                     c.args[0] == "llm" for c in mock_cm.set_config.call_args_list
                 )
                 mock_cm.reload_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_put_ignores_thinking_level(self):
+        """BDD 场景2: PUT 请求体含 thinking_level 时被忽略（不写入配置，不报错）。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with patch("app.api.llm.config_manager") as mock_cm:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                payload = {"provider": "anthropic_compat", "thinking_level": "high"}
+                response = await client.put("/api/llm/conf", json=payload)
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+
+                # thinking_level 不应被写入配置
+                options = [c.args[1] for c in mock_cm.set_config.call_args_list]
+                assert "thinking_level" not in options
+                assert "provider" in options
 
     @pytest.mark.asyncio
     async def test_empty_update_is_accepted(self):
@@ -737,11 +839,10 @@ class TestUpdateLLMConfig:
         "payload",
         [
             {"provider": "banana"},
-            {"thinking_level": "banana"},
         ],
     )
-    async def test_invalid_enum_values_rejected(self, payload):
-        """非法 provider / thinking_level 应在 API 边界被拒绝（422），不写入配置。"""
+    async def test_invalid_provider_rejected(self, payload):
+        """非法 provider 应在 API 边界被拒绝（422），不写入配置。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
@@ -1087,6 +1188,47 @@ class TestListSummaryJobs:
                 data = response.json()
                 assert data["data"] == []
 
+    @pytest.mark.asyncio
+    async def test_returns_thinking_level_in_response(self):
+        """GET /api/summary/jobs 响应中包含 thinking_level 字段。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with patch("app.api.summary_jobs.config_manager") as mock_cm:
+            mock_cm.get_summary_configs.return_value = [
+                {
+                    "id": 1,
+                    "name": "Thinking Summary",
+                    "cron": "0 21 * * *",
+                    "lookback_days": 1,
+                    "user_name": "",
+                    "system_prompt": "",
+                    "max_records": 200,
+                    "enabled": True,
+                    "thinking_level": "medium",
+                },
+            ]
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.get("/api/summary/jobs")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                assert len(data["data"]) == 1
+                assert data["data"][0]["thinking_level"] == "medium"
+
 
 class TestCreateSummaryJob:
     """POST /api/summary/jobs 端点测试。"""
@@ -1130,6 +1272,111 @@ class TestCreateSummaryJob:
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_create_with_thinking_level_high_returns_200(self):
+        """Scenario: 创建带思考强度的总结任务，thinking_level 透传至 save_summary_config。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+        ):
+            mock_scheduler.apply_config_after_save = AsyncMock()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                payload = {
+                    "name": "Thinking Job",
+                    "thinking_level": "high",
+                }
+                response = await client.post("/api/summary/jobs", json=payload)
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                call_args = mock_cm.save_summary_config.call_args[0][0]
+                assert call_args["thinking_level"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_create_without_thinking_level_defaults_to_off(self):
+        """Scenario: 创建任务未指定 thinking_level 时默认 off。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+        ):
+            mock_scheduler.apply_config_after_save = AsyncMock()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                payload = {"name": "Default Thinking Job"}
+                response = await client.post("/api/summary/jobs", json=payload)
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                call_args = mock_cm.save_summary_config.call_args[0][0]
+                assert call_args["thinking_level"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_create_with_invalid_thinking_level_returns_422(self):
+        """Scenario: 非法 thinking_level 值被拒绝（422）。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+        ):
+            mock_scheduler.apply_config_after_save = AsyncMock()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                payload = {
+                    "name": "Bad Thinking Job",
+                    "thinking_level": "turbo",
+                }
+                response = await client.post("/api/summary/jobs", json=payload)
+                assert response.status_code == 422
+                mock_cm.save_summary_config.assert_not_called()
+
 
 class TestUpdateSummaryJob:
     """PUT /api/summary/jobs/{id} 端点测试。"""
@@ -1171,6 +1418,40 @@ class TestUpdateSummaryJob:
                 assert call_args["name"] == "Updated Job"
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_update_with_thinking_level_low(self):
+        """Scenario: 更新 thinking_level 透传至 save_summary_config。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+        ):
+            mock_scheduler.apply_config_after_save = AsyncMock()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                payload = {"thinking_level": "low"}
+                response = await client.put("/api/summary/jobs/3", json=payload)
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "success"
+                call_args = mock_cm.save_summary_config.call_args[0][0]
+                assert call_args["thinking_level"] == "low"
 
 
 class TestDeleteSummaryJob:

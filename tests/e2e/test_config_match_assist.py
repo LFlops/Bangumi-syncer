@@ -59,7 +59,6 @@ def test_match_assist_switch_visible_when_llm_configured(authed_page, base_url: 
                 "temperature": 0.7,
                 "timeout": 60,
                 "provider": "openai_compat",
-                "thinking_level": "off",
             }
         ),
     )
