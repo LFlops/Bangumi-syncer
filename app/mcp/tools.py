@@ -40,6 +40,13 @@ def _require_read_scope() -> None:
 # 敏感字段回显掩码
 _MASK = "***"
 
+# MCP 侧专用敏感字段掩码集合：除 config_schema 的 sensitive_fields 外，
+# 额外屏蔽 auth 段的高危字段（口令哈希 / 派生 Fernet 密钥的主密钥）。
+# 不改动 config_schema.sensitive_fields，避免影响落盘加密语义。
+_EXTRA_SENSITIVE_FIELDS: frozenset[tuple[str, str]] = frozenset(
+    {("auth", "password"), ("auth", "secret_key")}
+)
+
 # 日志行时间戳格式: [2026/09/03 12:00:00.123]
 _LOG_TIMESTAMP_RE = re.compile(r"^\[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
 
@@ -124,7 +131,9 @@ def _mask_sensitive(config_data: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(fields, dict):
             continue
         for key in list(fields.keys()):
-            if is_sensitive_field(section, key):
+            if (section, key) in _EXTRA_SENSITIVE_FIELDS:
+                fields[key] = _MASK
+            elif is_sensitive_field(section, key):
                 fields[key] = _MASK
     return config_data
 

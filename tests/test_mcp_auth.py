@@ -132,6 +132,74 @@ class TestRSAKeyManager:
         assert private_path.read_bytes() == private_pem
         assert public_path.read_bytes() == public_pem
 
+    def test_load_or_generate_recovers_missing_public_key(self, tmp_path):
+        """Private key present + public key missing: re-derive public, keep private."""
+        from app.mcp.provider import RSAKeyManager
+
+        private_path = tmp_path / "private.pem"
+        public_path = tmp_path / "public.pem"
+
+        # Only the private key exists on disk.
+        private_pem, _ = _generate_keypair()
+        private_path.write_bytes(private_pem)
+        assert not public_path.exists()
+
+        manager = RSAKeyManager(
+            private_key_path=str(private_path),
+            public_key_path=str(public_path),
+        )
+        manager.load_or_generate()
+
+        # Private key must be byte-for-byte unchanged (no silent regeneration).
+        assert private_path.read_bytes() == private_pem
+        # Private key file keeps owner-only permissions.
+        assert (private_path.stat().st_mode & 0o777) == 0o600
+
+        # Public key is re-derived from the existing private key.
+        assert public_path.exists()
+        derived_public = (
+            serialization.load_pem_private_key(private_pem, password=None)
+            .public_key()
+            .public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+        assert public_path.read_bytes() == derived_public
+
+        # The recovered pair is usable.
+        token = manager.sign_jwt({"sub": "recover"})
+        decoded = jwt.decode(token, manager.get_public_key_pem(), algorithms=["RS256"])
+        assert decoded["sub"] == "recover"
+
+    def test_load_or_generate_generates_pair_when_private_missing(self, tmp_path):
+        """Private key missing: generate a fresh matching key pair."""
+        from app.mcp.provider import RSAKeyManager
+
+        private_path = tmp_path / "private.pem"
+        public_path = tmp_path / "public.pem"
+
+        # Stale public key exists but private key is gone -> must regenerate.
+        _, stale_public_pem = _generate_keypair()
+        public_path.write_bytes(stale_public_pem)
+
+        manager = RSAKeyManager(
+            private_key_path=str(private_path),
+            public_key_path=str(public_path),
+        )
+        manager.load_or_generate()
+
+        assert private_path.exists()
+        assert public_path.exists()
+        assert private_path.read_bytes() != b""
+        assert (private_path.stat().st_mode & 0o777) == 0o600
+        # Public key must now match the newly generated private key, not the stale one.
+        assert public_path.read_bytes() != stale_public_pem
+
+        token = manager.sign_jwt({"sub": "fresh"})
+        decoded = jwt.decode(token, manager.get_public_key_pem(), algorithms=["RS256"])
+        assert decoded["sub"] == "fresh"
+
     def test_public_key_pem_returns_public_key_bytes(self, tmp_path):
         """get_public_key_pem should return the public key in PEM format."""
         from app.mcp.provider import RSAKeyManager
@@ -1644,8 +1712,8 @@ class TestDCRFallback:
 
     @pytest.mark.asyncio
     async def test_unknown_client_id_rejected_in_authorize(self, provider):
-        """authorize should reject unknown client_id."""
-        from mcp.server.auth.provider import AuthorizationParams
+        """authorize should reject unknown client_id with unauthorized_client."""
+        from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
         from mcp.shared.auth import OAuthClientInformationFull
 
         # Create a client object but don't register it
@@ -1663,13 +1731,15 @@ class TestDCRFallback:
             redirect_uri_provided_explicitly=True,
         )
 
-        with pytest.raises(ValueError, match="Unknown client"):
+        with pytest.raises(AuthorizeError) as exc_info:
             await provider.authorize(client, params)
+        assert exc_info.value.error == "unauthorized_client"
+        assert "Unknown client" in (exc_info.value.error_description or "")
 
     @pytest.mark.asyncio
     async def test_authorize_validates_redirect_uri(self, provider):
-        """authorize should validate redirect_uri matches registered."""
-        from mcp.server.auth.provider import AuthorizationParams
+        """authorize should reject mismatched redirect_uri with invalid_request."""
+        from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
         from mcp.shared.auth import OAuthClientInformationFull
 
         client_info = OAuthClientInformationFull(
@@ -1689,8 +1759,34 @@ class TestDCRFallback:
             redirect_uri_provided_explicitly=True,
         )
 
-        with pytest.raises(ValueError, match="redirect_uri"):
+        with pytest.raises(AuthorizeError) as exc_info:
             await provider.authorize(client_info, params)
+        assert exc_info.value.error == "invalid_request"
+        assert "redirect_uri" in (exc_info.value.error_description or "")
+
+    def test_matches_redirect_uri_loopback_port_flexible(self):
+        """Loopback redirect_uri should match regardless of port (RFC 8252)."""
+        from app.mcp.provider import BangumiOAuthProvider
+
+        assert (
+            BangumiOAuthProvider._matches_redirect_uri(
+                "http://localhost:54321/callback",
+                ["http://localhost/callback"],
+            )
+            is True
+        )
+
+    def test_matches_redirect_uri_non_loopback_port_must_match(self):
+        """Non-loopback redirect_uri should require the exact port."""
+        from app.mcp.provider import BangumiOAuthProvider
+
+        assert (
+            BangumiOAuthProvider._matches_redirect_uri(
+                "http://example.com:8080/callback",
+                ["http://example.com/callback"],
+            )
+            is False
+        )
 
     @pytest.mark.asyncio
     async def test_register_client_validates_redirect_uris(self, provider):
@@ -1790,8 +1886,12 @@ class TestSecurityFixes:
             redirect_uri_provided_explicitly=True,
         )
 
-        with pytest.raises(ValueError, match="redirect_uri"):
+        from mcp.server.auth.provider import AuthorizeError
+
+        with pytest.raises(AuthorizeError) as exc_info:
             await provider.authorize(mock_client, params)
+        assert exc_info.value.error == "invalid_request"
+        assert "redirect_uri" in (exc_info.value.error_description or "")
 
     # --- P0-2: DCR prefix bypass ---
 
@@ -1819,8 +1919,12 @@ class TestSecurityFixes:
             redirect_uri_provided_explicitly=True,
         )
 
-        with pytest.raises(ValueError, match="redirect_uri"):
+        from mcp.server.auth.provider import AuthorizeError
+
+        with pytest.raises(AuthorizeError) as exc_info:
             await provider.authorize(client_info, params)
+        assert exc_info.value.error == "invalid_request"
+        assert "redirect_uri" in (exc_info.value.error_description or "")
 
     @pytest.mark.asyncio
     async def test_dcr_authorize_rejects_prefix_bypass_dot_segments(self, provider):
@@ -1846,8 +1950,12 @@ class TestSecurityFixes:
             redirect_uri_provided_explicitly=True,
         )
 
-        with pytest.raises(ValueError, match="redirect_uri"):
+        from mcp.server.auth.provider import AuthorizeError
+
+        with pytest.raises(AuthorizeError) as exc_info:
             await provider.authorize(client_info, params)
+        assert exc_info.value.error == "invalid_request"
+        assert "redirect_uri" in (exc_info.value.error_description or "")
 
     # --- P1-1: issuer_url ---
 
