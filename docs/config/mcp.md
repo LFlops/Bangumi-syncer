@@ -71,9 +71,36 @@ Docker 部署同理，单容器即可。
 JWT `issuer`（= 解析后的 `MCP_BASE_URL`）、`audience`（=`bangumi-syncer`）、Access Token 有效期（= `3600` 秒）在 `app/mcp/server.py` 中**硬编码**，没有对应环境变量。
 :::
 
-::: tip RSA 密钥
-BS 启动时自动生成 RSA 密钥对（RS256），私钥仅存于本地磁盘（`MCP_RSA_PRIVATE_KEY`），公钥用于验签 JWT。无需共享卷。
+::: warning RSA 密钥持久化
+RSA 密钥对在 BS 启动时自动生成（RS256）并写入 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 指向的路径。**默认路径在系统临时目录**（`tempfile.gettempdir()`），容器重建或临时目录被清理会导致密钥丢失：
+
+- 已签发的 Access Token（有效期 1 小时）验签失败，客户端需重新授权
+- 多实例部署时各实例密钥不一致，需共享同一密钥
+
+建议将两个环境变量指向持久卷/数据目录。Docker 示例（镜像内已预建 `/app/data`）：
+
+```bash
+docker run -d \
+  -v bs_data:/app/data \
+  -e MCP_RSA_PRIVATE_KEY=/app/data/mcp_private.pem \
+  -e MCP_RSA_PUBLIC_KEY=/app/data/mcp_public.pem \
+  -p 8000:8000 bangumi-syncer:latest
+```
 :::
+
+### 3. 部署约束：单进程
+
+OAuth 授权状态全部保存在**进程内存**中（`app/mcp/provider.py`）：已注册客户端 `_clients`、授权码 `_auth_codes`、Refresh Token `_refresh_tokens`、待授权请求 `_pending_auths`、已吊销 `jti` 集合 `_revoked_tokens`。
+
+仓库内置的启动方式均为**单进程**：`start.bat` 与 Dockerfile 的 `CMD` 都执行 `uvicorn app.main:app`，未使用 `--workers`。
+
+因此当前**不支持 `--workers N` 或 gunicorn 多进程**部署：
+
+- 授权码 / Refresh Token 可能因请求落到不同进程而无法换取
+- 吊销状态在各进程间不一致
+- Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响
+
+多实例部署时，除需共享同一 RSA 密钥（见上）外，进程内状态（授权码 / Refresh Token / 吊销集合）在各实例间不共享，授权与吊销互相独立。
 
 ## OAuth 授权流程
 
@@ -105,6 +132,18 @@ BS 内置的 FastMCP 服务实现了完整的 OAuth 2.1 授权服务器，支持
 - **标准端点**：`POST /revoke`（由 `RevocationOptions(enabled=True)` 提供）可吊销 access / refresh token；access token 吊销后其 `jti` 进入进程内吊销集合，验签时被拒绝
 - **内存方式**：删除进程内存中的 Refresh Token 即可吊销（重启进程会清空）。重新连接会触发新的授权流程
 :::
+
+## 动态客户端注册（DCR）
+
+BS 内置的 FastMCP 服务**默认开启**动态客户端注册（RFC 7591）：`ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`，暴露标准端点 `POST /register`（未认证可达）。
+
+::: warning 注册 ≠ 授权
+DCR 注册本身**不授予任何数据权限**。客户端注册成功后，仍需走完整授权流程：BS 登录会话（`auth.enabled=true` 时）+ consent 页点击 **Allow**，才能拿到 Access Token。
+:::
+
+- **存储与上限**：已注册客户端保存在进程内存，上限 `MAX_CLIENTS=1000`
+- **兜底方式**：**重启进程即清空全部已注册客户端**，同时清空待授权请求、授权码、Refresh Token 与吊销状态；RSA 密钥若已持久化则保留。已签发的 Access Token 在其 1 小时有效期内仍然有效（JWT 自包含验签，不查询注册表）
+- **关闭方式**：当前**没有配置开关**，需在装配代码中传入 `ClientRegistrationOptions(enabled=False)`。关闭后仅 CIMD（Client ID Metadata Document）客户端可授权，部分依赖 DCR 的客户端将不可用
 
 ## Claude Desktop 接入
 
@@ -194,7 +233,8 @@ BS 内置的 MCP 服务提供 3 个工具，AI 助手通过它们与 BS 交互�
 | **私钥隔离** | RSA 私钥仅存在于 BS 进程内存与本地磁盘 |
 | **公钥非机密** | 公钥用于验签 JWT，泄露不会导致 Token 被伪造（签名需要私钥） |
 | **工具端点受保护** | `/mcp` 需要有效 JWT 才能调用工具 |
-| **Scope 分离** | Token 带 `read` / `write` scope，读操作不要求 write 权限 |
+| **Scope 分离** | Token 默认只发放 `read`；`write` 需客户端**显式请求**，且请求的 scope 必须属于客户端已注册/声明的 scope。读操作不要求 write 权限 |
+| **动态注册受限** | DCR 注册不授予数据权限，仍需登录会话 + consent；客户端上限 1000，重启即清空 |
 | **Consent 确认** | 每次新客户端授权都需用户点击 Allow，防止未授权访问 |
 
 ::: tip 部署建议

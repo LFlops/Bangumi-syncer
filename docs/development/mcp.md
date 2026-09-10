@@ -60,6 +60,10 @@ tests/
 | `app/mcp/tools.py` | 工具实现（get_logs / get_current_config / update_config） |
 | `app/main.py` | FastAPI 应用入口，嵌入 FastMCP 路由 + combine_lifespans |
 
+::: warning 状态均为进程内存储，当前仅支持单进程
+`BangumiOAuthProvider`（`app/mcp/provider.py`）的客户端注册表、授权码、Refresh Token、待授权请求与吊销集合全部保存在**进程内存**中。仓库启动方式（`start.bat`、Dockerfile `CMD`）均为 `uvicorn app.main:app` 单进程，**不支持 `--workers N` / gunicorn 多进程**：否则授权码 / Refresh Token 会因请求落到不同进程而失效，吊销状态也会各进程不一致。Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响。
+:::
+
 ---
 
 ## 认证链路
@@ -90,6 +94,12 @@ JWT claims：
 }
 ```
 
+::: tip 默认 scope 为 read
+上面的 `"scope": "read write"` 仅为示例。实际实现中 `_default_scopes = ["read"]`（`provider.py`）：客户端**不请求 scope** 时只发放 `read`（authorize 的 `params.scopes or self._default_scopes`、DCR 注册时未声明 scope 也回填 `read`、CIMD 的 `default_scope` 同为 `read`）。`write` 需客户端在授权请求中**显式请求**，且 SDK（`OAuthClientInformationFull.validate_scope`）会校验请求的 scope 属于客户端已注册/声明的 scope，否则返回 `invalid_scope`。
+
+权限对照：`read` → `get_logs` / `get_current_config`（敏感字段已掩码）；`write` → `update_config`（`auth` 段始终禁写）。
+:::
+
 ### 2. auth.enabled 分流
 
 认证分流由 **BS 侧** `auth.enabled` 配置决定，`handle_consent` 在**同进程内**通过 `security_manager.validate_session()` 校验 BS 会话，不走 HTTP：
@@ -113,6 +123,15 @@ JWT claims：
 
 `auth.enabled=true` 且请求未携带有效 `session_token` 时，`handle_consent`（GET 与 POST allow）**直接返回 HTTP 401**，并不会跳转到 BS 登录页。用户需先在 BS Web 端登录，再重新触发授权。
 
+### 5. 动态客户端注册（DCR）
+
+`BangumiOAuthProvider` 默认传入 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`（`provider.py`），因此 `/register`（RFC 7591）默认开启且未认证可达（路由在 `app/main.py` 中平铺注册）。
+
+- **注册 ≠ 授权**：注册只登记客户端元数据，不授予任何数据权限；仍需 BS 登录会话（`auth.enabled=true` 时）+ consent 页点 Allow 才能拿到 Token
+- **存储与上限**：已注册客户端存于进程内存 `_clients`，上限 `MAX_CLIENTS=1000`，达到上限后注册抛 `RegistrationError`
+- **兜底**：重启进程即清空 `_clients`（及 `_auth_codes` / `_refresh_tokens` / `_pending_auths` / `_revoked_tokens`）；RSA 密钥若已持久化则保留。已签发 Access Token 在 1 小时有效期内仍有效（JWT 自包含验签，不查注册表）
+- **关闭方式**：当前无配置开关，需在装配代码（`_create_provider` / `create_auth_server`）传入 `ClientRegistrationOptions(enabled=False)`；关闭后仅 CIMD 客户端可授权（`get_client` / `authorize` 对 CIMD client_id 走独立分支，不依赖 `_clients`）
+
 ---
 
 ## 密钥管理
@@ -132,6 +151,10 @@ JWT claims：
 | 公钥 | `<系统临时目录>/mcp_public.pem` | 本地生成，用于验签 JWT |
 
 默认路径由 `tempfile.gettempdir()` 解析（`app/mcp/server.py`），因此会随操作系统不同而变化（Linux 通常为 `/tmp`，macOS 为 `$TMPDIR` 指向的目录）。路径可通过环境变量 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 配置。
+
+::: warning 默认路径不持久
+默认路径位于系统临时目录，容器重建或临时目录被清理会导致密钥丢失：已签发的 Access Token（有效期 1 小时）将验签失败，客户端需重新授权；多实例部署也需要各实例共享同一密钥。生产部署应将 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 指向持久卷/数据目录（如 `/app/data/mcp_private.pem`，镜像内已预建 `/app/data`）。
+:::
 
 ---
 
