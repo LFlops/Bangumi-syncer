@@ -14,7 +14,7 @@ import logging
 import re
 from collections import UserDict
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
 
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
@@ -107,6 +107,33 @@ class BatchResults(UserDict):
             )
             return
         super().__setitem__(key, value)
+
+
+@runtime_checkable
+class ToolSpanRecorder(Protocol):
+    """工具执行 span 记录协议（鸭子类型）。
+
+    实现者需持有可注入的时钟（构造参数注入 clock，默认真实时钟），
+    在 ``start_tool`` 记 t0、``end_tool`` 记 t1。包裹层只负责在正确时机
+    （await 前 start、完成后 end）调用，不持有时钟，不感知时间。
+    """
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> Optional[str]:
+        """记录工具执行开始；返回 span_id（或 None 表示无需记录）。"""
+
+    def end_tool(
+        self,
+        span_id: str,
+        *,
+        result: Optional[ToolResultBlock] = None,
+        error: str = "",
+    ) -> None:
+        """记录工具执行结束。
+
+        - ``result=None 且 error 非空``：执行异常（异常类型名）
+        - ``result=ToolResultBlock``：正常结果（含 is_error 的占位块）
+        - ``result=None 且 error=""``：terminal 捕获等非结果路径
+        """
 
 
 class ToolRegistry:
@@ -222,19 +249,28 @@ class ToolRegistry:
 
     # -- 批量分段并行执行 ---------------------------------------------------
 
-    async def execute_batch(self, tool_calls: list[ToolUseBlock]) -> "BatchResults":
+    async def execute_batch(
+        self,
+        tool_calls: list[ToolUseBlock],
+        *,
+        recorder: Optional[ToolSpanRecorder] = None,
+    ) -> "BatchResults":
         """分段并行批量执行。
 
         - 按原始顺序扫描：连续 readonly 段 ``asyncio.gather`` 并行（保序返回）
         - 非 readonly（write / terminal）单独串行，相对顺序保持
         - 返回 ``BatchResults``：``ordered`` 与 ``tool_calls`` **一一对应的独立槽位**，
           同时兼容 ``{tool_use_id: result}`` 的 dict 视图（按 id 取首个结果）：
-          - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
-          - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
-          - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
-          - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
-            槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
-            （独立槽位避免 dup 错误块覆盖首个真实结果）
+           - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
+           - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
+           - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
+           - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
+             槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
+             （独立槽位避免 dup 错误块覆盖首个真实结果）
+        - ``recorder``：工具级 span 记录器（鸭子类型 ``ToolSpanRecorder``）。
+          每个工具执行前 ``start_tool``、完成后 ``end_tool``（finally 必达）；
+          重复 ``tool_use_id`` 的占位错误块同样走包裹（有 span，is_error）；
+          ``None`` 时行为与现在完全一致（零回归）。
         """
         n = len(tool_calls)
         slots: list[Any] = [None] * n
@@ -242,9 +278,10 @@ class ToolRegistry:
         i = 0
         while i < n:
             tc = tool_calls[i]
-            # 重复 tool_use_id：不执行 handler，本槽位回填错误块
+            # 重复 tool_use_id：不执行 handler，本槽位回填错误块（同样走 recorder 包裹）
             if tc.id in seen_ids:
                 slots[i] = self._duplicate_block(tc.id)
+                self._record_duplicate(tc, slots[i], recorder=recorder, sequence=i)
                 i += 1
                 continue
             if self.is_readonly(tc.name):
@@ -255,19 +292,42 @@ class ToolRegistry:
                     cur = tool_calls[j]
                     if cur.id in seen_ids:
                         slots[j] = self._duplicate_block(cur.id)
+                        self._record_duplicate(
+                            cur, slots[j], recorder=recorder, sequence=j
+                        )
                     else:
                         seen_ids.add(cur.id)
                         seg.append((j, cur))
                     j += 1
-                seg_results = await asyncio.gather(*[self._exec_one(t) for _, t in seg])
+                seg_results = await asyncio.gather(
+                    *[
+                        self._exec_one(t, recorder=recorder, sequence=idx)
+                        for idx, t in seg
+                    ]
+                )
                 for (idx, _), r in zip(seg, seg_results):
                     slots[idx] = r
                 i = j
             else:
                 seen_ids.add(tc.id)
-                slots[i] = await self._exec_one(tc)
+                slots[i] = await self._exec_one(tc, recorder=recorder, sequence=i)
                 i += 1
         return BatchResults([(tc.id, slots[idx]) for idx, tc in enumerate(tool_calls)])
+
+    @staticmethod
+    def _record_duplicate(
+        tc: ToolUseBlock,
+        dup_block: ToolResultBlock,
+        *,
+        recorder: Optional[ToolSpanRecorder],
+        sequence: int,
+    ) -> None:
+        """为重复 tool_use_id 的占位错误块记录 span（有 span，is_error）。"""
+        if recorder is None:
+            return
+        span_id = recorder.start_tool(tc, sequence=sequence)
+        if span_id is not None:
+            recorder.end_tool(span_id, result=dup_block, error="")
 
     @staticmethod
     def _duplicate_block(tool_use_id: str) -> ToolResultBlock:
@@ -278,19 +338,46 @@ class ToolRegistry:
             is_error=True,
         )
 
-    async def _exec_one(self, tc: ToolUseBlock) -> Any:
-        """执行单条并统一包装为 ToolResultBlock / TerminalCapture。"""
+    async def _exec_one(
+        self,
+        tc: ToolUseBlock,
+        *,
+        recorder: Optional[ToolSpanRecorder] = None,
+        sequence: int = 0,
+    ) -> Any:
+        """执行单条并统一包装为 ToolResultBlock / TerminalCapture。
+
+        包裹层职责：在 await 执行前 ``start_tool``、完成后 ``finally`` 中 ``end_tool``
+        （必达）。保持现有异常语义不变：异常被吞掉转为错误块（不上抛）；
+        ``end_tool`` 的 ``error`` 参数携带异常类型名，``result`` 置 None。
+        """
+        span_id: Optional[str] = None
+        if recorder is not None:
+            span_id = recorder.start_tool(tc, sequence=sequence)
+        result_for_recorder: Optional[ToolResultBlock] = None
+        error_for_recorder: str = ""
         try:
             result = await self.execute(tc.name, tc.input)
+            if isinstance(result, TerminalCapture):
+                return result
+            result_for_recorder = ToolResultBlock(
+                tool_use_id=tc.id, content=str(result), is_error=False
+            )
+            return result_for_recorder
         except Exception as exc:  # ToolError / handler 异常 / 超时 统一转为错误块
+            error_for_recorder = type(exc).__name__
             return ToolResultBlock(
                 tool_use_id=tc.id,
                 content=f"工具执行失败: {type(exc).__name__}",
                 is_error=True,
             )
-        if isinstance(result, TerminalCapture):
-            return result
-        return ToolResultBlock(tool_use_id=tc.id, content=str(result), is_error=False)
+        finally:
+            if span_id is not None:
+                recorder.end_tool(
+                    span_id,
+                    result=result_for_recorder,
+                    error=error_for_recorder,
+                )
 
 
 # ---------------------------------------------------------------------------

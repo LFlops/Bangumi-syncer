@@ -10,11 +10,15 @@ Agent 追踪查询 API
 - 非本人且非管理员 → 403（经 ``sync_record_id`` 关联 ``sync_records.user_name`` 校验）
 - run 不存在 → 404
 
-观测 API 不返回 ``payload_json`` 全文之外的内部字段（run 端点不返回
-``payload_json`` / ``replay_delta``；steps 端点返回 ``payload_json`` 观测摘要，
-但绝不返回 ``replay_delta``——其为内部重放专用）。
+展示契约：
+- 响应永不包含 ``replay_delta`` 原文（仅用于内部重放）。
+- ``payload_json`` 列已删除，不再出现在响应中。
+- steps 端点新增 ``display_json``：读取时解密 replay_delta → 现场截断生成展示摘要。
+- 时间字段由 epoch 秒整数转为 ISO 8601 字符串（含时区）；0/None → None。
 """
 
+import json
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -23,6 +27,7 @@ from ..api.deps import get_current_user_flexible
 from ..core.database import database_manager
 from ..core.logging import logger
 from ..core.security import security_manager
+from ..utils.truncate import truncate_json
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -41,7 +46,7 @@ _RUN_PUBLIC_FIELDS = (
     "last_error",
 )
 
-# steps 端点对外暴露的字段（含 payload_json 观测摘要，但不含 replay_delta）
+# steps 端点对外暴露的字段（不含 payload_json / replay_delta；display_json 现场生成）
 _STEP_PUBLIC_FIELDS = (
     "span_id",
     "name",
@@ -54,10 +59,12 @@ _STEP_PUBLIC_FIELDS = (
     "error",
     "iteration",
     "sequence",
-    "payload_json",
     "started_at",
     "ended_at",
 )
+
+# 时间字段集合（run / steps 共享），用于 ISO 转换
+_TIME_FIELDS = ("started_at", "ended_at", "created_at")
 
 
 def _is_admin_user(current_user: dict) -> bool:
@@ -107,15 +114,85 @@ def _authorize(run: dict, current_user: dict) -> None:
     )
 
 
+def _iso_from_epoch(ts) -> Optional[str]:
+    """epoch 秒整数 → ISO 8601 字符串（含时区）；0/None/非数字 → None。"""
+    if not ts:
+        return None
+    if not isinstance(ts, (int, float)):
+        return None
+    try:
+        return datetime.fromtimestamp(ts).astimezone().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _apply_time_fields(record: dict) -> dict:
+    """将记录中的时间列原地转换为 ISO 字符串。"""
+    for field in _TIME_FIELDS:
+        if field in record:
+            record[field] = _iso_from_epoch(record.get(field))
+    return record
+
+
+def _build_display_json(name: str, replay_delta: str) -> str:
+    """从 replay_delta 现场生成展示摘要（截断至合法 JSON）。
+
+    - llm_chat → {"stop_reason", "content"}
+    - tool_execute → {"tool_use_id", "content", "is_error"}
+    - seed → {"seed_messages_count": N}
+    - 解析失败/空 delta/未知 name → ""
+    """
+    if not replay_delta:
+        return ""
+    try:
+        data = (
+            json.loads(replay_delta) if isinstance(replay_delta, str) else replay_delta
+        )
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(data, dict):
+        return ""
+
+    if name == "llm_chat":
+        response = data.get("response") or {}
+        preview = {
+            "stop_reason": response.get("stop_reason", ""),
+            "content": response.get("content", ""),
+        }
+    elif name == "tool_execute":
+        tool_result = data.get("tool_result") or {}
+        preview = {
+            "tool_use_id": tool_result.get("tool_use_id", ""),
+            "content": tool_result.get("content", ""),
+            "is_error": tool_result.get("is_error", False),
+        }
+    elif name == "seed":
+        seed_messages = data.get("seed_messages") or []
+        preview = {"seed_messages_count": len(seed_messages)}
+    else:
+        return ""
+
+    return truncate_json(preview)
+
+
 def _project_run(run: dict) -> dict:
-    """裁剪为对外元数据（剔除内部重放字段）。"""
-    return {field: run.get(field) for field in _RUN_PUBLIC_FIELDS}
+    """裁剪为对外元数据（剔除内部重放字段），时间列 ISO 化。"""
+    projected = {field: run.get(field) for field in _RUN_PUBLIC_FIELDS}
+    _apply_time_fields(projected)
+    return projected
 
 
 def _project_steps(steps: list) -> list:
-    """裁剪 span 列表并强制按 (iteration, sequence) 排序。"""
-    projected = [{f: s.get(f) for f in _STEP_PUBLIC_FIELDS} for s in steps]
-    projected.sort(key=lambda s: (s.get("iteration") or 0, s.get("sequence") or 0))
+    """裁剪 span 列表：剔除内部字段、生成 display_json、ISO 时间、按 (iteration, sequence) 排序。"""
+    projected = []
+    for s in steps:
+        record = {f: s.get(f) for f in _STEP_PUBLIC_FIELDS}
+        record["display_json"] = _build_display_json(
+            s.get("name", ""), s.get("replay_delta", "")
+        )
+        _apply_time_fields(record)
+        projected.append(record)
+    projected.sort(key=lambda r: (r.get("iteration") or 0, r.get("sequence") or 0))
     return projected
 
 

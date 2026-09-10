@@ -30,7 +30,7 @@ order: 30
 
 - **启用 LLM 辅助匹配（llm_match_assist）**：总开关，默认关闭。开启前必须先在 `[llm]` 段配置 `api_key`，否则通过 Web 界面保存会被拒绝（返回"需先配置 LLM"）。
 - **定时 Cron（llm_match_cron）**：LLM 匹配任务的调度表达式，默认 `*/1 * * * *`（每分钟一次）。保存后定时任务会热更新，无需重启。
-- **结果保留天数（llm_match_retention_days）**：LLM 匹配结果在数据库中保留天数，默认 7 天。
+- **结果保留天数（llm_match_retention_days）**：LLM 匹配结果在数据库中保留天数，默认 30 天。
 - **最大迭代次数（llm_match_max_iterations）**：单次 LLM 匹配的最大循环轮次。留空（默认）时按思考开关自动映射（见下方）；填写正整数时显式覆盖。
 - **跨调用缓存（llm_match_cross_call_cache）**：同一剧集多次匹配时是否复用历史 LLM 结果，默认关闭。
 - **恢复超时（llm_match_recovery_timeout_s）**：LLM 匹配恢复超时秒数，默认 120 秒。

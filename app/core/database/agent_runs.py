@@ -9,11 +9,12 @@
 - mark_applied / mark_rejected：仅当 status='succeeded' 可流转（WHERE 守卫）
 - increment_attempts：调度轮次失败计数，>=3 转 failed
 - requeue_failed：total_attempts<=10 才重置入队，>10 拒绝
-- cleanup_terminal：终态超保留期，先删 steps 再删 runs（防孤儿行）
+- cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps）
 """
 
-from datetime import datetime, timedelta
-from typing import Optional
+import json
+import time
+from typing import Any, Optional
 
 from .base_repository import BaseRepository
 
@@ -27,10 +28,46 @@ _TERMINAL_STATUSES = (
     "rejected",
 )
 
+# 活性态：pending / processing（cleanup_expired 的活性腿用）
+_ACTIVE_STATUSES = ("pending", "processing")
 
-def _now() -> str:
-    """本地时间字符串（与 Python 写入的 started_at/ended_at 同格式，便于字符串比较）"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+def _now() -> int:
+    """当前 epoch 秒整数（与 agent_steps/agent_runs 时间列格式一致，便于整数比较）。"""
+    return int(time.time())
+
+
+def _encrypt_replay_delta(raw: Any) -> str:
+    """加密 replay_delta（best-effort：失败降级存明文，不中断主流程）。
+
+    接受 str / dict / list 等类型：非字符串先序列化为 JSON 再加密。
+    """
+    if not raw:
+        return raw if isinstance(raw, str) else ""
+    try:
+        from ..config_secret_crypto import encrypt
+
+        text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+        return encrypt(text)
+    except Exception as e:  # best-effort：加密失败降级存明文
+        import logging
+
+        logging.getLogger(__name__).warning(
+            f"[agent_runs] replay_delta 加密失败（已降级存明文）: {e}"
+        )
+        return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+
+
+def _decrypt_replay_delta(stored: Any) -> str:
+    """解密 replay_delta（容错无前缀明文：原样返回）。"""
+    if not stored:
+        return stored if isinstance(stored, str) else ""
+    try:
+        from ..config_secret_crypto import decrypt
+
+        return decrypt(stored)
+    except Exception:  # 容错：解密失败原样返回
+        return stored if isinstance(stored, str) else ""
 
 
 class AgentRunsRepository(BaseRepository):
@@ -279,41 +316,36 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="重新入队 agent_run 失败", default=False
         )
 
-    def cleanup_terminal(self, retention_days: int = 7) -> int:
-        """清理终态且 ended_at 超保留期的会话。
+    def cleanup_expired(self, retention_days: int) -> int:
+        """按滑动窗口轮转清理过期 runs（单条 DELETE，FK 级联删 steps）。
 
-        先删 agent_steps 再删 agent_runs（级联，防孤儿行），返回删除的 runs 数。
+        两腿 OR：
+        - 终态腿：status IN (terminal) AND ended_at > 0 AND ended_at < cutoff
+        - 活性腿：status IN (pending, processing) AND created_at < cutoff（过期死行一并删）
+
+        retention_days <= 0 → 直接 return 0（永不清理语义，参照 sync_records.cleanup_old_records）。
+        时间比较统一为 epoch 秒整数。
         """
 
-        cutoff = (datetime.now() - timedelta(days=retention_days)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
-        placeholders = ",".join("?" * len(_TERMINAL_STATUSES))
+        if retention_days <= 0:
+            return 0
+
+        cutoff = _now() - retention_days * 86400
+        terminal_ph = ",".join("?" * len(_TERMINAL_STATUSES))
+        active_ph = ",".join("?" * len(_ACTIVE_STATUSES))
 
         def _write(conn):
             cursor = conn.execute(
                 f"""
-                SELECT run_id FROM agent_runs
-                WHERE status IN ({placeholders})
-                  AND ended_at IS NOT NULL AND ended_at < ?
+                DELETE FROM agent_runs
+                WHERE (status IN ({terminal_ph}) AND ended_at > 0 AND ended_at < ?)
+                   OR (status IN ({active_ph}) AND created_at < ?)
                 """,
-                _TERMINAL_STATUSES + (cutoff,),
-            )
-            run_ids = [r[0] for r in cursor.fetchall()]
-            if not run_ids:
-                return 0
-            # 先删 steps，防孤儿行
-            step_ph = ",".join("?" * len(run_ids))
-            conn.execute(
-                f"DELETE FROM agent_steps WHERE run_id IN ({step_ph})", run_ids
-            )
-            # 再删 runs
-            cursor = conn.execute(
-                f"DELETE FROM agent_runs WHERE run_id IN ({step_ph})", run_ids
+                _TERMINAL_STATUSES + (cutoff,) + _ACTIVE_STATUSES + (cutoff,),
             )
             return cursor.rowcount
 
-        return self._run_write(_write, error_msg="清理终态 agent_run 失败", default=0)
+        return self._run_write(_write, error_msg="清理过期 agent_run 失败", default=0)
 
     # ------------------------------------------------------------------
     # 查询：去重 / 调度器辅助
@@ -326,10 +358,9 @@ class AgentRunsRepository(BaseRepository):
 
         命中：status IN (pending, processing, succeeded)；或 no_suggestion 且
         ended_at 在保留期内（未超保留期也算活跃）。无则返回 None。
+        时间比较统一为 epoch 秒整数。
         """
-        cutoff = (datetime.now() - timedelta(days=retention_days)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        cutoff = _now() - retention_days * 86400
 
         def _read(conn):
             cursor = conn.execute(
@@ -423,16 +454,16 @@ class AgentRunsRepository(BaseRepository):
         )
 
     def list_stale_processing(self, timeout_seconds: int = 120) -> list:
-        """列出 started_at 超时的 processing 会话（崩溃遗留恢复用）"""
+        """列出 started_at 超时的 processing 会话（崩溃遗留恢复用）。
+        时间比较统一为 epoch 秒整数。
+        """
 
-        cutoff = (datetime.now() - timedelta(seconds=timeout_seconds)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        cutoff = _now() - timeout_seconds
 
         def _read(conn):
             cursor = conn.execute(
                 "SELECT * FROM agent_runs WHERE status='processing' "
-                "AND started_at IS NOT NULL AND started_at < ? ORDER BY id ASC",
+                "AND started_at > 0 AND started_at < ? ORDER BY id ASC",
                 (cutoff,),
             )
             cols = [d[0] for d in cursor.description]
@@ -460,7 +491,15 @@ class AgentRunsRepository(BaseRepository):
     # ------------------------------------------------------------------
 
     def add_step(self, step: dict) -> int:
-        """写入一条 span（agent_steps），返回记录 id（失败时 0）"""
+        """写入一条 span（agent_steps），返回记录 id（失败时 0）。
+
+        replay_delta 写入前统一加密（best-effort：失败降级存明文）。
+        started_at/ended_at 为 epoch 秒整数（0 表示未设置，写入时取当前时间）。
+        """
+
+        started_at = step.get("started_at") or _now()
+        ended_at = step.get("ended_at") or _now()
+        replay_delta = _encrypt_replay_delta(step.get("replay_delta", ""))
 
         def _write(conn):
             cursor = conn.execute(
@@ -468,8 +507,8 @@ class AgentRunsRepository(BaseRepository):
                 INSERT INTO agent_steps
                 (run_id, span_id, parent_id, name, status, model, tokens,
                  latency_ms, tool_name, input_summary, error, iteration,
-                 sequence, payload_json, replay_delta, started_at, ended_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 sequence, replay_delta, started_at, ended_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     step.get("run_id", ""),
@@ -485,18 +524,58 @@ class AgentRunsRepository(BaseRepository):
                     step.get("error", ""),
                     step.get("iteration", 0),
                     step.get("sequence", 0),
-                    step.get("payload_json", ""),
-                    step.get("replay_delta", ""),
-                    step.get("started_at") or _now(),
-                    step.get("ended_at") or _now(),
+                    replay_delta,
+                    started_at,
+                    ended_at,
                 ),
             )
             return cursor.lastrowid
 
         return self._run_write(_write, error_msg="写入 agent_step 失败", default=0)
 
+    def update_step(self, span_id: str, **fields: Any) -> bool:
+        """更新一条 span（agent_steps），供 trace.end_span / record_budget_message 调用。
+
+        支持的字段：status, model, tokens, latency_ms, tool_name, input_summary,
+        error, replay_delta, started_at, ended_at。
+        replay_delta 写入前统一加密（best-effort：失败降级存明文）。
+        返回是否成功（无变化或异常均返回 False）。
+        """
+        allowed = {
+            "status",
+            "model",
+            "tokens",
+            "latency_ms",
+            "tool_name",
+            "input_summary",
+            "error",
+            "replay_delta",
+            "started_at",
+            "ended_at",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+
+        if "replay_delta" in updates:
+            updates["replay_delta"] = _encrypt_replay_delta(updates["replay_delta"])
+
+        cols = ", ".join(f"{k}=?" for k in updates)
+        values = list(updates.values()) + [span_id]
+
+        def _write(conn):
+            cursor = conn.execute(
+                f"UPDATE agent_steps SET {cols} WHERE span_id=?", values
+            )
+            return cursor.rowcount > 0
+
+        return self._run_write(_write, error_msg="更新 agent_step 失败", default=False)
+
     def get_steps(self, run_id: str) -> list:
-        """按 run_id 查询 span 列表，按 (iteration, sequence) 排序"""
+        """按 run_id 查询 span 列表，按 (iteration, sequence) 排序。
+
+        replay_delta 读取时统一解密（容错无前缀明文：原样返回）。
+        """
 
         def _read(conn):
             cursor = conn.execute(
@@ -505,6 +584,11 @@ class AgentRunsRepository(BaseRepository):
                 (run_id,),
             )
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+            rows = []
+            for r in cursor.fetchall():
+                d = dict(zip(cols, r))
+                d["replay_delta"] = _decrypt_replay_delta(d.get("replay_delta"))
+                rows.append(d)
+            return rows
 
         return self._run_read(_read, error_msg="查询 agent_steps 失败", default=[])

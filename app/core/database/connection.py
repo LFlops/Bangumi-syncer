@@ -81,6 +81,7 @@ class DatabaseConnection:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys = ON")
             self._conn = conn
         return self._conn
 
@@ -605,6 +606,8 @@ class DatabaseConnection:
         # Agent 通用会话表：agent_runs（一次会话状态机）+ agent_steps（span 可重放日志）
         # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled/
         #              applied/rejected（exhausted 仅作 stop_reason，不作 status）
+        # 时间列统一 epoch 秒整数（写入方显式写入，DEFAULT 0 占位）。
+        # agent_runs 必须先于 agent_steps 创建（steps 有 FK 引用 runs）。
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -615,18 +618,19 @@ class DatabaseConnection:
                 stop_reason TEXT DEFAULT '',
                 attempts INTEGER DEFAULT 0,
                 total_attempts INTEGER DEFAULT 0,
-                last_attempt_at DATETIME,
+                last_attempt_at INTEGER DEFAULT 0,
                 last_error TEXT,
                 total_tokens INTEGER DEFAULT 0,
-                started_at DATETIME,
-                ended_at DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                started_at INTEGER DEFAULT 0,
+                ended_at INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0
             )
         """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
+                run_id TEXT NOT NULL REFERENCES agent_runs(run_id)
+                    ON DELETE CASCADE,
                 span_id TEXT NOT NULL,
                 parent_id TEXT DEFAULT '',
                 name TEXT NOT NULL,
@@ -639,10 +643,9 @@ class DatabaseConnection:
                 error TEXT DEFAULT '',
                 iteration INTEGER DEFAULT 0,
                 sequence INTEGER DEFAULT 0,
-                payload_json TEXT DEFAULT '',
                 replay_delta TEXT DEFAULT '',
-                started_at DATETIME,
-                ended_at DATETIME
+                started_at INTEGER DEFAULT 0,
+                ended_at INTEGER DEFAULT 0
             )
         """)
         cursor.execute(
@@ -651,6 +654,9 @@ class DatabaseConnection:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id)"
         )
 
         # Bangumi 账号（含 OAuth 令牌）：以「账号列表」为唯一真相源，

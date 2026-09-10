@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 from app.core.config import config_manager
@@ -96,17 +97,17 @@ class LlmMatchScheduler(BaseScheduler):
         dbm = get_database_manager()
         repo = dbm.agent_runs
 
-        # 1. 清理终态过期
+        # 1. 滑动窗口轮转清理（终态超窗 + 活性过期死行，单条 DELETE）
         retention_days = _cfg_int(
-            config_manager.get("sync", "llm_match_retention_days", fallback=7), 7
+            config_manager.get("sync", "llm_match_retention_days", fallback=30), 30
         )
         try:
-            deleted = repo.cleanup_terminal(retention_days=retention_days)
+            deleted = repo.cleanup_expired(retention_days=retention_days)
         except Exception as e:
-            logger.debug(f"🤖 清理终态 agent_run 失败: {e}")
+            logger.debug(f"🤖 清理过期 agent_run 失败: {e}")
             deleted = 0
         if deleted and deleted > 0:
-            logger.info(f"🤖 清理终态过期 agent_run {deleted} 条")
+            logger.info(f"🤖 清理过期 agent_run {deleted} 条")
 
         # 2. 恢复扫描
         recovery_timeout = _cfg_int(
@@ -186,7 +187,7 @@ class LlmMatchScheduler(BaseScheduler):
             # F5：thinking_level 与 config_override 统一从集中配置读取
             # G3：非法 / 非正数覆盖值由 resolve_max_iterations_override 统一告警并回退 None
             match_cfg = config_manager.get_sync_llm_match_config()
-            thinking_level = match_cfg.get("llm_match_thinking_level") or "medium"
+            thinking_level = match_cfg["llm_match_thinking_level"]
             config_override = llm_assist_module.resolve_max_iterations_override(
                 match_cfg.get("llm_match_max_iterations"), log=logger
             )
@@ -195,14 +196,8 @@ class LlmMatchScheduler(BaseScheduler):
                 "match", thinking_level, config_override=config_override
             )
 
-            candidates = llm_assist_module._extract_candidates(sync_record)
-            seed = llm_assist_module.build_seed_messages(
-                sync_record, candidates, llm_assist_module.DEFAULT_SYSTEM_TEMPLATE
-            )
-
-            replay_result = trace.replay(
-                run_id, seed_builder=lambda: seed, max_iterations=max_iterations
-            )
+            # seed 由 replay 从 agent_steps 的 seed 行提取，无需此处重建
+            replay_result = trace.replay(run_id)
             remaining = max_iterations - replay_result.executed_iterations
             if remaining <= 0:
                 # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
@@ -268,16 +263,20 @@ class LlmMatchScheduler(BaseScheduler):
                 defns = llm_assist_module.register_match_tools(registry, bgm)
                 tools_schemas = [d.to_schema() for d in defns]
                 # 注：register_match_tools 已在补执行前调用过，此处再调用为幂等刷新
-                chat_fn = llm_assist_module._build_default_chat_fn()
-                span_recorder = llm_assist_module._SpanRecorder(run_id)
+                span_recorder = llm_assist_module.TraceRecorder(run_id)
+                wrapped_chat_fn = span_recorder.wrap_chat_fn(
+                    llm_assist_module._build_default_chat_fn(thinking_level)
+                )
                 result = await loop_run(
-                    chat_fn=chat_fn,
+                    chat_fn=wrapped_chat_fn,
                     tools_schemas=tools_schemas,
-                    tool_calls_fn=registry.execute_batch,
+                    tool_calls_fn=functools.partial(
+                        registry.execute_batch, recorder=span_recorder
+                    ),
                     max_iterations=remaining,
                     tool_choice_terminal="submit_suggestion",
                     seed_messages=replay_result.messages,
-                    span_recorder=span_recorder,
+                    recorder=span_recorder,
                 )
                 llm_assist_module._handle_result(
                     get_database_manager(),
@@ -301,16 +300,20 @@ class LlmMatchScheduler(BaseScheduler):
                 await self._replay_missing_tool(tc, registry, replay_result.messages)
 
             # 续跑 loop（从 replay 重建消息续跑）
-            chat_fn = llm_assist_module._build_default_chat_fn()
-            span_recorder = llm_assist_module._SpanRecorder(run_id)
+            span_recorder = llm_assist_module.TraceRecorder(run_id)
+            wrapped_chat_fn = span_recorder.wrap_chat_fn(
+                llm_assist_module._build_default_chat_fn(thinking_level)
+            )
             result = await loop_run(
-                chat_fn=chat_fn,
+                chat_fn=wrapped_chat_fn,
                 tools_schemas=tools_schemas,
-                tool_calls_fn=registry.execute_batch,
+                tool_calls_fn=functools.partial(
+                    registry.execute_batch, recorder=span_recorder
+                ),
                 max_iterations=remaining,
                 tool_choice_terminal="submit_suggestion",
                 seed_messages=replay_result.messages,
-                span_recorder=span_recorder,
+                recorder=span_recorder,
             )
             llm_assist_module._handle_result(
                 get_database_manager(),
@@ -398,7 +401,7 @@ class LlmMatchScheduler(BaseScheduler):
             # F5：thinking_level 统一从集中配置读取并透传给 llm_assist.run
             # （config_override 由 llm_assist.run 内部从同一配置读取）。
             match_cfg = config_manager.get_sync_llm_match_config()
-            thinking_level = match_cfg.get("llm_match_thinking_level") or "medium"
+            thinking_level = match_cfg["llm_match_thinking_level"]
             # atomic_claim / 状态流转 / 落库均在 llm_assist.run 内部完成
             await llm_assist_module.run(
                 run_id,

@@ -5,6 +5,8 @@ ConfigManager tests - Simplified version
 import os
 from unittest.mock import patch
 
+import pytest
+
 
 class TestConfigManagerSimple:
     """Test ConfigManager class with simplified tests"""
@@ -441,7 +443,7 @@ class TestSyncLlmMatchConfig:
         assert cfg == {
             "llm_match_assist": False,
             "llm_match_cron": "*/1 * * * *",
-            "llm_match_retention_days": 7,
+            "llm_match_retention_days": 30,
             "llm_match_max_iterations": "",
             "llm_match_cross_call_cache": False,
             "llm_match_recovery_timeout_s": 120,
@@ -471,6 +473,27 @@ llm_match_thinking_level = high
         assert cfg["llm_match_recovery_timeout_s"] == 300
         assert cfg["llm_match_thinking_level"] == "high"
 
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("HIGH", "high"),
+            (" High ", "high"),
+            ("OFF", "off"),
+            ("Low", "low"),
+            ("medium", "medium"),
+            ("garbage", "medium"),
+        ],
+    )
+    def test_get_sync_llm_match_config_normalizes_thinking_level(
+        self, tmp_path, raw, expected
+    ):
+        """thinking_level 大小写/空格归一化；非法值回落 medium（llm_match 默认档）。"""
+        cm = _config_manager_from_ini(
+            tmp_path, f"[sync]\nllm_match_thinking_level = {raw}\n"
+        )
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_thinking_level"] == expected
+
     def test_get_sync_llm_match_config_invalid_int_falls_back(self, tmp_path):
         """非法整数值回退默认值（与调度器 _cfg_int 行为对齐）。"""
         ini = """[sync]
@@ -479,7 +502,7 @@ llm_match_recovery_timeout_s = bad
 """
         cm = _config_manager_from_ini(tmp_path, ini)
         cfg = cm.get_sync_llm_match_config()
-        assert cfg["llm_match_retention_days"] == 7
+        assert cfg["llm_match_retention_days"] == 30
         assert cfg["llm_match_recovery_timeout_s"] == 120
 
     def test_get_sync_llm_match_config_empty_max_iterations_default(self, tmp_path):

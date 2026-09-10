@@ -39,7 +39,7 @@ def _make_config(enabled: bool = True, api_key: str = "k", cron: str = "*/2 * * 
 def _make_repo() -> MagicMock:
     """构造 agent_runs repo mock（各方法默认返回安全值）。"""
     repo = MagicMock()
-    repo.cleanup_terminal.return_value = 0
+    repo.cleanup_expired.return_value = 0
     repo.list_stale_processing.return_value = []
     repo.list_pending.return_value = []
     repo.increment_attempts.return_value = 1
@@ -107,7 +107,7 @@ def test_disabled_run_sync_job_returns_early():
 
         asyncio.run(sched._run_sync_job())
     # 禁用时不应做任何 repo 操作
-    repo.cleanup_terminal.assert_not_called()
+    repo.cleanup_expired.assert_not_called()
     repo.list_pending.assert_not_called()
 
 
@@ -120,7 +120,7 @@ def test_cleanup_deletes_expired_terminal_and_logs():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.cleanup_terminal.return_value = 3
+    repo.cleanup_expired.return_value = 3
     log = MagicMock()
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -133,15 +133,15 @@ def test_cleanup_deletes_expired_terminal_and_logs():
         import asyncio
 
         asyncio.run(sched._run_sync_job())
-    repo.cleanup_terminal.assert_called_once()
-    log.info.assert_any_call("🤖 清理终态过期 agent_run 3 条")
+    repo.cleanup_expired.assert_called_once()
+    log.info.assert_any_call("🤖 清理过期 agent_run 3 条")
 
 
 def test_cleanup_no_log_when_nothing_expired():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.cleanup_terminal.return_value = 0
+    repo.cleanup_expired.return_value = 0
     log = MagicMock()
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -154,7 +154,7 @@ def test_cleanup_no_log_when_nothing_expired():
         import asyncio
 
         asyncio.run(sched._run_sync_job())
-    repo.cleanup_terminal.assert_called_once()
+    repo.cleanup_expired.assert_called_once()
     # 删除数为 0 时不打清理日志
     for call in log.info.call_args_list:
         assert "清理终态过期 agent_run" not in call.args[0]
@@ -905,7 +905,7 @@ def test_recover_end_to_end_no_double_llm_call_m22(monkeypatch):
     reg = get_tool_registry()
     eb_calls = {"n": 0}
 
-    async def _eb(tool_calls):
+    async def _eb(tool_calls, *, recorder=None):
         eb_calls["n"] += 1
         if eb_calls["n"] == 1:
             raise RuntimeError("crash mid-exec")
@@ -918,7 +918,7 @@ def test_recover_end_to_end_no_double_llm_call_m22(monkeypatch):
 
     async def _go():
         # 初始正常运行至崩溃（记录 1 条 llm_chat span）
-        await llm_assist.run(run_id, sync_record=sr, bgm=bgm)
+        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
         # 恢复续跑：真实 trace.replay + 真实 loop_run（仅 _continue_replay 不 mock）
         await sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr)
 
@@ -928,3 +928,183 @@ def test_recover_end_to_end_no_double_llm_call_m22(monkeypatch):
     assert chat.call_count == 2, f"期望累计 2 次 LLM 调用，实际 {chat.call_count}"
     run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
+
+
+# ---------------------------------------------------------------------------
+# P0-3：恢复路径续跑应写入 chat span
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_path_writes_chat_span(monkeypatch):
+    """P0-3：_continue_replay 续跑轮应产生 chat span。"""
+    from app.core.database import database_manager, set_database_manager
+
+    set_database_manager(database_manager)
+
+    run_id = "run-rec-spans"
+    sr_id = 200
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = {
+        "id": sr_id,
+        "title": f"标题{sr_id}",
+        "ori_title": "test",
+        "season": 1,
+        "user_name": "alice",
+        "source": "plex",
+        "match_trace": {"steps": []},
+    }
+
+    # 模拟 chat：返回 end_turn 立即结束
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    sched = LlmMatchScheduler()
+    monkeypatch.setattr(sched, "_build_bgm", lambda s: MagicMock())
+
+    # replay 返回 last_response=None → 进入续跑通用循环
+    rr = ReplayResult(
+        messages=[
+            Message(role="system", content="s"),
+            Message(role="user", content="u"),
+        ],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+    monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
+
+    asyncio.run(sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr))
+
+    # 验证续跑产生了 chat span
+    steps = database_manager.agent_runs.get_steps(run_id)
+    chat_steps = [s for s in steps if s["name"] == "llm_chat"]
+    assert len(chat_steps) >= 1, (
+        f"恢复路径应产生至少 1 条 chat span，实际 {len(chat_steps)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P0-3 附带：恢复路径 thinking_level 透传
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_path_thinking_level_respected(monkeypatch):
+    """P0-3 附带：配置 thinking_level='high' → _build_default_chat_fn 收到 'high'。"""
+    sched = LlmMatchScheduler()
+    captured = {}
+
+    def _fake_build(thinking_level):
+        captured["thinking_level"] = thinking_level
+
+        async def chat_fn(messages, *, tools=None, tool_choice=None):
+            return ChatResponse(content="done", stop_reason="end_turn")
+
+        return chat_fn
+
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(_make_repo()),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.llm_match_scheduler.llm_assist_module._build_default_chat_fn",
+            side_effect=_fake_build,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "high",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay(
+                {"run_id": "r-think", "sync_record_id": 1}, {"id": 1}
+            )
+        )
+
+    assert captured.get("thinking_level") == "high", (
+        f"恢复路径应透传 thinking_level='high'，实际 {captured}"
+    )
+
+
+def test_recovery_path_normalizes_uppercase_thinking_level(monkeypatch, tmp_path):
+    """修复1+2 集成：ini 配 'HIGH' → config 归一化为 'high' → 恢复路径透传 'high'。
+
+    验证 scheduler 删除 `or "medium"` 后直接消费归一化后的配置值，不再自行兜底。
+    """
+    from app.core.config import ConfigManager
+
+    ini = tmp_path / "config.ini"
+    ini.write_text("[sync]\nllm_match_thinking_level = HIGH\n", encoding="utf-8")
+    cm = ConfigManager.__new__(ConfigManager)
+    cm.platform = "Test"
+    cm.cwd = tmp_path
+    cm.config_paths = {
+        "env": None,
+        "mounted": tmp_path / "__no_mounted__.ini",
+        "dev": tmp_path / "__no_dev__.ini",
+        "default": ini,
+    }
+    cm.active_config_path = ini
+    cm._config_cache = None
+    cm._last_modified = 0
+    cm._load_config()
+
+    # 前置断言：真实 config 已完成归一化（否则后续透传断言无意义）
+    assert cm.get_sync_llm_match_config()["llm_match_thinking_level"] == "high"
+
+    sched = LlmMatchScheduler()
+    captured = {}
+
+    def _fake_build(thinking_level):
+        captured["thinking_level"] = thinking_level
+
+        async def chat_fn(messages, *, tools=None, tool_choice=None):
+            return ChatResponse(content="done", stop_reason="end_turn")
+
+        return chat_fn
+
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(_make_repo()),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.llm_match_scheduler.llm_assist_module._build_default_chat_fn",
+            side_effect=_fake_build,
+        ),
+    ):
+        asyncio.run(
+            sched._continue_replay(
+                {"run_id": "r-think-normalize", "sync_record_id": 1}, {"id": 1}
+            )
+        )
+
+    assert captured.get("thinking_level") == "high", (
+        f"恢复路径应透传归一化后的 thinking_level='high'，实际 {captured}"
+    )

@@ -15,6 +15,7 @@ connection.py schema 迁移，保持本任务文件自包含）。
 
 from __future__ import annotations
 
+import functools
 import json
 from dataclasses import asdict
 from datetime import datetime
@@ -24,15 +25,15 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent.budget import get_max_iterations
-from app.services.agent.loop import RunResult, run as loop_run
+from app.services.agent.loop import ChatFn, RunResult, run as loop_run
 from app.services.agent.trace import (
     end_span as trace_end_span,
     record_budget_message as trace_record_budget_message,
     start_span as trace_start_span,
 )
 from app.services.llm.models import (
-    ChatResponse,
     Message,
+    ToolResultBlock,
     ToolUseBlock,
 )
 from app.services.llm.output_parser import parse_suggestion
@@ -316,68 +317,189 @@ def build_seed_messages(
 
 
 # ---------------------------------------------------------------------------
-# span 记录适配器（委托 agent/trace.py）
+# 统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）
 # ---------------------------------------------------------------------------
 
 
-class _SpanRecorder:
-    """将循环调用的 span 钩子适配到 trace 模块。"""
+class TraceRecorder:
+    """统一 trace 记录器，替代旧 ``_SpanRecorder``。
 
-    def __init__(self, run_id: str) -> None:
+    职责：
+    - **chat span 包装**：``wrap_chat_fn`` 返回包装后的 chat_fn，每轮 start_span
+      → await → end_span（model/tokens 写专用列，不再塞 payload_json）。
+    - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
+      包裹层调用；幂等安全。
+    - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
+    - **budget 钩子**：``record_budget`` 定位本轮最后 tool span（无则回退 chat span）。
+    """
+
+    def __init__(
+        self, run_id: str, *, clock: Callable[[], float] | None = None
+    ) -> None:
         self.run_id = run_id
+        self._clock = clock or _default_clock
+        self._next_iteration: int = 0
+        # 当前轮的 iteration（wrap_chat_fn 开始时设定，start_tool / record_budget 读取）
+        self._current_iteration: int = 0
+        self._chat_span_id: str | None = None
+        self._last_tool_span_id: str | None = None
+        # span_id → (tool_use, t0)，供 end_tool 检索后清除（幂等）
+        self._tool_state: dict[str, tuple] = {}
 
-    def start_span(
-        self, name: str, iteration: int, sequence: int, parent_id: str = ""
-    ) -> str:
-        return trace_start_span(self.run_id, name, iteration, sequence, parent_id)
+    # -- chat span 包装 -----------------------------------------------------
 
-    def end_span(
+    def wrap_chat_fn(self, chat_fn: ChatFn) -> ChatFn:
+        """包装 chat_fn：每轮 start_span → await → end_span。
+
+        iteration 状态机：
+        - 每轮开始时设定 ``_current_iteration`` 为 ``_next_iteration`` 的当前值，
+          然后推进 ``_next_iteration``（供下一轮使用）。
+        - ``start_tool`` / ``record_budget`` 读取 ``_current_iteration``，
+          保证同轮内 chat span 与全部 tool span 的 iteration 一致。
+        - ``resp`` 在 ``try`` 前初始化为 ``None``，避免 chat_fn 抛异常时
+          ``finally`` 引用未绑定变量（UnboundLocalError 覆盖原始异常）。
+        """
+        recorder = self
+
+        async def wrapped(messages, *, tools=None, tool_choice=None):
+            # 设定当前轮并推进单调计数（仅在新一轮 chat 开始时推进）
+            recorder._current_iteration = recorder._next_iteration
+            recorder._next_iteration += 1
+            iteration = recorder._current_iteration
+            span_id = trace_start_span(
+                recorder.run_id, name="llm_chat", iteration=iteration, sequence=0
+            )
+            recorder._chat_span_id = span_id
+            recorder._last_tool_span_id = None  # 新轮重置
+            t0 = recorder._clock()
+            resp = None
+            try:
+                resp = await chat_fn(messages, tools=tools, tool_choice=tool_choice)
+                return resp
+            finally:
+                latency_ms = int((recorder._clock() - t0) * 1000)
+                if resp is not None:
+                    tokens = resp.usage.total_tokens if resp.usage is not None else 0
+                    tool_calls = [
+                        b.model_dump() if hasattr(b, "model_dump") else asdict(b)
+                        for b in resp.blocks
+                        if isinstance(b, ToolUseBlock)
+                    ]
+                    trace_end_span(
+                        span_id,
+                        status="ok",
+                        model=resp.model,
+                        tokens=tokens,
+                        latency_ms=latency_ms,
+                        replay_delta={
+                            "response": {
+                                "stop_reason": resp.stop_reason,
+                                "content": resp.content,
+                                "tool_calls": tool_calls,
+                            }
+                        },
+                    )
+                else:
+                    # chat_fn 抛异常：写 error span 但不遮掩原始异常
+                    logger.warning(
+                        f"[llm_assist] chat_fn 异常（iteration={iteration}），写 error span"
+                    )
+                    trace_end_span(
+                        span_id,
+                        status="error",
+                        latency_ms=latency_ms,
+                        error="chat_fn raised before response",
+                    )
+
+        return wrapped
+
+    # -- ToolSpanRecorder 协议 ----------------------------------------------
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None:
+        """工具执行开始：创建 tool_execute span 并记录 t0。
+
+        读取 ``_current_iteration``（当前轮），保证与本轮 chat span 的 iteration 一致。
+        """
+        span_id = trace_start_span(
+            self.run_id,
+            name="tool_execute",
+            iteration=self._current_iteration,
+            sequence=sequence,
+            parent_id=self._chat_span_id or "",
+        )
+        self._tool_state[span_id] = (tool_use, self._clock())
+        self._last_tool_span_id = span_id
+        return span_id
+
+    def end_tool(
         self,
         span_id: str,
-        status: str = "ok",
-        response: ChatResponse | None = None,
         *,
-        tool_name: str = "",
-        input_summary: str = "",
-        payload_json: Any = "",
-        replay_delta: Any = "",
+        result: ToolResultBlock | None = None,
+        error: str = "",
     ) -> None:
-        if response is not None:
-            tool_calls = [
-                b.model_dump() if hasattr(b, "model_dump") else asdict(b)
-                for b in response.blocks
-                if isinstance(b, ToolUseBlock)
-            ]
+        """工具执行结束：幂等安全（同 span_id 二次调用不崩溃）。"""
+        state = self._tool_state.pop(span_id, None)
+        if state is None:
+            # 已处理过（幂等）
+            return
+        tool_use, t0 = state
+        latency_ms = int((self._clock() - t0) * 1000)
+
+        if result is None and error:
+            status = "error"
+        else:
+            status = "ok"
+
+        replay_delta: dict | None = None
+        if result is not None:
             replay_delta = {
-                "response": {
-                    "stop_reason": response.stop_reason,
-                    "content": response.content,
-                    "tool_calls": tool_calls,
+                "tool_result": {
+                    "tool_use_id": result.tool_use_id,
+                    "content": result.content,
+                    "is_error": result.is_error,
                 }
             }
-            tokens = 0
-            if response.usage is not None:
-                tokens = response.usage.total_tokens
-            payload_json = {"model": response.model, "tokens": tokens}
-            trace_end_span(
-                span_id,
-                status=status,
-                payload_json=payload_json,
-                replay_delta=replay_delta,
-            )
-        else:
-            # tool_execute span：携带 tool_name / input_summary / 完整 replay_delta
-            trace_end_span(
-                span_id,
-                status=status,
-                tool_name=tool_name,
-                input_summary=input_summary,
-                payload_json=payload_json,
-                replay_delta=replay_delta,
-            )
 
-    def record_budget_message(self, span_id: str, budget_message: str) -> None:
-        trace_record_budget_message(span_id, budget_message)
+        trace_end_span(
+            span_id,
+            status=status,
+            tool_name=tool_use.name,
+            input_summary=_input_summary(tool_use.input),
+            latency_ms=latency_ms,
+            replay_delta=replay_delta,
+            error=error,
+        )
+
+    # -- seed 行 ------------------------------------------------------------
+
+    def write_seed_row(self, seed_messages: list[Message]) -> None:
+        """run 启动时写一条 name='seed' span 行。"""
+        span_id = trace_start_span(self.run_id, name="seed", iteration=0, sequence=0)
+        seed_delta = [m.model_dump() for m in seed_messages]
+        trace_end_span(
+            span_id,
+            status="ok",
+            replay_delta={"seed_messages": seed_delta},
+        )
+
+    # -- budget 钩子 -------------------------------------------------------
+
+    def record_budget(self, budget_message: str) -> None:
+        """预算钩子：并入本轮最后 tool span，无则回退 chat span。"""
+        target = self._last_tool_span_id or self._chat_span_id
+        if target:
+            trace_record_budget_message(target, budget_message)
+
+
+def _default_clock() -> float:
+    """默认时钟：秒级时间戳（浮点）。"""
+    return datetime.now().timestamp()
+
+
+def _input_summary(inp: dict) -> str:
+    """输入摘要：仅记录参数名与类型（不记录参数值）。"""
+    return ", ".join(f"{k}:{type(v).__name__}" for k, v in (inp or {}).items())
 
 
 # ---------------------------------------------------------------------------
@@ -396,9 +518,9 @@ def _ensure_llm_columns(conn) -> None:
     for col, ddl in _LLM_COLUMNS:
         try:
             conn.execute(f"ALTER TABLE pending_candidates ADD COLUMN {col} {ddl}")
-        except Exception:
-            # 列已存在（duplicate column）等情况：忽略
-            pass
+        except Exception as e:
+            # 列已存在（duplicate column）等情况：忽略（记录 debug 日志便于排查）
+            logger.debug(f"[llm_assist] pending_candidates 补列跳过（列已存在？）: {e}")
 
 
 def ensure_llm_columns(dbm) -> None:
@@ -619,7 +741,7 @@ def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None
     return value
 
 
-def _build_default_chat_fn(thinking_level: str = "medium"):
+def _build_default_chat_fn(thinking_level: str):
     """构造默认 chat_fn：包装 LLMClient.chat（job_name='llm_match' 归属用量）。
 
     ``thinking_level`` 由调用方（run）传入，透传到 provider 层，使 match 的 LLM
@@ -646,7 +768,7 @@ async def run(
     *,
     sync_record: dict,
     bgm: Any,
-    thinking_level: str = "medium",
+    thinking_level: str,
     chat_fn: Callable | None = None,
     notification_service: Any | None = None,
     span_recorder: Any | None = None,
@@ -674,7 +796,7 @@ async def run(
     seed = build_seed_messages(sync_record, candidates, DEFAULT_SYSTEM_TEMPLATE)
 
     if span_recorder is None:
-        span_recorder = _SpanRecorder(run_id)
+        span_recorder = TraceRecorder(run_id)
 
     # F5：config_override 优先（[sync] llm_match_max_iterations 显式整体覆盖
     # > thinking_level 策略映射 > 默认兜底）。调度器负责把 thinking_level 透传进来，
@@ -690,16 +812,22 @@ async def run(
     if chat_fn is None:
         chat_fn = _build_default_chat_fn(thinking_level)
 
+    # 包装 chat_fn（chat span）并写 seed 行
+    wrapped_chat_fn = span_recorder.wrap_chat_fn(chat_fn)
+    span_recorder.write_seed_row(seed)
+
     # LLM 调用异常（chat_fn 抛错）→ 累加 attempts，达 3 → failed
     try:
         result = await loop_run(
-            chat_fn=chat_fn,
+            chat_fn=wrapped_chat_fn,
             tools_schemas=tools_schemas,
-            tool_calls_fn=registry.execute_batch,
+            tool_calls_fn=functools.partial(
+                registry.execute_batch, recorder=span_recorder
+            ),
             max_iterations=max_iterations,
             tool_choice_terminal="submit_suggestion",
             seed_messages=seed,
-            span_recorder=span_recorder,
+            recorder=span_recorder,
         )
     except Exception as e:
         logger.error(f"[llm_assist] run {run_id} LLM 调用异常: {e}")

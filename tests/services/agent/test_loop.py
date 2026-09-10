@@ -8,13 +8,14 @@
 - 透明预算：每轮追加 ``[剩余轮次：N]``；remaining==0 的末轮 tool_choice=terminal
 - 畸形 tool_use（execute_batch 返回 is_error 的 ToolResultBlock）→ 循环继续不崩溃
 - max_iterations 耗尽 → stop_reason=exhausted + last_response
-- span 钩子：span_recorder 在每轮 chat 前后被调用（start/end），None 时跳过
+- 预算钩子：recorder.record_budget 每轮恰好调用一次且参数为 "[剩余轮次：N]"；None 时跳过
+- 防御分支：result 非 ToolResultBlock 时记 warning
 - 不直接依赖 LLMClient：LLM 调用经注入的 chat_fn（可 mock）
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
@@ -472,13 +473,23 @@ async def test_max_iterations_exhausted_returns_last_response():
 
 
 # ---------------------------------------------------------------------------
-# 9. span 钩子：每轮 chat 前后调用 start_span/end_span；None 时跳过
+# 9. 预算钩子：recorder.record_budget 每轮恰好调用一次; None 时跳过
 # ---------------------------------------------------------------------------
 
 
-async def test_span_recorder_hooks_called_per_round():
-    span_recorder = MagicMock()
-    span_recorder.start_span.return_value = "span-1"
+class _FakeBudgetRecorder:
+    """记录 record_budget 调用，便于断言预算消息。"""
+
+    def __init__(self) -> None:
+        self.budget_calls: list[str] = []
+
+    def record_budget(self, budget_message: str) -> None:
+        self.budget_calls.append(budget_message)
+
+
+async def test_budget_record_budget_called_per_round_with_remaining():
+    """每轮恰好调用一次 record_budget，参数为 "[剩余轮次：N]"。"""
+    recorder = _FakeBudgetRecorder()
 
     chat_fn = AsyncMock(
         return_value=_resp("tool_use", [_tool_use("t", "search_bangumi")])
@@ -494,18 +505,18 @@ async def test_span_recorder_hooks_called_per_round():
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
-        span_recorder=span_recorder,
+        recorder=recorder,
     )
 
-    # 3 轮，每轮一次 chat（1 个 tool_execute）+ 一次预算消息记录
-    # → start_span: 3 llm_chat + 3 tool_execute = 6；end_span 同 6；budget=3
-    assert span_recorder.start_span.call_count == 6
-    assert span_recorder.end_span.call_count == 6
-    assert span_recorder.record_budget_message.call_count == 3
+    # 3 轮，每轮一次 record_budget
+    assert len(recorder.budget_calls) == 3
+    assert recorder.budget_calls[0] == "[剩余轮次：2]"
+    assert recorder.budget_calls[1] == "[剩余轮次：1]"
+    assert recorder.budget_calls[2] == "[剩余轮次：0]"
 
 
-async def test_span_recorder_none_is_noop():
-    # span_recorder=None 不应抛错（可空实现）
+async def test_budget_recorder_none_is_noop():
+    """recorder=None 时不应抛错（可空实现）。"""
     chat_fn = AsyncMock(return_value=_resp("end_turn", None))
 
     await run(
@@ -515,128 +526,21 @@ async def test_span_recorder_none_is_noop():
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
-        span_recorder=None,
+        recorder=None,
     )
 
 
-# ---------------------------------------------------------------------------
-# 10. 每轮 LLM(llm_chat) + 每次工具(tool_execute) 各一条 span
-# ---------------------------------------------------------------------------
+async def test_budget_appended_to_messages_even_without_recorder():
+    """预算消息仍追加进 messages（与 recorder 无关的领域语义）。"""
+    calls: list[tuple[list[Message], dict]] = []
 
+    def _side_effect(*args, **kwargs):
+        calls.append((list(args[0]), dict(kwargs)))
+        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
 
-class _FakeSpanRecorder:
-    """记录 span 钩子调用，便于断言名字/轮次/父子关系/预算归属。"""
-
-    def __init__(self) -> None:
-        self.spans: list[dict] = []  # {name, iteration, sequence, parent_id, id}
-        self.ended: list[tuple[str, dict]] = []  # (span_id, kwargs)
-        self.budget: list[tuple[str, str]] = []  # (span_id, message)
-        self._counter = 0
-
-    def start_span(self, name, iteration, sequence, parent_id=""):
-        self._counter += 1
-        sid = f"{name}-{iteration}-{sequence}-{self._counter}"
-        self.spans.append(
-            {
-                "name": name,
-                "iteration": iteration,
-                "sequence": sequence,
-                "parent_id": parent_id,
-                "id": sid,
-            }
-        )
-        return sid
-
-    def end_span(self, span_id, status="ok", response=None, **kwargs):
-        self.ended.append((span_id, kwargs))
-
-    def record_budget_message(self, span_id, budget_message):
-        self.budget.append((span_id, budget_message))
-
-    def tool_execute_ids(self, iteration=None):
-        return [
-            s["id"]
-            for s in self.spans
-            if s["name"] == "tool_execute"
-            and (iteration is None or s["iteration"] == iteration)
-        ]
-
-    def llm_chat_ids(self):
-        return [s["id"] for s in self.spans if s["name"] == "llm_chat"]
-
-
-async def test_tool_execute_span_per_tool_m19():
-    # 2 轮 chat + 3 工具（iter0 两个、iter1 一个）→ 5 条 span（2 llm_chat + 3 tool_execute）
-    recorder = _FakeSpanRecorder()
-    a = _tool_use("a", "search_bangumi")
-    b = _tool_use("b", "get_subject_detail")
-    c = _tool_use("c", "get_related_subjects")
-
-    states = [[a, b], [c]]
-    idx = {"i": 0}
-
-    def _chat(*_args, **_kwargs):
-        tc = states[idx["i"]]
-        idx["i"] += 1
-        return _resp("tool_use", tc)
-
-    chat_fn = AsyncMock(side_effect=_chat)
+    chat_fn = AsyncMock(side_effect=_side_effect)
     tool_calls_fn = AsyncMock(
-        return_value={
-            "a": _ok_result(a),
-            "b": _ok_result(b),
-            "c": _ok_result(c),
-        }
-    )
-
-    result = await run(
-        chat_fn=chat_fn,
-        tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
-        max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
-        seed_messages=_seed(),
-        span_recorder=recorder,
-    )
-
-    assert result.stop_reason == "exhausted"
-    names = [s["name"] for s in recorder.spans]
-    # 每轮 LLM + 每次工具各一条 span
-    assert names.count("llm_chat") == 2
-    assert names.count("tool_execute") == 3
-    assert len(recorder.spans) == 5
-
-    # tool_execute 的 parent 应为同轮 llm_chat span_id
-    llm_by_iter = {
-        s["iteration"]: s["id"] for s in recorder.spans if s["name"] == "llm_chat"
-    }
-    for s in recorder.spans:
-        if s["name"] == "tool_execute":
-            assert s["parent_id"] == llm_by_iter[s["iteration"]]
-
-
-async def test_tool_execute_replay_delta_and_budget_target():
-    # tool_execute.replay_delta 含 tool_result；预算消息并入同轮最后 tool_execute span
-    recorder = _FakeSpanRecorder()
-    a = _tool_use("a", "search_bangumi", {"title": "x"})
-    b = _tool_use("b", "get_subject_detail", {"subject_id": "123"})
-    c = _tool_use("c", "get_related_subjects", {"subject_id": "123"})
-
-    def _chat(*_args, **_kwargs):
-        _chat.n += 1
-        if _chat.n == 1:
-            return _resp("tool_use", [a, b])
-        return _resp("tool_use", [c])
-
-    _chat.n = 0
-
-    chat_fn = AsyncMock(side_effect=_chat)
-    tool_calls_fn = AsyncMock(
-        return_value={
-            "a": _ok_result(a, "res-a"),
-            "b": _ok_result(b, "res-b"),
-            "c": _ok_result(c, "res-c"),
-        }
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
     )
 
     await run(
@@ -646,52 +550,66 @@ async def test_tool_execute_replay_delta_and_budget_target():
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
-        span_recorder=recorder,
+        recorder=None,
     )
 
-    # 每条 tool_execute end_span 的 replay_delta 含完整 tool_result
-    te_ids = set(recorder.tool_execute_ids())
-    te_ended = [(sid, kw) for (sid, kw) in recorder.ended if sid in te_ids]
-    assert len(te_ended) == 3
-    for _sid, kw in te_ended:
-        delta = kw.get("replay_delta") or {}
-        assert "tool_result" in delta, delta
-        tr = delta["tool_result"]
-        assert set(tr.keys()) >= {"tool_use_id", "content", "is_error"}
-        # input_summary 仅记录参数名与类型（不记录参数值）
-        summary = kw.get("input_summary", "")
-        assert "title" in summary or "subject_id" in summary
-        assert "x" not in summary and "123" not in summary
-
-    # 预算消息归属：每轮最后 tool_execute span（两轮各一条）
-    assert len(recorder.budget) == 2
-    iter0_last = recorder.tool_execute_ids(iteration=0)[-1]
-    iter1_last = recorder.tool_execute_ids(iteration=1)[-1]
-    assert recorder.budget[0][0] == iter0_last
-    assert recorder.budget[1][0] == iter1_last
+    # 第二轮请求收到的 messages 末尾应携带第一轮留下的预算消息 [剩余轮次：1]
+    second_messages = calls[1][0]
+    last_msg = second_messages[-1]
+    assert last_msg.role == "user"
+    assert last_msg.content == "[剩余轮次：1]"
 
 
-async def test_budget_fallback_to_llm_chat_when_no_tool_executed():
-    # 该轮无工具实际执行（结果缺失）→ tool_execute span 为空 → 预算消息回退 llm_chat span
-    recorder = _FakeSpanRecorder()
+# ---------------------------------------------------------------------------
+# 10. 防御分支：result 非 ToolResultBlock 时记 warning
+# ---------------------------------------------------------------------------
+
+
+async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
+    """result 非 ToolResultBlock（如 TerminalCapture 泄漏）→ 跳过并记 warning。"""
+    import logging
+
     a = _tool_use("a", "search_bangumi")
 
     chat_fn = AsyncMock(return_value=_resp("tool_use", [a]))
-    tool_calls_fn = AsyncMock(return_value={})  # 结果缺失
+    # 返回 None 结果（模拟 TerminalCapture 泄漏到 aligned 槽位）
+    tool_calls_fn = AsyncMock(return_value={})
 
-    await run(
-        chat_fn=chat_fn,
-        tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
-        max_iterations=1,
-        tool_choice_terminal="submit_suggestion",
-        seed_messages=_seed(),
-        span_recorder=recorder,
-    )
+    with caplog.at_level(logging.WARNING):
+        await run(
+            chat_fn=chat_fn,
+            tools_schemas=[],
+            tool_calls_fn=tool_calls_fn,
+            max_iterations=1,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )
 
-    # 无 tool_execute span（结果缺失被防御跳过）
-    assert len(recorder.tool_execute_ids()) == 0
-    assert len(recorder.budget) == 1
-    # 预算消息回退到本轮 llm_chat span
-    llm_span_id = recorder.llm_chat_ids()[0]
-    assert recorder.budget[0][0] == llm_span_id
+    # 应打出 warning 日志
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("tool result 缺失或非 ToolResultBlock" in r.message for r in warnings)
+
+
+# ---------------------------------------------------------------------------
+# 11. loop.py 不 import 任何 trace 符号（S2.4）
+# ---------------------------------------------------------------------------
+
+
+def test_loop_no_trace_imports():
+    """loop.py 不应 import trace 相关符号（零 span 逻辑）。"""
+    import ast
+
+    with open("app/services/agent/loop.py") as f:
+        tree = ast.parse(f.read())
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert "trace" not in alias.name, (
+                    f"loop.py 不应 import trace 模块: {alias.name}"
+                )
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and "trace" in node.module:
+                raise AssertionError(
+                    f"loop.py 不应 from ... import trace: {node.module}"
+                )

@@ -163,6 +163,7 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -210,6 +211,7 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -245,6 +247,7 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -289,6 +292,7 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -348,6 +352,7 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=_Boom(),
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -392,6 +397,7 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -427,6 +433,7 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
         run_id,
         sync_record=sr,
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         notification_service=ns,
         span_recorder=None,
@@ -459,6 +466,23 @@ def test_build_seed_messages_injection_guard_and_isolation():
     assert "标题1" in user.content
     # 候选摘要出现在 user 区（来自 trace）
     assert "规则A" in user.content
+
+
+def test_ensure_llm_columns_duplicate_logs_debug(monkeypatch):
+    """重复补列（duplicate column）时记录 debug 日志，不再静默 pass。"""
+    import sqlite3
+    from unittest.mock import MagicMock
+
+    log = MagicMock()
+    monkeypatch.setattr(llm_assist, "logger", log)
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE pending_candidates (id INTEGER PRIMARY KEY)")
+    llm_assist._ensure_llm_columns(conn)  # 首次建列：无异常
+    llm_assist._ensure_llm_columns(conn)  # 第二次：命中 duplicate column
+
+    assert log.debug.call_count == 2, "两列重复补列应各记一条 debug 日志"
+    assert all("补列跳过" in str(c.args[0]) for c in log.debug.call_args_list)
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +569,7 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
         run_id,
         sync_record=_make_sync_record(sync_record_id=sr_id),
         bgm=bgm,
+        thinking_level="medium",
         chat_fn=chat,
         span_recorder=None,
     )
@@ -670,6 +695,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
         run_a,
         sync_record=_make_sync_record(sync_record_id=sr_a),
         bgm=bgm1,
+        thinking_level="medium",
         chat_fn=_chat_side_effect([_search_response()]),
         span_recorder=None,
     )
@@ -681,6 +707,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
         run_b,
         sync_record=_make_sync_record(sync_record_id=sr_b),
         bgm=bgm2,
+        thinking_level="medium",
         chat_fn=_chat_side_effect([_search_response()]),
         span_recorder=None,
     )
@@ -765,7 +792,9 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     sr_id = 51
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     sr = _make_sync_record(sync_record_id=sr_id)
-    await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm())
+    await llm_assist.run(
+        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
+    )
 
     assert captured["config_override"] is None
 
@@ -817,7 +846,9 @@ async def test_run_non_positive_config_override_falls_back_to_none(
         "前置：agent_run 应创建成功（否则 run 会因抢占失败提前返回 skipped）"
     )
     sr = _make_sync_record(sync_record_id=sr_id)
-    status = await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm())
+    status = await llm_assist.run(
+        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
+    )
     assert status != "skipped"
 
     assert captured["config_override"] is None, (
@@ -859,7 +890,10 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     sr_id = 71
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     await llm_assist.run(
-        run_id, sync_record=_make_sync_record(sync_record_id=sr_id), bgm=_make_bgm()
+        run_id,
+        sync_record=_make_sync_record(sync_record_id=sr_id),
+        bgm=_make_bgm(),
+        thinking_level="medium",
     )
 
     assert captured["config_override"] is None
@@ -1051,3 +1085,380 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
     # 签名保持不变：tools / tool_choice 以关键字参数传入
     assert "tools" in custom_called
     assert "tool_choice" in custom_called
+
+
+# ---------------------------------------------------------------------------
+# TraceRecorder 接线：seed 行 / chat 包装 / tool span / budget 钩子
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
+    """S4.1：正常 run 全链路——seed 行存在、chat span model/tokens 专用列有值、
+    tool_execute span 由 executor 包裹产生、replay_delta 格式与现状一致。"""
+    run_id = "run-tr-full"
+    sr_id = 90
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    bgm = _make_bgm()
+
+    # 捕获 trace 模块调用
+    captured = {
+        "start": [],
+        "end": [],
+        "budget": [],
+    }
+    original_start = llm_assist.trace_start_span
+    original_end = llm_assist.trace_end_span
+    original_budget = llm_assist.trace_record_budget_message
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        span_id = original_start(run_id, name, iteration, sequence, parent_id)
+        captured["start"].append(
+            {
+                "name": name,
+                "iteration": iteration,
+                "sequence": sequence,
+                "span_id": span_id,
+            }
+        )
+        return span_id
+
+    def fake_end(span_id, **kwargs):
+        captured["end"].append({"span_id": span_id, **kwargs})
+        return original_end(span_id, **kwargs)
+
+    def fake_budget(span_id, budget_message):
+        captured["budget"].append(
+            {"span_id": span_id, "budget_message": budget_message}
+        )
+        return original_budget(span_id, budget_message)
+
+    monkeypatch.setattr(llm_assist, "trace_start_span", fake_start)
+    monkeypatch.setattr(llm_assist, "trace_end_span", fake_end)
+    monkeypatch.setattr(llm_assist, "trace_record_budget_message", fake_budget)
+
+    chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=bgm,
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+
+    # seed 行存在
+    seed_starts = [s for s in captured["start"] if s["name"] == "seed"]
+    assert len(seed_starts) == 1, "应存在 1 条 seed span"
+    seed_ends = [
+        e for e in captured["end"] if e["span_id"] == seed_starts[0]["span_id"]
+    ]
+    assert len(seed_ends) == 1
+    assert "seed_messages" in seed_ends[0]["replay_delta"]
+
+    # chat span 存在（llm_chat）
+    chat_starts = [s for s in captured["start"] if s["name"] == "llm_chat"]
+    assert len(chat_starts) >= 1, "应存在 llm_chat span"
+    chat_ends = [
+        e
+        for e in captured["end"]
+        if e["span_id"] in [s["span_id"] for s in chat_starts]
+    ]
+    for ce in chat_ends:
+        # replay_delta 含 response 结构
+        delta = ce.get("replay_delta", {})
+        assert "response" in delta, delta
+        resp = delta["response"]
+        assert set(resp.keys()) >= {"stop_reason", "content", "tool_calls"}
+
+    # tool_execute span 存在（由 executor 包裹产生）
+    tool_starts = [s for s in captured["start"] if s["name"] == "tool_execute"]
+    assert len(tool_starts) >= 1, "应存在 tool_execute span"
+
+    # budget 钩子被调用（每轮一次）
+    assert len(captured["budget"]) >= 1, "budget 应被记录"
+
+
+@pytest.mark.asyncio
+async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
+    """S4.2：span_recorder=None 路径语义保持——run 结果正确、loop 领域语义不破。"""
+    run_id = "run-tr-none"
+    sr_id = 91
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    bgm = _make_bgm()
+
+    chat = _chat_side_effect([_submit_response("111", "直接建议")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=bgm,
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "succeeded"
+    assert run_row["stop_reason"] == "submit_suggestion"
+
+
+def test_trace_recorder_wrap_chat_fn_tracks_iteration():
+    """S1.4：wrap_chat_fn 每轮 start/end span，iteration 自增。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from app.services.llm.models import Message
+
+    starts = []
+    ends = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        starts.append({"name": name, "iteration": iteration, "sequence": sequence})
+        return f"span-{name}-{iteration}-{sequence}"
+
+    def fake_end(span_id, **kwargs):
+        ends.append({"span_id": span_id, **kwargs})
+
+    recorder = llm_assist.TraceRecorder("run-test")
+
+    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+        return ChatResponse(
+            content="",
+            stop_reason="end_turn",
+            blocks=[],
+            model="test-model",
+        )
+
+    wrapped = recorder.wrap_chat_fn(dummy_chat)
+
+    # patch llm_assist 模块上的引用（闭包通过模块全局名字查找）
+    with (
+        patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
+        patch.object(llm_assist, "trace_end_span", side_effect=fake_end),
+    ):
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+    # 应有一条 llm_chat start + end
+    assert len(starts) == 1
+    assert starts[0]["name"] == "llm_chat"
+    assert starts[0]["iteration"] == 0
+    assert len(ends) == 1
+    # model 写专用列（不再塞 payload_json）
+    assert ends[0]["model"] == "test-model"
+    assert ends[0]["status"] == "ok"
+    assert "response" in ends[0]["replay_delta"]
+
+
+def test_trace_recorder_tool_start_end_idempotent():
+    """S1.3：end_tool 幂等——同 span_id 二次调用不崩溃。"""
+    from unittest.mock import patch
+
+    from app.services.llm.models import ToolResultBlock
+
+    starts = []
+    ends = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        sid = f"tool-span-{len(starts)}"
+        starts.append(sid)
+        return sid
+
+    def fake_end(span_id, **kwargs):
+        ends.append(span_id)
+
+    recorder = llm_assist.TraceRecorder("run-test")
+    tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+
+    # 模拟 chat 已发生（设置 chat_span_id）
+    recorder._chat_span_id = "chat-span-0"
+
+    with (
+        patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
+        patch.object(llm_assist, "trace_end_span", side_effect=fake_end),
+    ):
+        span_id = recorder.start_tool(tc, sequence=0)
+        assert span_id is not None
+        assert len(starts) == 1
+
+        # 第一次 end
+        recorder.end_tool(
+            span_id,
+            result=ToolResultBlock(tool_use_id="t1", content="ok", is_error=False),
+        )
+        assert len(ends) == 1
+
+        # 第二次 end（幂等）——不应崩溃
+        recorder.end_tool(
+            span_id,
+            result=ToolResultBlock(tool_use_id="t1", content="ok", is_error=False),
+        )
+        assert len(ends) == 1, "幂等：第二次 end_tool 不应产生新 span 记录"
+
+
+def test_trace_recorder_budget_falls_back_to_chat_span():
+    """S1.5：budget 钩子定位本轮最后 tool span，无则回退 chat span。"""
+    from unittest.mock import patch
+
+    budget_targets = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        return f"span-{name}-{iteration}"
+
+    def fake_end(span_id, **kwargs):
+        pass
+
+    def fake_budget(span_id, budget_message):
+        budget_targets.append(span_id)
+
+    recorder = llm_assist.TraceRecorder("run-test")
+    # 仅有 chat span，无 tool span
+    recorder._chat_span_id = "span-llm_chat-0"
+    recorder._next_iteration = 1
+
+    with (
+        patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
+        patch.object(llm_assist, "trace_end_span", side_effect=fake_end),
+        patch.object(
+            llm_assist, "trace_record_budget_message", side_effect=fake_budget
+        ),
+    ):
+        recorder.record_budget("[剩余轮次：2]")
+        assert len(budget_targets) == 1
+        assert budget_targets[0] == "span-llm_chat-0", "无 tool span 时应回退 chat span"
+
+
+# ---------------------------------------------------------------------------
+# P0-1：wrap_chat_fn chat span 与 tool span 同轮 iteration 一致
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_chat_fn_chat_and_tool_same_iteration():
+    """P0-1：同一轮内 chat span 与 tool span 的 iteration 必须一致；连续两轮时第二轮 iteration=1。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from app.services.llm.models import Message
+
+    starts = []
+    ends = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        starts.append({"name": name, "iteration": iteration, "sequence": sequence})
+        return f"span-{name}-{iteration}-{sequence}"
+
+    def fake_end(span_id, **kwargs):
+        ends.append({"span_id": span_id, **kwargs})
+
+    recorder = llm_assist.TraceRecorder("run-test")
+
+    # chat_fn 返回含 tool_calls 的响应 → 模拟工具执行后调用 start_tool
+    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+        return ChatResponse(
+            content="",
+            stop_reason="tool_use",
+            blocks=[ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})],
+            model="test-model",
+        )
+
+    wrapped = recorder.wrap_chat_fn(dummy_chat)
+
+    with (
+        patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
+        patch.object(llm_assist, "trace_end_span", side_effect=fake_end),
+    ):
+        # 第一轮
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        # 模拟工具执行（与 chat 同轮）
+        tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+        recorder.start_tool(tc, sequence=0)
+
+        # 第二轮
+        asyncio.run(wrapped([Message(role="user", content="hi2")], tools=[]))
+        tc2 = ToolUseBlock(
+            id="t2", name="get_subject_detail", input={"subject_id": "1"}
+        )
+        recorder.start_tool(tc2, sequence=0)
+
+    # 提取 chat 和 tool 的 iteration
+    chat_starts = [s for s in starts if s["name"] == "llm_chat"]
+    tool_starts = [s for s in starts if s["name"] == "tool_execute"]
+
+    assert len(chat_starts) == 2, f"应有 2 条 chat span，实际 {len(chat_starts)}"
+    assert len(tool_starts) == 2, f"应有 2 条 tool span，实际 {len(tool_starts)}"
+
+    # 第一轮：chat 与 tool 同 iteration
+    assert chat_starts[0]["iteration"] == 0, (
+        f"第一轮 chat iteration 应为 0，实际 {chat_starts[0]['iteration']}"
+    )
+    assert tool_starts[0]["iteration"] == 0, (
+        f"第一轮 tool iteration 应与 chat 一致为 0，实际 {tool_starts[0]['iteration']}"
+    )
+
+    # 第二轮：chat 与 tool 同 iteration = 1
+    assert chat_starts[1]["iteration"] == 1, (
+        f"第二轮 chat iteration 应为 1，实际 {chat_starts[1]['iteration']}"
+    )
+    assert tool_starts[1]["iteration"] == 1, (
+        f"第二轮 tool iteration 应与 chat 一致为 1，实际 {tool_starts[1]['iteration']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P0-2：wrap_chat_fn 异常不得被 UnboundLocalError 遮蔽
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_chat_fn_exception_propagates_original():
+    """P0-2：chat_fn 抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from app.services.llm.models import Message
+
+    ends = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        return f"span-{name}-{iteration}-{sequence}"
+
+    def fake_end(span_id, **kwargs):
+        ends.append({"span_id": span_id, **kwargs})
+
+    recorder = llm_assist.TraceRecorder("run-test")
+
+    async def exploding_chat(messages, *, tools=None, tool_choice=None):
+        raise ValueError("boom")
+
+    wrapped = recorder.wrap_chat_fn(exploding_chat)
+
+    with (
+        patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
+        patch.object(llm_assist, "trace_end_span", side_effect=fake_end),
+    ):
+        with pytest.raises(ValueError, match="boom"):
+            asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+    # 不应写 ok span（允许写 error span，但 status 不得为 "ok"）
+    ok_ends = [e for e in ends if e.get("status") == "ok"]
+    assert len(ok_ends) == 0, f"异常时不应写 ok span，实际写了 {len(ok_ends)} 条"
+
+
+# ---------------------------------------------------------------------------
+# P1：_build_default_chat_fn 必填 thinking_level
+# ---------------------------------------------------------------------------
+
+
+def test_build_default_chat_fn_requires_thinking_level():
+    """P1：_build_default_chat_fn 不传 thinking_level 应抛 TypeError。"""
+    with pytest.raises(TypeError):
+        llm_assist._build_default_chat_fn()

@@ -11,18 +11,16 @@
   tool_result（重复 tool_use_id 时首个保留真实结果、后续为 duplicate 错误块）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
 - **透明预算**：每轮追加 ``[剩余轮次：N]``；末轮（remaining==1 起手）强制 ``tool_choice=terminal``。
-- **span 钩子**：每轮 chat 前后调用 ``span_recorder.start_span/end_span``（name=llm_chat），
-  并为该轮**每个**工具执行创建 ``tool_execute`` span（start 于 llm_chat span 之后、sequence=工具序号、
-  parent=当前 llm_chat span_id → 执行 → end 写入 ``replay_delta={tool_result: {...}}`` + payload 摘要，
-  保证每轮 LLM + 每次工具各一条 span）。``record_budget_message`` 并入**同轮最后一个**
-  ``tool_execute`` span 的 replay_delta；若该轮无工具则回退 llm_chat span（保留可重放性）。
-  ``span_recorder=None`` 时整体跳过（可空实现）。
+- **预算钩子**：每轮预算消息生成后调用 ``recorder.record_budget(budget_message)``，
+  由 recorder 内部决定并入哪条 span（同轮最后 tool_execute 或回退 llm_chat）。
+  ``recorder=None`` 时整体跳过（可空实现）。
 
 不引入 token/wall-time 预算系统，只做轮次上限。
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -33,6 +31,8 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -61,11 +61,6 @@ def _extract_tool_calls(resp: ChatResponse) -> list[ToolUseBlock]:
     return [b for b in resp.blocks if isinstance(b, ToolUseBlock)]
 
 
-def _input_summary(inp: dict) -> str:
-    """输入摘要：仅记录参数名与类型（不记录参数值）。"""
-    return ", ".join(f"{k}:{type(v).__name__}" for k, v in (inp or {}).items())
-
-
 def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
     """把执行器返回值对齐为与 ``tool_calls`` 一一对应的结果槽位列表。
 
@@ -77,8 +72,6 @@ def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
     if isinstance(ordered, list) and len(ordered) == len(tool_calls):
         if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls)):
             return [result for _, result in ordered]
-        from app.core.logging import logger
-
         logger.debug("ordered 槽位与 tool_calls 不一致，回退 dict 取值")
     getter = getattr(results, "get", None)
     if getter is None:
@@ -94,7 +87,7 @@ async def run(
     max_iterations: int,
     tool_choice_terminal: str,
     seed_messages: list[Message],
-    span_recorder: Any | None = None,
+    recorder: Any | None = None,
 ) -> RunResult:
     """运行轻量 Agent 循环，返回 ``RunResult``。
 
@@ -107,27 +100,17 @@ async def run(
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）
-    - ``span_recorder``：可选 span 记录器，None 时跳过钩子
+    - ``recorder``：可选预算记录器（鸭子类型 ``record_budget(str)``），None 时跳过钩子
     """
     messages: list[Message] = list(seed_messages)
     remaining = max_iterations
+    resp: ChatResponse | None = None
 
-    for iteration in range(max_iterations):
+    for _iteration in range(max_iterations):
         # 末轮（remaining==1 起手）强制 terminal 收尾；其余轮不指定 tool_choice
         tool_choice = tool_choice_terminal if remaining == 1 else None
 
-        # span：chat 前 start_span
-        span_id = (
-            span_recorder.start_span(name="llm_chat", iteration=iteration, sequence=0)
-            if span_recorder is not None
-            else None
-        )
-        resp: ChatResponse | None = None
-        try:
-            resp = await chat_fn(messages, tools=tools_schemas, tool_choice=tool_choice)
-        finally:
-            if span_recorder is not None:
-                span_recorder.end_span(span_id, status="ok", response=resp)
+        resp = await chat_fn(messages, tools=tools_schemas, tool_choice=tool_choice)
 
         # ① end_turn → 终止
         if resp.stop_reason == "end_turn":
@@ -167,53 +150,25 @@ async def run(
         # ⑤ 分段并行执行（循环把整批交给 tool_calls_fn，由 execute_batch 内部 gather/串行）
         results = await tool_calls_fn(tool_calls)
 
-        # ⑥ 逐条：创建 tool_execute span → 追加 tool_result
-        #    span start 在拿到结果后（started_at 有微小误差，可接受），但语义完整：
-        #    span 存在 + replay_delta 含完整 tool_result，供断点重放（trace.replay）重建。
-        tool_execute_span_ids: list[str] = []
+        # ⑥ 逐条：追加 tool_result
         aligned = _align_results(tool_calls, results)
-        for seq, (tc, result) in enumerate(zip(tool_calls, aligned)):
+        for tc, result in zip(tool_calls, aligned):
             if result is None or not isinstance(result, ToolResultBlock):
                 # 防御：缺失结果或非 ToolResultBlock（如极少数 TerminalCapture 泄漏）跳过
+                logger.warning(
+                    "tool result 缺失或非 ToolResultBlock（tool=%s, type=%s），跳过",
+                    tc.name,
+                    type(result).__name__,
+                )
                 continue
-            if span_recorder is not None:
-                te_span_id = span_recorder.start_span(
-                    name="tool_execute",
-                    iteration=iteration,
-                    sequence=seq,
-                    parent_id=span_id,
-                )
-                span_recorder.end_span(
-                    te_span_id,
-                    status="ok",
-                    tool_name=tc.name,
-                    input_summary=_input_summary(tc.input),
-                    payload_json={
-                        "tool_name": tc.name,
-                        "tool_use_id": result.tool_use_id,
-                        "is_error": result.is_error,
-                    },
-                    replay_delta={
-                        "tool_result": {
-                            "tool_use_id": result.tool_use_id,
-                            "content": result.content,
-                            "is_error": result.is_error,
-                        }
-                    },
-                )
-                tool_execute_span_ids.append(te_span_id)
             messages.append(Message(role="user", content=[result]))
 
-        # ⑦ 透明预算：递减并注入剩余轮次；预算消息并入**同轮最后一个 tool_execute**
-        #    span 的 replay_delta。若该轮无工具（防御），回退 llm_chat span 以保持可重放。
+        # ⑦ 透明预算：递减并注入剩余轮次
         remaining -= 1
         budget_message = f"[剩余轮次：{remaining}]"
         messages.append(Message(role="user", content=budget_message))
-        if span_recorder is not None and span_id is not None:
-            budget_target = (
-                tool_execute_span_ids[-1] if tool_execute_span_ids else span_id
-            )
-            span_recorder.record_budget_message(budget_target, budget_message)
+        if recorder is not None:
+            recorder.record_budget(budget_message)
 
     # 预算刚性耗尽（兜底由场景层 output_parser 解析 last_response）
     return RunResult(stop_reason="exhausted", last_response=resp)

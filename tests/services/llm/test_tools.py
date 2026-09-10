@@ -4,10 +4,12 @@
 - ToolDefinition 的 readonly 推导与 to_schema 序列化
 - ToolRegistry.register / get / execute 的注册、审计、terminal 捕获、超时、JSON Schema 校验
 - execute_batch 的分段并行（连续 readonly 段 gather 并行、非只读串行、保序）与异常统一包装
+- execute_batch + ToolSpanRecorder：工具级包裹（真实时序 + 逐工具即刻落库）
 """
 
 import asyncio
 import logging
+from typing import Optional
 
 import pytest
 
@@ -695,3 +697,313 @@ def test_module_singleton_get_and_reset():
     # reset 后获得新实例
     reset_tool_registry()
     assert get_tool_registry() is not reg
+
+
+# ---------------------------------------------------------------------------
+# execute_batch + ToolSpanRecorder：工具级包裹（真实时序 + 逐工具即刻落库）
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """可注入的假时钟。
+
+    - 手动模式：time() 返回当前 _t，由测试通过 advance() 推进。
+    - 自动模式（auto_increment=True）：每次 time() 调用后 _t 自增 1，
+      适合仅需保序、无需精确值的场景（如并行/串行时序断言）。
+    """
+
+    def __init__(self, auto_increment: bool = False) -> None:
+        self._t: float = 0.0
+        self._auto = auto_increment
+
+    def time(self) -> float:
+        t = self._t
+        if self._auto:
+            self._t += 1.0
+        return t
+
+    def advance(self, delta: float) -> None:
+        self._t += delta
+
+
+class FakeRecorder:
+    """记录 start/end 调用顺序与 span 区间的假 recorder。"""
+
+    def __init__(self, clock: Optional[FakeClock] = None) -> None:
+        self.clock = clock or FakeClock()
+        self.events: list[dict] = []
+        self._counter: int = 0
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str:
+        span_id = f"span_{self._counter}"
+        self._counter += 1
+        self.events.append(
+            {
+                "type": "start",
+                "span_id": span_id,
+                "time": self.clock.time(),
+                "tool_use_id": tool_use.id,
+                "tool_name": tool_use.name,
+                "sequence": sequence,
+            }
+        )
+        return span_id
+
+    def end_tool(
+        self,
+        span_id: str,
+        *,
+        result: Optional[ToolResultBlock] = None,
+        error: str = "",
+    ) -> None:
+        self.events.append(
+            {
+                "type": "end",
+                "span_id": span_id,
+                "time": self.clock.time(),
+                "result": result,
+                "error": error,
+            }
+        )
+
+
+def _spans_by_sequence(recorder: FakeRecorder) -> dict[int, dict]:
+    """按 sequence 聚合 start/end 区间，返回 {sequence: {"start": ..., "end": ...}}。
+
+    通过 span_id 关联 start 与 end 事件（end 事件不直接携带 sequence）。
+    """
+    # 先按 span_id 聚合
+    by_id: dict[str, dict] = {}
+    for e in recorder.events:
+        by_id.setdefault(e["span_id"], {})[e["type"]] = e
+    # 再通过 start 事件的 sequence 建立索引
+    spans: dict[int, dict] = {}
+    for events in by_id.values():
+        if "start" in events:
+            seq = events["start"]["sequence"]
+            spans[seq] = events
+    return spans
+
+
+# 场景1：真实时序 —— start 在执行前、end 在完成后（fake clock，区间覆盖执行体）
+
+
+@pytest.mark.asyncio
+async def test_recorder_真实时序_start在handler前_end在handler后():
+    clock = FakeClock()
+    recorder = FakeRecorder(clock=clock)
+    reg = ToolRegistry()
+
+    async def handler(args):
+        clock.advance(10)  # 模拟执行体耗时
+        return "ok"
+
+    reg.register(
+        ToolDefinition(
+            name="t",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    await reg.execute_batch(
+        [ToolUseBlock(id="x", name="t", input={})], recorder=recorder
+    )
+
+    spans = _spans_by_sequence(recorder)
+    assert len(spans) == 1
+    s = spans[0]
+    assert "start" in s
+    assert "end" in s
+    # start 在 handler advance 之前（t=0），end 在 advance 之后（t=10）
+    assert s["start"]["time"] == 0.0
+    assert s["end"]["time"] == 10.0
+
+
+# 场景2：逐工具即刻落库 —— 批内某工具执行中断，已完成工具已被记录
+
+
+@pytest.mark.asyncio
+async def test_recorder_逐工具即刻落库_前序工具end在异常工具之前落库():
+    """3 工具（2 readonly 并行 + 1 write 串行），write 抛异常时，
+    前 2 个 readonly 工具的 end_tool 已被调用。"""
+    recorder = FakeRecorder(FakeClock(auto_increment=True))
+    reg = ToolRegistry()
+
+    async def fast(args):
+        return "fast"
+
+    async def boom(args):
+        raise ValueError("kaboom")
+
+    reg.register(
+        ToolDefinition(
+            name="ra",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=fast,
+            access="read",
+        )
+    )
+    reg.register(
+        ToolDefinition(
+            name="rb",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=fast,
+            access="read",
+        )
+    )
+    reg.register(
+        ToolDefinition(
+            name="wc",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=boom,
+            access="write",
+        )
+    )
+    calls = [
+        ToolUseBlock(id="a", name="ra", input={}),
+        ToolUseBlock(id="b", name="rb", input={}),
+        ToolUseBlock(id="c", name="wc", input={}),
+    ]
+    results = await reg.execute_batch(calls, recorder=recorder)
+
+    # 三个工具都有 start + end
+    spans = _spans_by_sequence(recorder)
+    assert len(spans) == 3
+    for seq in (0, 1, 2):
+        assert "start" in spans[seq]
+        assert "end" in spans[seq]
+
+    # 前 2 个 readonly 的 end 发生在第 3 个 write 的 start 之前
+    assert spans[0]["end"]["time"] < spans[2]["start"]["time"]
+    assert spans[1]["end"]["time"] < spans[2]["start"]["time"]
+
+    # write 工具异常被正确包装为 error block
+    assert results["c"].is_error is True
+
+
+# 场景3：并行/串行时序 —— 并行段区间重叠、串行段有序不重叠
+
+
+@pytest.mark.asyncio
+async def test_recorder_并行串行时序_并行重叠_串行有序():
+    recorder = FakeRecorder(FakeClock(auto_increment=True))
+    reg = ToolRegistry()
+
+    async def make_handler():
+        async def handler(args):
+            return "ok"
+
+        return handler
+
+    for k in ("ra", "rb", "wc"):
+        access = "write" if k == "wc" else "read"
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(),
+                access=access,  # type: ignore[arg-type]
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("ra", "rb", "wc")]
+    await reg.execute_batch(calls, recorder=recorder)
+
+    spans = _spans_by_sequence(recorder)
+    ra = spans[0]
+    rb = spans[1]
+    wc = spans[2]
+
+    # 并行段：ra 和 rb 区间重叠（max(start) < min(end)）
+    parallel_max_start = max(ra["start"]["time"], rb["start"]["time"])
+    parallel_min_end = min(ra["end"]["time"], rb["end"]["time"])
+    assert parallel_max_start < parallel_min_end
+
+    # 串行段：ra/rb 的 end 都在 wc start 之前
+    assert ra["end"]["time"] < wc["start"]["time"]
+    assert rb["end"]["time"] < wc["start"]["time"]
+
+
+# 场景4：异常必达 —— 工具抛异常 → end_tool 仍被调用，error 参数非空
+
+
+@pytest.mark.asyncio
+async def test_recorder_异常必达_工具抛异常时end仍调用且error非空():
+    recorder = FakeRecorder(FakeClock(auto_increment=True))
+    reg = ToolRegistry()
+
+    async def boom(args):
+        raise RuntimeError("crash")
+
+    reg.register(
+        ToolDefinition(
+            name="boom",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=boom,
+            access="read",
+        )
+    )
+    calls = [ToolUseBlock(id="x1", name="boom", input={})]
+    results = await reg.execute_batch(calls, recorder=recorder)
+
+    spans = _spans_by_sequence(recorder)
+    assert len(spans) == 1
+    s = spans[0]
+    assert "start" in s
+    assert "end" in s
+    # error 参数携带异常类型名
+    assert s["end"]["error"] == "RuntimeError"
+    # result=None（执行异常不产生 ToolResultBlock）
+    assert s["end"]["result"] is None
+    # 异常被包装为 error block
+    assert results["x1"].is_error is True
+
+
+# 场景5：重复 id —— 占位错误块同样有 span（is_error）
+
+
+@pytest.mark.asyncio
+async def test_recorder_重复id_占位错误块同样有span且is_error():
+    recorder = FakeRecorder(FakeClock(auto_increment=True))
+    reg = ToolRegistry()
+
+    def handler(args):
+        return "ran"
+
+    reg.register(
+        ToolDefinition(
+            name="dup",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    calls = [
+        ToolUseBlock(id="same", name="dup", input={}),
+        ToolUseBlock(id="same", name="dup", input={}),
+    ]
+    results = await reg.execute_batch(calls, recorder=recorder)
+
+    spans = _spans_by_sequence(recorder)
+    assert len(spans) == 2  # 两个 span（首个真实 + 重复占位）
+    for seq in (0, 1):
+        assert "start" in spans[seq]
+        assert "end" in spans[seq]
+        # 两个 span 的 result 都是 ToolResultBlock
+        assert isinstance(spans[seq]["end"]["result"], ToolResultBlock)
+
+    # 其中一个是真实结果（is_error=False），一个是占位错误块（is_error=True）
+    end_results = [spans[seq]["end"]["result"] for seq in (0, 1)]
+    assert any(r.is_error is False for r in end_results)
+    assert any(r.is_error is True for r in end_results)
+
+    # 首个保留真实结果
+    assert results["same"].is_error is False
+    assert results["same"].content == "ran"

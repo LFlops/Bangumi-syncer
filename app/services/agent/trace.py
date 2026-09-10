@@ -1,8 +1,15 @@
 """Span 记录器与断点重放（otel 概念，自建不引 SDK）。
 
+存储形态（单表双职责）：
+- ``agent_steps`` 是唯一存储；trace 是它的全部，replay 是它的一个读取视角。
+- **类型化列**（status / model / tokens / latency_ms / tool_name / input_summary /
+  error / iteration / sequence）：payload 摘要，供观测与索引。
+- **replay_delta**：重放所需全部增量（seed / response / tool_result / budget_message），
+  完整、Fernet 加密（BGS1: 前缀）、永不截断、无大小上限、无 error 标记机制。
+
 提供：
 - ``start_span`` / ``end_span``：写入 ``agent_steps``（独立 best-effort 事务，失败仅日志），
-  承载可重放会话日志。
+  承载可重放会话日志。时间列统一 epoch 秒整数。
 - ``record_budget_message``：将透明预算消息并入最后一条 ``tool_execute`` 的 ``replay_delta``。
 - ``replay``：从 ``agent_steps`` 按 ``(iteration, sequence)`` 重放会话增量，
   重建可续跑的 ``messages``（断点恢复重建规则）。
@@ -14,77 +21,30 @@ replay_delta 写入语义：
 - 预算消息：由 ``record_budget_message`` 并入同轮最后一个 ``tool_execute`` 的
   ``replay_delta``（``budget_message`` 字段）。
 
-职责分离：``payload_json`` 仅观测摘要（结构化截断 ≤2KB 保 JSON 合法）；
-``replay_delta`` 为断点重放增量（完整，超 32KB 标记该 span ``status=error`` 视为不可恢复点）。
-``input_summary`` 仅记录参数名与类型（不记录参数值）。
+读取/展示侧的截断（含 ``...[shrinked]`` 标记）由 ``app.utils.truncate`` 承担；
+写入路径零截断。
 """
 
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
+from app.core.config_secret_crypto import decrypt, encrypt
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 
-# 观测摘要上限（payload_json 截断 ≤2KB）
-MAX_PAYLOAD_JSON_BYTES = 2 * 1024
-# replay_delta 上限（超 32KB 标记该 span status=error，视为不可恢复点）
-MAX_REPLAY_DELTA_BYTES = 32 * 1024
-# input_summary 上限（≤500 字符）
+# input_summary 上限（≤500 字符，仅参数名与类型，不记录参数值）
 MAX_INPUT_SUMMARY_CHARS = 500
 
 
-def _now() -> str:
-    """本地时间字符串（与 repository 写入的 started_at/ended_at 同格式，便于字符串比较）。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-# ----------------------------------------------------------------------
-# 观测摘要结构化截断（保 JSON 合法）
-# ----------------------------------------------------------------------
-
-
-def _shrink(obj: Any, max_bytes: int) -> Any:
-    """递归截断字符串叶子，使 JSON 序列化后 ≤ max_bytes（近似自底向上）。"""
-    if len(json.dumps(obj, ensure_ascii=False).encode("utf-8")) <= max_bytes:
-        return obj
-    if isinstance(obj, str):
-        return obj[: max(0, max_bytes - 16)]
-    if isinstance(obj, dict):
-        return {k: _shrink(v, max_bytes) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_shrink(v, max_bytes) for v in obj]
-    return obj
-
-
-def truncate_json(payload: Any, max_bytes: int = MAX_PAYLOAD_JSON_BYTES) -> str:
-    """将 payload 序列化为 JSON 字符串，并在超出 max_bytes 时结构化截断，保证结果仍是合法 JSON。
-
-    - 小 payload：原样返回。
-    - 大 payload：先尝试递归缩短字符串叶子以保留原始结构；若仍超限，降级为
-      ``{"truncated": true, "preview": "<前缀>"}`` 包壳，确保大小上限与 JSON 合法性。
-    """
-    text = (
-        payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False)
-    )
-    if len(text.encode("utf-8")) <= max_bytes:
-        return text
-    try:
-        obj = json.loads(text) if isinstance(payload, str) else payload
-    except (ValueError, TypeError):
-        obj = text
-    shrunk = _shrink(obj, max_bytes)
-    result = json.dumps(shrunk, ensure_ascii=False)
-    if len(result.encode("utf-8")) <= max_bytes:
-        return result
-    # 兜底：包成截断预览，保证合法 JSON 与大小上限
-    preview = text[: max(0, max_bytes - 64)]
-    return json.dumps({"truncated": True, "preview": preview}, ensure_ascii=False)
+def _now() -> int:
+    """当前 epoch 秒整数（与 agent_steps/agent_runs 时间列格式一致）。"""
+    return int(time.time())
 
 
 # ----------------------------------------------------------------------
@@ -98,12 +58,16 @@ def start_span(
     iteration: int,
     sequence: int,
     parent_id: str = "",
+    *,
+    started_at: int | None = None,
 ) -> str:
     """开始一条 span，写入 ``agent_steps`` 并返回 span_id（uuid hex）。
 
+    ``started_at`` 为 epoch 秒整数（None → 当前时间）。
     失败（DB 异常）仅记录日志并返回生成的 span_id，不影响主流程。
     """
     span_id = uuid.uuid4().hex
+    ts = started_at if started_at is not None else _now()
     try:
         dbm = get_database_manager()
         dbm.agent_runs.add_step(
@@ -115,6 +79,7 @@ def start_span(
                 "status": "ok",
                 "iteration": iteration,
                 "sequence": sequence,
+                "started_at": ts,
             }
         )
     except Exception as e:  # best-effort：失败不影响主流程
@@ -138,57 +103,44 @@ def end_span(
     tool_name: str = "",
     input_summary: str = "",
     error: str = "",
-    payload_json: Any = "",
     replay_delta: Any = "",
+    started_at: int | None = None,
+    ended_at: int | None = None,
 ) -> None:
     """结束一条 span，更新 ``agent_steps``（独立 best-effort 事务，失败仅日志）。
 
-    - ``payload_json``：经结构化截断（≤2KB 保 JSON 合法）。
-    - ``replay_delta``：序列化后若超 32KB，将该 span 标记为 ``status=error``（不可恢复点）。
+    - ``replay_delta``：完整保存，无大小上限、无截断、无 error 标记（加密由仓储层统一处理）。
     - ``input_summary``：截断至 500 字符（仅参数名与类型，不记录参数值）。
+    - ``started_at``：epoch 秒整数；**仅显式传入时**才写回，未传时 UPDATE 不触碰
+      ``start_span`` 已写入的真实开始时间。
+    - ``ended_at``：epoch 秒整数（None → 当前时间）。
     """
     try:
-        payload_str = (
-            truncate_json(payload_json) if payload_json not in ("", None) else ""
-        )
         delta_str = (
             _normalize_replay_delta(replay_delta)
             if replay_delta not in ("", None)
             else ""
         )
-        final_status = status
-        if delta_str and len(delta_str.encode("utf-8")) > MAX_REPLAY_DELTA_BYTES:
-            final_status = "error"
         input_summary_str = (input_summary or "")[:MAX_INPUT_SUMMARY_CHARS]
+        ts_ended = ended_at if ended_at is not None else _now()
+
+        fields: dict[str, Any] = dict(
+            status=status,
+            model=model,
+            tokens=tokens,
+            latency_ms=latency_ms,
+            tool_name=tool_name,
+            input_summary=input_summary_str,
+            error=error,
+            replay_delta=delta_str,
+            ended_at=ts_ended,
+        )
+        # 仅显式传入 started_at 时才写回，避免覆盖 start_span 已写入的真实开始时间
+        if started_at is not None:
+            fields["started_at"] = started_at
 
         dbm = get_database_manager()
-
-        def _write(conn):
-            conn.execute(
-                """
-                UPDATE agent_steps
-                SET status=?, model=?, tokens=?, latency_ms=?, tool_name=?,
-                    input_summary=?, error=?, payload_json=?, replay_delta=?, ended_at=?
-                WHERE span_id=?
-                """,
-                (
-                    final_status,
-                    model,
-                    tokens,
-                    latency_ms,
-                    tool_name,
-                    input_summary_str,
-                    error,
-                    payload_str,
-                    delta_str,
-                    _now(),
-                    span_id,
-                ),
-            )
-
-        dbm.agent_runs._run_write(
-            _write, error_msg="[trace] end_span 更新失败（已忽略）"
-        )
+        dbm.agent_runs.update_step(span_id, **fields)
     except Exception as e:  # best-effort：失败不影响主流程
         logger.error(f"[trace] end_span 失败（已忽略）: {e}")
 
@@ -197,6 +149,10 @@ def record_budget_message(span_id: str, budget_message: str) -> None:
     """将透明预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
 
     在现有 replay_delta 上追加 ``budget_message`` 字段。独立 best-effort 事务。
+    读改写路径：SELECT → 解密 → 改 → 加密写回（加密由仓储层 decrypt/encrypt 处理）。
+
+    安全约束：任何解密/解析失败路径都**保留原 raw 不变**（不写库），仅记 warning 日志。
+    仅当成功解析为 dict 时才合并 budget_message 并写回。
     """
     try:
         dbm = get_database_manager()
@@ -208,15 +164,28 @@ def record_budget_message(span_id: str, budget_message: str) -> None:
             row = cur.fetchone()
             if not row:
                 return
-            raw = row[0] or "{}"
+            raw = row[0] or ""
+            # 解密（容错无前缀明文）；解析失败保留原 raw，不写库
             try:
-                obj = json.loads(raw)
-            except (ValueError, TypeError):
-                obj = {}
+                obj = json.loads(decrypt(raw))
+            except Exception:
+                logger.warning(
+                    "[trace] record_budget_message 解密/解析失败，保留原 raw 不写库"
+                )
+                return
+            if not isinstance(obj, dict):
+                logger.warning(
+                    "[trace] record_budget_message 解析结果非 dict，保留原 raw 不写库"
+                )
+                return
             obj["budget_message"] = budget_message
+            try:
+                new_delta = encrypt(json.dumps(obj, ensure_ascii=False))
+            except Exception:
+                new_delta = json.dumps(obj, ensure_ascii=False)
             conn.execute(
                 "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
-                (json.dumps(obj, ensure_ascii=False), span_id),
+                (new_delta, span_id),
             )
 
         dbm.agent_runs._run_write(
@@ -241,22 +210,12 @@ class ReplayResult:
       tool_execute 的缺失项（供调用方补执行；readonly 校验由调用方做）。
     - ``last_response``：最后一条完整 llm_chat 的响应（当其未产生工具/已终止时，
       调用方直接消费分派 end_turn / tool_use / submit；为 None 表示应直接进入下一轮 chat）。
-    - ``unrecoverable_iteration``：存在 status=error 的 span 时，返回其 iteration，
-      供调用方从该轮重新 chat 丢弃其后所有已存响应；无则为 None。
     """
 
     messages: list = field(default_factory=list)
     executed_iterations: int = 0
     missing_tool_calls: list = field(default_factory=list)
     last_response: dict | None = None
-    unrecoverable_iteration: int | None = None
-
-    # 类型注解（运行期仍为 list，便于混合 seed 与重建消息）：
-    # messages: list[Message] —— seed 前缀（调用方提供，应为 Message）+ 各轮重建的 Message
-    #   - assistant: Message(role="assistant", content=list[ToolUseBlock])
-    #   - 每条 tool_result: Message(role="user", content=[ToolResultBlock(...)])(逐条不合并)
-    #   - 预算: Message(role="user", content=f"[剩余轮次：N]")
-    # 该列表可直接作为 loop.run(seed_messages=...) 的入参。
 
 
 def _parse_json(raw: str, default: Any = None) -> Any:
@@ -287,16 +246,14 @@ def _extract_budget_message(step: dict) -> str | None:
     return bm if isinstance(bm, str) else None
 
 
-def replay(
-    run_id: str,
-    seed_builder: Callable[[], list],
-    max_iterations: int | None = None,
-) -> ReplayResult:
-    """按 (iteration, sequence) 重放会话增量，重建可续跑 ``list[Message]``。
+def replay(run_id: str) -> ReplayResult:
+    """按 (iteration, sequence, id) 重放会话增量，重建可续跑 ``list[Message]``。
 
-    ``seed_builder`` 返回种子消息（system + user 列表），由场景层提供
-    （llm_assist 从 sync_records 还原），原样保留（调用方应返回 ``Message`` 实例，
-    以便整体可直接作为 ``loop.run(seed_messages=...)`` 消费的列表）。
+    排序以 ``(iteration, sequence)`` 为主键、``id`` 为末级 tie-break，确保 seed 行
+    与首轮 llm_chat 同 ``(0, 0)`` 时顺序稳定。
+
+    种子消息从 ``name="seed"`` 行的 ``replay_delta.seed_messages`` 还原
+    （seed 行由写入方在 run 启动时写入），无需调用方提供额外入参。
 
     重建规则（与原执行 ``loop.run`` 完全一致）：
     - 每轮从 ``llm_chat.replay_delta`` 重建**一条** assistant 消息：
@@ -304,44 +261,41 @@ def replay(
       （content 为 ``list[ToolUseBlock]``，与原执行对齐）。
     - 逐条追加各 ``tool_execute.replay_delta.tool_result`` 重建的
       ``Message(role="user", content=[ToolResultBlock(...)])``（每条工具结果独立成消息，不合并）。
-    - 预算消息：``Message(role="user", content=f"[剩余轮次：N]")``。
-      优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入）；
-      缺失时按 ``N = max_iterations - executed_iterations`` 计算（用已执行轮数而非
-      iteration 索引，避免稀疏 iteration 时算错剩余轮次）。
+    - 预算消息：优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入）；
+       缺失时不追加预算消息。
     - 缺失工具识别（S(tool_calls) - R(已记录 tool_execute)）逻辑不变；命中缺失的该轮
-      不追加预算消息、不计入 executed_iterations，交回调用方补执行。
+       不追加预算消息、不计入 executed_iterations，交回调用方补执行。
+    - 行缺失 / 空 delta：在该轮 break（executed_iterations 不含该轮，调用方从该轮重新 chat）。
     """
     dbm = get_database_manager()
     steps = dbm.agent_runs.get_steps(run_id)
 
     steps_by_iter: dict[int, list] = {}
+    seed_messages: list[Message] = []
     for s in steps:
+        if s["name"] == "seed":
+            # 提取种子消息
+            obj = _parse_json(s.get("replay_delta"), {})
+            if isinstance(obj, dict):
+                for m in obj.get("seed_messages") or []:
+                    if isinstance(m, dict):
+                        try:
+                            seed_messages.append(Message.model_validate(m))
+                        except Exception:
+                            pass
+            continue
         steps_by_iter.setdefault(s["iteration"], []).append(s)
 
-    # 不可恢复点：任何 status=error 的 span 标记其 iteration（取最小）
-    unrecoverable: int | None = None
-    for s in steps:
-        if s.get("status") == "error":
-            it = s["iteration"]
-            if unrecoverable is None or it < unrecoverable:
-                unrecoverable = it
-
-    seed = list(seed_builder()) if seed_builder else []
-    messages: list = list(seed)
+    messages: list = list(seed_messages)
     executed_iterations = 0
     missing_tool_calls: list = []
     last_response: dict | None = None
 
     for it in sorted(steps_by_iter.keys()):
-        if unrecoverable is not None and it >= unrecoverable:
-            # 到达不可恢复点：停止重建，交回调用方从该轮重新 chat
-            break
-
         isteps = steps_by_iter[it]
         chat = next((s for s in isteps if s["name"] == "llm_chat"), None)
         if chat is None:
-            # 该轮无 llm_chat（异常数据），视为不可恢复
-            unrecoverable = it
+            # 该轮无 llm_chat（异常数据）：在该轮 break，交回调用方从该轮重新 chat
             break
 
         response = _parse_response(chat)
@@ -359,11 +313,15 @@ def replay(
             ],
         )
 
+        if not response:
+            # 空 delta（异常数据）：在该轮 break，交回调用方从该轮重新 chat
+            break
+
         if tool_calls:
             messages.append(assistant_msg)
             recorded_ids: set = set()
             budget_message: str | None = None
-            for t in sorted(isteps, key=lambda x: x["sequence"]):
+            for t in sorted(isteps, key=lambda x: (x["sequence"], x["id"])):
                 if t["name"] != "tool_execute":
                     continue
                 tr = _parse_tool_result(t)
@@ -390,18 +348,13 @@ def replay(
             missing = [tc for tc in tool_calls if tc.get("id") not in recorded_ids]
             if missing:
                 # 最后一轮工具未全部执行完：返回缺失项供调用方补执行；
-                # 该轮未完整，不追加预算消息（避免与调用方重跑该轮产生的预算重复）
+                # 该轮未完整，不追加预算消息、不计入 executed_iterations
                 missing_tool_calls = missing
                 last_response = response
                 break
 
             # 本轮完整执行：计入 executed_iterations 并追加预算消息
             executed_iterations += 1
-            if budget_message is None and max_iterations is not None:
-                # 确定性重建预算消息：用已执行轮数而非 iteration 索引
-                budget_message = (
-                    f"[剩余轮次：{max(0, max_iterations - executed_iterations)}]"
-                )
             if budget_message is not None:
                 messages.append(Message(role="user", content=budget_message))
             last_response = None
@@ -415,5 +368,4 @@ def replay(
         executed_iterations=executed_iterations,
         missing_tool_calls=missing_tool_calls,
         last_response=last_response,
-        unrecoverable_iteration=unrecoverable,
     )

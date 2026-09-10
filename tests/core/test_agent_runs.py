@@ -24,8 +24,11 @@ def _make_db(tmp_path: Path) -> DatabaseManager:
     return DatabaseManager(db_path)
 
 
-def _set_status(dbm, run_id: str, status: str, ended_at: Optional[str] = None) -> None:
-    """测试辅助：直接改写 run 状态（绕过业务方法，便于构造超期场景）"""
+def _set_status(dbm, run_id: str, status: str, ended_at: Optional[int] = None) -> None:
+    """测试辅助：直接改写 run 状态（绕过业务方法，便于构造超期场景）。
+
+    ``ended_at`` 为 epoch 秒整数（与当前 schema 一致）。
+    """
     conn = dbm._connection._conn
     if ended_at is not None:
         conn.execute(
@@ -84,12 +87,13 @@ class TestAgentRunsSchema:
                 "error",
                 "iteration",
                 "sequence",
-                "payload_json",
                 "replay_delta",
                 "started_at",
                 "ended_at",
             ):
                 assert c in cols
+            # payload_json 列已删除（观测摘要不再存储；截断仅存在于读取/展示侧）
+            assert "payload_json" not in cols
         finally:
             dbm._connection._conn.close()
 
@@ -240,8 +244,8 @@ class TestFindActiveBySyncRecord:
         try:
             dbm.agent_runs.create_pending("dnx", "match", 201)
             dbm.agent_runs.mark_no_suggestion("dnx")
-            # 把 ended_at 改到远早于保留期
-            _set_status(dbm, "dnx", "no_suggestion", ended_at="2000-01-01 00:00:00")
+            # 把 ended_at 改到远早于保留期（epoch 秒整数，2000-01-01）
+            _set_status(dbm, "dnx", "no_suggestion", ended_at=946684800)
             assert dbm.agent_runs.find_active_by_sync_record(201) is None
         finally:
             dbm._connection._conn.close()
@@ -306,10 +310,16 @@ class TestFindFailedBySyncRecord:
             dbm._connection._conn.close()
 
 
-class TestCleanupTerminal:
-    """终态超保留期：先删 steps 再删 runs，无孤儿 steps"""
+class TestCleanupExpired:
+    """按滑动窗口轮转清理过期 runs（单条 DELETE，FK 级联删 steps）。
 
-    def test_cleanup_deletes_steps_then_runs(self, tmp_path):
+    两腿 OR：
+    - 终态腿：status IN (terminal) AND ended_at > 0 AND ended_at < cutoff
+    - 活性腿：status IN (pending, processing) AND created_at < cutoff
+    """
+
+    def test_cleanup_expired_deletes_terminal_over_window_with_cascade(self, tmp_path):
+        """终态超窗 run 被删且 agent_steps 级联消失（FK 取代两步删除）。"""
         dbm = _make_db(tmp_path)
         try:
             # run A：succeeded + 超期 + 2 条 steps
@@ -335,9 +345,10 @@ class TestCleanupTerminal:
                 }
             )
             conn = dbm._connection._conn
+            # 把 ended_at 改到远早于保留期（epoch 秒整数，2000-01-01）
             conn.execute(
-                "UPDATE agent_runs SET ended_at='2000-01-01 00:00:00' WHERE run_id=?",
-                ("cleanup-a",),
+                "UPDATE agent_runs SET ended_at=? WHERE run_id=?",
+                (946684800, "cleanup-a"),
             )
             conn.commit()
 
@@ -354,28 +365,126 @@ class TestCleanupTerminal:
                 }
             )
 
-            deleted = dbm.agent_runs.cleanup_terminal(7)
+            deleted = dbm.agent_runs.cleanup_expired(7)
             assert deleted == 1
 
             # A 已删，B 仍在
             assert dbm.agent_runs.get_run("cleanup-a") is None
             assert dbm.agent_runs.get_run("cleanup-b") is not None
 
-            # 无孤儿 steps：A 的 steps 已随 runs 删除
+            # 无孤儿 steps：A 的 steps 已随 runs 级联删除
             assert dbm.agent_runs.get_steps("cleanup-a") == []
             # B 的 steps 保留
             assert len(dbm.agent_runs.get_steps("cleanup-b")) == 1
         finally:
             dbm._connection._conn.close()
 
-    def test_cleanup_keeps_recent_terminal(self, tmp_path):
+    def test_cleanup_expired_deletes_over_window_pending_and_processing(self, tmp_path):
+        """pending/processing 超窗被删（含 steps 级联）。"""
         dbm = _make_db(tmp_path)
         try:
-            dbm.agent_runs.create_pending("keep", "match", 1)
-            dbm.agent_runs.mark_succeeded("keep")
-            # ended_at = now（未超期）
-            assert dbm.agent_runs.cleanup_terminal(7) == 0
-            assert dbm.agent_runs.get_run("keep") is not None
+            # run P：pending 超窗 + 1 step
+            dbm.agent_runs.create_pending("old-pending", "match", 10)
+            dbm.agent_runs.add_step(
+                {
+                    "run_id": "old-pending",
+                    "span_id": "sp1",
+                    "name": "llm_chat",
+                    "iteration": 0,
+                    "sequence": 0,
+                }
+            )
+            # run C：processing 超窗 + 1 step
+            dbm.agent_runs.create_pending("old-processing", "match", 11)
+            dbm.agent_runs.atomic_claim("old-processing")
+            dbm.agent_runs.add_step(
+                {
+                    "run_id": "old-processing",
+                    "span_id": "sp2",
+                    "name": "tool_execute",
+                    "iteration": 0,
+                    "sequence": 0,
+                }
+            )
+            # run F：fresh pending（不应被删）
+            dbm.agent_runs.create_pending("fresh-pending", "match", 12)
+
+            conn = dbm._connection._conn
+            # 把活性超窗 run 的 created_at 改到远早于保留期
+            conn.execute(
+                "UPDATE agent_runs SET created_at=? WHERE run_id IN (?, ?)",
+                (946684800, "old-pending", "old-processing"),
+            )
+            conn.commit()
+
+            deleted = dbm.agent_runs.cleanup_expired(7)
+            assert deleted == 2
+
+            # 超窗的 pending/processing 已删
+            assert dbm.agent_runs.get_run("old-pending") is None
+            assert dbm.agent_runs.get_run("old-processing") is None
+            assert dbm.agent_runs.get_steps("old-pending") == []
+            assert dbm.agent_runs.get_steps("old-processing") == []
+            # fresh pending 保留
+            assert dbm.agent_runs.get_run("fresh-pending") is not None
+        finally:
+            dbm._connection._conn.close()
+
+    def test_cleanup_expired_keeps_in_window_any_status(self, tmp_path):
+        """窗内（<30 天）任何状态不删；窗内 processing 不删（防回归）。"""
+        import time
+
+        dbm = _make_db(tmp_path)
+        try:
+            now = int(time.time())
+
+            # 各终态均在窗内（ended_at = now，未超期）
+            for rid, term_fn in [
+                ("succeeded", dbm.agent_runs.mark_succeeded),
+                ("failed", lambda r: dbm.agent_runs.mark_failed(r, "failed", "e", 0)),
+                ("no_suggestion", dbm.agent_runs.mark_no_suggestion),
+            ]:
+                dbm.agent_runs.create_pending(rid, "match", 1)
+                dbm.agent_runs.atomic_claim(rid)
+                term_fn(rid)
+
+            # cancelled 没有语义方法，直接改 status + ended_at
+            dbm.agent_runs.create_pending("cancelled", "match", 1)
+            _set_status(dbm, "cancelled", "cancelled", ended_at=now)
+
+            # processing 在窗内（刚 claim，started_at = now，未超 30 天）
+            dbm.agent_runs.create_pending("proc-in-window", "match", 1)
+            dbm.agent_runs.atomic_claim("proc-in-window")
+
+            assert dbm.agent_runs.cleanup_expired(30) == 0
+            # 全部保留
+            assert dbm.agent_runs.get_run("succeeded") is not None
+            assert dbm.agent_runs.get_run("failed") is not None
+            assert dbm.agent_runs.get_run("no_suggestion") is not None
+            assert dbm.agent_runs.get_run("cancelled") is not None
+            assert dbm.agent_runs.get_run("proc-in-window") is not None
+        finally:
+            dbm._connection._conn.close()
+
+    def test_cleanup_expired_zero_or_negative_returns_0(self, tmp_path):
+        """retention_days=0/负数不删、返回 0（永不清理语义）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            # 构造一条超期终态 run
+            dbm.agent_runs.create_pending("zero-test", "match", 1)
+            dbm.agent_runs.atomic_claim("zero-test")
+            dbm.agent_runs.mark_succeeded("zero-test")
+            conn = dbm._connection._conn
+            conn.execute(
+                "UPDATE agent_runs SET ended_at=? WHERE run_id=?",
+                (946684800, "zero-test"),
+            )
+            conn.commit()
+
+            assert dbm.agent_runs.cleanup_expired(0) == 0
+            assert dbm.agent_runs.cleanup_expired(-5) == 0
+            # 记录仍在
+            assert dbm.agent_runs.get_run("zero-test") is not None
         finally:
             dbm._connection._conn.close()
 
@@ -453,9 +562,10 @@ class TestSchedulerHelpers:
             dbm.agent_runs.create_pending("stale", "match", 3)
             dbm.agent_runs.atomic_claim("stale")  # started_at = now
             conn = dbm._connection._conn
+            # 把 started_at 改到远早于超时阈值（epoch 秒整数，2000-01-01）
             conn.execute(
-                "UPDATE agent_runs SET started_at='2000-01-01 00:00:00' WHERE run_id=?",
-                ("stale",),
+                "UPDATE agent_runs SET started_at=? WHERE run_id=?",
+                (946684800, "stale"),
             )
             conn.commit()
 
