@@ -33,12 +33,12 @@ MCP 采用**嵌入式架构**（FastMCP 4 直接嵌入 BS 进程）：
 ```
 
 | 组件 | 说明 |
-| --- | --- | --- | --- |
+| --- | --- |
 | **BS（FastAPI）** | 主程序，端口 8000，内置 FastMCP 服务（工具 + OAuth AS） |
 | **RSA 密钥** | 本地生成（RS256），私钥仅存于 BS 进程内存与本地磁盘，公钥用于验签 JWT |
 
 ::: tip 嵌入式优势
-FastMCP 直接嵌入 BS 进程，工具函数调用同进程业务层（无需 HTTP），部署更简单（单进程、单端口），无需 Sidecar 与共享卷。
+FastMCP 直接嵌入 BS 进程，工具函数调用同进程业务层（无需 HTTP），部署更简单（单进程、单端口），无需额外进程与共享卷。
 :::
 
 ::: warning 工具函数直接嵌入进程
@@ -61,45 +61,49 @@ Docker 部署同理，单容器即可。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MCP_RSA_PRIVATE_KEY` | `/tmp/mcp_private.pem` | RSA 私钥路径（本地磁盘，仅 BS 持有） |
-| `MCP_RSA_PUBLIC_KEY` | `/tmp/mcp_public.pem` | RSA 公钥路径（本地生成，用于验签 JWT） |
-| `MCP_TOKEN_EXPIRY_SECONDS` | `3600` | JWT 有效期（秒） |
-| `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
-| `MCP_ISSUER` | `http://localhost:8000` | OAuth Issuer URL（同 BS base_url） |
-| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience（已统一为 `bangumi-syncer`，不再有 `bs` 死路由） |
+| `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | RSA 私钥路径（本地磁盘，仅 BS 持有） |
+| `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | RSA 公钥路径（本地生成，用于验签 JWT） |
+| `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点（解析优先级：参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值） |
+
+默认 RSA 路径由 `tempfile.gettempdir()` 解析，随操作系统不同而变化（Linux 通常 `/tmp`，macOS 为 `$TMPDIR`）。
+
+::: warning 当前不可配置
+JWT `issuer`（= 解析后的 `MCP_BASE_URL`）、`audience`（=`bangumi-syncer`）、Access Token 有效期（= `3600` 秒）在 `app/mcp/server.py` 中**硬编码**，没有对应环境变量。
+:::
 
 ::: tip RSA 密钥
-BS 启动时自动生成 RSA 密钥对（RS256），私钥仅存于本地磁盘（`MCP_RSA_PRIVATE_KEY`），公钥用于验签 JWT。无需共享卷或 Sidecar。
+BS 启动时自动生成 RSA 密钥对（RS256），私钥仅存于本地磁盘（`MCP_RSA_PRIVATE_KEY`），公钥用于验签 JWT。无需共享卷。
 :::
 
 ## OAuth 授权流程
 
-mcp_server 实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确认** 与 **自动续期**。
+BS 内置的 FastMCP 服务实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确认** 与 **自动续期**。
 
 ### auth.enabled=true（推荐）
 
 首次授权流程：
 
-1. AI 助手连接 mcp_server → 触发 OAuth 授权
-2. mcp_server 检查 BS 会话（调用 `GET /api/auth/status`）
-3. **已登录**：直接显示 consent 页，用户确认后发放 Token
-4. **未登录**：跳转到 BS 登录页，用户输入账号密码登录后回到 consent 页
+1. AI 助手连接 BS 的 `/mcp` 端点 → 触发 OAuth 授权
+2. BS 在**同进程内**读取请求 Cookie 中的 `session_token`，调用 `security_manager.validate_session()` 校验会话（不经 HTTP）
+3. **已登录**：显示 consent 页，用户确认后发放 Token
+4. **未登录或会话失效**：`/consent` 直接返回 **HTTP 401**（不会跳转到 BS 登录页）。请先在 BS Web 端登录，再重新触发授权
 5. 用户点击 **Allow** → 发放 Access Token + Refresh Token
 
 ### auth.enabled=false
 
-- consent 流程仍探测 BS `GET /api/auth/status`；BS 关闭认证时 `get_current_user_flexible` 返回内置 admin 会话，**身份沿用 BS 侧返回的会话用户**（`MCP_AUTH_USERNAME` 在生产入口下不可达）
+- 不校验 BS 会话，consent 时直接使用 BS 认证配置中的用户名（`auth_username`），无需登录
 - **consent 确认仍保留**：用户仍需点击 Allow/Deny 授权
 - 适合纯内网、无需区分用户身份的场景
 
 ### 自动续期
 
-- Access Token 过期后，mcp_server 自动用 Refresh Token 换取新 Token
+- Access Token 过期后，服务自动用 Refresh Token 换取新 Token
 - Refresh Token 轮换（每次换取后旧 Token 失效）
 - **一次授权后无需重复登录**，除非 Token 被吊销或过期时间过长
 
 ::: tip 吊销方式
-删除 mcp_server 进程内存中的 Refresh Token 即可吊销（重启进程会清空）。重新连接会触发新的授权流程。
+- **标准端点**：`POST /revoke`（由 `RevocationOptions(enabled=True)` 提供）可吊销 access / refresh token；access token 吊销后其 `jti` 进入进程内吊销集合，验签时被拒绝
+- **内存方式**：删除进程内存中的 Refresh Token 即可吊销（重启进程会清空）。重新连接会触发新的授权流程
 :::
 
 ## Claude Desktop 接入
@@ -146,7 +150,7 @@ mcp_server 实现了完整的 OAuth 2.1 授权服务器，支持 **consent 确�
 
 ## 工具说明
 
-mcp_server 提供 3 个工具，AI 助手通过它们与 BS 交互：
+BS 内置的 MCP 服务提供 3 个工具，AI 助手通过它们与 BS 交互：
 
 ### get_logs — 读取日志
 
@@ -172,9 +176,9 @@ mcp_server 提供 3 个工具，AI 助手通过它们与 BS 交互：
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `section` | string | 是 | 配置段名（如 `sync`、`auth`、`dev`） |
+| `section` | string | 是 | 配置段名（如 `sync`、`dev`；`auth` 段禁止通过 MCP 修改） |
 | `key` | string | 是 | 配置键名（如 `log_level`、`enabled`） |
-| `value` | string | 是 | 配置值（字符串形式） |
+| `value` | any | 是 | 配置值，支持任意 JSON 值（字符串、数字、布尔、数组、对象等） |
 
 ::: warning 配置回滚
 `update_config` 直接生效，不会自动创建备份。如需回滚：
@@ -194,7 +198,7 @@ mcp_server 提供 3 个工具，AI 助手通过它们与 BS 交互：
 | **Consent 确认** | 每次新客户端授权都需用户点击 Allow，防止未授权访问 |
 
 ::: tip 部署建议
-- BS 单进程部署（端口 8000），无需 Sidecar
+- BS 单进程部署（端口 8000），无需额外进程
 - 避免将 BS 端口直接暴露到公网
 - 如需公网访问，建议通过 VPN 或反向代理 + TLS 保护
 :::
