@@ -31,6 +31,7 @@ from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
+    AuthorizeError,
     RefreshToken,
     RegistrationError,
 )
@@ -79,39 +80,76 @@ class RSAKeyManager:
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption(),
         )
-        public_pem = private_key.public_key().public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
 
         # Ensure directories exist
         os.makedirs(os.path.dirname(self.private_key_path) or ".", exist_ok=True)
-        os.makedirs(os.path.dirname(self.public_key_path) or ".", exist_ok=True)
 
         with open(self.private_key_path, "wb") as f:
             f.write(private_pem)
         # Set private key to owner-only read/write (chmod 600)
         os.chmod(self.private_key_path, 0o600)
-        with open(self.public_key_path, "wb") as f:
-            f.write(public_pem)
+        self._write_public_key()
 
     def load_or_generate(self) -> None:
-        """Load existing keys from disk, or generate new ones if not found."""
-        if os.path.exists(self.private_key_path) and os.path.exists(
-            self.public_key_path
-        ):
-            self._load_keys()
+        """Load existing keys from disk, or generate new ones if not found.
+
+        If only the private key is present, the public key is re-derived from it
+        (the private key is never replaced). Only a missing private key triggers
+        generation of a new key pair, so an accidentally deleted public key does
+        not invalidate previously issued JWTs.
+        """
+        if os.path.exists(self.private_key_path):
+            self._load_private_key()
+            self._ensure_private_key_permissions()
+            if os.path.exists(self.public_key_path):
+                self._load_public_key()
+            else:
+                logger.warning(
+                    "Public key %s missing; re-deriving it from private key %s",
+                    self.public_key_path,
+                    self.private_key_path,
+                )
+                self._write_public_key()
         else:
+            logger.info(
+                "Private key %s not found; generating new RSA key pair",
+                self.private_key_path,
+            )
             self.generate_keys()
 
-    def _load_keys(self) -> None:
-        """Load keys from disk."""
+    def _load_private_key(self) -> None:
+        """Load the private key from disk."""
         with open(self.private_key_path, "rb") as f:
             self._private_key = serialization.load_pem_private_key(
                 f.read(), password=None
             )
+
+    def _load_public_key(self) -> None:
+        """Load the public key from disk."""
         with open(self.public_key_path, "rb") as f:
             self._public_key = serialization.load_pem_public_key(f.read())
+
+    def _ensure_private_key_permissions(self) -> None:
+        """Enforce owner-only (0o600) permissions on the existing private key."""
+        current_mode = os.stat(self.private_key_path).st_mode & 0o777
+        if current_mode != 0o600:
+            logger.warning(
+                "Private key %s had mode 0o%o; enforcing owner-only 0o600",
+                self.private_key_path,
+                current_mode,
+            )
+            os.chmod(self.private_key_path, 0o600)
+
+    def _write_public_key(self) -> None:
+        """Derive the public key from the loaded private key and persist it."""
+        self._public_key = self.private_key.public_key()
+        public_pem = self._public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        os.makedirs(os.path.dirname(self.public_key_path) or ".", exist_ok=True)
+        with open(self.public_key_path, "wb") as f:
+            f.write(public_pem)
 
     @property
     def private_key(self) -> rsa.RSAPrivateKey:
@@ -298,7 +336,10 @@ class BangumiOAuthProvider(OAuthProvider):
             # CIMD clients are validated via CIMD, skip registry check
             pass
         elif client_id not in self._clients:
-            raise ValueError(f"Unknown client: {client_id}")
+            raise AuthorizeError(
+                error="unauthorized_client",
+                error_description=f"Unknown client: {client_id}",
+            )
 
         # Validate redirect_uri
         redirect_uri_str = str(params.redirect_uri)
@@ -316,12 +357,20 @@ class BangumiOAuthProvider(OAuthProvider):
                     if not self.cimd._fetcher.validate_redirect_uri(
                         cimd_client.cimd_document, redirect_uri_str
                     ):
-                        raise ValueError(
-                            f"redirect_uri mismatch: {redirect_uri_str} not in CIMD document redirect_uris"
+                        raise AuthorizeError(
+                            error="invalid_request",
+                            error_description=(
+                                f"redirect_uri mismatch: {redirect_uri_str} "
+                                "not in CIMD document redirect_uris"
+                            ),
                         )
                 else:
-                    raise ValueError(
-                        f"redirect_uri validation failed: cannot resolve CIMD document for {client_id}"
+                    raise AuthorizeError(
+                        error="invalid_request",
+                        error_description=(
+                            "redirect_uri validation failed: cannot resolve "
+                            f"CIMD document for {client_id}"
+                        ),
                     )
             elif client_id in self._clients:
                 # P0-2: DCR clients use component-level exact matching
@@ -330,8 +379,12 @@ class BangumiOAuthProvider(OAuthProvider):
                 if allowed_uris and not self._matches_redirect_uri(
                     redirect_uri_str, allowed_uris
                 ):
-                    raise ValueError(
-                        f"redirect_uri mismatch: {redirect_uri_str} not in registered URIs"
+                    raise AuthorizeError(
+                        error="invalid_request",
+                        error_description=(
+                            f"redirect_uri mismatch: {redirect_uri_str} "
+                            "not in registered URIs"
+                        ),
                     )
 
         # Trigger cleanup of expired pending auths to prevent unbounded growth

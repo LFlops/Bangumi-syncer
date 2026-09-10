@@ -5,11 +5,11 @@ MCP 工具函数测试（app/mcp/tools.py）
 覆盖 BDD 场景：
 1. get_logs：参数透传、时间过滤、文件缺失返回空
 2. get_current_config：脱敏生效
-3. update_config：正常写入、非法段名 400、auth 段拒绝
+3. update_config：正常写入、非法段名拒绝、auth 段拒绝
 """
 
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
 
@@ -64,6 +64,10 @@ class TestGetLogs:
         assert result["status"] == "success"
         assert "content" in result["data"]
         assert "stats" in result["data"]
+        assert result["data"]["stats"]["size"] == len(SAMPLE_LOG)
+        assert result["data"]["stats"]["lines"] == 4
+        assert result["data"]["stats"]["errors"] == 1
+        assert result["data"]["stats"]["modified"] == 1234567890000.0
 
     @pytest.mark.asyncio
     async def test_get_logs_level过滤_仅返回指定级别(self):
@@ -188,7 +192,7 @@ class TestGetLogs:
     @pytest.mark.asyncio
     async def test_get_logs_异常_不泄露路径(self):
         """日志读取异常时，错误信息不应包含绝对路径。"""
-        from unittest.mock import AsyncMock
+        from fastmcp.exceptions import ToolError
 
         from app.mcp import tools
 
@@ -209,10 +213,13 @@ class TestGetLogs:
                             )
                         ),
                     ):
-                        with pytest.raises(Exception) as exc_info:
+                        with pytest.raises(ToolError) as exc_info:
                             await tools.get_logs()
-                            assert "/secret/path" not in str(exc_info.value)
-                            assert "permission denied" not in str(exc_info.value)
+
+        msg = str(exc_info.value)
+        assert "/secret/path" not in msg
+        assert "permission denied" not in msg
+        assert "获取日志失败" in msg
 
     @pytest.mark.asyncio
     async def test_get_logs_无token_拒绝(self):
@@ -225,7 +232,7 @@ class TestGetLogs:
             with pytest.raises(ToolError) as exc_info:
                 await tools.get_logs()
 
-        assert "read" in str(exc_info.value).lower() or "令牌" in str(exc_info.value)
+        assert "未找到访问令牌" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_logs_无read_scope_拒绝(self):
@@ -241,7 +248,206 @@ class TestGetLogs:
             with pytest.raises(ToolError) as exc_info:
                 await tools.get_logs()
 
-        assert "read" in str(exc_info.value).lower() or "权限" in str(exc_info.value)
+        assert "需要 read scope" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_非法level_抛出ToolError(self):
+        """level=TRACE 不在白名单 → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs(level="TRACE")
+
+        assert "无效的日志级别" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_WARN别名_归一化为WARNING(self):
+        """level=WARN 归一化为 WARNING 后再过滤。"""
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
+                        )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs(level="WARN")
+
+        content = result["data"]["content"]
+        assert "WARNING" in content
+        assert "INFO" not in content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_默认limit透传(self):
+        """默认 limit=50 应以字符串 "50" 透传给 _dispatch_read_log。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": "",
+                "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+            }
+        )
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        await tools.get_logs()
+
+        assert mock_dispatch.call_args.args[3] == "50"
+
+    @pytest.mark.asyncio
+    async def test_get_logs_limit超上限_钳制为10000(self):
+        """limit=99999 超过上限 → 透传 "10000"。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": "",
+                "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+            }
+        )
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        await tools.get_logs(limit=99999)
+
+        assert mock_dispatch.call_args.args[3] == "10000"
+
+    @pytest.mark.asyncio
+    async def test_get_logs_limit下限_钳制为1(self):
+        """limit=0 低于下限 → 透传 "1"。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": "",
+                "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+            }
+        )
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        await tools.get_logs(limit=0)
+
+        assert mock_dispatch.call_args.args[3] == "1"
+
+    @pytest.mark.asyncio
+    async def test_get_logs_非法since格式_抛出ToolError(self):
+        """since 无法解析为 ISO 时间 → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs(since="not-a-date")
+
+        assert "无效的 since 时间格式" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_非法until格式_抛出ToolError(self):
+        """until 无法解析为 ISO 时间 → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs(until="not-a-date")
+
+        assert "无效的 until 时间格式" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_since晚于until_抛出ToolError(self):
+        """since 晚于 until → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with pytest.raises(ToolError) as exc_info:
+                await tools.get_logs(
+                    since="2026-09-03T13:00:00",
+                    until="2026-09-03T11:00:00",
+                )
+
+        assert "since 时间必须早于或等于 until 时间" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_logs_时间边界_包含端点行(self):
+        """since/until 端点对应的日志行应被包含（闭区间）。"""
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools.os.stat") as mock_stat:
+                        mock_stat.return_value = MagicMock(
+                            st_size=len(SAMPLE_LOG), st_mtime=1234567890.0
+                        )
+                        with patch("builtins.open", mock_open(read_data=SAMPLE_LOG)):
+                            result = await tools.get_logs(
+                                since="2026-09-03T10:00:00",
+                                until="2026-09-03T12:00:00",
+                            )
+
+        content = result["data"]["content"]
+        assert "开始同步" in content
+        assert "数据库连接失败" in content
+        assert "重试第 1 次" not in content
 
 
 # ===========================================================================
@@ -281,13 +487,21 @@ class TestGetCurrentConfig:
 
     @pytest.mark.asyncio
     async def test_get_current_config_敏感字段已脱敏(self):
-        """auth.webhook_key 与 llm.api_key 应被掩码，非敏感字段明文保留。"""
+        """auth.password/secret_key、auth.webhook_key、llm.api_key 应被掩码，
+        非敏感字段明文保留，且返回体中不含原始哈希/密钥原文。"""
+        import json
+
         from app.mcp import tools
+
+        plain_password_hash = "pbkdf2:sha256:260000$salt$deadbeefhash"
+        plain_secret_key = "super-secret-master-key-please-hide-me"
 
         mock_cm = MagicMock()
         mock_cm.get_all_config.return_value = {
             "auth": {
                 "username": "admin",
+                "password": plain_password_hash,
+                "secret_key": plain_secret_key,
                 "webhook_key": "plain-webhook-key-123",
                 "session_timeout": 3600,
             },
@@ -309,12 +523,19 @@ class TestGetCurrentConfig:
 
         data = result["data"]
         # 敏感字段 → 掩码
+        assert data["auth"]["password"] == "***"
+        assert data["auth"]["secret_key"] == "***"
         assert data["auth"]["webhook_key"] == "***"
         assert data["llm"]["api_key"] == "***"
         # 非敏感字段 → 明文
         assert data["auth"]["username"] == "admin"
         assert data["auth"]["session_timeout"] == 3600
         assert data["sync"]["match_confidence_threshold"] == 0.6
+        # 返回体序列化后不得含原文
+        serialized = json.dumps(result, ensure_ascii=False)
+        assert plain_password_hash not in serialized
+        assert plain_secret_key not in serialized
+        assert "plain-webhook-key-123" not in serialized
 
     @pytest.mark.asyncio
     async def test_get_current_config_调用_config_manager(self):
@@ -344,7 +565,7 @@ class TestGetCurrentConfig:
             with pytest.raises(ToolError) as exc_info:
                 await tools.get_current_config()
 
-        assert "read" in str(exc_info.value).lower() or "令牌" in str(exc_info.value)
+        assert "未找到访问令牌" in str(exc_info.value)
 
     @pytest.mark.asyncio
     async def test_get_current_config_无read_scope_拒绝(self):
@@ -360,7 +581,37 @@ class TestGetCurrentConfig:
             with pytest.raises(ToolError) as exc_info:
                 await tools.get_current_config()
 
-        assert "read" in str(exc_info.value).lower() or "权限" in str(exc_info.value)
+        assert "需要 read scope" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_get_current_config_多实例与账号段_敏感字段已脱敏(self):
+        """多实例段与多账号段的敏感字段均应脱敏，非敏感字段明文保留。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        mock_cm.get_all_config.return_value = {
+            "notify-email-1": {
+                "smtp_password": "p@ss",
+                "url": "https://example.com",
+            },
+            "bangumi-alice": {
+                "access_token": "tok",
+                "username": "alice",
+            },
+        }
+
+        with patch(
+            "app.mcp.tools.get_access_token",
+            return_value=self._make_read_token(),
+        ):
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                result = await tools.get_current_config()
+
+        data = result["data"]
+        assert data["notify-email-1"]["smtp_password"] == "***"
+        assert data["bangumi-alice"]["access_token"] == "***"
+        assert data["notify-email-1"]["url"] == "https://example.com"
+        assert data["bangumi-alice"]["username"] == "alice"
 
 
 # ===========================================================================
@@ -442,6 +693,7 @@ class TestUpdateConfig:
                     )
 
         assert "nonexistent_section" in str(exc_info.value)
+        assert "未知配置段" in str(exc_info.value)
         mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
@@ -469,27 +721,28 @@ class TestUpdateConfig:
         mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_update_config_auth段_未调用set_config(self):
-        """auth 段写入被拒时，不应调用 set_config。"""
+    async def test_update_config_auth变体段名_拒绝(self):
+        """auth 的大小写/空白/下划线变体均应被拒绝，且不调用 set_config。"""
         from fastmcp.exceptions import ToolError
 
         from app.mcp import tools
 
-        mock_cm = MagicMock()
+        for section in ("Auth", " auth ", "auth_"):
+            mock_cm = MagicMock()
 
-        with patch("app.mcp.tools.config_manager", mock_cm):
-            with patch(
-                "app.mcp.tools.get_access_token",
-                return_value=self._make_write_token(),
-            ):
-                with pytest.raises(ToolError):
-                    await tools.update_config(
-                        section="auth",
-                        key="webhook_key",
-                        value="stolen-key",
-                    )
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                with patch(
+                    "app.mcp.tools.get_access_token",
+                    return_value=self._make_write_token(),
+                ):
+                    with pytest.raises(ToolError):
+                        await tools.update_config(
+                            section=section,
+                            key="enabled",
+                            value=False,
+                        )
 
-        mock_cm.set_config.assert_not_called()
+            mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_config_多实例段_正常写入(self):
@@ -536,7 +789,7 @@ class TestUpdateConfig:
                         value=0.7,
                     )
 
-        assert "write" in str(exc_info.value).lower() or "权限" in str(exc_info.value)
+        assert "需要 write scope" in str(exc_info.value)
         mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
@@ -595,7 +848,7 @@ class TestUpdateConfigKeyValueValidation:
                         value="anything",
                     )
 
-        assert "key" in str(exc_info.value).lower() or "键" in str(exc_info.value)
+        assert "非法配置键" in str(exc_info.value)
         mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
@@ -623,8 +876,8 @@ class TestUpdateConfigKeyValueValidation:
         mock_cm.set_config.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_update_config_合法key_正常写入(self):
-        """schema 中存在的 key 应正常写入。"""
+    async def test_update_config_value恰好上限_通过(self):
+        """value 长度恰好等于上限（10000）时应正常写入。"""
         from app.mcp import tools
 
         mock_cm = MagicMock()
@@ -637,8 +890,10 @@ class TestUpdateConfigKeyValueValidation:
                 result = await tools.update_config(
                     section="sync",
                     key="match_confidence_threshold",
-                    value=0.7,
+                    value="x" * 10000,
                 )
 
         assert result["status"] == "success"
-        mock_cm.set_config.assert_called_with("sync", "match_confidence_threshold", 0.7)
+        mock_cm.set_config.assert_called_once_with(
+            "sync", "match_confidence_threshold", "x" * 10000
+        )
