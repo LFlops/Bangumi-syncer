@@ -81,6 +81,7 @@ class DatabaseConnection:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys = ON")
             self._conn = conn
         return self._conn
 
@@ -259,6 +260,21 @@ class DatabaseConnection:
             "pending_candidates",
             [("sync_record_id", "INTEGER")],
             message="pending_candidates 已迁移：增加 sync_record_id 列",
+        )
+
+    def _ensure_pending_candidates_llm_columns(self, cursor) -> None:
+        """旧库迁移：为 pending_candidates 增加 llm_subject_id / llm_reason（AI 推荐字段）。
+
+        承载 LLM 匹配增强给出的建议 subject 与理由。
+        """
+        self._ensure_columns(
+            cursor,
+            "pending_candidates",
+            [
+                ("llm_subject_id", "TEXT DEFAULT ''"),
+                ("llm_reason", "TEXT DEFAULT ''"),
+            ],
+            message="pending_candidates 已迁移：增加 llm_subject_id / llm_reason 列",
         )
 
     def _ensure_bangumi_accounts_private(self, cursor) -> None:
@@ -562,6 +578,7 @@ class DatabaseConnection:
             )
         """)
         self._ensure_pending_candidates_sync_record_id(cursor)
+        self._ensure_pending_candidates_llm_columns(cursor)
 
         # 待同步队列：Bangumi API 不可达时缓存已匹配的同步请求，API 恢复后补发
         cursor.execute("""
@@ -585,6 +602,62 @@ class DatabaseConnection:
             )
         """)
         self._ensure_pending_sync_queue_sync_record_id(cursor)
+
+        # Agent 通用会话表：agent_runs（一次会话状态机）+ agent_steps（span 可重放日志）
+        # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled/
+        #              applied/rejected（exhausted 仅作 stop_reason，不作 status）
+        # 时间列统一 epoch 秒整数（写入方显式写入，DEFAULT 0 占位）。
+        # agent_runs 必须先于 agent_steps 创建（steps 有 FK 引用 runs）。
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL UNIQUE,
+                task_type TEXT NOT NULL,
+                sync_record_id INTEGER,
+                status TEXT DEFAULT 'pending',
+                stop_reason TEXT DEFAULT '',
+                attempts INTEGER DEFAULT 0,
+                total_attempts INTEGER DEFAULT 0,
+                last_attempt_at INTEGER DEFAULT 0,
+                last_error TEXT,
+                total_tokens INTEGER DEFAULT 0,
+                started_at INTEGER DEFAULT 0,
+                ended_at INTEGER DEFAULT 0,
+                created_at INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES agent_runs(run_id)
+                    ON DELETE CASCADE,
+                span_id TEXT NOT NULL,
+                parent_id TEXT DEFAULT '',
+                name TEXT NOT NULL,
+                status TEXT DEFAULT 'ok',
+                model TEXT DEFAULT '',
+                tokens INTEGER DEFAULT 0,
+                latency_ms INTEGER DEFAULT 0,
+                tool_name TEXT DEFAULT '',
+                input_summary TEXT DEFAULT '',
+                error TEXT DEFAULT '',
+                iteration INTEGER DEFAULT 0,
+                sequence INTEGER DEFAULT 0,
+                replay_delta TEXT DEFAULT '',
+                started_at INTEGER DEFAULT 0,
+                ended_at INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_sync_record_id "
+            "ON agent_runs(sync_record_id)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id)"
+        )
 
         # Bangumi 账号（含 OAuth 令牌）：以「账号列表」为唯一真相源，
         # 取代散落在 INI 各 [bangumi-*] 段的配置。

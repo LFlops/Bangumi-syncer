@@ -617,7 +617,6 @@ class ConfigManager:
             "max_tokens": 2000,
             "temperature": 0.7,
             "timeout": 60,
-            "thinking_level": "off",
             "retention_days": 365,
         }
         raw = self.get_section(LLM_SECTION, {})
@@ -625,8 +624,6 @@ class ConfigManager:
         # 空字符串会覆盖默认值（{**defaults, **raw} 语义），对关键枚举字段兜底
         if not merged.get("provider"):
             merged["provider"] = "openai_compat"
-        if not merged.get("thinking_level"):
-            merged["thinking_level"] = "off"
         # 确保类型正确（使用 is not None 以允许 0 等 falsy 值）
         if merged.get("max_tokens") is not None:
             merged["max_tokens"] = int(merged["max_tokens"])
@@ -635,6 +632,61 @@ class ConfigManager:
         if merged.get("timeout") is not None:
             merged["timeout"] = int(merged["timeout"])
         return merged
+
+    def get_sync_llm_match_config(self) -> dict[str, Any]:
+        """获取 [sync] 段 LLM 匹配增强（llm_match_*）配置，集中填充默认值。
+
+        上游调度器/编排曾各自直接 ``get("sync", "llm_match_*", fallback=...)``；
+        本方法将其正式化为单一读取入口，保证默认值一致，并供
+        ``GET /api/sync/config`` 复用默认值。
+
+        返回字段：
+        - llm_match_assist (bool, 默认 false)
+        - llm_match_cron (str, 默认 "*/1 * * * *")
+        - llm_match_retention_days (int, 默认 30)
+        - llm_match_max_iterations (str, 默认空=按 thinking_level 映射)
+        - llm_match_cross_call_cache (bool, 默认 false)
+        - llm_match_recovery_timeout_s (int, 默认 120)
+        - llm_match_thinking_level (str, 默认 "medium")
+        """
+
+        def _to_bool(v: Any, default: bool) -> bool:
+            if isinstance(v, bool):
+                return v
+            if v is None:
+                return default
+            return str(v).strip().lower() in ("true", "1", "yes", "on", "enabled")
+
+        def _to_int(v: Any, default: int) -> int:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "llm_match_assist": _to_bool(
+                self.get("sync", "llm_match_assist", fallback=False), False
+            ),
+            "llm_match_cron": self.get("sync", "llm_match_cron", fallback="*/1 * * * *")
+            or "*/1 * * * *",
+            "llm_match_retention_days": _to_int(
+                self.get("sync", "llm_match_retention_days", fallback=30), 30
+            ),
+            "llm_match_max_iterations": self.get(
+                "sync", "llm_match_max_iterations", fallback=""
+            )
+            or "",
+            "llm_match_cross_call_cache": _to_bool(
+                self.get("sync", "llm_match_cross_call_cache", fallback=False), False
+            ),
+            "llm_match_recovery_timeout_s": _to_int(
+                self.get("sync", "llm_match_recovery_timeout_s", fallback=120), 120
+            ),
+            "llm_match_thinking_level": self._normalize_thinking_level(
+                self.get("sync", "llm_match_thinking_level", fallback="medium"),
+                default="medium",
+            ),
+        }
 
     def get_fongmi_config(self) -> dict[str, Any]:
         """fongmi 局域网轮询同步配置（默认关闭）
@@ -704,7 +756,22 @@ class ConfigManager:
         "max_records",
         "memory_limit",
         "related_limit",
+        "thinking_level",
     )
+
+    _VALID_THINKING_LEVELS = frozenset({"off", "low", "medium", "high"})
+
+    def _normalize_thinking_level(self, raw: Any, *, default: str) -> str:
+        """归一化 thinking_level：strip + 小写，非法值回落 ``default``。
+
+        合法值集合复用 ``_VALID_THINKING_LEVELS``（与 summary 配置同一来源）。
+        调用方显式传入 ``default``（llm_match 为 medium，summary 为 off），避免隐藏默认值。
+        """
+        normalized = str(raw or "").strip().lower()
+        if normalized not in self._VALID_THINKING_LEVELS:
+            logger.warning(f"thinking_level 非法值 {raw!r}，回落默认档 {default!r}")
+            return default
+        return normalized
 
     def get_summary_configs(self) -> list[dict[str, Any]]:
         """获取所有 summary 配置节，按名称排序。"""
@@ -714,6 +781,10 @@ class ConfigManager:
             if section_name.startswith("summary-"):
                 section_config = self.get_section(section_name)
                 section_config["name"] = section_name[len("summary-") :]
+                # 容错：先归一化（去空格+小写），非法才回落默认值
+                section_config["thinking_level"] = self._normalize_thinking_level(
+                    section_config.get("thinking_level", ""), default="off"
+                )
                 configs.append(section_config)
         configs.sort(key=lambda x: x.get("name", ""))
         return configs

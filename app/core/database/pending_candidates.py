@@ -132,7 +132,7 @@ class PendingCandidatesRepository(BaseRepository):
                 SELECT id, created_at, request_title, request_ori_title,
                        request_season, request_episode, user_name, source,
                        candidates_json, status, confirmed_subject_id, resolved_at,
-                       sync_record_id
+                       sync_record_id, llm_subject_id, llm_reason
                 FROM pending_candidates
                 {where_clause}
                 ORDER BY id DESC
@@ -166,7 +166,7 @@ class PendingCandidatesRepository(BaseRepository):
                 SELECT id, created_at, request_title, request_ori_title,
                        request_season, request_episode, user_name, source,
                        candidates_json, trace_json, status, confirmed_subject_id,
-                       resolved_at, sync_record_id
+                       resolved_at, sync_record_id, llm_subject_id, llm_reason
                 FROM pending_candidates WHERE id = ?
                 """,
                 (candidate_id,),
@@ -202,7 +202,7 @@ class PendingCandidatesRepository(BaseRepository):
             SELECT id, created_at, request_title, request_ori_title,
                    request_season, request_episode, user_name, source,
                    candidates_json, trace_json, status, confirmed_subject_id,
-                   resolved_at, sync_record_id
+                   resolved_at, sync_record_id, llm_subject_id, llm_reason
             FROM pending_candidates
             WHERE sync_record_id = ?
         """

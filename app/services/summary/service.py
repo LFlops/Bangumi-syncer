@@ -19,7 +19,14 @@ _USER_PROMPT_TEMPLATE = (
     "{date_from} 至 {date_to} 观影记录（共 {record_count} 条）：\n\n{records}"
 )
 
+# 历史素材小节标题：随素材一起置于 user 消息末尾（明细之后）
 _MEMORY_SECTION = "## 历史执行上下文"
+
+# 轻引导语（软约束措辞，非硬指令）：留在 system prompt 首部，只说明素材位置与用途，
+# 素材本身作为"用户提供的资料"随 user 消息投递。
+_MEMORY_GUIDANCE = (
+    "用户消息末尾附有往期历史摘要，作为背景参考，帮助你更了解用户的过往观影情况。"
+)
 
 # 执行阶段（execute_job 出错时用于定位失败环节；任何阶段失败都会通知，文案按阶段区分）
 _STAGE_QUERY = "query"  # 查询明细 + 注入记忆 + 构建消息
@@ -62,7 +69,7 @@ class SummaryService:
         return get_llm_client()
 
     # ------------------------------------------------------------------
-    # 查询与构建（Phase 2.0.2 拆解，execute_job / generate_summary 共用）
+    # 查询与构建（execute_job / generate_summary 共用）
     # ------------------------------------------------------------------
 
     def _query_records(
@@ -122,8 +129,13 @@ class SummaryService:
         system_prompt: str,
         date_from: str,
         date_to: str,
+        memory_context: str = "",
     ) -> list[Message]:
-        """格式化记录并构建 system + user 两条消息。"""
+        """格式化记录并构建 system + user 两条消息。
+
+        `memory_context` 非空时，历史素材以 `_MEMORY_SECTION` 小节追加到 user
+        消息末尾（明细之后）；预览路径不传该参数，故预览内容不含历史素材。
+        """
         records_text = self._format_records(records)
         user_content = _USER_PROMPT_TEMPLATE.format(
             date_from=date_from,
@@ -131,6 +143,8 @@ class SummaryService:
             records=records_text,
             record_count=len(records),
         )
+        if memory_context:
+            user_content += f"\n\n{_MEMORY_SECTION}\n{memory_context}"
         return [
             Message(role="system", content=system_prompt),
             Message(role="user", content=user_content),
@@ -195,6 +209,7 @@ class SummaryService:
         response = await self.llm_client.chat(
             messages,
             job_name=job_config.name,
+            thinking_level=job_config.thinking_level,
         )
 
         return {
@@ -241,21 +256,27 @@ class SummaryService:
                     job_config, task_id, records
                 )
 
-            # 历史上下文拼进 system prompt（多 system message 对 OpenAI 兼容端点不安全）
+            # 历史素材随 user 消息投递（用户提供的资料），system 仅前置一句引导语说明
+            # 其位置与用途；用户自定义提示词原样保留在 system
             system_prompt = job_config.system_prompt.strip()
             if not system_prompt:
                 system_prompt = SummaryJobConfig.system_prompt
             if memory_context:
-                system_prompt = (
-                    f"{_MEMORY_SECTION}\n{memory_context}\n\n{system_prompt}"
-                )
-            messages = self._build_messages(records, system_prompt, date_from, date_to)
+                system_prompt = f"{_MEMORY_GUIDANCE}\n\n{system_prompt}"
+            messages = self._build_messages(
+                records,
+                system_prompt,
+                date_from,
+                date_to,
+                memory_context=memory_context,
+            )
 
             # 2. 调 LLM 生成总结
             stage = _STAGE_CHAT
             response = await self.llm_client.chat(
                 messages,
                 job_name=job_config.name,
+                thinking_level=job_config.thinking_level,
             )
 
             # 3. 提取记忆（读写同开关：memory_limit=0 不注入也不写入）
@@ -312,7 +333,7 @@ class SummaryService:
         date_to: str,
     ) -> None:
         """空内容→失败通知 / 正常→成功通知（保持既有失败语义）。"""
-        # H1 修正：provider 空内容时 model 可能仍非空，仅以 content 判定失败
+        # provider 空内容时 model 可能仍非空，仅以 content 判定失败
         # （空 choices + model 名 会误走成功分支、吞掉失败通知）
         if not response.content:
             summary_text = (

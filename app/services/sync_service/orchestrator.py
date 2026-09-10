@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import traceback
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from ...core.logging import get_sync_run_id, logger, sync_log_context
@@ -355,6 +356,24 @@ class SyncOrchestrator:
             trace.final_message = "未找到匹配的番剧"
         trace.finish()
 
+        # ===== 匹配增强接入：开关开 + LLM 可用时提交 AI 评估任务 =====
+        # 决定前先读取开关与 LLM 配置；trace step 必须在 _persist_sync_record
+        # 之前追加（trace 入库后不可改），LLM 评估结论异步承载于 agent_runs。
+        assist_enabled = self._match_assist_enabled()
+        run_id: str | None = None
+        if assist_enabled:
+            # 幂等：同一 trace 已含 llm_assist step（异常重入）则跳过整个增强
+            if any(s.stage == "llm_assist" for s in trace.steps):
+                assist_enabled = False
+            else:
+                run_id = str(uuid.uuid4())
+                llm_step = trace.start_step("llm_assist")
+                llm_step.status = "pending"
+                llm_step.reason = "已提交 AI 评估"
+                llm_step.processed_payload = {"run_id": run_id}
+                # 立即提交到 trace.steps，确保 persist 序列化时含该 step
+                trace._finish_current_step()
+
         sync_record_id = self._persist_sync_record(
             trace,
             item,
@@ -380,8 +399,80 @@ class SyncOrchestrator:
         self._sync._sediment_pending_candidate(
             item, actual_source, trace, sync_record_id=sync_record_id
         )
+        # 提交 AI 评估任务（去重 + 落库，失败不阻塞主流程）
+        if assist_enabled and run_id:
+            self._enqueue_match_assist_run(run_id, sync_record_id, trace)
         status_holder[0] = "error"
         return SyncResponse(status="error", message="未找到匹配的番剧")
+
+    # ------------------------------------------------------------------
+    # 匹配增强接入辅助：开关/配置判定 + 任务去重落库
+    # ------------------------------------------------------------------
+
+    def _match_assist_enabled(self) -> bool:
+        """判定是否启用 LLM 匹配增强。
+
+        开关关或 LLM 配置（api_key）缺失时返回 False 并给出说明日志，
+        原失败逻辑不受影响。
+        """
+        try:
+            from . import config_manager
+
+            raw = config_manager.get("sync", "llm_match_assist", fallback=False)
+            enabled = str(raw).strip().lower() in ("true", "1", "yes", "on")
+        except Exception:
+            enabled = False
+        if not enabled:
+            return False
+        try:
+            from . import config_manager as cm
+
+            llm_cfg = cm.get_llm_config() or {}
+            api_key = llm_cfg.get("api_key", "")
+        except Exception:
+            api_key = ""
+        if not api_key:
+            logger.info("LLM 配置缺失，匹配增强已禁用")
+            return False
+        return True
+
+    def _enqueue_match_assist_run(
+        self, run_id: str, sync_record_id: int, trace: MatchTrace
+    ) -> None:
+        """去重后向 agent_runs 提交一条 match 任务。
+
+        去重（F7）：同 key 已有活跃会话 → 跳过；已有 failed 且
+        total_attempts<=10 → 重新入队复用；否则新建 pending。
+        任何落库异常仅日志，不阻塞主匹配流程。
+        """
+        try:
+            from . import database_manager
+
+            repo = database_manager.agent_runs
+            existing = repo.find_active_by_sync_record(sync_record_id)
+            if existing:
+                logger.info(
+                    "匹配增强任务已存在（去重），跳过创建: "
+                    f"sync_record_id={sync_record_id}"
+                )
+                return
+            failed = repo.find_failed_by_sync_record(sync_record_id)
+            if failed:
+                total = int(failed.get("total_attempts") or 0)
+                if total <= 10:
+                    repo.requeue_failed(failed["run_id"])
+                    logger.info(f"匹配增强失败任务重新入队: run_id={failed['run_id']}")
+                else:
+                    logger.info(
+                        "匹配增强任务重试超限（total_attempts>10），停止重入: "
+                        f"run_id={failed['run_id']}"
+                    )
+                return
+            repo.create_pending(
+                run_id=run_id, task_type="match", sync_record_id=sync_record_id
+            )
+        except Exception as e:
+            logger.warning(f"匹配增强任务落库失败（不影响主流程）: {e}")
 
     # ------------------------------------------------------------------
     # 执行阶段管线（episode_resolve → cross_season → sync_action → result）

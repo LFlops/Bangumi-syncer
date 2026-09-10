@@ -115,8 +115,6 @@ def _build_provider(
         "temperature": cfg["temperature"],
         "timeout": cfg["timeout"],
         "proxy": proxy,
-        # 双 provider 构造函数均接受 thinking_level（openai 侧映射 reasoning_effort）
-        "thinking_level": cfg.get("thinking_level", "off"),
     }
     return cls(**kwargs)
 

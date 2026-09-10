@@ -5,6 +5,8 @@ ConfigManager tests - Simplified version
 import os
 from unittest.mock import patch
 
+import pytest
+
 
 class TestConfigManagerSimple:
     """Test ConfigManager class with simplified tests"""
@@ -426,6 +428,87 @@ smtp_server = smtp.example.com
             tmp_path, cm.active_config_path.read_text(encoding="utf-8")
         )
         assert cm2.get("sync", "k_extra") == "v99"
+
+
+class TestSyncLlmMatchConfig:
+    """[sync] 段 llm_match_* 键读取（含默认值）。
+
+    上游调度器/编排已直接 get 这些键；本方法集中默认值供 API 复用。
+    """
+
+    def test_get_sync_llm_match_config_defaults(self, tmp_path):
+        """无 [sync] 段时返回全部默认值。"""
+        cm = _config_manager_from_ini(tmp_path, "[sync]\nmode = single\n")
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg == {
+            "llm_match_assist": False,
+            "llm_match_cron": "*/1 * * * *",
+            "llm_match_retention_days": 30,
+            "llm_match_max_iterations": "",
+            "llm_match_cross_call_cache": False,
+            "llm_match_recovery_timeout_s": 120,
+            "llm_match_thinking_level": "medium",
+        }
+
+    def test_get_sync_llm_match_config_reads_set_values(self, tmp_path):
+        """读取已设置值并做类型转换。"""
+        ini = """[sync]
+mode = single
+llm_match_assist = true
+llm_match_cron = 0 */2 * * *
+llm_match_retention_days = 30
+llm_match_max_iterations = 5
+llm_match_cross_call_cache = yes
+llm_match_recovery_timeout_s = 300
+llm_match_thinking_level = high
+"""
+        cm = _config_manager_from_ini(tmp_path, ini)
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_assist"] is True
+        assert cfg["llm_match_cron"] == "0 */2 * * *"
+        assert cfg["llm_match_retention_days"] == 30
+        # 数字字符串经 get() 协程为 int（与 get_max_iterations 的 config_override 类型一致）
+        assert cfg["llm_match_max_iterations"] == 5
+        assert cfg["llm_match_cross_call_cache"] is True
+        assert cfg["llm_match_recovery_timeout_s"] == 300
+        assert cfg["llm_match_thinking_level"] == "high"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("HIGH", "high"),
+            (" High ", "high"),
+            ("OFF", "off"),
+            ("Low", "low"),
+            ("medium", "medium"),
+            ("garbage", "medium"),
+        ],
+    )
+    def test_get_sync_llm_match_config_normalizes_thinking_level(
+        self, tmp_path, raw, expected
+    ):
+        """thinking_level 大小写/空格归一化；非法值回落 medium（llm_match 默认档）。"""
+        cm = _config_manager_from_ini(
+            tmp_path, f"[sync]\nllm_match_thinking_level = {raw}\n"
+        )
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_thinking_level"] == expected
+
+    def test_get_sync_llm_match_config_invalid_int_falls_back(self, tmp_path):
+        """非法整数值回退默认值（与调度器 _cfg_int 行为对齐）。"""
+        ini = """[sync]
+llm_match_retention_days = notint
+llm_match_recovery_timeout_s = bad
+"""
+        cm = _config_manager_from_ini(tmp_path, ini)
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_retention_days"] == 30
+        assert cfg["llm_match_recovery_timeout_s"] == 120
+
+    def test_get_sync_llm_match_config_empty_max_iterations_default(self, tmp_path):
+        """llm_match_max_iterations 显式空字符串仍返回空（优先级覆盖语义）。"""
+        cm = _config_manager_from_ini(tmp_path, "[sync]\nllm_match_max_iterations = \n")
+        assert cm.get_sync_llm_match_config()["llm_match_max_iterations"] == ""
 
 
 class TestMediaServerUsernameParseAndMigration:

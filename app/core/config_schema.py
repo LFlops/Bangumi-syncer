@@ -118,6 +118,8 @@ SECTIONS: dict[str, SectionMeta] = {
             # 模糊匹配置信度阈值（0~1）：低于该相似度的 Bangumi API 匹配
             # 不会自动采用，而是沉淀到待审队列由用户在 Web 界面人工确认。
             FieldMeta(name="match_confidence_threshold", default=0.6),
+            # LLM 匹配结果滑动窗口轮转天数（终态超窗 + 过期死行一并清理）
+            FieldMeta(name="llm_match_retention_days", default=30),
         ),
     ),
     "auth": SectionMeta(
@@ -316,6 +318,7 @@ SECTIONS: dict[str, SectionMeta] = {
         order=600,
         is_multi_instance=True,
         # summary 调度器为 instance 类型，配置联动由 summary_jobs API 直调
+        fields=(FieldMeta(name="thinking_level", default="off"),),
     ),
     "llm": SectionMeta(
         name="llm",
@@ -327,7 +330,6 @@ SECTIONS: dict[str, SectionMeta] = {
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),
             FieldMeta(name="timeout", default=60),
-            FieldMeta(name="thinking_level", default="off"),
         ),
     ),
     # ── 调度器全局（order 900）──
