@@ -1,19 +1,18 @@
 ---
-title: 🔌 MCP Server 子项目
+title: 🔌 MCP Server（内置模块）
 order: 13
 ---
 
-# 🔌 MCP Server 子项目
+# 🔌 MCP Server（内置模块）
 
-MCP Server 是 Bangumi-syncer 的**伴生服务**，通过 MCP 协议（Model Context Protocol）让 LLM 客户端读写 BS 配置、查询日志。它是 uv workspace 成员，独立 `pyproject.toml`，独立 `uv.lock`。
+MCP Server 是 Bangumi-syncer 的**内置模块**，通过 MCP 协议（Model Context Protocol）让 LLM 客户端读写 BS 配置、查询日志。它随 BS 单进程启动，**不是独立的 workspace 成员**，没有独立 `pyproject.toml` / `uv.lock`；依赖（如 `fastmcp`）统一声明在根 `pyproject.toml`。
 
 ## 技术栈
 
 - **Python**：`>=3.10`（与 BS 主项目一致，全仓已升级至 3.10）
-- **MCP SDK**：`mcp>=1.27`（Streamable HTTP 传输）
-- **HTTP 客户端**：`httpx>=0.25`（调用 BS 内部 API）
+- **MCP SDK**：[`fastmcp>=4.0.3`](https://github.com/jlowin/fastmcp)（Streamable HTTP 传输，见根 `pyproject.toml`）
 - **认证**：`cryptography`（RSA 密钥对）+ `PyJWT`（RS256 JWT 签发）
-- **测试**：`pytest` + `pytest-asyncio` + `respx`
+- **测试**：`pytest` + `pytest-asyncio`（嵌入路由用 `httpx.AsyncClient` + `ASGITransport` 验证）
 
 ---
 
@@ -29,6 +28,7 @@ app/mcp/
 tests/
 ├── test_mcp_tools.py       # 工具函数测试
 ├── test_mcp_auth.py        # OAuth 流程测试
+├── test_mcp_cimd_real.py   # CIMD（Client ID Metadata Document）流程测试
 ├── test_mcp_embed.py       # FastMCP 嵌入 FastAPI 测试
 ├── test_mcp_integration.py # 端到端集成测试
 └── test_main_mcp.py        # main.py MCP 集成测试
@@ -64,15 +64,16 @@ tests/
 
 ## 认证链路
 
-### 1. OAuth Authorization Server（mcp_server 侧）
+### 1. OAuth Authorization Server（BS 侧）
 
-`auth.py` 实现 MCP SDK 的 `OAuthAuthorizationServerProvider` 接口：
+`app/mcp/provider.py` 的 `BangumiOAuthProvider`（继承 FastMCP 4 的 `OAuthProvider`）实现 OAuth 授权服务：
 
 | 端点 | 功能 |
 | --- | --- |
 | `/authorize` | 发起授权请求，重定向到 `/consent` |
 | `/token` | 用 authorization code 换 JWT access_token |
 | `/register` | 动态客户端注册（RFC 7591） |
+| `/revoke` | 吊销 access / refresh token（`RevocationOptions(enabled=True)`） |
 | `/consent` | 用户确认页面（allow/deny） |
 
 JWT claims：
@@ -81,22 +82,22 @@ JWT claims：
 {
     "sub": "admin",  # 用户名
     "scope": "read write",  # 权限范围
-    "iss": "http://localhost:8000",
-    "aud": "bangumi-syncer",
+    "iss": "http://localhost:8000",  # = 解析后的 base_url（不可单独配置）
+    "aud": "bangumi-syncer",  # 硬编码
     "iat": 1700000000,
-    "exp": 1700003600,
+    "exp": 1700003600,  # 硬编码 3600 秒
     "jti": "...",  # 唯一标识（sign_jwt 自动添加）
 }
 ```
 
 ### 2. auth.enabled 分流
 
-认证分流由 **BS 侧** `auth.enabled` 配置决定，mcp_server 在运行时通过调用 `BS_BASE_URL/api/auth/status` 自动探测：
+认证分流由 **BS 侧** `auth.enabled` 配置决定，`handle_consent` 在**同进程内**通过 `security_manager.validate_session()` 校验 BS 会话，不走 HTTP：
 
 | 模式 | 行为 |
 | --- | --- |
-| BS `auth.enabled=true` | 登录时调用 `BS_BASE_URL/api/auth/status` 复用 BS 会话，身份为 BS 当前用户 |
-| BS `auth.enabled=false` | consent 流程仍探测 `/api/auth/status`，BS 关闭认证时返回内置 admin 会话，身份沿用 BS 侧会话用户（`MCP_AUTH_USERNAME` 在生产入口下不可达） |
+| BS `auth.enabled=true` | consent 时读取请求 Cookie 中的 `session_token`，调用 `security_manager.validate_session()` 复用 BS 会话，身份为 BS 当前用户 |
+| BS `auth.enabled=false` | 不校验会话，直接使用 `auth_username`（来自 BS 认证配置），无需登录 |
 
 ### 3. JWT 验签（FastMCP provider 侧）
 
@@ -107,6 +108,10 @@ JWT claims：
 3. 公钥验签（RS256）
 
 公钥由 `RSAKeyManager` 本地生成/加载，路径可通过 `MCP_RSA_PUBLIC_KEY` 环境变量配置。
+
+### 4. consent 未登录行为
+
+`auth.enabled=true` 且请求未携带有效 `session_token` 时，`handle_consent`（GET 与 POST allow）**直接返回 HTTP 401**，并不会跳转到 BS 登录页。用户需先在 BS Web 端登录，再重新触发授权。
 
 ---
 
@@ -123,10 +128,10 @@ JWT claims：
 
 | 密钥 | 路径（默认） | 说明 |
 | --- | --- | --- |
-| 私钥 | `/tmp/mcp_private.pem` | **仅 BS 持有**，本地磁盘 |
-| 公钥 | `/tmp/mcp_public.pem` | 本地生成，用于验签 JWT |
+| 私钥 | `<系统临时目录>/mcp_private.pem` | **仅 BS 持有**，本地磁盘 |
+| 公钥 | `<系统临时目录>/mcp_public.pem` | 本地生成，用于验签 JWT |
 
-路径可通过环境变量 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 配置。
+默认路径由 `tempfile.gettempdir()` 解析（`app/mcp/server.py`），因此会随操作系统不同而变化（Linux 通常为 `/tmp`，macOS 为 `$TMPDIR` 指向的目录）。路径可通过环境变量 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 配置。
 
 ---
 
@@ -219,8 +224,8 @@ uv run pytest tests/test_mcp_*.py -v
 
 ### 环境限制
 
-- **Python 版本**：`>=3.10`，CI 使用 3.11
-- **UV_PYTHON**：若系统 Python < 3.10，需通过 `uv python install 3.11` 或设置 `UV_PYTHON` 环境变量指定解释器
+- **Python 版本**：`>=3.10`，CI 使用 3.10
+- **UV_PYTHON**：若系统 Python < 3.10，需通过 `uv python install 3.10` 或设置 `UV_PYTHON` 环境变量指定解释器
 
 ---
 
@@ -236,9 +241,14 @@ BS 单容器部署，内置 MCP 服务。
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MCP_RSA_PRIVATE_KEY` | `/tmp/mcp_private.pem` | RSA 私钥路径（本地磁盘） |
-| `MCP_RSA_PUBLIC_KEY` | `/tmp/mcp_public.pem` | RSA 公钥路径 |
-| `MCP_AUTH_USERNAME` | `admin` | 保留变量；生产入口下 consent 流程始终探测 BS `/api/auth/status`，`auth.enabled=false` 时 BS 返回内置 admin 会话，故此变量实际不可达 |
-| `MCP_TOKEN_EXPIRY_SECONDS` | `3600` | JWT 有效期 |
-| `MCP_ISSUER` | `http://localhost:8000` | OAuth issuer |
-| `MCP_AUDIENCE` | `bangumi-syncer` | JWT audience（已统一为 `bangumi-syncer`，不再有 `bs` 死路由） |
+| `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | RSA 私钥路径（本地磁盘） |
+| `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | RSA 公钥路径 |
+| `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点；解析优先级：`create_mcp_server(base_url=...)` 参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值 |
+
+::: warning 不可配置项
+以下值当前在 `app/mcp/server.py` 中硬编码，**没有对应环境变量**：
+
+- OAuth `issuer` = 解析后的 `base_url`
+- JWT `audience` = `"bangumi-syncer"`
+- Access Token 有效期 = `3600` 秒
+:::
