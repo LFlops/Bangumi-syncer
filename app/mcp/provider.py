@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 MAX_CLIENTS = 1000
 PENDING_AUTH_TTL = 600  # 10 minutes
 AUTH_CODE_TTL = 300  # 5 minutes
+REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 days
 
 
 class RSAKeyManager:
@@ -221,6 +222,7 @@ class BangumiOAuthProvider(OAuthProvider):
         token_expiry_seconds: int = 3600,
         auth_enabled: bool = False,
         auth_username: str = "admin",
+        refresh_token_ttl: int = REFRESH_TOKEN_TTL,
         client_registration_options: ClientRegistrationOptions | None = None,
         revocation_options: RevocationOptions | None = None,
     ) -> None:
@@ -235,6 +237,7 @@ class BangumiOAuthProvider(OAuthProvider):
         self.issuer = issuer
         self.audience = audience
         self.token_expiry_seconds = token_expiry_seconds
+        self.refresh_token_ttl = refresh_token_ttl
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
 
@@ -247,7 +250,8 @@ class BangumiOAuthProvider(OAuthProvider):
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
         self._pending_auths: dict[str, dict[str, Any]] = {}
-        self._revoked_tokens: set[str] = set()
+        # jti -> access token 的 exp，用于惰性清理吊销记录
+        self._revoked_tokens: dict[str, float] = {}
 
         # CIMD manager with default scope injection
         self.cimd = CIMDClientManager(
@@ -387,8 +391,8 @@ class BangumiOAuthProvider(OAuthProvider):
                         ),
                     )
 
-        # Trigger cleanup of expired pending auths to prevent unbounded growth
-        self._cleanup_expired_pending_auths()
+        # Trigger lazy cleanup of expired in-memory state to prevent unbounded growth
+        self._cleanup_expired_state()
         request_token = secrets.token_urlsafe(32)
         # Generate CSRF token bound to this pending auth
         csrf_token = secrets.token_urlsafe(32)
@@ -474,6 +478,7 @@ class BangumiOAuthProvider(OAuthProvider):
         authorization_code: AuthorizationCode,
     ) -> OAuthToken:
         """Exchange authorization code for access token + refresh token."""
+        self._cleanup_expired_state()
         _, access_token = self._build_jwt_claims(
             subject=authorization_code.subject or self.auth_username,
             scopes=authorization_code.scopes,
@@ -487,6 +492,7 @@ class BangumiOAuthProvider(OAuthProvider):
             token=refresh_token_str,
             client_id=client.client_id,
             scopes=authorization_code.scopes,
+            expires_at=int(time.time()) + self.refresh_token_ttl,
             subject=authorization_code.subject,
         )
         self._refresh_tokens[refresh_token_str] = refresh_token
@@ -543,18 +549,21 @@ class BangumiOAuthProvider(OAuthProvider):
         scopes: list[str],
     ) -> OAuthToken:
         """Exchange refresh token for new access token + refresh token (rotation)."""
+        self._cleanup_expired_state()
         _, access_token = self._build_jwt_claims(
             subject=refresh_token.subject or self.auth_username,
             scopes=scopes,
             client_id=client.client_id,
         )
 
-        # Rotate refresh token (new one)
+        # Rotate refresh token (new one). Expiry restarts on every rotation
+        # (sliding window): an actively used session never expires.
         new_refresh_token_str = secrets.token_urlsafe(32)
         new_refresh_token = RefreshToken(
             token=new_refresh_token_str,
             client_id=client.client_id,
             scopes=scopes,
+            expires_at=int(time.time()) + self.refresh_token_ttl,
             subject=refresh_token.subject,
         )
         self._refresh_tokens[new_refresh_token_str] = new_refresh_token
@@ -576,14 +585,18 @@ class BangumiOAuthProvider(OAuthProvider):
     ) -> None:
         """Revoke an access or refresh token.
 
-        For AccessToken: records the jti in the revocation set (P1-2).
+        For AccessToken: records the jti (+ its exp) in the revocation map (P1-2).
         For RefreshToken: removes from the refresh tokens store.
         """
+        self._cleanup_expired_state()
         if isinstance(token, AccessToken):
-            # P1-2: Record jti in revocation set so verify_token rejects it
+            # P1-2: Record jti in revocation set so verify_token rejects it.
+            # Store the token's exp so the record can be lazily pruned later.
             jti = token.claims.get("jti")
             if jti:
-                self._revoked_tokens.add(jti)
+                self._revoked_tokens[jti] = float(
+                    token.expires_at or (time.time() + self.token_expiry_seconds)
+                )
         elif isinstance(token, RefreshToken):
             self._refresh_tokens.pop(token.token, None)
 
@@ -591,16 +604,52 @@ class BangumiOAuthProvider(OAuthProvider):
     # Consent flow helpers
     # ------------------------------------------------------------------
 
-    def _cleanup_expired_pending_auths(self) -> None:
-        """Remove expired pending auth requests (TTL enforcement)."""
+    def _cleanup_expired_state(self) -> None:
+        """Remove expired in-memory state (lazy TTL enforcement).
+
+        Cleans four stores so unclaimed/expired entries do not accumulate:
+        - pending auth requests: PENDING_AUTH_TTL after creation
+        - authorization codes: after their ``expires_at``
+        - refresh tokens: after their ``expires_at`` (None = never expires)
+        - revoked jti records: after the access token's exp
+        """
         now = time.time()
-        expired = [
+        expired_pending = [
             rt
             for rt, info in self._pending_auths.items()
             if now - info.get("created_at", 0) > PENDING_AUTH_TTL
         ]
-        for rt in expired:
+        for rt in expired_pending:
             del self._pending_auths[rt]
+
+        expired_codes = [
+            code for code, obj in self._auth_codes.items() if obj.expires_at < now
+        ]
+        for code in expired_codes:
+            del self._auth_codes[code]
+
+        expired_refresh = [
+            token
+            for token, obj in self._refresh_tokens.items()
+            if obj.expires_at is not None and obj.expires_at < now
+        ]
+        for token in expired_refresh:
+            del self._refresh_tokens[token]
+
+        expired_revoked = [
+            jti for jti, exp in self._revoked_tokens.items() if exp < now
+        ]
+        for jti in expired_revoked:
+            del self._revoked_tokens[jti]
+
+        logger.debug(
+            "Cleaned in-memory OAuth state: pending=%d auth_codes=%d "
+            "refresh_tokens=%d revoked=%d",
+            len(expired_pending),
+            len(expired_codes),
+            len(expired_refresh),
+            len(expired_revoked),
+        )
 
     async def get_consent_context(
         self, request_token: str, session_token: str | None = None
@@ -611,7 +660,7 @@ class BangumiOAuthProvider(OAuthProvider):
             request_token: The pending auth request token.
             session_token: Optional session token to validate via security_manager.
         """
-        self._cleanup_expired_pending_auths()
+        self._cleanup_expired_state()
         pending = self._pending_auths.get(request_token)
         if pending is None:
             return None
@@ -647,7 +696,7 @@ class BangumiOAuthProvider(OAuthProvider):
             username: Optional username override.
             csrf_token: CSRF token from the form submission.
         """
-        self._cleanup_expired_pending_auths()
+        self._cleanup_expired_state()
         pending_info = self._pending_auths.get(request_token)
         if pending_info is None:
             raise ValueError("Invalid or expired request_token")

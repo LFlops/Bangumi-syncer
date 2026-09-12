@@ -667,6 +667,190 @@ class TestOAuthProviderUnit:
 
 
 # ---------------------------------------------------------------------------
+# In-memory state TTL / lazy cleanup tests
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryStateTTL:
+    """进程内存态的 TTL 与惰性清理（pending / auth code / refresh / 吊销记录）。"""
+
+    @pytest.fixture
+    def rsa_manager(self, tmp_path):
+        from app.mcp.provider import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+        return manager
+
+    @pytest.fixture
+    def provider(self, rsa_manager):
+        from app.mcp.provider import BangumiOAuthProvider
+
+        return BangumiOAuthProvider(
+            base_url="http://localhost:8000",
+            rsa_manager=rsa_manager,
+            issuer="http://localhost:8000",
+            audience="bs",
+            token_expiry_seconds=3600,
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+    def _make_code(self, code: str, expires_at: float):
+        from mcp.server.auth.provider import AuthorizationCode
+        from pydantic import AnyUrl
+
+        return AuthorizationCode(
+            code=code,
+            scopes=["read"],
+            expires_at=expires_at,
+            client_id="test-client",
+            code_challenge="challenge123",
+            redirect_uri=AnyUrl("http://localhost/callback"),
+            redirect_uri_provided_explicitly=True,
+            subject="testuser",
+        )
+
+    def _make_refresh(self, token: str, expires_at: int | None):
+        from mcp.server.auth.provider import RefreshToken
+
+        return RefreshToken(
+            token=token,
+            client_id="test-client",
+            scopes=["read"],
+            expires_at=expires_at,
+            subject="testuser",
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_签发时带有效期(self, provider):
+        """exchange_authorization_code 签发的 refresh token 带 30 天有效期。"""
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyHttpUrl("http://localhost/callback")],
+            grant_types=["authorization_code"],
+            token_endpoint_auth_method="none",
+        )
+        code_obj = self._make_code("code-1", time.time() + 300)
+
+        token = await provider.exchange_authorization_code(client, code_obj)
+
+        assert provider.refresh_token_ttl == 30 * 24 * 3600
+        stored = provider._refresh_tokens[token.refresh_token]
+        assert stored.expires_at == pytest.approx(
+            time.time() + provider.refresh_token_ttl, abs=5
+        )
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_轮换后重新计时(self, provider):
+        """exchange_refresh_token 轮换后新 token 重新计时，旧 token 被删除。"""
+        from mcp.server.auth.provider import RefreshToken
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            redirect_uris=[AnyHttpUrl("http://localhost/callback")],
+            grant_types=["authorization_code", "refresh_token"],
+            token_endpoint_auth_method="none",
+        )
+        old_str = secrets.token_urlsafe(32)
+        # 旧 token 临近过期（60 秒后），轮换后新 token 应重新按 30 天计时
+        old = RefreshToken(
+            token=old_str,
+            client_id="test-client",
+            scopes=["read"],
+            expires_at=int(time.time()) + 60,
+            subject="testuser",
+        )
+        provider._refresh_tokens[old_str] = old
+
+        token = await provider.exchange_refresh_token(client, old, ["read"])
+
+        assert old_str not in provider._refresh_tokens
+        new_stored = provider._refresh_tokens[token.refresh_token]
+        assert new_stored.expires_at == pytest.approx(
+            time.time() + provider.refresh_token_ttl, abs=5
+        )
+
+    @pytest.mark.asyncio
+    async def test_cleanup_移除过期auth_code(self, provider):
+        """_cleanup_expired_state 应清除已过期的授权码，保留有效授权码。"""
+        provider._auth_codes["expired-code"] = self._make_code(
+            "expired-code", time.time() - 10
+        )
+        provider._auth_codes["valid-code"] = self._make_code(
+            "valid-code", time.time() + 300
+        )
+
+        provider._cleanup_expired_state()
+
+        assert "expired-code" not in provider._auth_codes
+        assert "valid-code" in provider._auth_codes
+
+    @pytest.mark.asyncio
+    async def test_cleanup_移除过期refresh_token(self, provider):
+        """_cleanup_expired_state 应清除已过期 refresh token，保留有效与无过期的。"""
+        provider._refresh_tokens["expired-rt"] = self._make_refresh(
+            "expired-rt", int(time.time()) - 10
+        )
+        provider._refresh_tokens["valid-rt"] = self._make_refresh(
+            "valid-rt", int(time.time()) + 3600
+        )
+        # expires_at=None 表示不过期，必须保留
+        provider._refresh_tokens["no-exp"] = self._make_refresh("no-exp", None)
+
+        provider._cleanup_expired_state()
+
+        assert "expired-rt" not in provider._refresh_tokens
+        assert "valid-rt" in provider._refresh_tokens
+        assert "no-exp" in provider._refresh_tokens
+
+    def test_cleanup_移除过期吊销记录_未过期的保留(self, provider):
+        """吊销记录按 access token 的 exp 惰性清理，未过期的保留。"""
+        provider._revoked_tokens["past-jti"] = time.time() - 10
+        provider._revoked_tokens["future-jti"] = time.time() + 3600
+
+        provider._cleanup_expired_state()
+
+        assert "past-jti" not in provider._revoked_tokens
+        assert "future-jti" in provider._revoked_tokens
+
+    @pytest.mark.asyncio
+    async def test_revoke_access_token_记录到期时间用于清理(self, provider):
+        """revoke_token 记录 jti 时同时记录其 exp，供惰性清理。"""
+        from mcp.server.auth.provider import AccessToken
+
+        access = AccessToken(
+            token="access-token",
+            client_id="test-client",
+            scopes=["read"],
+            expires_at=int(time.time()) + 3600,
+            claims={"jti": "jti-recording"},
+        )
+
+        await provider.revoke_token(access)
+
+        assert provider._revoked_tokens["jti-recording"] == pytest.approx(
+            access.expires_at
+        )
+
+    def test_pending_过期清理回归(self, provider):
+        """pending 过期清理行为保持不变（10 分钟 TTL）。"""
+        provider._pending_auths["expired-pending"] = {"created_at": time.time() - 700}
+        provider._pending_auths["valid-pending"] = {"created_at": time.time()}
+
+        provider._cleanup_expired_state()
+
+        assert "expired-pending" not in provider._pending_auths
+        assert "valid-pending" in provider._pending_auths
+
+
+# ---------------------------------------------------------------------------
 # Consent + CSRF Tests (T3)
 # ---------------------------------------------------------------------------
 
@@ -1063,6 +1247,67 @@ class TestOAuthFullFlow:
     def _make_test_client(self, app):
         return TestClient(app, raise_server_exceptions=False)
 
+    def _complete_authorization_code_flow(self, client):
+        """走完 DCR → authorize → consent → token，返回 (client_id, token_json)。"""
+        reg_response = client.post(
+            "/register",
+            json={
+                "redirect_uris": ["http://localhost/callback"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "token_endpoint_auth_method": "none",
+                "scope": "read",
+            },
+        )
+        assert reg_response.status_code == 201
+        client_id = reg_response.json()["client_id"]
+
+        code_verifier = secrets.token_urlsafe(32)
+        code_challenge = _make_code_challenge_b64(code_verifier)
+        auth_response = client.get(
+            "/authorize",
+            params={
+                "client_id": client_id,
+                "redirect_uri": "http://localhost/callback",
+                "response_type": "code",
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "scope": "read",
+            },
+            follow_redirects=False,
+        )
+        consent_url = auth_response.headers["location"]
+        parsed = urlparse(consent_url)
+        request_token = parse_qs(parsed.query)["request_token"][0]
+
+        consent_get = client.get(consent_url)
+        assert consent_get.status_code == 200
+        csrf_token = _extract_csrf_token(consent_get.text)
+
+        consent_post = client.post(
+            "/consent",
+            data={
+                "action": "allow",
+                "request_token": request_token,
+                "csrf_token": csrf_token,
+            },
+            follow_redirects=False,
+        )
+        assert consent_post.status_code == 302
+        code = parse_qs(urlparse(consent_post.headers["location"]).query)["code"][0]
+
+        token_response = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost/callback",
+                "client_id": client_id,
+                "code_verifier": code_verifier,
+            },
+        )
+        assert token_response.status_code == 200
+        return client_id, token_response.json()
+
     def test_metadata_endpoint_returns_authorization_server_metadata(
         self, server_app_auth_disabled
     ):
@@ -1453,6 +1698,36 @@ class TestOAuthFullFlow:
         new_token_data = refresh_response.json()
         assert new_token_data["access_token"]
         assert new_token_data["access_token"] != token_response.json()["access_token"]
+
+    def test_过期refresh_token_刷新被拒(self, server_app_auth_disabled):
+        """过期 refresh token 换新 token 应被拒绝。
+
+        provider 的 load_refresh_token 只负责加载；过期判定由 MCP SDK token
+        handler 承担（mcp/server/auth/handlers/token.py:215），返回 invalid_grant。
+        """
+        client = self._make_test_client(server_app_auth_disabled)
+        client_id, token_data = self._complete_authorization_code_flow(client)
+
+        provider = server_app_auth_disabled.state.provider
+        stored = provider._refresh_tokens[token_data["refresh_token"]]
+        # 签发的 refresh token 必须自带有效期
+        assert stored.expires_at is not None
+        assert stored.expires_at == pytest.approx(
+            time.time() + provider.refresh_token_ttl, abs=5
+        )
+        # 再将其手动置为过期，模拟自然到期
+        stored.expires_at = int(time.time()) - 10
+
+        refresh_response = client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": token_data["refresh_token"],
+                "client_id": client_id,
+            },
+        )
+        assert refresh_response.status_code == 401
+        assert refresh_response.json()["error"] == "invalid_grant"
 
     def test_revoke_token_endpoint(self, server_app_auth_disabled):
         """POST /revoke should revoke a token."""

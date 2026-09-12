@@ -14,7 +14,12 @@ from starlette.responses import Response
 from app.core.config import config_manager
 from app.core.security import security_manager
 
-from .provider import BangumiOAuthProvider, RSAKeyManager, handle_consent
+from .provider import (
+    REFRESH_TOKEN_TTL,
+    BangumiOAuthProvider,
+    RSAKeyManager,
+    handle_consent,
+)
 from .tools import get_current_config, get_logs, update_config
 
 # base_url 占位：生产环境应从配置读取公共 URL
@@ -58,12 +63,15 @@ def _create_provider(base_url: str | None = None) -> BangumiOAuthProvider:
     )
     rsa_manager.load_or_generate()
 
+    refresh_ttl = int(os.environ.get("MCP_REFRESH_TOKEN_TTL", str(REFRESH_TOKEN_TTL)))
+
     return BangumiOAuthProvider(
         base_url=resolved_base_url,
         rsa_manager=rsa_manager,
         issuer=resolved_base_url,
         audience="bangumi-syncer",
         token_expiry_seconds=3600,
+        refresh_token_ttl=refresh_ttl,
         auth_enabled=bool(auth_config["enabled"]),
         auth_username=str(auth_config["username"]),
     )
