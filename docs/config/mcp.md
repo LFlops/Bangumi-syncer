@@ -64,6 +64,7 @@ Docker 部署同理，单容器即可。
 | `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | RSA 私钥路径（本地磁盘，仅 BS 持有） |
 | `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | RSA 公钥路径（本地生成，用于验签 JWT） |
 | `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点（解析优先级：参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值） |
+| `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，**单位：秒**；每次轮换后重新计时（滑动窗口） |
 
 默认 RSA 路径由 `tempfile.gettempdir()` 解析，随操作系统不同而变化（Linux 通常 `/tmp`，macOS 为 `$TMPDIR`）。
 
@@ -90,7 +91,7 @@ docker run -d \
 
 ### 3. 部署约束：单进程
 
-OAuth 授权状态全部保存在**进程内存**中（`app/mcp/provider.py`）：已注册客户端 `_clients`、授权码 `_auth_codes`、Refresh Token `_refresh_tokens`、待授权请求 `_pending_auths`、已吊销 `jti` 集合 `_revoked_tokens`。
+OAuth 授权状态全部保存在**进程内存**中（`app/mcp/provider.py`）：已注册客户端 `_clients`、授权码 `_auth_codes`、Refresh Token `_refresh_tokens`、待授权请求 `_pending_auths`、已吊销 `jti` 记录 `_revoked_tokens`（jti → access token 到期时间）。过期状态按 TTL 惰性清理（授权码 5 分钟、待授权请求 10 分钟、Refresh Token 30 天、吊销记录随 access token 到期）。
 
 仓库内置的启动方式均为**单进程**：`start.bat` 与 Dockerfile 的 `CMD` 都执行 `uvicorn app.main:app`，未使用 `--workers`。
 
@@ -126,10 +127,13 @@ BS 内置的 FastMCP 服务实现了完整的 OAuth 2.1 授权服务器，支持
 
 - Access Token 过期后，服务自动用 Refresh Token 换取新 Token
 - Refresh Token 轮换（每次换取后旧 Token 失效）
-- **一次授权后无需重复登录**，除非 Token 被吊销或过期时间过长
+- Refresh Token 默认有效期 **30 天**（`2592000` 秒，可用 `MCP_REFRESH_TOKEN_TTL` 调整）
+- **每次轮换后重新计时**（滑动窗口）：只要在有效期内使用过，就会延长到「最近一次使用 + 30 天」
+- 若连续 **30 天未使用**，Refresh Token 过期失效，客户端需**重新授权**
+- **一次授权后无需重复登录**，除非 Token 被吊销或长时间未使用
 
 ::: tip 吊销方式
-- **标准端点**：`POST /revoke`（由 `RevocationOptions(enabled=True)` 提供）可吊销 access / refresh token；access token 吊销后其 `jti` 进入进程内吊销集合，验签时被拒绝
+- **标准端点**：`POST /revoke`（由 `RevocationOptions(enabled=True)` 提供）可吊销 access / refresh token；access token 吊销后其 `jti` 进入进程内吊销记录（附带该 token 的到期时间，到期后惰性清理），验签时被拒绝
 - **内存方式**：删除进程内存中的 Refresh Token 即可吊销（重启进程会清空）。重新连接会触发新的授权流程
 :::
 

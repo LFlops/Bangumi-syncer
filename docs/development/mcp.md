@@ -61,8 +61,17 @@ tests/
 | `app/main.py` | FastAPI 应用入口，嵌入 FastMCP 路由 + combine_lifespans |
 
 ::: warning 状态均为进程内存储，当前仅支持单进程
-`BangumiOAuthProvider`（`app/mcp/provider.py`）的客户端注册表、授权码、Refresh Token、待授权请求与吊销集合全部保存在**进程内存**中。仓库启动方式（`start.bat`、Dockerfile `CMD`）均为 `uvicorn app.main:app` 单进程，**不支持 `--workers N` / gunicorn 多进程**：否则授权码 / Refresh Token 会因请求落到不同进程而失效，吊销状态也会各进程不一致。Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响。
+`BangumiOAuthProvider`（`app/mcp/provider.py`）的客户端注册表、授权码、Refresh Token、待授权请求与吊销记录全部保存在**进程内存**中。仓库启动方式（`start.bat`、Dockerfile `CMD`）均为 `uvicorn app.main:app` 单进程，**不支持 `--workers N` / gunicorn 多进程**：否则授权码 / Refresh Token 会因请求落到不同进程而失效，吊销状态也会各进程不一致。Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响。
 :::
+
+各状态表的 TTL 与清理策略（均为进程内存态，由 `_cleanup_expired_state()` **惰性清理**，调用时机为 `authorize` / `get_consent_context` / `exchange_authorization_code` / `exchange_refresh_token` / `revoke_token`）：
+
+| 状态表 | 键 | TTL | 说明 |
+| --- | --- | --- | --- |
+| `_pending_auths` | `request_token` | 10 分钟（`PENDING_AUTH_TTL`） | 待 consent 的授权请求；过期即删除 |
+| `_auth_codes` | 授权码 | 5 分钟（`AUTH_CODE_TTL`） | 已兑换/过期的授权码被清除；SDK 兑换时另行校验过期 |
+| `_refresh_tokens` | Refresh Token | 30 天（`REFRESH_TOKEN_TTL`，环境变量 `MCP_REFRESH_TOKEN_TTL` 可配） | 每次轮换**重新计时**（滑动窗口）；`expires_at=None` 视为不过期 |
+| `_revoked_tokens` | `jti` → access token `exp` | 随 access token 到期 | 吊销记录在对应 access token 过期后清理，避免只增不减 |
 
 ---
 
@@ -267,6 +276,7 @@ BS 单容器部署，内置 MCP 服务。
 | `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | RSA 私钥路径（本地磁盘） |
 | `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | RSA 公钥路径 |
 | `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点；解析优先级：`create_mcp_server(base_url=...)` 参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值 |
+| `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，单位：秒；每次轮换后重新计时（滑动窗口） |
 
 ::: warning 不可配置项
 以下值当前在 `app/mcp/server.py` 中硬编码，**没有对应环境变量**：
