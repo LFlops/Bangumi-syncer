@@ -40,8 +40,8 @@ tests/
 
 ```
 ┌─────────────────┐     MCP (Streamable HTTP)     ┌─────────────────────────────┐
-│   LLM Client    │ ◄────────────────────────────► │  Bangumi-syncer (BS)        │
-│  (Claude/Cursor)│    OAuth 2.1 + RS256 JWT      │  (port 8000)                │
+│   AI 助手        │ ◄────────────────────────────► │  Bangumi-syncer (BS)        │
+│                 │    OAuth 2.1 + RS256 JWT      │  (port 8000)                │
 └─────────────────┘                                │                             │
                                                    │  内置 FastMCP 服务           │
                                                    │  - app/mcp/server.py        │
