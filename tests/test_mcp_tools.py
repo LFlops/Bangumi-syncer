@@ -620,7 +620,7 @@ class TestGetCurrentConfig:
 
 
 class TestUpdateConfig:
-    """update_config 工具：正常写入、非法段名 400、auth 段拒绝。"""
+    """update_config 工具：正常写入、非法段名拒绝、auth 段拒绝。"""
 
     @staticmethod
     def _make_write_token():
