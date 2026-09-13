@@ -1004,13 +1004,13 @@ class TestLLMCallError:
         assert exc_info.value.retryable is False
 
     @pytest.mark.asyncio
-    async def test_param_400_degraded_then_failed_retryable_true(
+    async def test_param_400_degraded_then_failed_retryable_false(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """参数类 400 降级后仍失败 → LLMCallError.retryable=True。
+        """参数类 400 降级后仍失败 → LLMCallError.retryable=False（终态）。
 
-        参数类 400 的 _is_terminal_error 返回 False（因为 _is_param_rejection=True），
-        所以 retryable = not False = True。
+        已降级去除扩展参数后再次命中参数类拒绝，说明该端点始终不支持该参数，
+        继续重试无意义，应归类为终态（retryable=False）。
         """
         from app.services.llm.client import LLMCallError, LLMClient
 
@@ -1040,8 +1040,8 @@ class TestLLMCallError:
         with pytest.raises(LLMCallError) as exc_info:
             await client.chat([Message(role="user", content="Q")])
 
-        # 参数类 400 → _is_terminal_error 返回 False → retryable=True
-        assert exc_info.value.retryable is True
+        # 降级后仍参数类拒绝 → 终态 → retryable=False
+        assert exc_info.value.retryable is False
 
     @pytest.mark.asyncio
     async def test_success_does_not_raise(

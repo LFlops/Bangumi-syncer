@@ -204,6 +204,9 @@ class LLMClient:
                     # 顺手项 1：降级重试前重置计时，避免把首次失败请求的耗时计入 latency
                     t_attempt = time.time()
                     continue
+                # 已降级后再次命中参数类拒绝 → 该端点始终不支持该参数 → 终态
+                if extras_degraded and _is_param_rejection(e):
+                    break
                 # M7/M9：确定性错误（refusal/鉴权/参数类）不重试
                 if _is_terminal_error(e):
                     break
@@ -230,6 +233,13 @@ class LLMClient:
             latency_ms=latency_ms,
         )
         retryable = not _is_terminal_error(last_error)
+        # 已降级后再次命中参数类拒绝 → 该端点始终不支持该参数，重试无意义 → 终态
+        if (
+            extras_degraded
+            and last_error is not None
+            and _is_param_rejection(last_error)
+        ):
+            retryable = False
         raise LLMCallError(error_detail, retryable=retryable) from last_error
 
     def _log_success(

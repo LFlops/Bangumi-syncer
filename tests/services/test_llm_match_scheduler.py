@@ -385,6 +385,40 @@ def test_process_run_passes_thinking_level_from_config():
     assert kwargs.get("thinking_level") == "high"
 
 
+def test_process_run_passes_notification_service_to_llm_assist_run():
+    """生产路径：_process_run 调 llm_assist.run 时必须传入非 None 的 notification_service。"""
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    run = {"run_id": "a", "sync_record_id": 1}
+
+    cm = MagicMock()
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_thinking_level": "medium",
+        "llm_match_max_iterations": "",
+    }
+    run_mock = AsyncMock(return_value="succeeded")
+    fake_svc = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch(
+            "app.services.llm_match_scheduler.get_notification_service",
+            return_value=fake_svc,
+        ),
+    ):
+        asyncio.run(sched._process_run(run))
+
+    run_mock.assert_awaited_once()
+    _, kwargs = run_mock.call_args
+    assert kwargs.get("notification_service") is fake_svc
+
+
 # ---------------------------------------------------------------------------
 # F2：断点恢复消费 last_response（不 mock _continue_replay 本身；trace.replay 可 mock）
 # ---------------------------------------------------------------------------
@@ -444,6 +478,7 @@ def test_continue_replay_submit_suggestion_dispatches_to_handle_result():
         },
     )
     loop = AsyncMock()
+    fake_svc = MagicMock()
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.llm_match_scheduler.config_manager") as cm,
@@ -455,6 +490,10 @@ def test_continue_replay_submit_suggestion_dispatches_to_handle_result():
         patch("app.services.agent.loop.run", loop),
         patch(
             "app.services.llm_match_scheduler.llm_assist_module._handle_result", handle
+        ),
+        patch(
+            "app.services.llm_match_scheduler.get_notification_service",
+            return_value=fake_svc,
         ),
     ):
         cm.get_sync_llm_match_config.return_value = {
@@ -470,6 +509,9 @@ def test_continue_replay_submit_suggestion_dispatches_to_handle_result():
     assert result_arg.stop_reason == "submit_suggestion"
     assert result_arg.suggestion == {"subject_id": "123", "reason": "跨季匹配"}
     loop.assert_not_awaited()
+    # 接线断言：notification_service 必须非 None（生产链路真正发送站内信）
+    kwargs = handle.call_args[1]
+    assert kwargs.get("notification_service") is fake_svc
 
 
 def test_continue_replay_tool_use_backfills_and_continues_loop():

@@ -26,6 +26,7 @@ from app.services.base.scheduler import BaseScheduler
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
+from app.services.notification_service import get_notification_service
 
 # 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
@@ -238,7 +239,7 @@ class LlmMatchScheduler(BaseScheduler):
                         sync_record=sync_record,
                         sync_record_id=sync_record.get("id"),
                         bgm=bgm,
-                        notification_service=None,
+                        notification_service=get_notification_service(),
                     )
                     return
 
@@ -299,7 +300,7 @@ class LlmMatchScheduler(BaseScheduler):
                     sync_record=sync_record,
                     sync_record_id=sync_record.get("id"),
                     bgm=bgm,
-                    notification_service=None,
+                    notification_service=get_notification_service(),
                 )
                 return
 
@@ -352,7 +353,7 @@ class LlmMatchScheduler(BaseScheduler):
                 sync_record=sync_record,
                 sync_record_id=sync_record.get("id"),
                 bgm=bgm,
-                notification_service=None,
+                notification_service=get_notification_service(),
             )
         except LLMCallError as e:
             # LLM 调用失败：按可重试性分流
@@ -488,6 +489,7 @@ class LlmMatchScheduler(BaseScheduler):
                 sync_record=sync_record,
                 bgm=bgm,
                 thinking_level=thinking_level,
+                notification_service=get_notification_service(),
             )
         except Exception as e:
             logger.error(f"🤖 处理 run {run_id} 异常: {e}")
