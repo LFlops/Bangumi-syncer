@@ -469,6 +469,66 @@ def test_build_seed_messages_injection_guard_and_isolation():
 
 
 # ---------------------------------------------------------------------------
+# 事务原子性：_persist_llm_candidate 内第二条 UPDATE 抛错时整体回滚
+# ---------------------------------------------------------------------------
+
+
+def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
+    """_persist_llm_candidate 内 agent_runs UPDATE 抛错 → 整体回滚，run 不 succeeded、候选 llm 列不被改写。"""
+    import sqlite3
+
+    run_id = "run-atomic"
+    sr_id = 8
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    database_manager.log_pending_candidate(
+        request_title=f"rule-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    # 在事务内的第二条语句（agent_runs UPDATE）抛错，验证整体回滚。
+    # sqlite3.Connection 为内置类型不可直接 monkeypatch，改用连接包装器，
+    # 并经 monkeypatch 自动恢复，避免污染后续测试连接。
+    real_conn = database_manager._connection._conn
+
+    class _Conn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, *args, **kwargs):
+            if args and "UPDATE agent_runs" in args[0]:
+                raise sqlite3.OperationalError("boom mid-transaction")
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    with pytest.raises(sqlite3.OperationalError):
+        llm_assist._persist_llm_candidate(
+            database_manager,
+            run_id=run_id,
+            sync_record_id=sr_id,
+            sync_record=sr,
+            subject_id="123",
+            reason="r",
+            stop_reason="submit_suggestion",
+            bgm=None,
+        )
+
+    # 回滚验证：agent_runs 未 succeeded，pending_candidates 未被改写
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "pending"  # 原始状态，未 succeeded
+    row = _read_candidate(sr_id)
+    assert row["llm_subject_id"] == ""  # 候选写入被回滚
+
+
+# ---------------------------------------------------------------------------
 # 并发抢占：atomic_claim 失败 → 返回 skipped
 # ---------------------------------------------------------------------------
 
@@ -1669,3 +1729,62 @@ def test_begin_replayed_round_sets_next_iteration_to_iteration_plus_one():
     recorder.begin_replayed_round(5)
     assert recorder._current_iteration == 5
     assert recorder._next_iteration == 6
+
+
+# ---------------------------------------------------------------------------
+# P1-a 回归：_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数
+# ---------------------------------------------------------------------------
+
+
+def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
+    """P1-a：_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数。"""
+    import time
+
+    run_id = "run-ended-at"
+    sr_id = 300
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    database_manager.log_pending_candidate(
+        request_title=f"rule-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    before = int(time.time())
+    llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+    after = int(time.time())
+
+    run_row = database_manager.agent_runs.get_run(run_id)
+    ended_at = run_row["ended_at"]
+    # 断言 ended_at 为 int 且 > 0
+    assert isinstance(ended_at, int), f"ended_at 应为 int，实际 {type(ended_at)}"
+    assert ended_at > 0, "ended_at 应 > 0"
+    assert before <= ended_at <= after + 1, (
+        f"ended_at 应在 [{before}, {after}+1] 范围内，实际 {ended_at}"
+    )
+
+    # 断言 _iso_from_epoch 返回非 None（可解析为 ISO 字符串）
+    from app.api.agent_runs import _iso_from_epoch
+
+    iso = _iso_from_epoch(ended_at)
+    assert iso is not None, "_iso_from_epoch(ended_at) 应返回非 None"
+
+    # 断言 SQLite typeof(ended_at)='integer'
+    conn = database_manager._connection._conn
+    cur = conn.execute(
+        "SELECT typeof(ended_at) FROM agent_runs WHERE run_id=?", (run_id,)
+    )
+    row = cur.fetchone()
+    assert row[0] == "integer", f"SQLite typeof(ended_at) 应为 'integer'，实际 {row[0]}"
