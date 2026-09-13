@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from app.services.agent.trace import ReplayResult
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 from app.services.llm.tools import ToolDefinition, ToolRegistry
@@ -1107,4 +1109,316 @@ def test_recovery_path_normalizes_uppercase_thinking_level(monkeypatch, tmp_path
 
     assert captured.get("thinking_level") == "high", (
         f"恢复路径应透传归一化后的 thinking_level='high'，实际 {captured}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1-b：恢复续跑后新 span iteration 严格大于既有最大 iteration
+# ---------------------------------------------------------------------------
+
+
+def test_continuation_iteration_strictly_greater_than_existing_max(monkeypatch):
+    """P1-b：_continue_replay 续跑产生的新 chat span iteration 必须严格大于既有最大 iteration。"""
+    from app.core.database import database_manager, set_database_manager
+
+    set_database_manager(database_manager)
+
+    run_id = "run-iter-continue"
+    sr_id = 400
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = {
+        "id": sr_id,
+        "title": f"标题{sr_id}",
+        "ori_title": "test",
+        "season": 1,
+        "user_name": "alice",
+        "source": "plex",
+        "match_trace": {"steps": []},
+    }
+
+    # 模拟 chat：返回 end_turn 立即结束
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    sched = LlmMatchScheduler()
+    monkeypatch.setattr(sched, "_build_bgm", lambda s: MagicMock())
+
+    # replay 返回 executed_iterations=2（既有轮次 0、1 已完整），last_response=None
+    rr = ReplayResult(
+        messages=[
+            Message(role="system", content="s"),
+            Message(role="user", content="u"),
+        ],
+        executed_iterations=2,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+    monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
+
+    asyncio.run(sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr))
+
+    # 验证续跑产生了 chat span，且 iteration >= 2（严格大于既有最大 iteration=1）
+    steps = database_manager.agent_runs.get_steps(run_id)
+    chat_steps = [s for s in steps if s["name"] == "llm_chat"]
+    assert len(chat_steps) >= 1, "恢复路径应产生至少 1 条 chat span"
+    min_chat_iter = min(s["iteration"] for s in chat_steps)
+    assert min_chat_iter >= 2, (
+        f"续跑 chat span 的最小 iteration 应 >= 2（接续 executed_iterations=2），"
+        f"实际最小 iteration={min_chat_iter}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1-c：补执行落 tool span（二次 replay 不再判缺失）
+# ---------------------------------------------------------------------------
+
+
+def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):
+    """P1-c：补执行缺失工具后写 tool_execute span，二次 replay 不再判缺失。"""
+    from app.core.database import database_manager, set_database_manager
+    from app.services.agent.trace import replay as real_replay
+
+    set_database_manager(database_manager)
+
+    run_id = "run-replay-span"
+    sr_id = 401
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = {
+        "id": sr_id,
+        "title": f"标题{sr_id}",
+        "ori_title": "test",
+        "season": 1,
+        "user_name": "alice",
+        "source": "plex",
+        "match_trace": {"steps": []},
+    }
+
+    # 模拟 chat：首次返回 tool_use（search_bangumi），恢复时返回 end_turn
+    call_count = {"n": 0}
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ChatResponse(
+                content="",
+                stop_reason="tool_use",
+                blocks=[
+                    ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+                ],
+            )
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    class _Bgm:
+        def search(self, **kwargs):
+            return [{"id": 1, "name": "result"}]
+
+        def get_subject(self, sid):
+            return {"name": f"s-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    bgm = _Bgm()
+    sched = LlmMatchScheduler()
+    monkeypatch.setattr(sched, "_build_bgm", lambda s: bgm)
+
+    # execute_batch：首次（崩溃前）抛错模拟崩溃
+    from app.services.llm.tools import get_tool_registry
+
+    reg = get_tool_registry()
+    eb_calls = {"n": 0}
+
+    async def _eb(tool_calls, *, recorder=None):
+        eb_calls["n"] += 1
+        if eb_calls["n"] == 1:
+            raise RuntimeError("crash mid-exec")
+        return {
+            tc.id: ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
+            for tc in tool_calls
+        }
+
+    monkeypatch.setattr(reg, "execute_batch", _eb)
+
+    async def _go():
+        # 初始正常运行至崩溃（记录 1 条 llm_chat span，但 tool_execute 缺失）
+        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+        # 恢复续跑：真实 trace.replay + 真实 loop_run
+        await sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr)
+
+    asyncio.run(_go())
+
+    # 验证补执行后写了 tool_execute span
+    steps = database_manager.agent_runs.get_steps(run_id)
+    tool_steps = [s for s in steps if s["name"] == "tool_execute"]
+    assert len(tool_steps) >= 1, (
+        f"补执行应产生至少 1 条 tool_execute span，实际 {len(tool_steps)}"
+    )
+
+    # 二次 replay 不再判缺失（因为补执行已落 span）
+    rr2 = real_replay(run_id)
+    assert len(rr2.missing_tool_calls) == 0, (
+        f"二次 replay 不应再判缺失，实际 missing={rr2.missing_tool_calls}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1-e2e：原始 run 崩溃 → 恢复 → 再次崩溃 → 第二次恢复
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_double_recovery_no_extra_llm_call(monkeypatch):
+    """P1-e2e：原始 run 崩溃 → 恢复完成 → 再次重置为 processing → 第二次恢复。
+    断言：第二次恢复不产生额外 LLM 调用（直接 mark_no_suggestion），
+    且所有 chat span iteration 无撞号。"""
+    from app.core.database import database_manager, set_database_manager
+    from app.services.agent.trace import replay as real_replay
+    from app.services.llm.tools import get_tool_registry
+
+    set_database_manager(database_manager)
+
+    run_id = "run-double-recover"
+    sr_id = 402
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = {
+        "id": sr_id,
+        "title": f"标题{sr_id}",
+        "ori_title": "test",
+        "season": 1,
+        "user_name": "alice",
+        "source": "plex",
+        "match_trace": {"steps": []},
+    }
+
+    # chat spy：第 1 次崩溃前 tool_use；第 2 次（恢复）end_turn
+    chat_calls = {"n": 0}
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        chat_calls["n"] += 1
+        if chat_calls["n"] == 1:
+            return ChatResponse(
+                content="",
+                stop_reason="tool_use",
+                blocks=[
+                    ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+                ],
+            )
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    class _Bgm:
+        def search(self, **kwargs):
+            return [{"id": 1, "name": "result"}]
+
+        def get_subject(self, sid):
+            return {"name": f"s-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    bgm = _Bgm()
+    sched = LlmMatchScheduler()
+    monkeypatch.setattr(sched, "_build_bgm", lambda s: bgm)
+
+    reg = get_tool_registry()
+    # 先注册只读工具，使 execute_batch 能正常执行 handler
+    from app.services.llm.tools import ToolDefinition
+
+    def _search_handler(args):
+        return [{"id": 1, "name": "result"}]
+
+    reg.register(
+        ToolDefinition(
+            name="search_bangumi",
+            description="search",
+            parameters={"type": "object", "properties": {}},
+            handler=_search_handler,
+            access="read",
+        ),
+        quiet=True,
+    )
+
+    eb_calls = {"n": 0}
+
+    async def _eb(tool_calls, *, recorder=None):
+        """模拟 execute_batch：写 tool_execute span（同真实实现），首次调用抛错。"""
+        eb_calls["n"] += 1
+        if eb_calls["n"] == 1:
+            # 崩溃前仍写 span（模拟崩溃发生在 tool 执行期间）
+            if recorder is not None:
+                for i, tc in enumerate(tool_calls):
+                    sid = recorder.start_tool(tc, sequence=i)
+                    recorder.end_tool(sid, error="crash")
+            raise RuntimeError(f"crash #{eb_calls['n']}")
+        # 成功路径：写 span 并返回结果
+        results = {}
+        for i, tc in enumerate(tool_calls):
+            sid = recorder.start_tool(tc, sequence=i) if recorder else None
+            blk = ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
+            results[tc.id] = blk
+            if sid is not None:
+                recorder.end_tool(sid, result=blk)
+        return results
+
+    monkeypatch.setattr(reg, "execute_batch", _eb)
+
+    # 第一次 run → 崩溃
+    await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+    # 第一次恢复（完成对话）
+    await sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr)
+
+    # 验证第一次恢复后状态：chat span iteration 无撞号
+    steps_after_first = database_manager.agent_runs.get_steps(run_id)
+    chat_steps_after_first = sorted(
+        [s for s in steps_after_first if s["name"] == "llm_chat"],
+        key=lambda s: s["id"],
+    )
+    chat_iters_after_first = [s["iteration"] for s in chat_steps_after_first]
+    assert len(chat_iters_after_first) == len(set(chat_iters_after_first)), (
+        f"第一次恢复后 chat span iteration 存在撞号：{chat_iters_after_first}"
+    )
+
+    # 模拟二次崩溃：改回 processing
+    database_manager.agent_runs.update_run_status(run_id, "processing")
+
+    # 第二次恢复（应直接 mark_no_suggestion，无额外 LLM 调用）
+    await sched._continue_replay({"run_id": run_id, "sync_record_id": sr_id}, sr)
+
+    # 验证：LLM 调用次数 = 2（首次 + 第一次恢复），第二次恢复无额外调用
+    assert chat_calls["n"] == 2, (
+        f"期望累计 2 次 LLM 调用（第二次恢复不应额外调 LLM），实际 {chat_calls['n']}"
+    )
+
+    # 验证：所有 chat span iteration 互不相同（无撞号）
+    steps_final = database_manager.agent_runs.get_steps(run_id)
+    chat_steps_final = sorted(
+        [s for s in steps_final if s["name"] == "llm_chat"],
+        key=lambda s: s["id"],
+    )
+    chat_iters_final = [s["iteration"] for s in chat_steps_final]
+    assert len(chat_iters_final) == len(set(chat_iters_final)), (
+        f"最终 chat span iteration 存在撞号：{chat_iters_final}"
+    )
+
+    # 验证：二次 replay 不再判缺失（replay 自包含）
+    rr_final = real_replay(run_id)
+    assert len(rr_final.missing_tool_calls) == 0, (
+        f"二次 replay 不应再判缺失，实际 missing={rr_final.missing_tool_calls}"
     )

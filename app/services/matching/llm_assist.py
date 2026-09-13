@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import functools
 import json
+import time
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Callable
@@ -334,11 +335,15 @@ class TraceRecorder:
     """
 
     def __init__(
-        self, run_id: str, *, clock: Callable[[], float] | None = None
+        self,
+        run_id: str,
+        *,
+        start_iteration: int,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self.run_id = run_id
         self._clock = clock or _default_clock
-        self._next_iteration: int = 0
+        self._next_iteration: int = start_iteration
         # 当前轮的 iteration（wrap_chat_fn 开始时设定，start_tool / record_budget 读取）
         self._current_iteration: int = 0
         self._chat_span_id: str | None = None
@@ -482,6 +487,18 @@ class TraceRecorder:
             status="ok",
             replay_delta={"seed_messages": seed_delta},
         )
+
+    # -- 恢复续跑锚定 ------------------------------------------------------
+
+    def begin_replayed_round(self, iteration: int) -> None:
+        """锚定到指定轮次，供恢复路径补执行缺失工具落 span 使用。
+
+        将 ``_current_iteration`` 设为 ``iteration``，并使 ``_next_iteration``
+        落后于该值（保证后续 ``wrap_chat_fn`` 推进到 ``iteration`` 的下一个值）。
+        """
+        self._current_iteration = iteration
+        self._next_iteration = iteration
+        self._last_tool_span_id = None
 
     # -- budget 钩子 -------------------------------------------------------
 
@@ -644,13 +661,14 @@ def _persist_llm_candidate(
             candidate_id = cur.lastrowid
 
         # 同一事务内更新 agent_runs 为 succeeded（F6 原子）
+        # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致
         conn.execute(
             "UPDATE agent_runs SET status='succeeded', stop_reason=?, "
             "total_tokens=?, ended_at=? WHERE run_id=?",
             (
                 stop_reason,
                 total_tokens,
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                int(time.time()),
                 run_id,
             ),
         )
@@ -796,7 +814,7 @@ async def run(
     seed = build_seed_messages(sync_record, candidates, DEFAULT_SYSTEM_TEMPLATE)
 
     if span_recorder is None:
-        span_recorder = TraceRecorder(run_id)
+        span_recorder = TraceRecorder(run_id, start_iteration=0)
 
     # F5：config_override 优先（[sync] llm_match_max_iterations 显式整体覆盖
     # > thinking_level 策略映射 > 默认兜底）。调度器负责把 thinking_level 透传进来，

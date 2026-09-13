@@ -242,15 +242,6 @@ class LlmMatchScheduler(BaseScheduler):
                     return
 
                 # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
-                bgm = self._build_bgm(sync_record)
-                registry = get_tool_registry()
-                # 先确保工具已注册（恢复路径可能尚未在正常路径注册过），否则补执行时
-                # registry.get 找不到工具；同时注册后才能拿到 tools_schemas 供 loop 续跑。
-                llm_assist_module.register_match_tools(registry, bgm)
-                for tc in replay_result.missing_tool_calls:
-                    await self._replay_missing_tool(
-                        tc, registry, replay_result.messages
-                    )
                 # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
                 remaining = max(0, remaining - 1)
                 if remaining <= 0:
@@ -260,10 +251,35 @@ class LlmMatchScheduler(BaseScheduler):
                     )
                     repo.mark_no_suggestion(run_id, stop_reason="exhausted")
                     return
+
+                bgm = self._build_bgm(sync_record)
+                registry = get_tool_registry()
+                # 先确保工具已注册（恢复路径可能尚未在正常路径注册过），否则补执行时
+                # registry.get 找不到工具；同时注册后才能拿到 tools_schemas 供 loop 续跑。
                 defns = llm_assist_module.register_match_tools(registry, bgm)
                 tools_schemas = [d.to_schema() for d in defns]
-                # 注：register_match_tools 已在补执行前调用过，此处再调用为幂等刷新
-                span_recorder = llm_assist_module.TraceRecorder(run_id)
+
+                # 创建 recorder 并锚定到正确轮次：
+                # last_response 非 None → 既有 chat 在 executed_iterations，
+                # 补执行 tool span 同轮；续跑 chat 从 executed_iterations+1 开始。
+                span_recorder = llm_assist_module.TraceRecorder(
+                    run_id, start_iteration=replay_result.executed_iterations
+                )
+                span_recorder.begin_replayed_round(replay_result.executed_iterations)
+                # 补执行缺失工具并落 tool_execute span（二次 replay 不再判缺失）
+                seq = 0
+                for tc in replay_result.missing_tool_calls:
+                    await self._replay_missing_tool(
+                        tc,
+                        registry,
+                        replay_result.messages,
+                        span_recorder=span_recorder,
+                        sequence=seq,
+                    )
+                    seq += 1
+                # 推进 _next_iteration 使续跑 chat span 不与 tool span / 旧 chat 撞号
+                span_recorder._next_iteration = replay_result.executed_iterations + 1
+
                 wrapped_chat_fn = span_recorder.wrap_chat_fn(
                     llm_assist_module._build_default_chat_fn(thinking_level)
                 )
@@ -295,12 +311,28 @@ class LlmMatchScheduler(BaseScheduler):
             defns = llm_assist_module.register_match_tools(registry, bgm)
             tools_schemas = [d.to_schema() for d in defns]
 
-            # 缺失工具补执行（仅 readonly，写/终止性工具在续跑 loop 中自然触发）
-            for tc in replay_result.missing_tool_calls:
-                await self._replay_missing_tool(tc, registry, replay_result.messages)
+            # 创建 recorder 并锚定：executed_iterations 为下一轮起始
+            start_iter = replay_result.executed_iterations
+            span_recorder = llm_assist_module.TraceRecorder(
+                run_id, start_iteration=start_iter
+            )
+            # 缺失工具补执行并落 tool_execute span
+            if replay_result.missing_tool_calls:
+                span_recorder.begin_replayed_round(replay_result.executed_iterations)
+                seq = 0
+                for tc in replay_result.missing_tool_calls:
+                    await self._replay_missing_tool(
+                        tc,
+                        registry,
+                        replay_result.messages,
+                        span_recorder=span_recorder,
+                        sequence=seq,
+                    )
+                    seq += 1
+                # 推进 _next_iteration 使续跑 chat span 不与 tool span 撞号
+                span_recorder._next_iteration = replay_result.executed_iterations + 1
 
             # 续跑 loop（从 replay 重建消息续跑）
-            span_recorder = llm_assist_module.TraceRecorder(run_id)
             wrapped_chat_fn = span_recorder.wrap_chat_fn(
                 llm_assist_module._build_default_chat_fn(thinking_level)
             )
@@ -329,7 +361,13 @@ class LlmMatchScheduler(BaseScheduler):
             repo.increment_attempts(run_id)
 
     async def _replay_missing_tool(
-        self, tool_call: dict, registry, messages: list
+        self,
+        tool_call: dict,
+        registry,
+        messages: list,
+        *,
+        span_recorder=None,
+        sequence: int = 0,
     ) -> None:
         """补执行单条缺失的只读工具调用（readonly 校验）。
 
@@ -340,6 +378,10 @@ class LlmMatchScheduler(BaseScheduler):
         G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
         tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
         真实调用留给续跑 loop 自然触发。
+
+        当 ``span_recorder`` 不为 None 时，为每条缺失工具写 ``tool_execute`` span
+        （iteration 由调用方通过 ``begin_replayed_round`` 锚定），保证二次 replay
+        不再判缺失（replay 自包含）。
         """
         name = (tool_call or {}).get("name")
         if not name:
@@ -347,11 +389,32 @@ class LlmMatchScheduler(BaseScheduler):
         args = (tool_call or {}).get("input") or {}
         tool_use_id = (tool_call or {}).get("id", "")
         defn = registry.get(name)
+
+        # 落 tool_execute span（如果提供了 recorder）
+        tool_use_block = None
+        span_id = None
+        if span_recorder is not None:
+            from app.services.llm.models import ToolUseBlock
+
+            tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
+            span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
+
         if defn is None or defn.access != "read":
             logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
             self._append_tool_result(
                 messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
             )
+            if span_id is not None:
+                from app.services.llm.models import ToolResultBlock
+
+                span_recorder.end_tool(
+                    span_id,
+                    result=ToolResultBlock(
+                        tool_use_id=tool_use_id,
+                        content=_SKIP_PLACEHOLDER_CONTENT,
+                        is_error=False,
+                    ),
+                )
             return
         try:
             result = await registry.execute(name, args)
@@ -362,6 +425,15 @@ class LlmMatchScheduler(BaseScheduler):
             content = f"工具执行失败: {type(e).__name__}"
             is_error = True
         self._append_tool_result(messages, tool_use_id, content, is_error=is_error)
+        if span_id is not None:
+            from app.services.llm.models import ToolResultBlock
+
+            span_recorder.end_tool(
+                span_id,
+                result=ToolResultBlock(
+                    tool_use_id=tool_use_id, content=content, is_error=is_error
+                ),
+            )
 
     @staticmethod
     def _append_tool_result(

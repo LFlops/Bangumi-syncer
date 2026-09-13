@@ -1230,7 +1230,7 @@ def test_trace_recorder_wrap_chat_fn_tracks_iteration():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test")
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
     async def dummy_chat(messages, *, tools=None, tool_choice=None):
         return ChatResponse(
@@ -1277,7 +1277,7 @@ def test_trace_recorder_tool_start_end_idempotent():
     def fake_end(span_id, **kwargs):
         ends.append(span_id)
 
-    recorder = llm_assist.TraceRecorder("run-test")
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
     tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
 
     # 模拟 chat 已发生（设置 chat_span_id）
@@ -1321,10 +1321,9 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
     def fake_budget(span_id, budget_message):
         budget_targets.append(span_id)
 
-    recorder = llm_assist.TraceRecorder("run-test")
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=1)
     # 仅有 chat span，无 tool span
     recorder._chat_span_id = "span-llm_chat-0"
-    recorder._next_iteration = 1
 
     with (
         patch.object(llm_assist, "trace_start_span", side_effect=fake_start),
@@ -1360,7 +1359,7 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test")
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
     # chat_fn 返回含 tool_calls 的响应 → 模拟工具执行后调用 start_tool
     async def dummy_chat(messages, *, tools=None, tool_choice=None):
@@ -1434,7 +1433,7 @@ def test_wrap_chat_fn_exception_propagates_original():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test")
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
     async def exploding_chat(messages, *, tools=None, tool_choice=None):
         raise ValueError("boom")
@@ -1462,3 +1461,141 @@ def test_build_default_chat_fn_requires_thinking_level():
     """P1：_build_default_chat_fn 不传 thinking_level 应抛 TypeError。"""
     with pytest.raises(TypeError):
         llm_assist._build_default_chat_fn()
+
+
+# ---------------------------------------------------------------------------
+# P1-a：_persist_llm_candidate ended_at 必须为 epoch 整数（与 mark_succeeded 一致）
+# ---------------------------------------------------------------------------
+
+
+def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
+    """P1-a：_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数。"""
+    import time
+
+    run_id = "run-ended-at"
+    sr_id = 300
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    database_manager.log_pending_candidate(
+        request_title=f"rule-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+    llm_assist.ensure_llm_columns(database_manager)
+
+    before = int(time.time())
+    llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+    after = int(time.time())
+
+    run_row = database_manager.agent_runs.get_run(run_id)
+    ended_at = run_row["ended_at"]
+    # 断言 ended_at 为 int 且 > 0
+    assert isinstance(ended_at, int), f"ended_at 应为 int，实际 {type(ended_at)}"
+    assert ended_at > 0, "ended_at 应 > 0"
+    assert before <= ended_at <= after + 1, (
+        f"ended_at 应在 [{before}, {after}+1] 范围内，实际 {ended_at}"
+    )
+
+    # 断言 _iso_from_epoch 返回非 None（可解析为 ISO 字符串）
+    from app.api.agent_runs import _iso_from_epoch
+
+    iso = _iso_from_epoch(ended_at)
+    assert iso is not None, "_iso_from_epoch(ended_at) 应返回非 None"
+
+    # 断言 SQLite typeof(ended_at)='integer'
+    conn = database_manager._connection._conn
+    cur = conn.execute(
+        "SELECT typeof(ended_at) FROM agent_runs WHERE run_id=?", (run_id,)
+    )
+    row = cur.fetchone()
+    assert row[0] == "integer", f"SQLite typeof(ended_at) 应为 'integer'，实际 {row[0]}"
+
+
+# ---------------------------------------------------------------------------
+# P1-b：TraceRecorder 增加必填 start_iteration 构造参数
+# ---------------------------------------------------------------------------
+
+
+def test_trace_recorder_requires_start_iteration():
+    """P1-b：TraceRecorder 构造函数要求必填 start_iteration（不得有默认值）。"""
+    import inspect
+
+    sig = inspect.signature(llm_assist.TraceRecorder.__init__)
+    param = sig.parameters.get("start_iteration")
+    assert param is not None, "TraceRecorder.__init__ 应有 start_iteration 参数"
+    assert param.default is inspect.Parameter.empty, (
+        "start_iteration 不得有默认值（必须显式传入）"
+    )
+
+
+def test_trace_recorder_start_iteration_affects_first_chat_iteration():
+    """P1-b：start_iteration=N → 首轮 chat span iteration=N。"""
+    import asyncio
+    from unittest.mock import patch
+
+    from app.services.llm.models import Message
+
+    starts = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        starts.append({"name": name, "iteration": iteration, "sequence": sequence})
+        return f"span-{name}-{iteration}-{sequence}"
+
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=5)
+
+    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+        return ChatResponse(content="", stop_reason="end_turn", blocks=[], model="m")
+
+    wrapped = recorder.wrap_chat_fn(dummy_chat)
+
+    with patch.object(llm_assist, "trace_start_span", side_effect=fake_start):
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+    chat_starts = [s for s in starts if s["name"] == "llm_chat"]
+    assert len(chat_starts) == 1
+    assert chat_starts[0]["iteration"] == 5, (
+        f"首轮 chat iteration 应等于 start_iteration=5，实际 {chat_starts[0]['iteration']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P1-c：TraceRecorder.begin_replayed_round 锚定到指定轮次
+# ---------------------------------------------------------------------------
+
+
+def test_trace_recorder_begin_replayed_round_sets_current_iteration():
+    """P1-c：begin_replayed_round(N) 后 start_tool 的 iteration=N。"""
+    from unittest.mock import patch
+
+    from app.services.llm.models import ToolUseBlock
+
+    starts = []
+
+    def fake_start(run_id, name, iteration, sequence, parent_id=""):
+        starts.append({"name": name, "iteration": iteration, "sequence": sequence})
+        return f"span-{name}-{iteration}-{sequence}"
+
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=3)
+    recorder.begin_replayed_round(7)
+
+    tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+    with patch.object(llm_assist, "trace_start_span", side_effect=fake_start):
+        recorder.start_tool(tc, sequence=0)
+
+    tool_starts = [s for s in starts if s["name"] == "tool_execute"]
+    assert len(tool_starts) == 1
+    assert tool_starts[0]["iteration"] == 7, (
+        f"begin_replayed_round(7) 后 tool iteration 应为 7，实际 {tool_starts[0]['iteration']}"
+    )
