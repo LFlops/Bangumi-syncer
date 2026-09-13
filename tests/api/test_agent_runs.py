@@ -13,6 +13,7 @@ Agent 追踪 API 测试
 """
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -124,19 +125,25 @@ async def test_get_agent_run_owner_allowed_200(app, mock_db):
 
     assert resp.status_code == 200
     data = resp.json()
-    assert data == {
-        "status": "succeeded",
-        "stop_reason": "submit_suggestion",
-        "task_type": "match",
-        "sync_record_id": 42,
-        "attempts": 1,
-        "total_attempts": 1,
-        "total_tokens": 1234,
-        "started_at": "2024-01-01T08:00:00+08:00",
-        "ended_at": "2024-01-01T08:01:00+08:00",
-        "created_at": "2024-01-01T08:00:00+08:00",
-        "last_error": "boom",
-    }
+    # 非时间字段精确相等
+    assert data["status"] == "succeeded"
+    assert data["stop_reason"] == "submit_suggestion"
+    assert data["task_type"] == "match"
+    assert data["sync_record_id"] == 42
+    assert data["attempts"] == 1
+    assert data["total_attempts"] == 1
+    assert data["total_tokens"] == 1234
+    assert data["last_error"] == "boom"
+    # 时间字段：以固定 epoch 为地面真值，做时刻等价断言（与运行时区无关）
+    assert datetime.fromisoformat(data["started_at"]) == datetime.fromtimestamp(
+        1704067200, tz=timezone.utc
+    )
+    assert datetime.fromisoformat(data["ended_at"]) == datetime.fromtimestamp(
+        1704067260, tz=timezone.utc
+    )
+    assert datetime.fromisoformat(data["created_at"]) == datetime.fromtimestamp(
+        1704067200, tz=timezone.utc
+    )
     # 内部重放字段绝不可出现在观测 API 响应
     assert "payload_json" not in data
     assert "replay_delta" not in data
@@ -413,12 +420,16 @@ async def test_run_timestamps_epoch_to_iso(app, mock_db):
 
     assert resp.status_code == 200
     data = resp.json()
-    # ISO 格式断言：以数字开头、含 T、含时区偏移
+    # ISO 格式断言：含 T、含时区偏移
     assert "T" in data["started_at"]
     assert "+" in data["started_at"] or "Z" in data["started_at"]
-    # 固定 epoch → 固定 ISO（UTC+8 示例：2024-01-01T08:00:00+08:00）
-    assert data["started_at"].startswith("2024-01-01T08:00:00")
-    assert data["ended_at"].startswith("2024-01-01T08:01:00")
+    # 固定 epoch → 固定时刻（与运行时区无关）
+    assert datetime.fromisoformat(data["started_at"]) == datetime.fromtimestamp(
+        1704067200, tz=timezone.utc
+    )
+    assert datetime.fromisoformat(data["ended_at"]) == datetime.fromtimestamp(
+        1704067260, tz=timezone.utc
+    )
 
 
 async def test_run_timestamps_zero_or_none_returns_none(app, mock_db):
@@ -459,4 +470,10 @@ async def test_steps_timestamps_epoch_to_iso(app, mock_db):
     )
     s = steps[0]
     assert "T" in s["started_at"]
-    assert s["started_at"].startswith("2024-01-01T08:00:00")
+    # 固定 epoch → 固定时刻（与运行时区无关）
+    assert datetime.fromisoformat(s["started_at"]) == datetime.fromtimestamp(
+        1704067200, tz=timezone.utc
+    )
+    assert datetime.fromisoformat(s["ended_at"]) == datetime.fromtimestamp(
+        1704067201, tz=timezone.utc
+    )
