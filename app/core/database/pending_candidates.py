@@ -25,11 +25,16 @@ class PendingCandidatesRepository(BaseRepository):
         candidates: Optional[list[dict[str, Any]]] = None,
         trace: Optional[dict[str, Any]] = None,
         sync_record_id: Optional[int] = None,
+        business_key: str = "",
     ) -> Optional[int]:
         """沉淀一条待确认候选，返回记录 id（失败时 None）。
 
-        按 (request_title, request_season, user_name, source) 去重：
-        已有 pending 行时更新候选和 trace，否则插入新行。
+        去重策略：
+        - business_key 非空时，按 (business_key, status='pending') 查询/更新，
+          business_key 对齐 agent_runs 业务身份：(user_name, normalize(title), season)，
+          跨 source 共享同一 pending 行。
+        - business_key 为空时，保留旧 4 元组 (request_title, request_season, user_name, source)
+          去重行为（向后兼容既有测试与老数据）。
 
         sync_record_id：关联的 sync_records 行 id，用于候选确认后回写原记录状态。
         去重 UPDATE 时也会刷新为最新值（同一标题多次失败时以最新 sync_record 为准）。
@@ -42,15 +47,25 @@ class PendingCandidatesRepository(BaseRepository):
             )
             trace_json = json.dumps(trace, ensure_ascii=False) if trace else "{}"
 
-            # 先查是否已有 pending 行（按 title+season+user+source 去重）
-            cursor = conn.execute(
-                """
-                SELECT id FROM pending_candidates
-                WHERE request_title = ? AND request_season = ?
-                  AND user_name = ? AND source = ? AND status = 'pending'
-                """,
-                (request_title, request_season, user_name, source),
-            )
+            if business_key:
+                # 按 business_key 去重（跨 source 共享）
+                cursor = conn.execute(
+                    """
+                    SELECT id FROM pending_candidates
+                    WHERE business_key = ? AND status = 'pending'
+                    """,
+                    (business_key,),
+                )
+            else:
+                # business_key 为空：保留旧 4 元组去重
+                cursor = conn.execute(
+                    """
+                    SELECT id FROM pending_candidates
+                    WHERE request_title = ? AND request_season = ?
+                      AND user_name = ? AND source = ? AND status = 'pending'
+                    """,
+                    (request_title, request_season, user_name, source),
+                )
             row = cursor.fetchone()
 
             if row:
@@ -83,8 +98,9 @@ class PendingCandidatesRepository(BaseRepository):
                 INSERT INTO pending_candidates
                 (created_at, request_title, request_ori_title, request_season,
                  request_episode, user_name, source, candidates_json, trace_json,
-                 status, confirmed_subject_id, resolved_at, sync_record_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?)
+                 status, confirmed_subject_id, resolved_at, sync_record_id,
+                 business_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?)
                 """,
                 (
                     local_time,
@@ -97,6 +113,7 @@ class PendingCandidatesRepository(BaseRepository):
                     cand_json,
                     trace_json,
                     sync_record_id,
+                    business_key,
                 ),
             )
             return cursor.lastrowid
@@ -269,53 +286,93 @@ class PendingCandidatesRepository(BaseRepository):
         status: str,
         confirmed_subject_id: str = "",
         exclude_id: Optional[int] = None,
+        business_key: str = "",
     ) -> int:
         """批量更新同 key 的 pending 候选状态，返回受影响行数。
 
         用于 confirm_pending_candidate 后清理同标题的残留 pending 行。
+
+        策略：
+        - business_key 非空时按 business_key 批量更新（exclude_id 逻辑保留）；
+        - business_key 为空时保持旧 4 元组行为。
         """
 
         def _write(conn):
             local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if exclude_id is not None:
-                cursor = conn.execute(
-                    """
-                    UPDATE pending_candidates
-                    SET status = ?, confirmed_subject_id = ?, resolved_at = ?
-                    WHERE request_title = ? AND request_season = ?
-                      AND user_name = ? AND source = ?
-                      AND status = 'pending' AND id != ?
-                    """,
-                    (
-                        status,
-                        confirmed_subject_id,
-                        local_time,
-                        request_title,
-                        request_season,
-                        user_name,
-                        source,
-                        exclude_id,
-                    ),
-                )
+            if business_key:
+                # 按 business_key 批量更新
+                if exclude_id is not None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE pending_candidates
+                        SET status = ?, confirmed_subject_id = ?, resolved_at = ?
+                        WHERE business_key = ?
+                          AND status = 'pending' AND id != ?
+                        """,
+                        (
+                            status,
+                            confirmed_subject_id,
+                            local_time,
+                            business_key,
+                            exclude_id,
+                        ),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE pending_candidates
+                        SET status = ?, confirmed_subject_id = ?, resolved_at = ?
+                        WHERE business_key = ?
+                          AND status = 'pending'
+                        """,
+                        (
+                            status,
+                            confirmed_subject_id,
+                            local_time,
+                            business_key,
+                        ),
+                    )
             else:
-                cursor = conn.execute(
-                    """
-                    UPDATE pending_candidates
-                    SET status = ?, confirmed_subject_id = ?, resolved_at = ?
-                    WHERE request_title = ? AND request_season = ?
-                      AND user_name = ? AND source = ?
-                      AND status = 'pending'
-                    """,
-                    (
-                        status,
-                        confirmed_subject_id,
-                        local_time,
-                        request_title,
-                        request_season,
-                        user_name,
-                        source,
-                    ),
-                )
+                # business_key 为空：保留旧 4 元组行为
+                if exclude_id is not None:
+                    cursor = conn.execute(
+                        """
+                        UPDATE pending_candidates
+                        SET status = ?, confirmed_subject_id = ?, resolved_at = ?
+                        WHERE request_title = ? AND request_season = ?
+                          AND user_name = ? AND source = ?
+                          AND status = 'pending' AND id != ?
+                        """,
+                        (
+                            status,
+                            confirmed_subject_id,
+                            local_time,
+                            request_title,
+                            request_season,
+                            user_name,
+                            source,
+                            exclude_id,
+                        ),
+                    )
+                else:
+                    cursor = conn.execute(
+                        """
+                        UPDATE pending_candidates
+                        SET status = ?, confirmed_subject_id = ?, resolved_at = ?
+                        WHERE request_title = ? AND request_season = ?
+                          AND user_name = ? AND source = ?
+                          AND status = 'pending'
+                        """,
+                        (
+                            status,
+                            confirmed_subject_id,
+                            local_time,
+                            request_title,
+                            request_season,
+                            user_name,
+                            source,
+                        ),
+                    )
             return cursor.rowcount
 
         return self._run_write(_write, error_msg="批量更新待确认候选失败", default=0)

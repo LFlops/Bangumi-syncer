@@ -277,6 +277,18 @@ class DatabaseConnection:
             message="pending_candidates 已迁移：增加 llm_subject_id / llm_reason 列",
         )
 
+    def _ensure_pending_candidates_business_key(self, cursor) -> None:
+        """旧库迁移：为 pending_candidates 增加 business_key（业务身份去重用）。
+
+        对齐 agent_runs 的去重键语义：(user_name, normalize(title), season)。
+        """
+        self._ensure_columns(
+            cursor,
+            "pending_candidates",
+            [("business_key", "TEXT DEFAULT ''")],
+            message="pending_candidates 已迁移：增加 business_key 列",
+        )
+
     def _ensure_bangumi_accounts_private(self, cursor) -> None:
         """旧库迁移：为 bangumi_accounts 增加 private（收藏是否私有）。
 
@@ -583,11 +595,13 @@ class DatabaseConnection:
                 status TEXT DEFAULT 'pending',
                 confirmed_subject_id TEXT DEFAULT '',
                 resolved_at DATETIME,
-                sync_record_id INTEGER
+                sync_record_id INTEGER,
+                business_key TEXT DEFAULT ''
             )
         """)
         self._ensure_pending_candidates_sync_record_id(cursor)
         self._ensure_pending_candidates_llm_columns(cursor)
+        self._ensure_pending_candidates_business_key(cursor)
 
         # 待同步队列：Bangumi API 不可达时缓存已匹配的同步请求，API 恢复后补发
         cursor.execute("""
@@ -763,12 +777,15 @@ class DatabaseConnection:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_candidates_status ON pending_candidates(status)"
         )
-        # 部分唯一索引：同一 (title, season, user, source) 仅允许一个 pending 行，
-        # 用于 pending_candidates 去重（upsert 依赖此索引）
+        # 删除旧的 4 元组唯一索引（对齐 business_key 去重后废弃）
+        cursor.execute("DROP INDEX IF EXISTS idx_pending_candidates_dedup")
+        # 部分唯一索引：同一 business_key 仅允许一个 pending 行（空 key 不参与约束，
+        # 兼容老数据 / 手动沉淀）。去重键对齐 agent_runs 业务身份：
+        # (user_name, normalize(title), season)
         cursor.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_candidates_dedup "
-            "ON pending_candidates(request_title, request_season, user_name, source) "
-            "WHERE status = 'pending'"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_candidates_business_key_active "
+            "ON pending_candidates(business_key) "
+            "WHERE status = 'pending' AND business_key != ''"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_sync_queue_status ON pending_sync_queue(status)"

@@ -254,6 +254,7 @@ class DatabaseManager:
         candidates: Optional[list] = None,
         trace: Optional[dict] = None,
         sync_record_id: Optional[int] = None,
+        business_key: str = "",
     ) -> Optional[int]:
         """沉淀一条待确认候选"""
         return self._pending.log_pending_candidate(
@@ -266,6 +267,7 @@ class DatabaseManager:
             candidates=candidates,
             trace=trace,
             sync_record_id=sync_record_id,
+            business_key=business_key,
         )
 
     def get_pending_candidates(
@@ -315,6 +317,7 @@ class DatabaseManager:
         status: str,
         confirmed_subject_id: str = "",
         exclude_id: Optional[int] = None,
+        business_key: str = "",
     ) -> int:
         """批量更新同 key 的 pending 候选状态，返回受影响行数"""
         return self._pending.resolve_similar_pending_candidates(
@@ -325,6 +328,7 @@ class DatabaseManager:
             status=status,
             confirmed_subject_id=confirmed_subject_id,
             exclude_id=exclude_id,
+            business_key=business_key,
         )
 
     # ------------------------------------------------------------------
