@@ -645,7 +645,6 @@ class ConfigManager:
         - llm_match_cron (str, 默认 "*/1 * * * *")
         - llm_match_retention_days (int, 默认 30)
         - llm_match_max_iterations (str, 默认空=按 thinking_level 映射)
-        - llm_match_cross_call_cache (bool, 默认 false)
         - llm_match_recovery_timeout_s (int, 默认 120)
         - llm_match_thinking_level (str, 默认 "medium")
         """
@@ -676,9 +675,6 @@ class ConfigManager:
                 "sync", "llm_match_max_iterations", fallback=""
             )
             or "",
-            "llm_match_cross_call_cache": _to_bool(
-                self.get("sync", "llm_match_cross_call_cache", fallback=False), False
-            ),
             "llm_match_recovery_timeout_s": _to_int(
                 self.get("sync", "llm_match_recovery_timeout_s", fallback=120), 120
             ),

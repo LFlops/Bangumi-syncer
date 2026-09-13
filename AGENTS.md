@@ -98,3 +98,11 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **读改写路径失败时必须保留原值**：`SELECT→改→UPDATE` 的解析/解密失败分支必须原样保留 raw 并记 warning，禁止用空对象重建覆盖。反面案例：`record_budget_message` 解析失败以 `{}` 覆盖，丢 tool_result 致重放重执行写工具（P1）。
 - **测试名与断言一一对应**：测试名/docstring 声称的每个对象都必须在断言中出现；mock 场景无法产生的对象（如 end_turn 无 tool span）不得写进测试名。反面案例：`test_recovery_path_writes_chat_and_tool_spans` 实际只断言 chat span（判弱断言后重命名）。
 - **新增枚举型配置项必须复用归一化 helper**：读取枚举配置走单一归一化入口（`ConfigManager._normalize_thinking_level`），配大小写/空格/非法值参数化用例；消费侧禁止 `or "medium"` 冗余兜底。反面案例：`llm_match_thinking_level` 未归一化，`HIGH` 在 Anthropic 静默关闭思考（P1）。
+
+## 评审复盘沉淀（2026-09-13，LLM 匹配业务键与失败语义）
+
+圆桌验收高频问题与规避规则，规划与编码时直接遵守：
+
+- **去重/重试键必须用稳定业务键，禁止用每次新生成的记录 id 做历史匹配**：每次新生成的 `sync_record_id` 是单调递增的，用它查 `agent_runs` 做 dedup/requeue 永远 miss。反面案例：`_enqueue_match_assist_run` 用刚 INSERT 的 `sync_record_id` 查 `agent_runs` 决定在途/重入队，导致同一剧集反复新建 run、失败无法重入（P0）。正确做法：用 `business_key`（`{task_type}|{user}|{normalized_title}|{season}`）作为身份，来源（`source`/`retry-*`）不参与。
+- **外部依赖失败不得折叠为业务结论**：LLM client 重试耗尽返回空响应时，不得当作 `end_turn` 处理为 `no_suggestion`（丢失故障信号、误判为无建议）。反面案例：client 重试耗尽空响应 → 当作 `end_turn` → `no_suggestion`，后续调度器看不到失败、不再重试（P0）。正确做法：client 层抛 `LLMCallError(retryable=...)`，`llm_assist.run` 按 `retryable` 分流：`False` → 立即 `mark_failed(stop_reason='llm_error')`；`True` → `increment_attempts`，达 3 次转 `failed`。
+- **生产代码禁止跨层直接赋值私有属性**：调度器跨层直接写 `span_recorder._next_iteration = ...` 绕过公开方法，破坏封装且易在恢复路径遗漏同步。反面案例：scheduler `span_recorder._next_iteration = ...`，恢复续跑时 `begin_replayed_round` 已设 `_next_iteration = iteration + 1`，两侧不一致导致 tool span iteration 错乱（P1）。正确做法：所有状态推进走公开方法（`begin_replayed_round` / `wrap_chat_fn`），禁止外部直接赋值 `_` 前缀属性。

@@ -144,6 +144,14 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
 - 展示摘要（`display_json`）由 API 读取时从解密 `replay_delta` 截断生成，以 `...[shrinked]` 标记结尾（工具位于 `app/utils/truncate.py`）。
 - `record_budget_message` 读改写（SELECT → 解密 → 改 → 加密写回）非原子：若解密阶段成功但写回前崩溃，存在窄窗导致 budget_message 未并入（best-effort 局限，可接受）。
 
+### business_key 与去重语义
+
+`agent_runs` 与 `pending_candidates` 均含 `business_key` 列，用于在途去重与结果复用：
+
+- **`agent_runs.business_key`**：格式为 `"{task_type}|{user}|{normalized_title}|{season}"`。由 `enqueue_run_dedup` 决策：同键已有在途（`pending`/`processing`）则只刷新 `sync_record_id`（`in_flight`）；同键 `failed` 且 `total_attempts≤10` 则复用并置 `pending`（`requeued`）；同键 `succeeded`/`no_suggestion` 且 7 天内则只刷新 `sync_record_id`（`reused`）；其余新建。来源（`source` / `retry-*`）不参与身份。
+- **`pending_candidates.business_key`**：同一身份（归一化标题 + 季 + 用户）只保留一条 pending 候选；部分唯一索引 `WHERE status='pending'` 保证在途唯一。
+- 两表均在 `business_key` 上建有索引，支撑高频去重查询。
+
 ### FK 级联与索引
 
 ```sql

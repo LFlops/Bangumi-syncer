@@ -32,7 +32,7 @@ order: 30
 - **定时 Cron（llm_match_cron）**：LLM 匹配任务的调度表达式，默认 `*/1 * * * *`（每分钟一次）。保存后定时任务会热更新，无需重启。
 - **结果保留天数（llm_match_retention_days）**：LLM 匹配结果在数据库中保留天数，默认 30 天。
 - **最大迭代次数（llm_match_max_iterations）**：单次 LLM 匹配的最大循环轮次。留空（默认）时按思考开关自动映射（见下方）；填写正整数时显式覆盖。
-- **跨调用缓存（llm_match_cross_call_cache）**：同一剧集多次匹配时是否复用历史 LLM 结果，默认关闭。
+- **业务键去重（business_key）**：同一用户、同一剧集（归一化标题 + 季）只保留一个在途评估。已失败的 run 在 `total_attempts≤10` 时自动重入队（`total_attempts+1`）；`succeeded` / `no_suggestion` 7 天内复用结论不重复调用 LLM。来源（`source` / `retry-*`）不参与身份判定。
 - **恢复超时（llm_match_recovery_timeout_s）**：LLM 匹配恢复超时秒数，默认 120 秒。
 - **思考开关（llm_match_thinking_level）**：可选 `off` / `low` / `medium` / `high`，默认 `medium`。该字段同时控制两个维度：
   - **Agent 循环轮次**：`off`→1 / `low`→2 / `medium`→3 / `high`→5；若设置了 `llm_match_max_iterations` 则显式覆盖轮次上限。

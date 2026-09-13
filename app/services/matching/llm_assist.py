@@ -8,9 +8,8 @@
 
 事务：候选写入（pending_candidates 两列）与 agent_runs 状态更新在
 **单一数据库事务**内完成（``database_manager._execute_with_lock`` 包裹两条
-语句，异常即整体回滚）。注：llm_subject_id / llm_reason 两列通过幂等
-``ALTER TABLE ... ADD COLUMN IF NOT EXISTS`` 在事务内按需补齐（避免触碰
-connection.py schema 迁移，保持本任务文件自包含）。
+语句，异常即整体回滚）。注：llm_subject_id / llm_reason 两列由
+``connection.py`` 建库期迁移保证存在，本服务层不再自行补列。
 """
 
 from __future__ import annotations
@@ -524,37 +523,6 @@ def _input_summary(inp: dict) -> str:
 # ---------------------------------------------------------------------------
 # 落库（单一事务）
 # ---------------------------------------------------------------------------
-
-# pending_candidates 新增列（按需补齐，idempotent）
-_LLM_COLUMNS = [
-    ("llm_subject_id", "TEXT DEFAULT ''"),
-    ("llm_reason", "TEXT DEFAULT ''"),
-]
-
-
-def _ensure_llm_columns(conn) -> None:
-    """幂等补齐 pending_candidates 的 llm 两列（SQLite 3.35+ 支持 ADD IF NOT EXISTS）。"""
-    for col, ddl in _LLM_COLUMNS:
-        try:
-            conn.execute(f"ALTER TABLE pending_candidates ADD COLUMN {col} {ddl}")
-        except Exception as e:
-            # 列已存在（duplicate column）等情况：忽略（记录 debug 日志便于排查）
-            logger.debug(f"[llm_assist] pending_candidates 补列跳过（列已存在？）: {e}")
-
-
-def ensure_llm_columns(dbm) -> None:
-    """在独立事务中补齐 pending_candidates 的 llm 两列（幂等、仅一次生效）。
-
-    由于 connection.py 的 schema 迁移尚未纳入本任务，这里在场景服务层
-    自行补足，保证写入与读取 llm 两列前列已存在。
-    """
-
-    def _w(conn):
-        _ensure_llm_columns(conn)
-
-    dbm._execute_with_lock(_w)
-
-
 def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
     """事务外预取 Bangumi 条目名称（F8：避免事务内发起 HTTP 调用）。
 
@@ -593,8 +561,6 @@ def _persist_llm_candidate(
     """
 
     def _write(conn):
-        _ensure_llm_columns(conn)
-
         # 找既有行（优先 pending，其次任意状态，按 id 倒序）
         row = conn.execute(
             "SELECT id, candidates_json FROM pending_candidates "
@@ -803,9 +769,6 @@ async def run(
     # 原子抢占（F3）：失败表示已被其它调度器处理
     if not dbm.agent_runs.atomic_claim(run_id):
         return "skipped"
-
-    # 补齐 pending_candidates 的 llm 两列（幂等，保证后续写入/读取可用）
-    ensure_llm_columns(dbm)
 
     registry = get_tool_registry()
     defns = register_match_tools(registry, bgm)

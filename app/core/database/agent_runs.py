@@ -8,8 +8,7 @@
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - mark_applied / mark_rejected：仅当 status='succeeded' 可流转（WHERE 守卫）
 - increment_attempts：调度轮次失败计数，>=3 转 failed
-- requeue_failed：total_attempts<=10 才重置入队，>10 拒绝
-- cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps）
+ - cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps）
 """
 
 import json
@@ -418,38 +417,8 @@ class AgentRunsRepository(BaseRepository):
         )
 
     # ------------------------------------------------------------------
-    # 重新入队与清理
+    # 清理
     # ------------------------------------------------------------------
-
-    def requeue_failed(self, run_id: str) -> bool:
-        """失败会话重新入队：total_attempts<=10 时重置 attempts 并 +1 total_attempts。
-
-        >10（即已 11 次）拒绝再入队，返回 False；否则返回 True。
-        """
-
-        def _write(conn):
-            row = conn.execute(
-                "SELECT total_attempts FROM agent_runs WHERE run_id=?", (run_id,)
-            ).fetchone()
-            if not row:
-                return False
-            if row[0] > 10:
-                return False
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='pending', attempts=0, total_attempts=total_attempts + 1,
-                    created_at=?, last_attempt_at=?, started_at=NULL,
-                    ended_at=NULL, last_error=''
-                WHERE run_id=?
-                """,
-                (_now(), _now(), run_id),
-            )
-            return cursor.rowcount > 0
-
-        return self._run_write(
-            _write, error_msg="重新入队 agent_run 失败", default=False
-        )
 
     def cleanup_expired(self, retention_days: int) -> int:
         """按滑动窗口轮转清理过期 runs（单条 DELETE，FK 级联删 steps）。
@@ -551,26 +520,6 @@ class AgentRunsRepository(BaseRepository):
             return dict(zip(cols, row))
 
         return self._run_read(_read, error_msg="查询最新 agent_run 失败", default=None)
-
-    def find_failed_by_sync_record(self, sync_record_id: int) -> Optional[dict]:
-        """按 sync_record_id 查最近一条 failed 会话（重新入队用）"""
-
-        def _read(conn):
-            cursor = conn.execute(
-                """
-                SELECT * FROM agent_runs
-                WHERE sync_record_id=? AND status='failed'
-                ORDER BY id DESC LIMIT 1
-                """,
-                (sync_record_id,),
-            )
-            row = cursor.fetchone()
-            if not row:
-                return None
-            cols = [d[0] for d in cursor.description]
-            return dict(zip(cols, row))
-
-        return self._run_read(_read, error_msg="查询失败 agent_run 失败", default=None)
 
     def list_pending(self, limit: int = 50) -> list:
         """列出 pending 会话（供调度器拾取），按 id 升序"""

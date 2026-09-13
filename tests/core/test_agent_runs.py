@@ -1,15 +1,15 @@
 """agent_runs / agent_steps 表与 repository 测试
 
-验证 T7 的核心行为：
+ 验证的核心行为：
 1. 建表：agent_runs / agent_steps 表与索引存在；status 枚举不含 exhausted
 2. create_pending / atomic_claim（双调度器竞争）
 3. mark_succeeded / mark_applied / mark_rejected 守卫（仅 succeeded 可 applied/rejected）
 4. increment_attempts 到 3 置 failed
 5. 去重查询 find_active_by_sync_record（pending/processing/succeeded/no_suggestion 命中；超保留期 no_suggestion 不命中）
-6. requeue_failed（total_attempts<=10 重置；>10 拒绝）
-7. cleanup_terminal（先删 steps 再删 runs，无孤儿 steps）
-8. get_steps 按 (iteration, sequence) 排序
-9. list_pending / list_stale_processing / find_failed_by_sync_record 辅助
+6. cleanup_terminal（先删 steps 再删 runs，无孤儿 steps）
+7. get_steps 按 (iteration, sequence) 排序
+8. list_pending / list_stale_processing 辅助
+9. enqueue_run_dedup 业务键去重/重入队/结果复用
 """
 
 import sqlite3
@@ -250,65 +250,6 @@ class TestFindActiveBySyncRecord:
             # 把 ended_at 改到远早于保留期（epoch 秒整数，2000-01-01）
             _set_status(dbm, "dnx", "no_suggestion", ended_at=946684800)
             assert dbm.agent_runs.find_active_by_sync_record(201) is None
-        finally:
-            dbm._connection._conn.close()
-
-
-class TestRequeueFailed:
-    """requeue_failed：total_attempts<=10 重置成功；>10 拒绝"""
-
-    def test_requeue_resets_attempts(self, tmp_path):
-        dbm = _make_db(tmp_path)
-        try:
-            dbm.agent_runs.create_pending("rq", "match", 1)
-            dbm.agent_runs.mark_failed("rq", "failed", "err", 0)
-            assert dbm.agent_runs.get_run("rq")["status"] == "failed"
-            assert dbm.agent_runs.get_run("rq")["total_attempts"] == 0
-
-            assert dbm.agent_runs.requeue_failed("rq") is True
-            run = dbm.agent_runs.get_run("rq")
-            assert run["status"] == "pending"
-            assert run["attempts"] == 0
-            assert run["total_attempts"] == 1
-        finally:
-            dbm._connection._conn.close()
-
-    def test_requeue_rejects_when_total_attempts_exceeded(self, tmp_path):
-        dbm = _make_db(tmp_path)
-        try:
-            dbm.agent_runs.create_pending("rq2", "match", 1)
-            dbm.agent_runs.mark_failed("rq2", "failed", "err", 0)
-            conn = dbm._connection._conn
-            # 边界：total_attempts=10 仍允许（→ 11）
-            conn.execute(
-                "UPDATE agent_runs SET total_attempts=10, status='failed', attempts=5 WHERE run_id=?",
-                ("rq2",),
-            )
-            conn.commit()
-            assert dbm.agent_runs.requeue_failed("rq2") is True
-            assert dbm.agent_runs.get_run("rq2")["total_attempts"] == 11
-            assert dbm.agent_runs.get_run("rq2")["status"] == "pending"
-
-            # 再次失败 → total_attempts=11 → 拒绝再入队
-            dbm.agent_runs.mark_failed("rq2", "failed", "err", 0)
-            assert dbm.agent_runs.requeue_failed("rq2") is False
-            assert dbm.agent_runs.get_run("rq2")["status"] == "failed"
-            assert dbm.agent_runs.get_run("rq2")["total_attempts"] == 11
-        finally:
-            dbm._connection._conn.close()
-
-
-class TestFindFailedBySyncRecord:
-    def test_returns_failed_row_with_total_attempts(self, tmp_path):
-        dbm = _make_db(tmp_path)
-        try:
-            dbm.agent_runs.create_pending("ff", "match", 999)
-            dbm.agent_runs.mark_failed("ff", "failed", "boom", 7)
-            row = dbm.agent_runs.find_failed_by_sync_record(999)
-            assert row is not None
-            assert row["status"] == "failed"
-            assert row["total_attempts"] == 0
-            assert row["last_error"] == "boom"
         finally:
             dbm._connection._conn.close()
 

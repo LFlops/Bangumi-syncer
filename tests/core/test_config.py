@@ -445,7 +445,6 @@ class TestSyncLlmMatchConfig:
             "llm_match_cron": "*/1 * * * *",
             "llm_match_retention_days": 30,
             "llm_match_max_iterations": "",
-            "llm_match_cross_call_cache": False,
             "llm_match_recovery_timeout_s": 120,
             "llm_match_thinking_level": "medium",
         }
@@ -458,7 +457,6 @@ llm_match_assist = true
 llm_match_cron = 0 */2 * * *
 llm_match_retention_days = 30
 llm_match_max_iterations = 5
-llm_match_cross_call_cache = yes
 llm_match_recovery_timeout_s = 300
 llm_match_thinking_level = high
 """
@@ -469,7 +467,6 @@ llm_match_thinking_level = high
         assert cfg["llm_match_retention_days"] == 30
         # 数字字符串经 get() 协程为 int（与 get_max_iterations 的 config_override 类型一致）
         assert cfg["llm_match_max_iterations"] == 5
-        assert cfg["llm_match_cross_call_cache"] is True
         assert cfg["llm_match_recovery_timeout_s"] == 300
         assert cfg["llm_match_thinking_level"] == "high"
 

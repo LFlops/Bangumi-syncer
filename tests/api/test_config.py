@@ -1053,7 +1053,6 @@ async def test_get_sync_config_llm_available_false_when_llm_not_configured(
         "llm_match_cron": "*/1 * * * *",
         "llm_match_retention_days": 7,
         "llm_match_max_iterations": "",
-        "llm_match_cross_call_cache": False,
         "llm_match_recovery_timeout_s": 120,
         "llm_match_thinking_level": "medium",
     }
@@ -1068,12 +1067,11 @@ async def test_get_sync_config_llm_available_false_when_llm_not_configured(
     data = response.json()["data"]
     assert data["llm_available"] is False
     assert data["llm_api_key_masked"] == ""
-    # 七键默认值透出
+    # 六键默认值透出
     assert data["llm_match_assist"] is False
     assert data["llm_match_cron"] == "*/1 * * * *"
     assert data["llm_match_retention_days"] == 7
     assert data["llm_match_max_iterations"] == ""
-    assert data["llm_match_cross_call_cache"] is False
     assert data["llm_match_recovery_timeout_s"] == 120
     assert data["llm_match_thinking_level"] == "medium"
 
@@ -1088,7 +1086,6 @@ async def test_get_sync_config_llm_available_true_when_llm_configured(
         "llm_match_cron": "*/1 * * * *",
         "llm_match_retention_days": 7,
         "llm_match_max_iterations": "",
-        "llm_match_cross_call_cache": False,
         "llm_match_recovery_timeout_s": 120,
         "llm_match_thinking_level": "medium",
     }
