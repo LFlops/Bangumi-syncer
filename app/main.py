@@ -256,6 +256,25 @@ for _mcp_route in mcp_app.routes:
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# FastMCP 中间件迁移
+# /mcp 端点的 RequireAuthMiddleware 只检查 scope["user"]，而该值由
+# AuthenticationMiddleware(BearerAuthBackend(provider)) 写入；此外
+# AuthContextMiddleware 写入 contextvar 供 get_access_token 读取，
+# RequestContextMiddleware 写入当前 HTTP request contextvar。
+# 这些中间件存在于 mcp_app.user_middleware，随路由摊平会被丢弃，
+# 导致携带合法 Bearer 仍永远 401 invalid_token，故需迁移到主 app。
+#
+# Starlette user_middleware[0] 为最外层；FastAPI add_middleware 为
+# insert(0)（后加者更外层），因此需 reversed 迭代，保持相对顺序。
+# 对普通 HTTP 路由影响：# AuthenticationMiddleware 仅尝试解析 Bearer
+# 并写入 scope["user"]，无效/缺失时不拦截；AuthContextMiddleware 仅
+# 在存在 AuthenticatedUser 时设置 contextvar。两者均为无副作用包装。
+# ─────────────────────────────────────────────────────────────────────────
+for _mcp_mw in reversed(mcp_app.user_middleware):
+    app.add_middleware(_mcp_mw.cls, **_mcp_mw.kwargs)
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # CSP 响应头（纵深防御，限制外域资源加载 + 禁用内联事件外的脚本注入）
 # ─────────────────────────────────────────────────────────────────────────
 # 现状：base.html 含内联防闪烁脚本，需保留 'unsafe-inline'
