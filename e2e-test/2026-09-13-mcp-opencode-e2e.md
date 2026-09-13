@@ -82,11 +82,14 @@ curl -X POST http://localhost:18000/Emby -H 'Content-Type: application/json' -d 
 | --- | --- | --- | --- | --- | --- | --- |
 | 142 | emby | emby-e2e | 藤本タツキ17-26 | 1/1 | error | Bangumi API 认证失败: access_token可能已过期或无效，请更新token |
 
-**结论**：
+**结论（2026-09-13 23:02 复测后更新）**：
 
 - ✅ **Webhook → 权限校验 → 标题匹配 → Bangumi API 调用 → 同步记录** 全链路已跑通；
-- ❌ 参考账号的 Bangumi `access_token`（`expires_at=2026-08-26`）与 `refresh_token` 均已失效，自动刷新返回 `bgm.tv/oauth/access_token 400 Bad Request`；
-- 🔜 完成"成功同步"需要**用户在 Web 端重新完成 Bangumi OAuth 授权**（浏览器操作，无法由 Agent 代做）。重新授权后重发上面的 curl 即可看到 `success` 记录。
+- ✅ 用户在 Web 端重新完成 Bangumi OAuth 后（账号 token 于 `22:51:56` 刷新），重发 webhook 得到 **success 记录**：
+  - `id=146`、`id=147`：`source=emby`、`藤本タツキ17-26 S01E01`、`success`、`已看过，不再重复标记`
+  - 该集此前已在 Bangumi 标记为看过，属**幂等成功**（真实调用了 Bangumi API，未改动用户收藏）
+- ⚠️ 复测中出现过一次**记录落库失败**（`记录同步日志失败: disk I/O error`）：根因是 E2E 环境操作方式——容器内服务进程为 uid 1000，而 `docker exec` 默认 root；root 进程的 SQLite 操作使 `-wal/-shm` 归属变更，服务进程随后写 WAL 报 I/O 错误。处理：停机 checkpoint + `chown 1000:1000` 数据目录后恢复正常（详见「发现汇总」）
+- 📌 观察：授权回调后结果页曾出现 `close?result=error`，但账号实际已刷新且同步成功——疑似前端结果提示与后端状态不一致，建议后续核查
 
 ## 六、发现汇总
 
@@ -94,7 +97,10 @@ curl -X POST http://localhost:18000/Emby -H 'Content-Type: application/json' -d 
 | --- | --- | --- |
 | P0 | 生产嵌入 `/mcp` 恒 401（中间件丢失） | ✅ 已修复（`fa661cf`）+ 回归测试 |
 | P0 | 下划线段名导致敏感字段掩码绕过 | ✅ 已修复（`ecf869c`）+ 回归测试 |
-| 环境 | 参考账号 Bangumi token/refresh token 已失效 | ⏳ 待用户 Web 端重新授权 |
+| 环境 | 参考账号 Bangumi token/refresh token 已失效 | ✅ 用户已重新授权（22:51:56），真实同步成功 |
+| 健壮性 | 同步记录写入失败（`disk I/O error`）被 `_run_write` 捕获后接口仍返回 `success` —— 静默丢记录 | 📌 建议改进：失败时重试/告警，或返回降级状态 |
+| 环境 | Docker Desktop 共享卷下，root `docker exec` 操作 SQLite 会破坏 uid 1000 服务进程的 WAL 写入 | ✅ E2E 环境已修复（chown + checkpoint） |
+| 观察 | 授权结果页 `close?result=error` 与后端实际成功不一致 | [待确认] 建议核查前端提示逻辑 |
 | 小尾巴 | 中间件迁移后 `/mcp` 的 `transport_type` 读取为 None（当前 3 个工具不依赖） | 📌 建议记入 `remain/` 备查 |
 
 全量测试：**3667 passed**（两项修复合并后）。
@@ -117,6 +123,8 @@ cd /tmp/bs-e2e/project && opencode mcp logout bangumi-syncer   # 如目录尚在
 
 ## 八、后续建议
 
-1. **继续真实同步验证**：用户在 Web 端重新授权 Bangumi 后，重发第五节的 curl，确认记录变为 `success`
-2. **补测试盲区**：生产组合（`app.main.app`）的 MCP 鉴权回归已补；建议后续为新加入的 MCP 工具沿用同一测试形态
-3. **`transport_type` 小尾巴**：如未来工具有依赖，需要在主 app 显式设置 `app.state.transport_type`
+1. ~~继续真实同步验证~~ ✅ 已完成（记录 `146/147` 均为 `success`）
+2. **记录持久化失败可观测性**：`log_sync_record` 失败目前仅写 ERROR 日志、接口仍返回 `success`；建议增加重试/告警或降级响应，避免静默丢记录
+3. **授权结果页提示核查**：`close?result=error` 与实际成功不一致，建议核对前端结果判断逻辑
+4. **补测试盲区**：生产组合（`app.main.app`）的 MCP 鉴权回归已补；建议后续为新加入的 MCP 工具沿用同一测试形态
+5. **`transport_type` 小尾巴**：如未来工具有依赖，需要在主 app 显式设置 `app.state.transport_type`
