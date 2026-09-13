@@ -13,6 +13,7 @@
 """
 
 import json
+import sqlite3
 import time
 from typing import Any, Optional
 
@@ -78,24 +79,158 @@ class AgentRunsRepository(BaseRepository):
     # ------------------------------------------------------------------
 
     def create_pending(
-        self, run_id: str, task_type: str, sync_record_id: Optional[int] = None
+        self,
+        run_id: str,
+        task_type: str,
+        sync_record_id: Optional[int] = None,
+        *,
+        business_key: str = "",
     ) -> int:
-        """沉淀一条 pending 会话，返回记录 id（失败时 0）"""
+        """沉淀一条 pending 会话，返回记录 id（失败时 0）。
+
+        business_key 为业务键去重用（写入该列，默认空字符串保持向后兼容）。
+        """
 
         def _write(conn):
             ts = _now()
             cursor = conn.execute(
                 """
                 INSERT INTO agent_runs
-                (run_id, task_type, sync_record_id, status, attempts,
+                (run_id, task_type, sync_record_id, business_key, status, attempts,
                  total_attempts, created_at, last_attempt_at)
-                VALUES (?, ?, ?, 'pending', 0, 0, ?, ?)
+                VALUES (?, ?, ?, ?, 'pending', 0, 0, ?, ?)
                 """,
-                (run_id, task_type, sync_record_id, ts, ts),
+                (run_id, task_type, sync_record_id, business_key, ts, ts),
             )
             return cursor.lastrowid
 
         return self._run_write(_write, error_msg="创建 agent_run 失败", default=0)
+
+    def enqueue_run_dedup(
+        self,
+        run_id: str,
+        task_type: str,
+        sync_record_id: int,
+        business_key: str = "",
+        *,
+        dedup_window_days: int = 7,
+        max_total_attempts: int = 10,
+    ) -> str:
+        """按 business_key 决策去重/重入队/结果复用，返回决策结果字符串。
+
+        单个 _run_write 事务内完成决策，保证并发安全：
+        - "created"：无历史或需新建 → INSERT 新 pending
+        - "in_flight"：同键已有 pending/processing → 只刷新 sync_record_id
+        - "requeued"：同键 failed 且 total_attempts<=max → 复用（status=pending, attempts=0, total+1）
+        - "exhausted"：同键 failed 且 total_attempts>max → 不写库
+        - "reused"：同键 succeeded/no_suggestion 且 7 天内 → 只刷新 sync_record_id
+
+        business_key 为空时退回 create_pending 语义（不去重）。
+        """
+        if not business_key:
+            self.create_pending(
+                run_id=run_id,
+                task_type=task_type,
+                sync_record_id=sync_record_id,
+            )
+            return "created"
+
+        result_holder: list[str] = ["created"]
+
+        def _write(conn):
+            row = self._find_latest_by_business_key(conn, business_key)
+            if row is None:
+                # 无历史 → 新建
+                ts = _now()
+                conn.execute(
+                    """
+                    INSERT INTO agent_runs
+                    (run_id, task_type, sync_record_id, business_key, status,
+                     attempts, total_attempts, created_at, last_attempt_at)
+                    VALUES (?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+                    """,
+                    (run_id, task_type, sync_record_id, business_key, ts, ts),
+                )
+                result_holder[0] = "created"
+                return
+
+            status = row["status"]
+            ended_at = row["ended_at"] or 0
+
+            if status in ("pending", "processing"):
+                # 在途去重：只刷新 sync_record_id
+                conn.execute(
+                    "UPDATE agent_runs SET sync_record_id=? WHERE id=?",
+                    (sync_record_id, row["id"]),
+                )
+                result_holder[0] = "in_flight"
+                return
+
+            if status == "failed":
+                total = row["total_attempts"] or 0
+                if total <= max_total_attempts:
+                    # 复用：重置为 pending，total_attempts+1
+                    ts = _now()
+                    conn.execute(
+                        """
+                        UPDATE agent_runs
+                        SET status='pending', attempts=0,
+                            total_attempts=total_attempts + 1,
+                            created_at=?, last_attempt_at=?,
+                            started_at=0, ended_at=0,
+                            last_error='', sync_record_id=?
+                        WHERE id=?
+                        """,
+                        (ts, ts, sync_record_id, row["id"]),
+                    )
+                    result_holder[0] = "requeued"
+                else:
+                    result_holder[0] = "exhausted"
+                return
+
+            if status in ("succeeded", "no_suggestion"):
+                cutoff = _now() - dedup_window_days * 86400
+                if ended_at >= cutoff:
+                    # 结果复用：只刷新 sync_record_id
+                    conn.execute(
+                        "UPDATE agent_runs SET sync_record_id=? WHERE id=?",
+                        (sync_record_id, row["id"]),
+                    )
+                    result_holder[0] = "reused"
+                    return
+
+            # applied/rejected/cancelled、或已出窗的终态 → 走新建
+            ts = _now()
+            conn.execute(
+                """
+                INSERT INTO agent_runs
+                (run_id, task_type, sync_record_id, business_key, status,
+                 attempts, total_attempts, created_at, last_attempt_at)
+                VALUES (?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+                """,
+                (run_id, task_type, sync_record_id, business_key, ts, ts),
+            )
+            result_holder[0] = "created"
+
+        try:
+            self._run_write(_write, error_msg="enqueue_run_dedup 失败")
+        except sqlite3.IntegrityError:
+            # 唯一索引兜底：并发重复插入同键在途时，视为 in_flight
+            result_holder[0] = "in_flight"
+        return result_holder[0]
+
+    @staticmethod
+    def _find_latest_by_business_key(conn, business_key: str) -> Optional[dict]:
+        """按 business_key 查最近一条 run（任意状态，按 id DESC），无则 None。"""
+        cursor = conn.execute(
+            "SELECT * FROM agent_runs WHERE business_key=? ORDER BY id DESC LIMIT 1",
+            (business_key,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
 
     def atomic_claim(self, run_id: str) -> bool:
         """原子抢占：仅当 status='pending' 时置 processing。

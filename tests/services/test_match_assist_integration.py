@@ -78,12 +78,11 @@ def test_handle_match_failure_enqueues_when_enabled(
 
     无候选也落任务；trace step 必须在 _persist_sync_record 之前（persist 被
     mock，其序列化结果即被视为 persist 时刻的 trace 状态）。
+    新实现使用 enqueue_run_dedup（业务键去重）。
     """
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None
-    agent_runs.find_failed_by_sync_record.return_value = None
-    agent_runs.create_pending.return_value = 1
+    agent_runs.enqueue_run_dedup.return_value = "created"
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {
         "api_key": "sk-test",
@@ -102,11 +101,12 @@ def test_handle_match_failure_enqueues_when_enabled(
     with patch.object(orch, "_persist_sync_record", side_effect=fake_persist):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.create_pending.assert_called_once()
-    kwargs = agent_runs.create_pending.call_args.kwargs
+    agent_runs.enqueue_run_dedup.assert_called_once()
+    kwargs = agent_runs.enqueue_run_dedup.call_args.kwargs
     assert kwargs["task_type"] == "match"
     assert kwargs["sync_record_id"] == 123
     assert kwargs["run_id"]
+    assert kwargs["business_key"]  # 业务键非空
     # trace step 在 persist 前已存在
     assert any(
         s["stage"] == "llm_assist" and s["status"] == "pending"
@@ -131,8 +131,7 @@ def test_handle_match_failure_switch_off_no_enqueue(mock_db, mock_cfg, mock_noti
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.create_pending.assert_not_called()
-    agent_runs.find_active_by_sync_record.assert_not_called()
+    agent_runs.enqueue_run_dedup.assert_not_called()
     assert not any(s["stage"] == "llm_assist" for s in trace.to_dict()["steps"])
 
 
@@ -155,22 +154,18 @@ def test_handle_match_failure_llm_missing_no_enqueue(
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.create_pending.assert_not_called()
+    agent_runs.enqueue_run_dedup.assert_not_called()
     assert "LLM 配置缺失" in capsys.readouterr().out
 
 
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
-def test_dedup_active_pending_skips(mock_db, mock_cfg, mock_notify, capsys):
-    """去重：同 key 已有活跃(pending)记录 → 跳过创建 + 日志"""
+def test_dedup_in_flight_returns_in_flight(mock_db, mock_cfg, mock_notify):
+    """去重：同键已有在途 → enqueue_run_dedup 返回 in_flight，不新建"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = {
-        "run_id": "r0",
-        "status": "pending",
-    }
-    agent_runs.find_failed_by_sync_record.return_value = None
+    agent_runs.enqueue_run_dedup.return_value = "in_flight"
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
     mock_db.agent_runs = agent_runs
@@ -181,23 +176,20 @@ def test_dedup_active_pending_skips(mock_db, mock_cfg, mock_notify, capsys):
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.create_pending.assert_not_called()
-    agent_runs.requeue_failed.assert_not_called()
-    assert "已存在" in capsys.readouterr().out
+    agent_runs.enqueue_run_dedup.assert_called_once()
+    # 业务键由 item 计算
+    kwargs = agent_runs.enqueue_run_dedup.call_args.kwargs
+    assert "business_key" in kwargs
 
 
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
-def test_dedup_failed_requeue_when_within_limit(mock_db, mock_cfg, mock_notify):
-    """去重：failed 且 total_attempts<=10 → 重新入队复用，不新建"""
+def test_dedup_requeued_returns_requeued(mock_db, mock_cfg, mock_notify):
+    """去重：同键 failed 且未超限 → enqueue_run_dedup 返回 requeued"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None
-    agent_runs.find_failed_by_sync_record.return_value = {
-        "run_id": "r2",
-        "total_attempts": 3,
-    }
+    agent_runs.enqueue_run_dedup.return_value = "requeued"
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
     mock_db.agent_runs = agent_runs
@@ -208,22 +200,17 @@ def test_dedup_failed_requeue_when_within_limit(mock_db, mock_cfg, mock_notify):
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.requeue_failed.assert_called_once_with("r2")
-    agent_runs.create_pending.assert_not_called()
+    agent_runs.enqueue_run_dedup.assert_called_once()
 
 
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
-def test_dedup_failed_exceeds_limit_no_requeue(mock_db, mock_cfg, mock_notify, capsys):
-    """去重：failed 且 total_attempts>10 → 不重新入队、不新建"""
+def test_dedup_exhausted_returns_exhausted(mock_db, mock_cfg, mock_notify):
+    """去重：同键 failed 且超限 → enqueue_run_dedup 返回 exhausted"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None
-    agent_runs.find_failed_by_sync_record.return_value = {
-        "run_id": "r3",
-        "total_attempts": 11,
-    }
+    agent_runs.enqueue_run_dedup.return_value = "exhausted"
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
     mock_db.agent_runs = agent_runs
@@ -234,9 +221,28 @@ def test_dedup_failed_exceeds_limit_no_requeue(mock_db, mock_cfg, mock_notify, c
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.requeue_failed.assert_not_called()
-    agent_runs.create_pending.assert_not_called()
-    assert "重试超限" in capsys.readouterr().out
+    agent_runs.enqueue_run_dedup.assert_called_once()
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_dedup_reused_returns_reused(mock_db, mock_cfg, mock_notify):
+    """去重：同键 succeeded 且 7 天内 → enqueue_run_dedup 返回 reused"""
+    orch = _make_orchestrator()
+    agent_runs = MagicMock()
+    agent_runs.enqueue_run_dedup.return_value = "reused"
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+
+    with patch.object(orch, "_persist_sync_record", return_value=123):
+        orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    agent_runs.enqueue_run_dedup.assert_called_once()
 
 
 # ----------------------------------------------------------------------

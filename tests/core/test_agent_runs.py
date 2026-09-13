@@ -12,8 +12,11 @@
 9. list_pending / list_stale_processing / find_failed_by_sync_record 辅助
 """
 
+import sqlite3
 from pathlib import Path
 from typing import Optional
+
+import pytest
 
 from app.core.database import DatabaseManager
 
@@ -577,5 +580,354 @@ class TestSchedulerHelpers:
             dbm.agent_runs.atomic_claim("fresh")
             stale2 = dbm.agent_runs.list_stale_processing(120)
             assert not any(r["run_id"] == "fresh" for r in stale2)
+        finally:
+            dbm._connection._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# enqueue_run_dedup 业务键去重/重入队/结果复用 测试
+# ---------------------------------------------------------------------------
+
+
+class TestEnqueueRunDedup:
+    """enqueue_run_dedup：按 business_key 决策（created / in_flight / requeued / reused / exhausted）"""
+
+    def test_no_history_creates_new(self, tmp_path):
+        """无历史 → 新建 pending（business_key 写入）→ 返回 created"""
+        dbm = _make_db(tmp_path)
+        try:
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="new-run",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            assert result == "created"
+            run = dbm.agent_runs.get_run("new-run")
+            assert run is not None
+            assert run["status"] == "pending"
+            assert run["business_key"] == "match|alice|test|1"
+            assert run["sync_record_id"] == 100
+            assert run["total_attempts"] == 0
+        finally:
+            dbm._connection._conn.close()
+
+    def test_in_flight_pending_refreshes_sync_record_id(self, tmp_path):
+        """同键已有 pending → 不新建、sync_record_id 刷新为最新 → in_flight"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            # 第二次入队（同键不同 run_id）
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "in_flight"
+            # 只有一条 run（r1），sync_record_id 刷新为 200
+            runs = dbm.agent_runs.list_pending(50)
+            assert len(runs) == 1
+            assert runs[0]["sync_record_id"] == 200
+            assert runs[0]["run_id"] == "r1"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_in_flight_processing_refreshes_sync_record_id(self, tmp_path):
+        """同键已有 processing → 不新建、sync_record_id 刷新为最新 → in_flight"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.atomic_claim("r1")  # → processing
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=300,
+                business_key="match|alice|test|1",
+            )
+            assert result == "in_flight"
+            run = dbm.agent_runs.get_run("r1")
+            assert run["status"] == "processing"
+            assert run["sync_record_id"] == 300
+        finally:
+            dbm._connection._conn.close()
+
+    def test_failed_within_limit_requeues(self, tmp_path):
+        """同键 failed 且 total_attempts<=10 → 复用同 run_id、attempts 归零、total_attempts+1 → requeued"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.mark_failed("r1", "failed", "err", 0)
+            run_before = dbm.agent_runs.get_run("r1")
+            assert run_before["status"] == "failed"
+            assert run_before["total_attempts"] == 0
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "requeued"
+            run = dbm.agent_runs.get_run("r1")
+            assert run["status"] == "pending"
+            assert run["attempts"] == 0
+            assert run["total_attempts"] == 1
+            assert run["sync_record_id"] == 200
+            assert run["last_error"] == ""
+            assert run["started_at"] == 0
+            assert run["ended_at"] == 0
+        finally:
+            dbm._connection._conn.close()
+
+    def test_failed_exceeds_limit_no_requeue(self, tmp_path):
+        """同键 failed 且 total_attempts>10 → 不重入 → exhausted"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.mark_failed("r1", "failed", "err", 0)
+            conn = dbm._connection._conn
+            conn.execute(
+                "UPDATE agent_runs SET total_attempts=11 WHERE run_id=?",
+                ("r1",),
+            )
+            conn.commit()
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "exhausted"
+            # 状态不变
+            run = dbm.agent_runs.get_run("r1")
+            assert run["status"] == "failed"
+            assert run["total_attempts"] == 11
+        finally:
+            dbm._connection._conn.close()
+
+    def test_succeeded_within_window_reuses(self, tmp_path):
+        """同键 succeeded 且 7 天内 → 不新建、只刷新 sync_record_id → reused"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.atomic_claim("r1")
+            dbm.agent_runs.mark_succeeded("r1")
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "reused"
+            run = dbm.agent_runs.get_run("r1")
+            assert run["status"] == "succeeded"
+            assert run["sync_record_id"] == 200
+        finally:
+            dbm._connection._conn.close()
+
+    def test_succeeded_outside_window_creates_new(self, tmp_path):
+        """同键 succeeded 但超窗 → 新建"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.atomic_claim("r1")
+            dbm.agent_runs.mark_succeeded("r1")
+            # 把 ended_at 改到远早于保留期
+            conn = dbm._connection._conn
+            conn.execute(
+                "UPDATE agent_runs SET ended_at=? WHERE run_id=?",
+                (946684800, "r1"),
+            )
+            conn.commit()
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "created"
+            # 现在有两条 run
+            runs = dbm.agent_runs.list_pending(50)
+            assert len(runs) == 1  # r2 是 pending
+            assert runs[0]["run_id"] == "r2"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_no_suggestion_within_window_reuses(self, tmp_path):
+        """同键 no_suggestion 且 7 天内 → reused"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.mark_no_suggestion("r1")
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "reused"
+            run = dbm.agent_runs.get_run("r1")
+            assert run["status"] == "no_suggestion"
+            assert run["sync_record_id"] == 200
+        finally:
+            dbm._connection._conn.close()
+
+    def test_applied_creates_new(self, tmp_path):
+        """applied 终态 → 新建"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.atomic_claim("r1")
+            dbm.agent_runs.mark_succeeded("r1")
+            dbm.agent_runs.mark_applied("r1")
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "created"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_rejected_creates_new(self, tmp_path):
+        """rejected 终态 → 新建"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            dbm.agent_runs.atomic_claim("r1")
+            dbm.agent_runs.mark_succeeded("r1")
+            dbm.agent_runs.mark_rejected("r1")
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "created"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_cancelled_creates_new(self, tmp_path):
+        """cancelled 终态 → 新建"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="match|alice|test|1",
+            )
+            _set_status(dbm, "r1", "cancelled", ended_at=946684800)
+
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="match|alice|test|1",
+            )
+            assert result == "created"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_empty_business_key_falls_back_to_create(self, tmp_path):
+        """business_key 为空时退回 create_pending 语义（不参与去重）"""
+        dbm = _make_db(tmp_path)
+        try:
+            result = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r1",
+                task_type="match",
+                sync_record_id=100,
+                business_key="",
+            )
+            assert result == "created"
+            # 第二次空 key 也创建（不去重）
+            result2 = dbm.agent_runs.enqueue_run_dedup(
+                run_id="r2",
+                task_type="match",
+                sync_record_id=200,
+                business_key="",
+            )
+            assert result2 == "created"
+            runs = dbm.agent_runs.list_pending(50)
+            assert len(runs) == 2
+        finally:
+            dbm._connection._conn.close()
+
+    def test_unique_index_fallback_no_crash(self, tmp_path):
+        """唯一索引兜底：并发/重复插入同键在途时不炸主流程"""
+        dbm = _make_db(tmp_path)
+        try:
+            # 直接插入两条同键 pending（模拟并发竞争）
+            conn = dbm._connection._conn
+            conn.execute(
+                """
+                INSERT INTO agent_runs
+                (run_id, task_type, sync_record_id, status, business_key,
+                 attempts, total_attempts, created_at, last_attempt_at)
+                VALUES ('x1', 'match', 1, 'pending', 'match|alice|dup|1', 0, 0, 1000, 1000)
+                """
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    """
+                    INSERT INTO agent_runs
+                    (run_id, task_type, sync_record_id, status, business_key,
+                     attempts, total_attempts, created_at, last_attempt_at)
+                    VALUES ('x2', 'match', 2, 'pending', 'match|alice|dup|1', 0, 0, 1000, 1000)
+                    """
+                )
         finally:
             dbm._connection._conn.close()

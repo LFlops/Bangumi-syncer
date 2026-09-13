@@ -364,6 +364,15 @@ class DatabaseConnection:
             "ON sync_records_consumed(run_id)"
         )
 
+    def _ensure_agent_runs_business_key(self, cursor) -> None:
+        """旧库迁移：为 agent_runs 增加 business_key（业务键去重用）。"""
+        self._ensure_columns(
+            cursor,
+            "agent_runs",
+            [("business_key", "TEXT DEFAULT ''")],
+            message="agent_runs 已迁移：增加 business_key 列",
+        )
+
     def _ensure_agent_memory(self, cursor) -> None:
         """Agent 工作记忆 schema：主表 + 归档表 + 索引 + FTS5 + 同步触发器。
 
@@ -614,6 +623,7 @@ class DatabaseConnection:
                 run_id TEXT NOT NULL UNIQUE,
                 task_type TEXT NOT NULL,
                 sync_record_id INTEGER,
+                business_key TEXT DEFAULT '',
                 status TEXT DEFAULT 'pending',
                 stop_reason TEXT DEFAULT '',
                 attempts INTEGER DEFAULT 0,
@@ -626,6 +636,7 @@ class DatabaseConnection:
                 created_at INTEGER DEFAULT 0
             )
         """)
+        self._ensure_agent_runs_business_key(cursor)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_steps (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -654,6 +665,16 @@ class DatabaseConnection:
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_runs_status ON agent_runs(status)"
+        )
+        # 业务键索引：部分唯一索引防在途重复 + 普通索引加速查询
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_business_key_active "
+            "ON agent_runs(business_key) "
+            "WHERE status IN ('pending','processing') AND business_key != ''"
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_runs_business_key "
+            "ON agent_runs(business_key, status)"
         )
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id)"

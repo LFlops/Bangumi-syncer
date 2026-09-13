@@ -401,7 +401,7 @@ class SyncOrchestrator:
         )
         # 提交 AI 评估任务（去重 + 落库，失败不阻塞主流程）
         if assist_enabled and run_id:
-            self._enqueue_match_assist_run(run_id, sync_record_id, trace)
+            self._enqueue_match_assist_run(run_id, item, sync_record_id, trace)
         status_holder[0] = "error"
         return SyncResponse(status="error", message="未找到匹配的番剧")
 
@@ -437,40 +437,43 @@ class SyncOrchestrator:
         return True
 
     def _enqueue_match_assist_run(
-        self, run_id: str, sync_record_id: int, trace: MatchTrace
+        self, run_id: str, item: CustomItem, sync_record_id: int, trace: MatchTrace
     ) -> None:
-        """去重后向 agent_runs 提交一条 match 任务。
+        """去重后向 agent_runs 提交一条 match 任务（业务键版本）。
 
-        去重（F7）：同 key 已有活跃会话 → 跳过；已有 failed 且
-        total_attempts<=10 → 重新入队复用；否则新建 pending。
+        按 business_key（user_name + normalize(title) + season）决策：
+        - 同键在途 → 只刷新 sync_record_id（in_flight）
+        - 同键 failed 且未超限 → 复用（requeued）
+        - 同键 succeeded/no_suggestion 且 7 天内 → 只刷新 sync_record_id（reused）
+        - 否则新建（created）
         任何落库异常仅日志，不阻塞主匹配流程。
         """
         try:
+            from ..matching.identity import build_match_business_key
             from . import database_manager
 
-            repo = database_manager.agent_runs
-            existing = repo.find_active_by_sync_record(sync_record_id)
-            if existing:
-                logger.info(
-                    "匹配增强任务已存在（去重），跳过创建: "
-                    f"sync_record_id={sync_record_id}"
-                )
-                return
-            failed = repo.find_failed_by_sync_record(sync_record_id)
-            if failed:
-                total = int(failed.get("total_attempts") or 0)
-                if total <= 10:
-                    repo.requeue_failed(failed["run_id"])
-                    logger.info(f"匹配增强失败任务重新入队: run_id={failed['run_id']}")
-                else:
-                    logger.info(
-                        "匹配增强任务重试超限（total_attempts>10），停止重入: "
-                        f"run_id={failed['run_id']}"
-                    )
-                return
-            repo.create_pending(
-                run_id=run_id, task_type="match", sync_record_id=sync_record_id
+            business_key = build_match_business_key(
+                user_name=item.user_name,
+                title=item.title,
+                season=item.season,
             )
+            result = database_manager.agent_runs.enqueue_run_dedup(
+                run_id=run_id,
+                task_type="match",
+                sync_record_id=sync_record_id,
+                business_key=business_key,
+            )
+            logger.info(
+                f"匹配增强任务落库: decision={result}, business_key={business_key}, "
+                f"sync_record_id={sync_record_id}"
+            )
+            if result == "in_flight":
+                # trace step 里记录的 run_id 与最终复用的 run_id 可能不一致
+                # （trace 已持久化无法回写，属已知展示层小瑕疵）
+                logger.debug(
+                    f"trace step 记录的 run_id={run_id} 与复用的 run_id 不一致"
+                    "（trace 已持久化无法回写，属已知展示层小瑕疵）"
+                )
         except Exception as e:
             logger.warning(f"匹配增强任务落库失败（不影响主流程）: {e}")
 
