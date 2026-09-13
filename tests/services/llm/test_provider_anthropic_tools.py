@@ -248,6 +248,70 @@ class TestBuildRequestToolsAndToolChoice:
         assert body["tools"] == tools
         assert body["tools"][0]["cache_control"] == {"type": "ephemeral"}
 
+    def test_flat_parameters_converted_to_input_schema(self):
+        """flat 形态（parameters）→ 转换为 input_schema（Anthropic wire 必填）。"""
+        provider = _make_provider()
+        tools = [
+            {
+                "name": "search_bangumi",
+                "description": "按标题搜索番组",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                },
+            }
+        ]
+        body = provider._build_request(
+            [Message(role="user", content="Hello")], tools=tools
+        )
+        assert "tools" in body
+        t = body["tools"][0]
+        assert "input_schema" in t
+        assert "parameters" not in t
+        assert t["input_schema"] == {
+            "type": "object",
+            "properties": {"title": {"type": "string"}},
+        }
+        assert t["name"] == "search_bangumi"
+        assert t["description"] == "按标题搜索番组"
+
+    def test_flat_parameters_with_cache_control_preserved(self):
+        """flat 形态 + cache_control：转换 input_schema 时保留 cache_control 等其它字段。"""
+        provider = _make_provider()
+        tools = [
+            {
+                "name": "search_bangumi",
+                "description": "按标题搜索番组",
+                "parameters": {"type": "object", "properties": {}},
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        body = provider._build_request(
+            [Message(role="user", content="Hello")], tools=tools
+        )
+        t = body["tools"][0]
+        assert "input_schema" in t
+        assert "parameters" not in t
+        assert t["cache_control"] == {"type": "ephemeral"}
+
+    def test_string_tool_choice_objectized(self):
+        """字符串 tool_choice → {"type":"tool","name":<str>}（Anthropic wire 对象化）。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [Message(role="user", content="Hello")],
+            tool_choice="submit_suggestion",
+        )
+        assert body["tool_choice"] == {"type": "tool", "name": "submit_suggestion"}
+
+    def test_tool_choice_none_not_in_body(self):
+        """tool_choice=None 时 body 不含该键（不发送 null）。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [Message(role="user", content="Hello")],
+            tool_choice=None,
+        )
+        assert "tool_choice" not in body
+
 
 # ===================================================================
 # Feature 2: 响应解析 — 工具协议

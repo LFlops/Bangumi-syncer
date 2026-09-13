@@ -149,6 +149,71 @@ class TestOpenAICompatToolsBuildRequest:
         )
         assert body["tool_choice"] == tool_choice
 
+    def test_flat_parameters_wrapped_as_function(self):
+        """flat 形态（parameters）→ 包装为 {"type":"function","function":{...}}。"""
+        provider = self._provider()
+        tools = [
+            {
+                "name": "search_bangumi",
+                "description": "按标题搜索番组",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        ]
+        body = provider._build_request([Message(role="user", content="Q")], tools=tools)
+        assert "tools" in body
+        t = body["tools"][0]
+        assert t["type"] == "function"
+        assert "function" in t
+        assert t["function"]["name"] == "search_bangumi"
+        assert t["function"]["description"] == "按标题搜索番组"
+        assert t["function"]["parameters"] == {"type": "object", "properties": {}}
+
+    def test_string_tool_choice_auto_required_none_passthrough(self):
+        """tool_choice 字符串 "none"/"auto"/"required" 原样透传。"""
+        provider = self._provider()
+        for choice in ("none", "auto", "required"):
+            body = provider._build_request(
+                [Message(role="user", content="Q")], tool_choice=choice
+            )
+            assert body["tool_choice"] == choice
+
+    def test_string_tool_choice_tool_name_objectized(self):
+        """tool_choice 字符串（工具名）→ {"type":"function","function":{"name":<str>}}。"""
+        provider = self._provider()
+        body = provider._build_request(
+            [Message(role="user", content="Q")],
+            tool_choice="submit_suggestion",
+        )
+        assert body["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "submit_suggestion"},
+        }
+
+    def test_tool_choice_none_not_in_body(self):
+        """tool_choice=None 时 body 不含该键（不发送 null）。"""
+        provider = self._provider()
+        body = provider._build_request(
+            [Message(role="user", content="Q")],
+            tool_choice=None,
+        )
+        assert "tool_choice" not in body
+
+    def test_native_function_tools_passthrough(self):
+        """原生 OpenAI 形态（含 type=function/function 包装）透传（无回归）。"""
+        provider = self._provider()
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_bangumi",
+                    "description": "搜索",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ]
+        body = provider._build_request([Message(role="user", content="Q")], tools=tools)
+        assert body["tools"] == tools
+
     def test_cache_control_not_in_body(self):
         """cache_control 是 Anthropic 专属参数，OpenAI 请求体不得包含。"""
         provider = self._provider()

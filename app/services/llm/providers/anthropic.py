@@ -147,15 +147,19 @@ class AnthropicProvider(BaseProvider):
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
 
-        # tools / tool_choice：工具协议参数透传（name/description/input_schema 与
-        # {"type": "tool", "name": ...} 格式由调用方构造，provider 仅 1:1 透传；
-        # tools 列表内可携带 cache_control 标记，同样随 dict 透传，实现以透传为主）
+        # tools / tool_choice：工具协议 wire 规范化（provider 拥有 wire 格式，
+        # agent/场景层保持 provider 无关）。
+        # - tools 元素含 input_schema → 原样透传；含 parameters（内部 flat 形态）
+        #   → 转换为 {"name", "description", "input_schema": parameters}；其余字段
+        #   （如 cache_control）一并无损保留。
+        # - tool_choice 字符串 → {"type":"tool","name":<str>}；dict → 透传；
+        #   None → 不发送该键。
         tools = kwargs.get("tools")
         if tools is not None:
-            body["tools"] = tools
+            body["tools"] = [self._normalize_anthropic_tool(t) for t in tools]
         tool_choice = kwargs.get("tool_choice")
         if tool_choice is not None:
-            body["tool_choice"] = tool_choice
+            body["tool_choice"] = self._normalize_anthropic_tool_choice(tool_choice)
 
         # thinking_level：每任务 kwargs 覆盖 > 全局默认；模型不支持时降级；
         # 端点拒绝过扩展参数时（_extras_disabled）不再发送
@@ -178,6 +182,34 @@ class AnthropicProvider(BaseProvider):
                 1  # Anthropic 要求 thinking 开启时 temperature 必须为 1
             )
         return body
+
+    @staticmethod
+    def _normalize_anthropic_tool(tool: dict) -> dict:
+        """将工具 schema 规范化为 Anthropic wire 形态。
+
+        - 含 input_schema → 原样透传（已是 Anthropic 形态）；
+        - 含 parameters（内部 flat 形态）→ 转为 input_schema；
+        - 其余字段（cache_control 等）一并无损保留。
+        """
+        if "input_schema" in tool:
+            return tool
+        result: dict[str, Any] = {
+            "name": tool["name"],
+            "description": tool["description"],
+        }
+        if "parameters" in tool:
+            result["input_schema"] = tool["parameters"]
+        for k, v in tool.items():
+            if k not in ("name", "description", "parameters"):
+                result[k] = v
+        return result
+
+    @staticmethod
+    def _normalize_anthropic_tool_choice(tool_choice: Any) -> Any:
+        """字符串 tool_choice → {"type":"tool","name":<str>}；dict → 透传。"""
+        if isinstance(tool_choice, str):
+            return {"type": "tool", "name": tool_choice}
+        return tool_choice
 
     def _thinking_enabled(self, level: str, model: str) -> int:
         """返回 budget_tokens；模型不支持或 level=off 时返回 0。"""

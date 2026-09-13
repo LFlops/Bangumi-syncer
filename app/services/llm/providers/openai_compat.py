@@ -156,11 +156,20 @@ class OpenAICompatProvider(BaseProvider):
             # 与 Anthropic thinking 开启时的处理对齐（anthropic.py 强制 1）
             body["temperature"] = 1
 
-        # 工具协议透传（调用方构造 dict 列表；OpenAI 自动前缀缓存，无 cache_control）
+        # 工具协议 wire 规范化（provider 拥有 wire 格式，agent/场景层保持 provider 无关）。
+        # - tools 元素已是 {"type":"function","function":{...}} → 透传；否则（内部
+        #   flat 形态 name/description/parameters）→ 包装为 function 形式。
+        # - tool_choice "none"/"auto"/"required" 原样透传；其它字符串（工具名）
+        #   → {"type":"function","function":{"name":<str>}}；dict 透传；
+        #   None → 不发送该键（避免序列化为 null）。
         if "tools" in kwargs:
-            body["tools"] = kwargs["tools"]
+            tools = kwargs["tools"]
+            if tools is not None:
+                body["tools"] = [self._normalize_openai_tool(t) for t in tools]
         if "tool_choice" in kwargs:
-            body["tool_choice"] = kwargs["tool_choice"]
+            tc = kwargs["tool_choice"]
+            if tc is not None:
+                body["tool_choice"] = self._normalize_openai_tool_choice(tc)
         # cache_control 是 Anthropic 专属参数，OpenAI 无此字段——忽略不发送，
         # 即便调用方误传也不得进入请求体（否则部分端点报错）
         body.pop("cache_control", None)
@@ -237,6 +246,40 @@ class OpenAICompatProvider(BaseProvider):
 
         # 默认：纯文本（或未知组合）→ 单条文本消息
         return [{"role": m.role, "content": "\n\n".join(text_parts)}]
+
+    @staticmethod
+    def _normalize_openai_tool(tool: dict) -> dict:
+        """将工具 schema 规范化为 OpenAI wire 形态。
+
+        - 已是 {"type":"function","function":{...}} → 透传；
+        - 否则（内部 flat 形态 name/description/parameters）→ 包装为 function 形式。
+        """
+        if tool.get("type") == "function" and "function" in tool:
+            return tool
+        return {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool.get("parameters", {}),
+            },
+        }
+
+    _OPENAI_TOOL_CHOICE_LITERALS = frozenset({"none", "auto", "required"})
+
+    @classmethod
+    def _normalize_openai_tool_choice(cls, tool_choice: Any) -> Any:
+        """规范化 tool_choice：
+
+        - "none"/"auto"/"required" 原样透传；
+        - 其它字符串（工具名）→ {"type":"function","function":{"name":<str>}}；
+        - dict 透传。
+        """
+        if isinstance(tool_choice, str):
+            if tool_choice in cls._OPENAI_TOOL_CHOICE_LITERALS:
+                return tool_choice
+            return {"type": "function", "function": {"name": tool_choice}}
+        return tool_choice
 
     def _reasoning_effort(self, level: str, model: str) -> str | None:
         """thinking_level → reasoning_effort；off/不支持时返回 None（不传字段）。"""
