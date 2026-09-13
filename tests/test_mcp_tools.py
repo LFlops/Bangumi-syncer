@@ -585,18 +585,32 @@ class TestGetCurrentConfig:
 
     @pytest.mark.asyncio
     async def test_get_current_config_多实例与账号段_敏感字段已脱敏(self):
-        """多实例段与多账号段的敏感字段均应脱敏，非敏感字段明文保留。"""
+        """真实 get_all_config 输出为下划线段名，敏感字段仍须脱敏。
+
+        回归 E2E 泄露：mock 使用连字符段名时假绿，实际 get_all_config 返回
+        bangumi_oauth / notify_email_1 等下划线形态，is_sensitive_field 漏判。
+        """
         from app.mcp import tools
 
         mock_cm = MagicMock()
         mock_cm.get_all_config.return_value = {
-            "notify-email-1": {
+            "bangumi_oauth": {
+                "client_id": "app-client-id",
+                "client_secret": "app-client-secret",
+            },
+            "notify_email_1": {
+                "smtp_host": "smtp.example.com",
                 "smtp_password": "p@ss",
                 "url": "https://example.com",
             },
-            "bangumi-alice": {
-                "access_token": "tok",
-                "username": "alice",
+            "notify_wecom_1": {
+                "key": "wecom-key",
+                "url": "https://qyapi.weixin.qq.com/hook",
+            },
+            "notify_dingtalk_1": {
+                "access_token": "dingtok",
+                "secret": "dingsecret",
+                "url": "https://oapi.dingtalk.com/hook",
             },
         }
 
@@ -608,10 +622,18 @@ class TestGetCurrentConfig:
                 result = await tools.get_current_config()
 
         data = result["data"]
-        assert data["notify-email-1"]["smtp_password"] == "***"
-        assert data["bangumi-alice"]["access_token"] == "***"
-        assert data["notify-email-1"]["url"] == "https://example.com"
-        assert data["bangumi-alice"]["username"] == "alice"
+        # 敏感字段 → 掩码
+        assert data["bangumi_oauth"]["client_secret"] == "***"
+        assert data["notify_email_1"]["smtp_password"] == "***"
+        assert data["notify_wecom_1"]["key"] == "***"
+        assert data["notify_dingtalk_1"]["access_token"] == "***"
+        assert data["notify_dingtalk_1"]["secret"] == "***"
+        # 非敏感字段 → 明文
+        assert data["bangumi_oauth"]["client_id"] == "app-client-id"
+        assert data["notify_email_1"]["smtp_host"] == "smtp.example.com"
+        assert data["notify_email_1"]["url"] == "https://example.com"
+        assert data["notify_wecom_1"]["url"] == "https://qyapi.weixin.qq.com/hook"
+        assert data["notify_dingtalk_1"]["url"] == "https://oapi.dingtalk.com/hook"
 
 
 # ===========================================================================
