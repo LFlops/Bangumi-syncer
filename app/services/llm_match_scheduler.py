@@ -23,6 +23,7 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.base.scheduler import BaseScheduler
+from app.services.llm.client import LLMCallError
 from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
 
@@ -277,9 +278,6 @@ class LlmMatchScheduler(BaseScheduler):
                         sequence=seq,
                     )
                     seq += 1
-                # 推进 _next_iteration 使续跑 chat span 不与 tool span / 旧 chat 撞号
-                span_recorder._next_iteration = replay_result.executed_iterations + 1
-
                 wrapped_chat_fn = span_recorder.wrap_chat_fn(
                     llm_assist_module._build_default_chat_fn(thinking_level)
                 )
@@ -318,6 +316,8 @@ class LlmMatchScheduler(BaseScheduler):
             )
             # 缺失工具补执行并落 tool_execute span
             if replay_result.missing_tool_calls:
+                # begin_replayed_round 内部已设 _next_iteration = iteration + 1，
+                # 无需再手动推进（避免私有属性赋值封装泄露）
                 span_recorder.begin_replayed_round(replay_result.executed_iterations)
                 seq = 0
                 for tc in replay_result.missing_tool_calls:
@@ -329,8 +329,6 @@ class LlmMatchScheduler(BaseScheduler):
                         sequence=seq,
                     )
                     seq += 1
-                # 推进 _next_iteration 使续跑 chat span 不与 tool span 撞号
-                span_recorder._next_iteration = replay_result.executed_iterations + 1
 
             # 续跑 loop（从 replay 重建消息续跑）
             wrapped_chat_fn = span_recorder.wrap_chat_fn(
@@ -356,6 +354,16 @@ class LlmMatchScheduler(BaseScheduler):
                 bgm=bgm,
                 notification_service=None,
             )
+        except LLMCallError as e:
+            # LLM 调用失败：按可重试性分流
+            if not e.retryable:
+                logger.error(f"🤖 恢复续跑 {run_id} 确定性 LLM 失败: {e}")
+                repo.mark_failed(
+                    run_id, stop_reason="llm_error", last_error=str(e)[:500]
+                )
+            else:
+                logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
+                repo.increment_attempts(run_id)
         except Exception as e:
             logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
             repo.increment_attempts(run_id)

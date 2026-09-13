@@ -180,7 +180,9 @@ class TestLLMClientChat:
     async def test_chat_all_retries_exhausted(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """全部 3 次尝试（首次 + 2 次重试）均失败 → 返回错误 ChatResponse。"""
+        """全部 3 次尝试（首次 + 2 次重试）均失败 → 抛 LLMCallError（不再返回空 ChatResponse）。"""
+        from app.services.llm.client import LLMCallError
+
         mock_sleep = AsyncMock()
         mock_chat = AsyncMock()
         mock_chat.side_effect = [
@@ -193,11 +195,9 @@ class TestLLMClientChat:
             with patch(_sleep_patch_path(), mock_sleep):
                 client = _build_client(mock_chat, mock_sleep=mock_sleep)
                 messages = [Message(role="user", content="Always fail")]
-                response = await client.chat(messages)
+                with pytest.raises(LLMCallError):
+                    await client.chat(messages)
 
-        assert response.content == ""
-        assert response.model == ""
-        assert response.usage is None
         assert mock_chat.await_count == 3
 
         mock_log_usage.assert_called_once()
@@ -210,6 +210,8 @@ class TestLLMClientChat:
     @pytest.mark.asyncio
     async def test_retry_backoff_delays(self, reset_llm_singleton, mock_config):
         """正确的退避延迟：重试间隔为 1 秒，然后 3 秒。"""
+        from app.services.llm.client import LLMCallError
+
         mock_sleep = AsyncMock()
         mock_chat = AsyncMock()
         mock_chat.side_effect = [
@@ -221,7 +223,8 @@ class TestLLMClientChat:
         with patch(_chat_patch_path(), mock_chat):
             with patch(_sleep_patch_path(), mock_sleep):
                 client = _build_client(mock_chat, mock_sleep=mock_sleep)
-                await client.chat([Message(role="user", content="Test")])
+                with pytest.raises(LLMCallError):
+                    await client.chat([Message(role="user", content="Test")])
 
         assert mock_sleep.await_count == 2
         mock_sleep.assert_any_await(1)
@@ -257,7 +260,9 @@ class TestLLMClientChat:
     async def test_failure_path_logs_error(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """失败路径记录 status='error' 并包含 error_message。"""
+        """失败路径记录 status='error' 并包含 error_message，且抛 LLMCallError。"""
+        from app.services.llm.client import LLMCallError
+
         mock_sleep = AsyncMock()
         mock_chat = AsyncMock()
         mock_chat.side_effect = [
@@ -269,7 +274,8 @@ class TestLLMClientChat:
         with patch(_chat_patch_path(), mock_chat):
             with patch(_sleep_patch_path(), mock_sleep):
                 client = _build_client(mock_chat, mock_sleep=mock_sleep)
-                await client.chat([Message(role="user", content="Error test")])
+                with pytest.raises(LLMCallError):
+                    await client.chat([Message(role="user", content="Error test")])
 
         mock_log_usage.assert_called_once()
         kwargs = mock_log_usage.call_args[1]
@@ -620,8 +626,8 @@ class TestParamRejectionDegradation:
     async def test_non_param_400_no_degration(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """非参数类 400（如 invalid_api_key）不触发降级，走普通退避重试。"""
-        from app.services.llm.client import LLMClient
+        """非参数类 400（如 invalid_api_key）不触发降级，走普通退避重试，耗尽后抛 LLMCallError。"""
+        from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
         calls = []
@@ -639,9 +645,9 @@ class TestParamRejectionDegradation:
         with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
             client = LLMClient()
             client._provider = provider
-            resp = await client.chat([Message(role="user", content="Q")])
+            with pytest.raises(LLMCallError):
+                await client.chat([Message(role="user", content="Q")])
 
-        assert resp.content == ""  # 重试耗尽返回空响应
         assert len(calls) == 3  # MAX_RETRIES=2 → 3 次尝试
         assert provider._extras_disabled is False  # 未降级
         assert mock_sleep.await_count == 2
@@ -654,8 +660,8 @@ class TestTerminalErrorsNoRetry:
     async def test_refusal_valueerror_no_retry(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """M7：refusal（ValueError）为终态——只尝试一次，不再退避重试。"""
-        from app.services.llm.client import LLMClient
+        """M7：refusal（ValueError）为终态——只尝试一次，不再退避重试，抛 LLMCallError。"""
+        from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
         calls = []
@@ -673,17 +679,18 @@ class TestTerminalErrorsNoRetry:
         with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
             client = LLMClient()
             client._provider = provider
-            await client.chat([Message(role="user", content="Q")])
+            with pytest.raises(LLMCallError):
+                await client.chat([Message(role="user", content="Q")])
 
         assert len(calls) == 1  # 不重试
         assert mock_sleep.await_count == 0  # 无退避
 
     @pytest.mark.asyncio
     async def test_401_no_retry(self, reset_llm_singleton, mock_config, mock_log_usage):
-        """M9：401（密钥错误）为终态——只尝试一次。"""
+        """M9：401（密钥错误）为终态——只尝试一次，抛 LLMCallError。"""
         import httpx as _h
 
-        from app.services.llm.client import LLMClient
+        from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
         calls = []
@@ -708,7 +715,8 @@ class TestTerminalErrorsNoRetry:
         with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
             client = LLMClient()
             client._provider = provider
-            await client.chat([Message(role="user", content="Q")])
+            with pytest.raises(LLMCallError):
+                await client.chat([Message(role="user", content="Q")])
 
         assert len(calls) == 1
         assert mock_sleep.await_count == 0
@@ -838,3 +846,219 @@ class TestParamRejectionExtended:
         e = _h.HTTPStatusError("err", request=request, response=response)
         assert _is_param_rejection(e) is False
         assert _is_terminal_error(e) is True
+
+
+# ===================================================================
+# LLMCallError：重试耗尽抛异常（不再返回空 ChatResponse）
+# ===================================================================
+
+
+class TestLLMCallError:
+    """重试耗尽时抛 LLMCallError，携带 retryable 标志。"""
+
+    @pytest.mark.asyncio
+    async def test_retries_exhausted_raises_llm_call_error(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """全部重试耗尽 → 抛 LLMCallError（不再返回空 ChatResponse）。"""
+        from app.services.llm.client import LLMCallError
+
+        mock_sleep = AsyncMock()
+        mock_chat = AsyncMock()
+        mock_chat.side_effect = [
+            Exception("Error 1"),
+            Exception("Error 2"),
+            Exception("Error 3"),
+        ]
+
+        with patch(_chat_patch_path(), mock_chat):
+            with patch(_sleep_patch_path(), mock_sleep):
+                client = _build_client(mock_chat, mock_sleep=mock_sleep)
+                with pytest.raises(LLMCallError):
+                    await client.chat([Message(role="user", content="Always fail")])
+
+        mock_log_usage.assert_called_once()
+        kwargs = mock_log_usage.call_args[1]
+        assert kwargs["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_429_retryable_true(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """429 重试耗尽 → LLMCallError.retryable=True。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMCallError, LLMClient
+
+        mock_sleep = AsyncMock()
+
+        def _raise429():
+            request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+            response = _h.Response(429, text="rate limited", request=request)
+            raise _h.HTTPStatusError("Too Many", request=request, response=response)
+
+        async def _bad(self, messages, **kwargs):
+            _raise429()
+
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _bad.__get__(provider, OpenAICompatProvider)
+
+        with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
+            client = LLMClient()
+            client._provider = provider
+            with pytest.raises(LLMCallError) as exc_info:
+                await client.chat([Message(role="user", content="Q")])
+
+        assert exc_info.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_401_retryable_false(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """401 → LLMCallError.retryable=False（确定性错误）。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMCallError, LLMClient
+
+        def _raise401():
+            request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+            response = _h.Response(
+                401, text='{"error": "Invalid API key"}', request=request
+            )
+            raise _h.HTTPStatusError("Unauthorized", request=request, response=response)
+
+        async def _bad(self, messages, **kwargs):
+            _raise401()
+
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _bad.__get__(provider, OpenAICompatProvider)
+
+        client = LLMClient()
+        client._provider = provider
+        with pytest.raises(LLMCallError) as exc_info:
+            await client.chat([Message(role="user", content="Q")])
+
+        assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_403_retryable_false(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """403 → LLMCallError.retryable=False（确定性错误）。"""
+        import httpx as _h
+
+        from app.services.llm.client import LLMCallError, LLMClient
+
+        def _raise403():
+            request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+            response = _h.Response(403, text='{"error": "Forbidden"}', request=request)
+            raise _h.HTTPStatusError("Forbidden", request=request, response=response)
+
+        async def _bad(self, messages, **kwargs):
+            _raise403()
+
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _bad.__get__(provider, OpenAICompatProvider)
+
+        client = LLMClient()
+        client._provider = provider
+        with pytest.raises(LLMCallError) as exc_info:
+            await client.chat([Message(role="user", content="Q")])
+
+        assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_valueerror_refusal_retryable_false(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """ValueError（refusal）→ LLMCallError.retryable=False。"""
+        from app.services.llm.client import LLMCallError, LLMClient
+
+        async def _refuse(self, messages, **kwargs):
+            raise ValueError("模型拒绝响应: 内容违反政策")
+
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _refuse.__get__(provider, OpenAICompatProvider)
+
+        client = LLMClient()
+        client._provider = provider
+        with pytest.raises(LLMCallError) as exc_info:
+            await client.chat([Message(role="user", content="Q")])
+
+        assert exc_info.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_param_400_degraded_then_failed_retryable_true(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """参数类 400 降级后仍失败 → LLMCallError.retryable=True。
+
+        参数类 400 的 _is_terminal_error 返回 False（因为 _is_param_rejection=True），
+        所以 retryable = not False = True。
+        """
+        from app.services.llm.client import LLMCallError, LLMClient
+
+        def _httpx_400():
+            import httpx as _h
+
+            request = _h.Request("POST", "https://test.api.com/v1/chat/completions")
+            response = _h.Response(
+                400,
+                text='{"error": "Unrecognized request argument supplied: reasoning_effort"}',
+                request=request,
+            )
+            return _h.HTTPStatusError("Bad Request", request=request, response=response)
+
+        async def _bad(self, messages, **kwargs):
+            raise _httpx_400()
+
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.chat = _bad.__get__(provider, OpenAICompatProvider)
+
+        client = LLMClient()
+        client._provider = provider
+        with pytest.raises(LLMCallError) as exc_info:
+            await client.chat([Message(role="user", content="Q")])
+
+        # 参数类 400 → _is_terminal_error 返回 False → retryable=True
+        assert exc_info.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_success_does_not_raise(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """成功路径不抛异常，正常返回 ChatResponse。"""
+
+        mock_chat = AsyncMock()
+        mock_chat.return_value = ChatResponse(
+            content="Hello!",
+            model="gpt-4o-mini",
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        )
+
+        with patch(_chat_patch_path(), mock_chat):
+            client = _build_client(mock_chat)
+            response = await client.chat([Message(role="user", content="Hello")])
+
+        assert response.content == "Hello!"
+        assert response.model == "gpt-4o-mini"

@@ -1658,6 +1658,54 @@ class TestTestSummaryJob:
                 assert data["error_message"]
                 assert data["record_count"] == 3
 
+    @pytest.mark.asyncio
+    async def test_llm_call_error_returns_success_false_not_500(self):
+        """T4：generate_summary 抛 LLMCallError → 返回 success=False（不得 500）。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+        from app.services.llm.client import LLMCallError
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_service") as mock_service,
+        ):
+            mock_cm.get_summary_configs.return_value = [
+                {
+                    "id": 1,
+                    "name": "Error Job",
+                    "cron": "0 21 * * *",
+                    "lookback_days": 1,
+                    "user_name": "",
+                    "system_prompt": "",
+                    "max_records": 200,
+                    "enabled": True,
+                },
+            ]
+            mock_service.generate_summary = AsyncMock(
+                side_effect=LLMCallError("401 Unauthorized", retryable=False)
+            )
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/summary/jobs/Error%20Job/test")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["success"] is False
+                assert "LLM 调用失败" in data["error_message"]
+                assert "401" in data["error_message"]
+
 
 class TestTriggerSummaryJob:
     """POST /api/summary/jobs/{id}/trigger 端点测试。"""

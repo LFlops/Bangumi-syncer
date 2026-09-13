@@ -118,9 +118,19 @@ async def run(
                 stop_reason="end_turn", text=resp.content, last_response=resp
             )
 
-        # ② 空响应 / 无 tool_calls 兜底终止（避免裸 success 卡死）
+        # ② 无 tool_calls → 按 stop_reason 细分终止原因
         tool_calls = _extract_tool_calls(resp)
         if not tool_calls:
+            if resp.stop_reason == "max_tokens":
+                # 生成长度超限（非故障，但属特殊终态）
+                return RunResult(
+                    stop_reason="max_tokens", text=resp.content, last_response=resp
+                )
+            if resp.stop_reason == "" and not resp.blocks and not resp.content:
+                # 空壳响应（LLM 调用失败后被错误传递到 loop，或 provider 异常）
+                # → 显式标记 llm_error，不再伪装 end_turn
+                return RunResult(stop_reason="llm_error", last_response=resp)
+            # 其余（stop_sequence / stop_reason 未知但有 content 等）维持 end_turn 兼容
             return RunResult(
                 stop_reason="end_turn", text=resp.content, last_response=resp
             )

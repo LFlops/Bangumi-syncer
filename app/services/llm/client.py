@@ -82,6 +82,19 @@ def _is_terminal_error(e: Exception) -> bool:
     return False
 
 
+class LLMCallError(Exception):
+    """LLM 调用失败（重试耗尽或确定性错误）。
+
+    ``retryable`` 指示调用方是否可以安全重试：
+    - ``True``：429/5xx/超时类故障，下个调度周期重试可能恢复。
+    - ``False``：401/403/400/参数类/refusal 等确定性错误，重试无意义。
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
 def _retry_delay(e: Exception, fallback: int) -> int:
     """429 优先读取 Retry-After（秒）；其余用固定退避。
 
@@ -152,7 +165,11 @@ class LLMClient:
             **kwargs: provider 特定的覆盖参数（temperature、max_tokens 等）。
 
         Returns:
-            成功时返回 ChatResponse，所有重试耗尽时返回空的 ChatResponse。
+            成功时返回 ChatResponse。
+
+        Raises:
+            LLMCallError: 所有重试耗尽或遇到确定性错误（401/403/refusal 等）。
+                ``retryable`` 标志指示调用方是否可安全重试。
         """
         last_error: Exception | None = None
         # L8：latency 只计量成功那次请求（不含退避睡眠墙钟）
@@ -200,7 +217,7 @@ class LLMClient:
                 attempt += 1
                 t_attempt = time.time()  # L8：重试后重新计时
 
-        # 所有重试耗尽 —— 记录错误并返回空响应（latency 仅最后尝试耗时）
+        # 所有重试耗尽 —— 记录错误并抛 LLMCallError（不再返回空响应伪装成功）
         latency_ms = int((time.time() - t_attempt) * 1000)
         error_detail = _format_error_detail(last_error) if last_error else "unknown"
         logger.error(
@@ -212,7 +229,8 @@ class LLMClient:
             job_name=job_name,
             latency_ms=latency_ms,
         )
-        return ChatResponse(content="", model="", usage=None, latency=latency_ms)
+        retryable = not _is_terminal_error(last_error)
+        raise LLMCallError(error_detail, retryable=retryable) from last_error
 
     def _log_success(
         self,

@@ -843,6 +843,108 @@ def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
 # ---------------------------------------------------------------------------
 
 
+def test_continue_replay_llm_call_error_retryable_false_marks_failed():
+    """恢复续跑遇 LLMCallError(retryable=False) → 直接 mark_failed(stop_reason='llm_error')。"""
+    from unittest.mock import patch
+
+    from app.services.agent.trace import ReplayResult
+    from app.services.llm.client import LLMCallError
+    from app.services.llm.models import Message
+
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    # 注入 mark_failed 为 MagicMock 以便断言
+    repo.mark_failed = MagicMock()
+
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+
+    # chat_fn 抛 LLMCallError(retryable=False)
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("401 Unauthorized", retryable=False)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.llm_match_scheduler.llm_assist_module._build_default_chat_fn",
+            return_value=_boom,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay(
+                {"run_id": "r-err-terminal", "sync_record_id": 1}, {"id": 1}
+            )
+        )
+
+    repo.mark_failed.assert_called_once()
+    call_kwargs = repo.mark_failed.call_args[1]
+    assert call_kwargs.get("stop_reason") == "llm_error"
+    assert "401" in call_kwargs.get("last_error", "")
+
+
+def test_continue_replay_llm_call_error_retryable_true_increments_attempts():
+    """恢复续跑遇 LLMCallError(retryable=True) → increment_attempts。"""
+    from unittest.mock import patch
+
+    from app.services.agent.trace import ReplayResult
+    from app.services.llm.client import LLMCallError
+    from app.services.llm.models import Message
+
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    repo.mark_failed = MagicMock()
+
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=0,
+        missing_tool_calls=[],
+        last_response=None,
+    )
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("500 Internal Server Error", retryable=True)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.llm_match_scheduler.llm_assist_module._build_default_chat_fn",
+            return_value=_boom,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay(
+                {"run_id": "r-err-retry", "sync_record_id": 1}, {"id": 1}
+            )
+        )
+
+    repo.increment_attempts.assert_called_once_with("r-err-retry")
+    repo.mark_failed.assert_not_called()
+
+
 def test_recover_end_to_end_no_double_llm_call_m22(monkeypatch):
     from app.core.database import database_manager, set_database_manager
     from app.services.llm.tools import ToolResultBlock, get_tool_registry

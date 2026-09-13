@@ -591,7 +591,98 @@ async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
 
 
 # ---------------------------------------------------------------------------
-# 11. loop.py 不 import 任何 trace 符号（S2.4）
+# 12. 终止分类：空壳响应 → llm_error；max_tokens → max_tokens
+# ---------------------------------------------------------------------------
+
+
+async def test_run_empty_shell_response_returns_llm_error():
+    """空壳响应（stop_reason=""、无 blocks、content 为空）→ stop_reason='llm_error'（不再 end_turn）。"""
+    from app.services.llm.models import ChatResponse
+
+    # 模拟 LLMCallError 后被包装成的空壳（client 不再返回此物，但 loop 仍需防御）
+    chat_fn = AsyncMock(
+        return_value=ChatResponse(content="", blocks=[], stop_reason="")
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "llm_error"
+
+
+async def test_run_max_tokens_response_returns_max_tokens():
+    """无 tool_calls 且 stop_reason='max_tokens' → stop_reason='max_tokens'。"""
+    from app.services.llm.models import ChatResponse
+
+    chat_fn = AsyncMock(
+        return_value=ChatResponse(
+            content="truncated...", blocks=[], stop_reason="max_tokens"
+        )
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "max_tokens"
+
+
+async def test_run_end_turn_unchanged():
+    """stop_reason='end_turn' 路径不变。"""
+    chat_fn = AsyncMock(return_value=_resp("end_turn", None))
+    chat_fn.return_value.content = "已分析完毕"
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[{"name": "search_bangumi"}],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    assert result.text == "已分析完毕"
+
+
+async def test_run_tool_calls_path_unchanged():
+    """有 tool_calls 的路径不受影响（stop_reason='tool_use' 含 tool_calls）。"""
+    chat_fn = AsyncMock(
+        side_effect=[
+            _resp("tool_use", [_tool_use("t1", "search_bangumi")]),
+            _resp("end_turn", None),
+        ]
+    )
+    tool_calls_fn = AsyncMock(
+        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    assert chat_fn.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 13. loop.py 不 import 任何 trace 符号（S2.4）
 # ---------------------------------------------------------------------------
 
 

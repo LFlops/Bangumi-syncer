@@ -1599,3 +1599,207 @@ def test_trace_recorder_begin_replayed_round_sets_current_iteration():
     assert tool_starts[0]["iteration"] == 7, (
         f"begin_replayed_round(7) 后 tool iteration 应为 7，实际 {tool_starts[0]['iteration']}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T4：LLMCallError 处理（run 捕获分流 + _handle_result 新增分支）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_llm_call_error_retryable_true_increments_attempts(
+    monkeypatch,
+):
+    """LLMCallError(retryable=True) → increment_attempts，返回 processing（attempts<3）。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-e-retryable"
+    sr_id = 500
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("429 rate limited", retryable=True)
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_boom,
+        span_recorder=None,
+    )
+
+    assert status == "processing"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["attempts"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch):
+    """LLMCallError(retryable=False) → 立即 mark_failed(stop_reason='llm_error')，返回 failed。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-e-terminal"
+    sr_id = 501
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("401 Unauthorized", retryable=False)
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_boom,
+        span_recorder=None,
+    )
+
+    assert status == "failed"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "failed"
+    assert run_row["stop_reason"] == "llm_error"
+    assert "401" in (run_row["last_error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch):
+    """LLMCallError(retryable=True) 连续 3 次 → mark_failed。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-e-retry3"
+    sr_id = 502
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    call_count = {"n": 0}
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        call_count["n"] += 1
+        raise LLMCallError("500 Internal Server Error", retryable=True)
+
+    # 第 1 次 → processing (attempts=1)
+    status1 = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_boom,
+        span_recorder=None,
+    )
+    assert status1 == "processing"
+
+    # 重新 claim 并跑第 2 次 → processing (attempts=2)
+    database_manager.agent_runs.update_run_status(run_id, "pending")
+    status2 = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_boom,
+        span_recorder=None,
+    )
+    assert status2 == "processing"
+
+    # 第 3 次 → failed (attempts=3)
+    database_manager.agent_runs.update_run_status(run_id, "pending")
+    status3 = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_boom,
+        span_recorder=None,
+    )
+    assert status3 == "failed"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "failed"
+    assert run_row["stop_reason"] == "llm_error"
+
+
+@pytest.mark.asyncio
+async def test_handle_result_llm_error_marks_failed(monkeypatch):
+    """_handle_result 对 stop_reason='llm_error' → mark_failed(stop_reason='llm_error')。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    result = RunResult(stop_reason="llm_error")
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-llm-err",
+        result,
+        sync_record=_make_sync_record(sync_record_id=510),
+        sync_record_id=510,
+        bgm=None,
+        notification_service=None,
+    )
+
+    assert status == "failed"
+    dbm.agent_runs.mark_failed.assert_called_once()
+    call_kwargs = dbm.agent_runs.mark_failed.call_args[1]
+    assert call_kwargs.get("stop_reason") == "llm_error"
+
+
+@pytest.mark.asyncio
+async def test_handle_result_max_tokens_marks_failed(monkeypatch):
+    """_handle_result 对 stop_reason='max_tokens' → mark_failed(stop_reason='max_tokens')。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    result = RunResult(stop_reason="max_tokens")
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-max-tok",
+        result,
+        sync_record=_make_sync_record(sync_record_id=511),
+        sync_record_id=511,
+        bgm=None,
+        notification_service=None,
+    )
+
+    assert status == "failed"
+    dbm.agent_runs.mark_failed.assert_called_once()
+    call_kwargs = dbm.agent_runs.mark_failed.call_args[1]
+    assert call_kwargs.get("stop_reason") == "max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_handle_result_end_turn_still_no_suggestion(monkeypatch):
+    """_handle_result 对 stop_reason='end_turn' 仍落 no_suggestion（语义不变）。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    result = RunResult(stop_reason="end_turn")
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-end-turn",
+        result,
+        sync_record=_make_sync_record(sync_record_id=512),
+        sync_record_id=512,
+        bgm=None,
+        notification_service=None,
+    )
+
+    assert status == "no_suggestion"
+    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+        "run-end-turn", stop_reason="end_turn"
+    )
+
+
+def test_begin_replayed_round_sets_next_iteration_to_iteration_plus_one():
+    """begin_replayed_round(iteration) 应设 _current_iteration=iteration 且 _next_iteration=iteration+1。"""
+    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder.begin_replayed_round(5)
+    assert recorder._current_iteration == 5
+    assert recorder._next_iteration == 6

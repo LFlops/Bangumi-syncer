@@ -32,6 +32,7 @@ from app.services.agent.trace import (
     record_budget_message as trace_record_budget_message,
     start_span as trace_start_span,
 )
+from app.services.llm.client import LLMCallError
 from app.services.llm.models import (
     Message,
     ToolResultBlock,
@@ -494,10 +495,11 @@ class TraceRecorder:
         """锚定到指定轮次，供恢复路径补执行缺失工具落 span 使用。
 
         将 ``_current_iteration`` 设为 ``iteration``，并使 ``_next_iteration``
-        落后于该值（保证后续 ``wrap_chat_fn`` 推进到 ``iteration`` 的下一个值）。
+        设为 ``iteration + 1``（保证后续 ``wrap_chat_fn`` 从正确轮次开始推进，
+        避免与补执行的 tool span 撞号）。
         """
         self._current_iteration = iteration
-        self._next_iteration = iteration
+        self._next_iteration = iteration + 1
         self._last_tool_span_id = None
 
     # -- budget 钩子 -------------------------------------------------------
@@ -834,7 +836,7 @@ async def run(
     wrapped_chat_fn = span_recorder.wrap_chat_fn(chat_fn)
     span_recorder.write_seed_row(seed)
 
-    # LLM 调用异常（chat_fn 抛错）→ 累加 attempts，达 3 → failed
+    # LLM 调用异常（chat_fn 抛错）→ 按可重试性分流
     try:
         result = await loop_run(
             chat_fn=wrapped_chat_fn,
@@ -847,6 +849,24 @@ async def run(
             seed_messages=seed,
             recorder=span_recorder,
         )
+    except LLMCallError as e:
+        # LLMCallError 携带 retryable 标志区分可重试/确定性失败
+        if not e.retryable:
+            # 确定性失败（401/403/400/refusal）→ 立即标记 failed，不浪费重试次数
+            logger.error(f"[llm_assist] run {run_id} 确定性 LLM 失败: {e}")
+            dbm.agent_runs.mark_failed(
+                run_id, stop_reason="llm_error", last_error=str(e)[:500]
+            )
+            return "failed"
+        # 可重试（429/5xx/超时）→ 累加 attempts，达 3 → failed
+        logger.error(f"[llm_assist] run {run_id} 可重试 LLM 失败: {e}")
+        attempts = dbm.agent_runs.increment_attempts(run_id)
+        if attempts >= 3:
+            dbm.agent_runs.mark_failed(
+                run_id, stop_reason="llm_error", last_error=str(e)[:500]
+            )
+            return "failed"
+        return "processing"
     except Exception as e:
         logger.error(f"[llm_assist] run {run_id} LLM 调用异常: {e}")
         attempts = dbm.agent_runs.increment_attempts(run_id)
@@ -928,6 +948,13 @@ def _handle_result(
             run_id, stop_reason="exhausted", last_error=perr or "无建议"
         )
         return "no_suggestion"
+
+    if stop in ("llm_error", "max_tokens"):
+        # LLM 调用失败 / 生成长度超限 → 显式标记 failed（不再伪装 no_suggestion）
+        dbm.agent_runs.mark_failed(
+            run_id, stop_reason=stop, last_error=f"循环终止原因: {stop}"
+        )
+        return "failed"
 
     # end_turn：直接终止，无建议
     dbm.agent_runs.mark_no_suggestion(run_id, stop_reason="end_turn")

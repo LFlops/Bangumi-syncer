@@ -15,6 +15,7 @@ from ..models.summary import (
     SummaryJobTestResponse,
     SummaryJobUpdate,
 )
+from ..services.llm.client import LLMCallError
 from ..services.memory.service import MemoryService
 from ..services.summary import SummaryJobConfig, summary_scheduler, summary_service
 from .deps import get_current_user_flexible
@@ -112,16 +113,25 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
     decoded = unquote(name)
     target = _find_config(decoded)
     job_config = SummaryJobConfig.from_config_dict(target)
-    result = await summary_service.generate_summary(job_config)
+    try:
+        result = await summary_service.generate_summary(job_config)
+    except LLMCallError as e:
+        # LLM 调用失败（重试耗尽/确定性错误）→ 返回 success=False，不得 500
+        return SummaryJobTestResponse(
+            success=False,
+            job_name=job_config.name,
+            error_message=f"LLM 调用失败：{e}",
+            record_count=0,
+        )
     summary_text = result["summary_text"]
     usage = result.get("usage")
 
     if not summary_text:
-        # H1-API 修正：空内容即失败（usage 存在但空 choices 仍可能是失败调用）
+        # 兜底：空内容即失败（LLMCallError 已被上方捕获，此处为额外防御）
         return SummaryJobTestResponse(
             success=False,
             job_name=job_config.name,
-            error_message="LLM 调用失败：所有重试均已耗尽",
+            error_message="LLM 调用失败：返回空内容",
             record_count=result["record_count"],
         )
 

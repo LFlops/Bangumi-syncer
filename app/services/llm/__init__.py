@@ -1,4 +1,4 @@
-from .client import LLMClient, get_llm_client, reset_llm_client
+from .client import LLMCallError, LLMClient, get_llm_client, reset_llm_client
 from .models import ChatResponse, Message, Usage
 
 __all__ = [
@@ -6,6 +6,7 @@ __all__ = [
     "Usage",
     "ChatResponse",
     "LLMClient",
+    "LLMCallError",
     "get_llm_client",
     "reset_llm_client",
 ]
