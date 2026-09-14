@@ -227,51 +227,13 @@ app.include_router(airing_calendar_router)
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 路由扁平化（兼容 Starlette >= 0.53 的 _IncludedRouter 内部结构）
-# Starlette 新版将 include_router 的 APIRouter 包装为 _IncludedRouter，
-# 导致 app.routes 不再直接暴露子路由（影响依赖 app.routes 的现有测试）。
-# 此处手动展开 _IncludedRouter，恢复扁平路由列表。
+# FastMCP 子应用挂载
+# 官方推荐：把 FastMCP 子应用以 Mount 方式嵌入，保持其原始根路径
+# （/.well-known/*、/authorize、/token、/consent、/mcp）。
+# 必须是 catch-all，放在所有具体路由之后；子应用的 user_middleware
+# 与 lifespan 由 Mount + combine_lifespans 负责，无需手动迁移。
 # ─────────────────────────────────────────────────────────────────────────
-_flattened: list = []
-for _iroute in app.router.routes:
-    if type(_iroute).__name__ == "_IncludedRouter":
-        _flattened.extend(_iroute.original_router.routes)
-    else:
-        _flattened.append(_iroute)
-app.router.routes = _flattened
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# FastMCP 路由手动注册（S1 Spike 结论：不能 app.mount("/mcp", mcp_app)，
-# 否则 /.well-known/*、/authorize、/token 会错位到 /mcp/ 下，违反 RFC 8414）
-# 遍历 mcp_app.routes 手动添加到 FastAPI router，保持原始路径：
-#   /.well-known/*  → 根路径（OAuth discovery）
-#   /authorize      → 根路径（授权端点）
-#   /token          → 根路径（令牌端点）
-#   /mcp            → /mcp（工具端点）
-# ─────────────────────────────────────────────────────────────────────────
-for _mcp_route in mcp_app.routes:
-    if hasattr(_mcp_route, "path"):
-        app.router.routes.append(_mcp_route)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# FastMCP 中间件迁移
-# /mcp 端点的 RequireAuthMiddleware 只检查 scope["user"]，而该值由
-# AuthenticationMiddleware(BearerAuthBackend(provider)) 写入；此外
-# AuthContextMiddleware 写入 contextvar 供 get_access_token 读取，
-# RequestContextMiddleware 写入当前 HTTP request contextvar。
-# 这些中间件存在于 mcp_app.user_middleware，随路由摊平会被丢弃，
-# 导致携带合法 Bearer 仍永远 401 invalid_token，故需迁移到主 app。
-#
-# Starlette user_middleware[0] 为最外层；FastAPI add_middleware 为
-# insert(0)（后加者更外层），因此需 reversed 迭代，保持相对顺序。
-# 对普通 HTTP 路由影响：# AuthenticationMiddleware 仅尝试解析 Bearer
-# 并写入 scope["user"]，无效/缺失时不拦截；AuthContextMiddleware 仅
-# 在存在 AuthenticatedUser 时设置 contextvar。两者均为无副作用包装。
-# ─────────────────────────────────────────────────────────────────────────
-for _mcp_mw in reversed(mcp_app.user_middleware):
-    app.add_middleware(_mcp_mw.cls, **_mcp_mw.kwargs)
+app.mount("/", mcp_app)
 
 
 # ─────────────────────────────────────────────────────────────────────────

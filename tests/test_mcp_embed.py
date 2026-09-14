@@ -34,12 +34,9 @@ class TestMcpEndpointExists:
         with _embed_mocks():
             from app.main import app
 
-            mcp_routes = [
-                route
-                for route in app.routes
-                if hasattr(route, "path") and route.path == "/mcp"
-            ]
-            assert len(mcp_routes) > 0, "app 应注册 /mcp 路由"
+            with TestClient(app) as client:
+                response = client.get("/mcp")
+            assert response.status_code != 404, "/mcp 不应返回 404"
 
     def test_mcp_endpoint_responds(self):
         """GET /mcp 应返回响应（200 或 401，但不 404）。"""
@@ -95,24 +92,18 @@ class TestOperationalRoutesAtRoot:
         with _embed_mocks():
             from app.main import app
 
-            authorize_routes = [
-                route
-                for route in app.routes
-                if hasattr(route, "path") and route.path == "/authorize"
-            ]
-            assert len(authorize_routes) > 0, "app 应注册 /authorize 路由"
+            with TestClient(app) as client:
+                response = client.get("/authorize")
+            assert response.status_code != 404, "/authorize 不应返回 404"
 
     def test_token_not_404(self):
         """/token 在根路径存在（不 404）。"""
         with _embed_mocks():
             from app.main import app
 
-            token_routes = [
-                route
-                for route in app.routes
-                if hasattr(route, "path") and route.path == "/token"
-            ]
-            assert len(token_routes) > 0, "app 应注册 /token 路由"
+            with TestClient(app) as client:
+                response = client.get("/token")
+            assert response.status_code != 404, "/token 不应返回 404"
 
 
 # ---------------------------------------------------------------------------
