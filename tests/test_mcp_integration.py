@@ -20,12 +20,12 @@ from httpx import ASGITransport, AsyncClient
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 辅助函数
 # ---------------------------------------------------------------------------
 
 
 def _make_code_challenge_b64(verifier: str) -> str:
-    """Create S256 code challenge from verifier (base64url)."""
+    """由 verifier 生成 S256 code challenge（base64url）。"""
     import base64
 
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -33,7 +33,7 @@ def _make_code_challenge_b64(verifier: str) -> str:
 
 
 def _extract_csrf_token(html_content: str) -> str:
-    """Extract CSRF token from consent form HTML."""
+    """从 consent 表单 HTML 中提取 CSRF token。"""
     import re
 
     match = re.search(r'name="csrf_token"\s+value="([^"]+)"', html_content)
@@ -50,9 +50,9 @@ def _create_test_server_with_tools(
     auth_enabled: bool = False,
     auth_username: str = "admin",
 ):
-    """Create a test server with both OAuth auth and MCP tools registered.
+    """创建同时注册 OAuth auth 与 MCP tools 的测试 server。
 
-    This combines create_auth_server (consent flow) with create_mcp_server (tools).
+    组合了 create_auth_server（consent flow）与 create_mcp_server（tools）。
     """
     from fastmcp import FastMCP
     from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
@@ -64,14 +64,14 @@ def _create_test_server_with_tools(
     )
     from app.mcp.server import _register_tools
 
-    # Initialize RSA keys
+    # 初始化 RSA 密钥
     rsa_manager = RSAKeyManager(
         private_key_path=private_key_path,
         public_key_path=public_key_path,
     )
     rsa_manager.load_or_generate()
 
-    # Create provider
+    # 创建 provider
     provider = BangumiOAuthProvider(
         base_url=issuer,
         rsa_manager=rsa_manager,
@@ -84,21 +84,21 @@ def _create_test_server_with_tools(
         revocation_options=RevocationOptions(enabled=True),
     )
 
-    # Create MCP server with auth
+    # 创建带 auth 的 MCP server
     mcp = FastMCP(name="bangumi-syncer-mcp", auth=provider)
 
-    # Register tools
+    # 注册工具
     _register_tools(mcp)
 
-    # Register consent route BEFORE calling http_app
+    # 在调用 http_app 之前注册 consent 路由
     @mcp.custom_route("/consent", methods=["GET", "POST"])
     async def consent_route(request):
         return await handle_consent(request, provider)
 
-    # Get the Starlette app
+    # 获取 Starlette app
     app = mcp.http_app(path="/mcp")
 
-    # Store public key and provider on app state for testing
+    # 将公钥和 provider 存入 app state 供测试使用
     app.state.public_key_pem = rsa_manager.get_public_key_pem()
     app.state.provider = provider
 
@@ -194,7 +194,7 @@ class TestProviderConfigWiring:
         """provider.auth_enabled 应跟随 security_manager.get_auth_config()["enabled"]。"""
         from app.mcp import server
 
-        # Mock security_manager.get_auth_config
+        # 模拟 security_manager.get_auth_config
         monkeypatch.setattr(
             "app.mcp.server.security_manager.get_auth_config",
             lambda: {
@@ -210,7 +210,7 @@ class TestProviderConfigWiring:
                 "webhook_auth_enabled": False,
             },
         )
-        # Mock config_manager.get for base_url fallback
+        # 模拟 config_manager.get 以提供 base_url 回退
         monkeypatch.setattr(
             "app.mcp.server.config_manager.get",
             lambda section, key, fallback="": fallback,
@@ -342,7 +342,7 @@ class TestFullOAuthFlowWithToolCall:
 
     @pytest.fixture
     def tmp_keys(self, tmp_path):
-        """Create temporary key files."""
+        """创建临时密钥文件。"""
         return {
             "private": str(tmp_path / "private.pem"),
             "public": str(tmp_path / "public.pem"),
@@ -350,7 +350,7 @@ class TestFullOAuthFlowWithToolCall:
 
     @pytest.fixture
     def server_app(self, tmp_keys):
-        """Create a test server with auth.enabled=False and tools registered."""
+        """创建 auth.enabled=False 且注册了 tools 的测试 server。"""
         return _create_test_server_with_tools(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
@@ -370,10 +370,10 @@ class TestFullOAuthFlowWithToolCall:
         注意：MCP /mcp 端点需要 FastMCP 内部任务组（通过 FastAPI combine_lifespan 初始化），
         这里测试 OAuth 流程 + 工具函数直接调用，验证端到端集成。
         """
-        # Steps 1-7: OAuth 流程（同步 TestClient 处理重定向/表单）
+        # 步骤 1-7：OAuth 流程（同步 TestClient 处理重定向/表单）
         client = self._make_test_client(server_app)
 
-        # Step 1: DCR 注册客户端（显式注册 read write scope，因默认 scope 已改为 read）
+        # 步骤 1：DCR 注册客户端（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
@@ -386,7 +386,7 @@ class TestFullOAuthFlowWithToolCall:
         assert reg_response.status_code == 201
         client_id = reg_response.json()["client_id"]
 
-        # Step 2: 发起授权
+        # 步骤 2：发起授权
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -406,16 +406,16 @@ class TestFullOAuthFlowWithToolCall:
         consent_url = auth_response.headers["location"]
         assert "/consent" in consent_url
 
-        # Step 3: 获取 consent 页面并提取 CSRF token
+        # 步骤 3：获取 consent 页面并提取 CSRF token
         consent_get = client.get(consent_url)
         assert consent_get.status_code == 200
         csrf_token = _extract_csrf_token(consent_get.text)
 
-        # Step 4: 解析 request_token
+        # 步骤 4：解析 request_token
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # Step 5: 同意授权
+        # 步骤 5：同意授权
         consent_post = client.post(
             "/consent",
             data={
@@ -429,11 +429,11 @@ class TestFullOAuthFlowWithToolCall:
         redirect_url = consent_post.headers["location"]
         assert "code=" in redirect_url
 
-        # Step 6: 提取 authorization code
+        # 步骤 6：提取 authorization code
         parsed_redirect = urlparse(redirect_url)
         code = parse_qs(parsed_redirect.query)["code"][0]
 
-        # Step 7: 换取 access token
+        # 步骤 7：换取 access token
         token_response = client.post(
             "/token",
             data={
@@ -450,14 +450,14 @@ class TestFullOAuthFlowWithToolCall:
         assert token_data["access_token"]
         access_token = token_data["access_token"]
 
-        # Step 8: 验证 access_token 有效（通过 provider 验签）
+        # 步骤 8：验证 access_token 有效（通过 provider 验签）
         provider = server_app.state.provider
         loaded_token = await provider.load_access_token(access_token)
         assert loaded_token is not None, "access_token 应能通过 provider 验签"
         assert "read" in loaded_token.scopes
         assert "write" in loaded_token.scopes
 
-        # Step 9: 直接调用工具函数（验证工具在 server 注册后可正常执行）
+        # 步骤 9：直接调用工具函数（验证工具在 server 注册后可正常执行）
         from unittest.mock import MagicMock, patch
 
         from app.mcp.tools import get_current_config
@@ -488,7 +488,7 @@ class TestRealHttpEndToEnd:
 
     @pytest.fixture
     def tmp_keys(self, tmp_path):
-        """Create temporary key files."""
+        """创建临时密钥文件。"""
         return {
             "private": str(tmp_path / "private.pem"),
             "public": str(tmp_path / "public.pem"),
@@ -496,7 +496,7 @@ class TestRealHttpEndToEnd:
 
     @pytest.fixture
     def server_app(self, tmp_keys):
-        """Create a test server with auth.enabled=False and tools registered."""
+        """创建 auth.enabled=False 且注册了 tools 的测试 server。"""
         return _create_test_server_with_tools(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
@@ -511,7 +511,7 @@ class TestRealHttpEndToEnd:
 
     def _do_full_oauth_flow(self, client) -> str:
         """执行完整 OAuth 流程，返回 access_token。"""
-        # Step 1: DCR（显式注册 read write scope，因默认 scope 已改为 read）
+        # 步骤 1：DCR（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
@@ -524,7 +524,7 @@ class TestRealHttpEndToEnd:
         assert reg_response.status_code == 201
         client_id = reg_response.json()["client_id"]
 
-        # Step 2: Authorize
+        # 步骤 2：发起授权
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -543,16 +543,16 @@ class TestRealHttpEndToEnd:
         assert auth_response.status_code == 302
         consent_url = auth_response.headers["location"]
 
-        # Step 3: Get consent form
+        # 步骤 3：获取 consent 表单
         consent_get = client.get(consent_url)
         assert consent_get.status_code == 200
         csrf_token = _extract_csrf_token(consent_get.text)
 
-        # Step 4: Parse request_token
+        # 步骤 4：解析 request_token
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # Step 5: Consent allow
+        # 步骤 5：同意授权
         consent_post = client.post(
             "/consent",
             data={
@@ -566,7 +566,7 @@ class TestRealHttpEndToEnd:
         redirect_url = consent_post.headers["location"]
         code = parse_qs(urlparse(redirect_url).query)["code"][0]
 
-        # Step 6: Token exchange
+        # 步骤 6：换取 token
         token_response = client.post(
             "/token",
             data={

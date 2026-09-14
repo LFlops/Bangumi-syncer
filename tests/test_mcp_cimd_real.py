@@ -24,7 +24,7 @@ from mcp.shared.auth import InvalidScopeError
 from pydantic import AnyHttpUrl, AnyUrl
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 辅助函数
 # ---------------------------------------------------------------------------
 
 CIMD_URL = "https://claude.ai/oauth/claude-code-client-metadata"

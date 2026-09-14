@@ -26,7 +26,7 @@ SAMPLE_LOG = (
 
 
 # ===========================================================================
-# get_logs
+# get_logs 测试
 # ===========================================================================
 
 
@@ -451,7 +451,7 @@ class TestGetLogs:
 
 
 # ===========================================================================
-# get_current_config
+# get_current_config 测试
 # ===========================================================================
 
 
@@ -637,7 +637,7 @@ class TestGetCurrentConfig:
 
 
 # ===========================================================================
-# update_config
+# update_config 测试
 # ===========================================================================
 
 
@@ -796,7 +796,7 @@ class TestUpdateConfig:
 
         from app.mcp import tools
 
-        # Mock get_access_token 返回仅含 read scope 的 token
+        # 模拟 get_access_token 返回仅含 read scope 的 token
         mock_token = MagicMock()
         mock_token.scopes = ["read"]
 
