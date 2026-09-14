@@ -25,7 +25,7 @@ from .tools import get_current_config, get_logs, update_config
 # base_url 占位：生产环境应从配置读取公共 URL
 _DEFAULT_BASE_URL = "http://localhost:8000"
 
-# RSA key paths (configurable via environment)
+# RSA 密钥路径（可通过环境变量配置）
 _PRIVATE_KEY_PATH = os.environ.get(
     "MCP_RSA_PRIVATE_KEY", os.path.join(tempfile.gettempdir(), "mcp_private.pem")
 )
@@ -49,7 +49,7 @@ def _resolve_base_url(base_url: str | None = None) -> str:
 
 
 def _create_provider(base_url: str | None = None) -> BangumiOAuthProvider:
-    """Create a BangumiOAuthProvider with RSA keys.
+    """创建携带 RSA 密钥的 BangumiOAuthProvider。
 
     auth_enabled / auth_username 从 BS 安全配置读取；
     base_url / 优先参数 > MCP_BASE_URL 环境变量 > 配置 > 默认值。
@@ -78,11 +78,11 @@ def _create_provider(base_url: str | None = None) -> BangumiOAuthProvider:
 
 
 def _register_tools(mcp: FastMCP) -> None:
-    """Register MCP tools on the FastMCP instance.
+    """在 FastMCP 实例上注册 MCP 工具。
 
-    Uses mcp.add_tool() to register async tool functions from app.mcp.tools.
-    Each tool returns a {"status": "success", "data": ...} envelope and raises
-    ToolError on failure.
+    使用 mcp.add_tool() 注册来自 app.mcp.tools 的异步工具函数。
+    每个工具返回 {"status": "success", "data": ...} 结构，失败时抛出
+    ToolError。
     """
     mcp.add_tool(get_logs)
     mcp.add_tool(get_current_config)
