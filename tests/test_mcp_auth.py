@@ -1107,7 +1107,7 @@ class TestCIMDIntegration:
 
     @pytest.mark.asyncio
     async def test_cimd_scope_injection(self, provider):
-        """CIMD client without scope should get default scope injected."""
+        """CIMD client without scope gets the allowed scope set injected (validation)."""
         from fastmcp.server.auth.cimd import CIMDDocument
         from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
 
@@ -1135,12 +1135,14 @@ class TestCIMDIntegration:
             cimd_fetched_at=time.time(),
         )
 
-        # Default scope should be injected
-        assert mock_client.scope == "read"
+        # 注入的是校验允许集（read write），请求 read write 不会被 SDK 拒绝；
+        # 实际发放的默认 scope 仍是 read（见 authorize 覆盖）。
+        assert mock_client.scope == "read write"
+        assert mock_client.validate_scope("read write") == ["read", "write"]
 
     def test_cimd_default_scope_configuration(self, provider):
-        """CIMDClientManager should be configured with default scope."""
-        assert provider.cimd.default_scope == "read"
+        """CIMDClientManager default_scope should be the allowed scope set."""
+        assert provider.cimd.default_scope == "read write"
 
 
 # ---------------------------------------------------------------------------

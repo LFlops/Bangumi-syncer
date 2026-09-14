@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastmcp.server.auth.cimd import CIMDClientManager, CIMDDocument
 from fastmcp.server.auth.ssrf import SSRFFetchError, SSRFFetchResponse
-from pydantic import AnyHttpUrl
+from mcp.server.auth.provider import AuthorizationParams
+from mcp.shared.auth import InvalidScopeError
+from pydantic import AnyHttpUrl, AnyUrl
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -509,7 +511,12 @@ class TestCIMDProviderIntegration:
 
     @pytest.mark.asyncio
     async def test_provider_get_client_cimd_scope_injection(self, provider):
-        """文档无 scope 时 provider 应注入默认 scope。"""
+        """文档无 scope 时 provider 应注入 CIMD 允许集（read write）。
+
+        回归 Docker E2E P1：Claude Code 的 CIMD 文档没有 scope，authorize 请求
+        带 scope=read。SDK 用合成 client 的 scope 作为允许集校验，若注入的是
+        read 之外的请求会被拒（invalid_scope）。
+        """
         mock_response = _make_ssrf_response(_make_cimd_doc_json(scope=None))
         with patch(
             "fastmcp.server.auth.cimd.ssrf_safe_fetch_response",
@@ -519,4 +526,83 @@ class TestCIMDProviderIntegration:
             result = await provider.get_client(CIMD_URL)
 
         assert result is not None
-        assert result.scope == "read"
+        assert result.scope == "read write"
+
+    @pytest.mark.asyncio
+    async def test_provider_cimd_client_validate_scope_allows_read_write(
+        self, provider
+    ):
+        """文档无 scope 时，合成 client.validate_scope 应放行 read write。"""
+        mock_response = _make_ssrf_response(_make_cimd_doc_json(scope=None))
+        with patch(
+            "fastmcp.server.auth.cimd.ssrf_safe_fetch_response",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = mock_response
+            client = await provider.get_client(CIMD_URL)
+
+        assert client is not None
+        # 允许集覆盖 read write，SDK authorize handler 不再抛 invalid_scope
+        assert client.validate_scope("read write") == ["read", "write"]
+        # 超出允许集仍应拒绝
+        with pytest.raises(InvalidScopeError):
+            client.validate_scope("admin")
+        # 未请求 scope → None（SDK 传给 provider 的 scopes=None）
+        assert client.validate_scope(None) is None
+
+    @pytest.mark.asyncio
+    async def test_provider_authorize_with_full_scope_grants_requested(self, provider):
+        """CIMD authorize 带 scope=read write 应通过校验并原样发放。
+
+        边界说明：此处用合成 client + validate_scope + provider.authorize 的
+        单元级组合模拟 SDK authorize handler 的调用序列；完整 HTTP 路由需
+        真实 CIMD 抓取，成本高，故不在此覆盖。
+        """
+        mock_response = _make_ssrf_response(_make_cimd_doc_json(scope=None))
+        with patch(
+            "fastmcp.server.auth.cimd.ssrf_safe_fetch_response",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = mock_response
+            client = await provider.get_client(CIMD_URL)
+            assert client is not None
+            # 模拟 SDK handler：先校验 scope（修复前此处抛 InvalidScopeError）
+            scopes = client.validate_scope("read write")
+            params = AuthorizationParams(
+                state="xyz",
+                scopes=scopes,
+                code_challenge="challenge",
+                redirect_uri=AnyUrl("http://localhost/callback"),
+                redirect_uri_provided_explicitly=True,
+            )
+            redirect_url = await provider.authorize(client, params)
+
+        request_token = redirect_url.split("request_token=", 1)[1]
+        pending = provider._pending_auths[request_token]
+        assert pending["scopes"] == ["read", "write"]
+
+    @pytest.mark.asyncio
+    async def test_provider_authorize_without_scope_grants_read_only(self, provider):
+        """CIMD authorize 未带 scope 时仍只发放 read（安全默认不变）。"""
+        mock_response = _make_ssrf_response(_make_cimd_doc_json(scope=None))
+        with patch(
+            "fastmcp.server.auth.cimd.ssrf_safe_fetch_response",
+            new_callable=AsyncMock,
+        ) as mock_fetch:
+            mock_fetch.return_value = mock_response
+            client = await provider.get_client(CIMD_URL)
+            assert client is not None
+            scopes = client.validate_scope(None)
+            assert scopes is None
+            params = AuthorizationParams(
+                state=None,
+                scopes=scopes,
+                code_challenge="challenge",
+                redirect_uri=AnyUrl("http://localhost/callback"),
+                redirect_uri_provided_explicitly=True,
+            )
+            redirect_url = await provider.authorize(client, params)
+
+        request_token = redirect_url.split("request_token=", 1)[1]
+        pending = provider._pending_auths[request_token]
+        assert pending["scopes"] == ["read"]

@@ -53,6 +53,12 @@ PENDING_AUTH_TTL = 600  # 10 minutes
 AUTH_CODE_TTL = 300  # 5 minutes
 REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 days
 
+# 客户端允许的 scope 全集（校验用），与 ClientRegistrationOptions.valid_scopes 对齐。
+# CIMD 合成 client 用它作为允许集：MCP SDK 的 validate_scope() 会据此校验请求 scope，
+# 因此请求 "read write" 必须落在允许集内，否则报 invalid_scope。
+# 注意这不改变发放策略——客户端未显式请求 scope 时仍按 _default_scopes 只发 "read"。
+_ALLOWED_SCOPES = ("read", "write")
+
 
 class RSAKeyManager:
     """Manages RSA key pair for JWT signing (RS256)."""
@@ -230,7 +236,9 @@ class BangumiOAuthProvider(OAuthProvider):
             base_url=base_url,
             issuer_url=issuer,
             client_registration_options=client_registration_options
-            or ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"]),
+            or ClientRegistrationOptions(
+                enabled=True, valid_scopes=list(_ALLOWED_SCOPES)
+            ),
             revocation_options=revocation_options or RevocationOptions(enabled=True),
         )
         self.rsa_manager = rsa_manager
@@ -241,7 +249,8 @@ class BangumiOAuthProvider(OAuthProvider):
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
 
-        # Default scopes for issued tokens：客户端不请求 scope 时只给 read（不再 read write）
+        # 实际发放的默认 scope：客户端不请求 scope 时只给 read（安全默认）。
+        # 与 _ALLOWED_SCOPES（校验允许集）区分：后者用于通过 SDK 的 scope 校验。
         self._default_scopes = ["read"]
         self.MAX_CLIENTS = MAX_CLIENTS
 
@@ -253,10 +262,12 @@ class BangumiOAuthProvider(OAuthProvider):
         # jti -> access token 的 exp，用于惰性清理吊销记录
         self._revoked_tokens: dict[str, float] = {}
 
-        # CIMD manager with default scope injection
+        # CIMD manager：default_scope 是校验允许集而非发放默认值。
+        # SDK 用 CIMD 合成 client 的 scope 校验请求 scope（如 "read write"），
+        # 故这里注入完整允许集；未显式请求 scope 时 authorize() 仍发放 _default_scopes。
         self.cimd = CIMDClientManager(
             enable_cimd=True,
-            default_scope=" ".join(self._default_scopes),
+            default_scope=" ".join(_ALLOWED_SCOPES),
         )
 
     # ------------------------------------------------------------------
@@ -803,7 +814,7 @@ def create_auth_server(
         auth_enabled=auth_enabled,
         auth_username=auth_username,
         client_registration_options=ClientRegistrationOptions(
-            enabled=True, valid_scopes=["read", "write"]
+            enabled=True, valid_scopes=list(_ALLOWED_SCOPES)
         ),
         revocation_options=RevocationOptions(enabled=True),
     )
