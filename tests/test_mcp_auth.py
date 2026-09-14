@@ -1591,7 +1591,7 @@ class TestOAuthFullFlow:
         """token 端点使用无效 code 时应返回 error。
 
         注意：按 MCP 规范，FastMCP 的 TokenHandler 会把 invalid_grant 的 400 转为 401
-        （"Invalid or expired tokens MUST receive a HTTP 401 response"）。
+        （原文："Invalid or expired tokens MUST receive a HTTP 401 response"，即"无效或过期的 token 必须收到 HTTP 401 响应"）。
         """
         client = self._make_test_client(server_app_auth_disabled)
 
