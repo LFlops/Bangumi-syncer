@@ -1,15 +1,15 @@
 """
-Tests for FastMCP OAuthProvider (app.mcp.provider).
+FastMCP OAuthProvider（app.mcp.provider）的测试。
 
-Covers T3 (full OAuthProvider), T4 (CIMD integration), T5 (DCR fallback):
-- RSA key management (generate, load, sign, verify)
-- DCR (Dynamic Client Registration) with scope defaults and limits
-- Authorize endpoint with auth.enabled branching
-- Consent page (allow/deny) with CSRF protection
-- Token endpoint (authorization_code, refresh_token)
-- JWT claims verification (RS256, sub/scope/iss/aud/exp)
-- CIMD: URL client_id detection, scope injection, metadata injection
-- Full end-to-end OAuth flows
+覆盖 T3（完整 OAuthProvider）、T4（CIMD 集成）、T5（DCR 回退）：
+- RSA 密钥管理（生成、加载、签名、验签）
+- DCR（Dynamic Client Registration）：默认 scope 与数量上限
+- authorize 端点：auth.enabled 分支
+- consent 页面（allow/deny）与 CSRF 保护
+- token 端点（authorization_code、refresh_token）
+- JWT claims 校验（RS256、sub/scope/iss/aud/exp）
+- CIMD：URL client_id 识别、scope 注入、元数据注入
+- 完整端到端 OAuth 流程
 """
 
 from __future__ import annotations
@@ -27,12 +27,12 @@ from pydantic import AnyHttpUrl
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
-# Helpers
+# 辅助函数
 # ---------------------------------------------------------------------------
 
 
 def _generate_keypair():
-    """Generate a fresh RSA key pair for testing."""
+    """生成全新的 RSA 密钥对（测试用）。"""
     private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -47,7 +47,7 @@ def _generate_keypair():
 
 
 def _make_code_challenge_b64(verifier: str) -> str:
-    """Create S256 code challenge from verifier (base64url)."""
+    """由 verifier 生成 S256 code challenge（base64url）。"""
     import base64
 
     digest = hashlib.sha256(verifier.encode()).digest()
@@ -55,7 +55,7 @@ def _make_code_challenge_b64(verifier: str) -> str:
 
 
 def _extract_csrf_token(html_content: str) -> str:
-    """Extract CSRF token from consent form HTML."""
+    """从 consent 表单 HTML 中提取 CSRF token。"""
     import re
 
     match = re.search(r'name="csrf_token"\s+value="([^"]+)"', html_content)
@@ -65,15 +65,15 @@ def _extract_csrf_token(html_content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# RSA Key Manager Tests
+# RSA 密钥管理器测试
 # ---------------------------------------------------------------------------
 
 
 class TestRSAKeyManager:
-    """RSA key generation, persistence, and JWT sign/verify."""
+    """RSA 密钥的生成、持久化，以及 JWT 签名/验签。"""
 
     def test_generate_creates_valid_keypair(self, tmp_path):
-        """generate_keys should produce a valid RSA key pair."""
+        """generate_keys 应生成合法的 RSA 密钥对。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -87,7 +87,7 @@ class TestRSAKeyManager:
         assert private_path.exists()
         assert public_path.exists()
 
-        # Verify keys work for sign/verify
+        # 验证密钥可用于签名/验签
         private_pem = private_path.read_bytes()
         public_pem = public_path.read_bytes()
 
@@ -96,7 +96,7 @@ class TestRSAKeyManager:
         assert decoded["sub"] == "test"
 
     def test_load_or_generate_creates_on_first_run(self, tmp_path):
-        """load_or_generate should create keys if they don't exist."""
+        """load_or_generate 在密钥不存在时应创建密钥。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -111,13 +111,13 @@ class TestRSAKeyManager:
         assert public_path.exists()
 
     def test_load_or_generate_loads_existing(self, tmp_path):
-        """load_or_generate should not overwrite existing keys."""
+        """load_or_generate 不应覆盖已存在的密钥。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
 
-        # Pre-generate keys
+        # 预先生成密钥
         private_pem, public_pem = _generate_keypair()
         private_path.write_bytes(private_pem)
         public_path.write_bytes(public_pem)
@@ -128,18 +128,18 @@ class TestRSAKeyManager:
         )
         manager.load_or_generate()
 
-        # Keys should be unchanged
+        # 密钥应保持不变
         assert private_path.read_bytes() == private_pem
         assert public_path.read_bytes() == public_pem
 
     def test_load_or_generate_recovers_missing_public_key(self, tmp_path):
-        """Private key present + public key missing: re-derive public, keep private."""
+        """私钥存在 + 公钥缺失：重新派生公钥，保留私钥。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
 
-        # Only the private key exists on disk.
+        # 磁盘上只存在私钥。
         private_pem, _ = _generate_keypair()
         private_path.write_bytes(private_pem)
         assert not public_path.exists()
@@ -150,12 +150,12 @@ class TestRSAKeyManager:
         )
         manager.load_or_generate()
 
-        # Private key must be byte-for-byte unchanged (no silent regeneration).
+        # 私钥必须逐字节保持不变（不得静默重新生成）。
         assert private_path.read_bytes() == private_pem
-        # Private key file keeps owner-only permissions.
+        # 私钥文件保持仅属主权限。
         assert (private_path.stat().st_mode & 0o777) == 0o600
 
-        # Public key is re-derived from the existing private key.
+        # 公钥由已存在的私钥重新派生。
         assert public_path.exists()
         derived_public = (
             serialization.load_pem_private_key(private_pem, password=None)
@@ -167,19 +167,19 @@ class TestRSAKeyManager:
         )
         assert public_path.read_bytes() == derived_public
 
-        # The recovered pair is usable.
+        # 恢复出的密钥对可用。
         token = manager.sign_jwt({"sub": "recover"})
         decoded = jwt.decode(token, manager.get_public_key_pem(), algorithms=["RS256"])
         assert decoded["sub"] == "recover"
 
     def test_load_or_generate_generates_pair_when_private_missing(self, tmp_path):
-        """Private key missing: generate a fresh matching key pair."""
+        """私钥缺失：生成一对全新的匹配密钥。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
 
-        # Stale public key exists but private key is gone -> must regenerate.
+        # 陈旧的公钥仍存在但私钥已丢失 -> 必须重新生成。
         _, stale_public_pem = _generate_keypair()
         public_path.write_bytes(stale_public_pem)
 
@@ -193,7 +193,7 @@ class TestRSAKeyManager:
         assert public_path.exists()
         assert private_path.read_bytes() != b""
         assert (private_path.stat().st_mode & 0o777) == 0o600
-        # Public key must now match the newly generated private key, not the stale one.
+        # 公钥现在必须匹配新生成的私钥，而不是陈旧的那把。
         assert public_path.read_bytes() != stale_public_pem
 
         token = manager.sign_jwt({"sub": "fresh"})
@@ -201,7 +201,7 @@ class TestRSAKeyManager:
         assert decoded["sub"] == "fresh"
 
     def test_public_key_pem_returns_public_key_bytes(self, tmp_path):
-        """get_public_key_pem should return the public key in PEM format."""
+        """get_public_key_pem 应返回 PEM 格式的公钥。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -216,7 +216,7 @@ class TestRSAKeyManager:
         assert b"BEGIN PUBLIC KEY" in pub_pem
 
     def test_sign_jwt_creates_valid_jwt(self, tmp_path):
-        """sign_jwt should create a JWT signed with RS256."""
+        """sign_jwt 应生成以 RS256 签名的 JWT。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -230,14 +230,14 @@ class TestRSAKeyManager:
         claims = {"sub": "user1", "scope": "read write"}
         token = manager.sign_jwt(claims)
 
-        # Verify with public key
+        # 用公钥验签
         public_pem = manager.get_public_key_pem()
         decoded = jwt.decode(token, public_pem, algorithms=["RS256"])
         assert decoded["sub"] == "user1"
         assert decoded["scope"] == "read write"
 
     def test_verify_jwt_rejects_expired(self, tmp_path):
-        """verify_jwt should return None for expired JWT."""
+        """verify_jwt 对已过期的 JWT 应返回 None。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -253,7 +253,7 @@ class TestRSAKeyManager:
         assert manager.verify_jwt(token) is None
 
     def test_verify_jwt_rejects_bad_signature(self, tmp_path):
-        """verify_jwt should return None for JWT with wrong signature."""
+        """verify_jwt 对签名错误的 JWT 应返回 None。"""
         from app.mcp.provider import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
@@ -271,12 +271,12 @@ class TestRSAKeyManager:
 
 
 # ---------------------------------------------------------------------------
-# OAuth Provider Unit Tests (T3)
+# OAuth Provider 单元测试（T3）
 # ---------------------------------------------------------------------------
 
 
 class TestOAuthProviderUnit:
-    """Unit tests for BangumiOAuthProvider (without full server)."""
+    """BangumiOAuthProvider 的单元测试（不启动完整 server）。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -305,13 +305,13 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_get_client_returns_none_for_unknown(self, provider):
-        """get_client should return None for unknown client_id."""
+        """get_client 对未知 client_id 应返回 None。"""
         result = await provider.get_client("nonexistent")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_register_and_get_client(self, provider):
-        """register_client should store client; get_client should retrieve it."""
+        """register_client 应存储 client；get_client 应能取回它。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
         client_info = OAuthClientInformationFull(
@@ -322,17 +322,17 @@ class TestOAuthProviderUnit:
         )
         await provider.register_client(client_info)
 
-        # Client should have a secret (for client_secret_post)
+        # client 应带有密钥（用于 client_secret_post）
         assert client_info.client_secret
 
-        # Retrieve it
+        # 取回它
         retrieved = await provider.get_client("test-dcr-client")
         assert retrieved is not None
         assert retrieved.client_id == "test-dcr-client"
 
     @pytest.mark.asyncio
     async def test_register_client_assigns_default_scope(self, provider):
-        """register_client should assign default scope when not specified."""
+        """register_client 在未指定 scope 时应赋默认 scope。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
         client_info = OAuthClientInformationFull(
@@ -346,17 +346,17 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_register_client_generates_client_id_if_missing(self, provider):
-        """register_client should generate client_id if not provided."""
+        """register_client 在未提供 client_id 时应生成 client_id。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
-        # Omit client_id entirely (Pydantic requires it, so we delete after creation)
+        # 完全省略 client_id（Pydantic 要求必填，故创建后再删除）
         client_info = OAuthClientInformationFull(
             client_id="temp-placeholder",
             redirect_uris=[AnyHttpUrl("http://localhost/callback")],
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Simulate missing client_id by clearing it
+        # 清空 client_id 来模拟其缺失
         client_info.client_id = ""
         await provider.register_client(client_info)
         assert client_info.client_id
@@ -365,7 +365,7 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_register_client_generates_secret_for_confidential(self, provider):
-        """register_client should generate client_secret for non-public clients."""
+        """register_client 应为非公开 client 生成 client_secret。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
         client_info = OAuthClientInformationFull(
@@ -380,14 +380,14 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_register_client_enforces_max_limit(self, provider):
-        """register_client should raise when client limit reached."""
+        """register_client 在达到 client 数量上限时应抛错。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
-        # Temporarily set max to a small number
+        # 临时把上限设为一个很小的数
         original_max = provider.MAX_CLIENTS
         provider.MAX_CLIENTS = 1
         try:
-            # Register one client
+            # 注册第一个 client
             client_info = OAuthClientInformationFull(
                 client_id="first-client",
                 redirect_uris=[AnyHttpUrl("http://localhost/callback")],
@@ -396,7 +396,7 @@ class TestOAuthProviderUnit:
             )
             await provider.register_client(client_info)
 
-            # Second should fail
+            # 第二个应失败
             from mcp.server.auth.provider import RegistrationError
 
             with pytest.raises(RegistrationError, match="limit"):
@@ -412,7 +412,7 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_authorize_returns_consent_url(self, provider):
-        """authorize should return a URL pointing to the consent page."""
+        """authorize 应返回指向 consent 页面的 URL。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -422,7 +422,7 @@ class TestOAuthProviderUnit:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -434,13 +434,13 @@ class TestOAuthProviderUnit:
         )
         url = await provider.authorize(client, params)
 
-        # Should redirect to consent page
+        # 应重定向到 consent 页面
         assert "/consent" in url
         assert "request_token=" in url
 
     @pytest.mark.asyncio
     async def test_authorize_stores_csrf_token(self, provider):
-        """authorize should store CSRF token in pending auth."""
+        """authorize 应把 CSRF token 存入 pending auth。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -450,7 +450,7 @@ class TestOAuthProviderUnit:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -462,7 +462,7 @@ class TestOAuthProviderUnit:
         )
         await provider.authorize(client, params)
 
-        # Check pending auth has csrf_token
+        # 检查 pending auth 中带有 csrf_token
         assert len(provider._pending_auths) == 1
         pending = next(iter(provider._pending_auths.values()))
         assert "csrf_token" in pending
@@ -470,7 +470,7 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_exchange_authorization_code_issues_jwt(self, provider):
-        """exchange_authorization_code should return JWT + refresh token."""
+        """exchange_authorization_code 应返回 JWT + refresh token。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -480,7 +480,7 @@ class TestOAuthProviderUnit:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -490,10 +490,10 @@ class TestOAuthProviderUnit:
             redirect_uri=AnyHttpUrl("http://localhost/callback"),
             redirect_uri_provided_explicitly=True,
         )
-        # Authorize to get request_token
+        # authorize 以获取 request_token
         await provider.authorize(client, params)
 
-        # Get the pending request's auth code (simulate consent allow)
+        # 取出 pending 请求的 auth code（模拟 consent allow）
         request_token = None
         for rt, pending in provider._pending_auths.items():
             if pending["client_id"] == "test-client":
@@ -502,13 +502,13 @@ class TestOAuthProviderUnit:
 
         assert request_token is not None
 
-        # Simulate consent allow (with CSRF token)
+        # 模拟 consent allow（带 CSRF token）
         csrf_token = provider._pending_auths[request_token]["csrf_token"]
         auth_code = await provider.handle_consent_allow(
             request_token, username="testuser", csrf_token=csrf_token
         )
 
-        # Exchange code for tokens
+        # 用 code 换取 token
         code_obj = await provider.load_authorization_code(client, auth_code)
         assert code_obj is not None
 
@@ -517,7 +517,7 @@ class TestOAuthProviderUnit:
         assert token.token_type == "Bearer"
         assert token.refresh_token
 
-        # Verify JWT claims
+        # 校验 JWT claims
         public_pem = provider.rsa_manager.get_public_key_pem()
         decoded = jwt.decode(
             token.access_token, public_pem, algorithms=["RS256"], audience="bs"
@@ -530,10 +530,10 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_load_access_token_verifies_jwt(self, provider):
-        """load_access_token should verify JWT and return AccessToken."""
+        """load_access_token 应校验 JWT 并返回 AccessToken。"""
         from mcp.server.auth.provider import AccessToken
 
-        # Sign a valid JWT
+        # 签发一个有效的 JWT
         claims = {
             "sub": "user1",
             "scope": "read write",
@@ -551,13 +551,13 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_load_access_token_rejects_expired_jwt(self, provider):
-        """load_access_token should return None for expired JWT."""
+        """load_access_token 对已过期的 JWT 应返回 None。"""
         claims = {
             "sub": "user1",
             "scope": "read write",
             "iss": "http://localhost:8000",
             "aud": "bs",
-            "exp": int(time.time()) - 100,  # expired
+            "exp": int(time.time()) - 100,  # 已过期
             "iat": int(time.time()) - 3700,
         }
         token_str = provider.rsa_manager.sign_jwt(claims)
@@ -567,8 +567,8 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_load_access_token_rejects_bad_signature(self, provider):
-        """load_access_token should return None for JWT with wrong signature."""
-        # Sign with a different key
+        """load_access_token 对签名错误的 JWT 应返回 None。"""
+        # 用另一把密钥签名
         other_private, _ = _generate_keypair()
         claims = {
             "sub": "user1",
@@ -584,7 +584,7 @@ class TestOAuthProviderUnit:
 
     @pytest.mark.asyncio
     async def test_consent_deny_clears_pending(self, provider):
-        """handle_consent_deny should clear the pending auth request."""
+        """handle_consent_deny 应清除 pending auth 请求。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -594,7 +594,7 @@ class TestOAuthProviderUnit:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -606,17 +606,17 @@ class TestOAuthProviderUnit:
         )
         await provider.authorize(client, params)
 
-        # Find request_token
+        # 找到 request_token
         request_token = next(iter(provider._pending_auths))
         assert request_token in provider._pending_auths
 
-        # Deny
+        # 拒绝
         await provider.handle_consent_deny(request_token)
         assert request_token not in provider._pending_auths
 
     @pytest.mark.asyncio
     async def test_refresh_token_rotation(self, provider):
-        """exchange_refresh_token should rotate refresh token."""
+        """exchange_refresh_token 应轮换 refresh token。"""
         from mcp.server.auth.provider import (
             OAuthClientInformationFull,
             RefreshToken,
@@ -629,7 +629,7 @@ class TestOAuthProviderUnit:
             token_endpoint_auth_method="none",
         )
 
-        # Create a refresh token
+        # 创建一个 refresh token
         old_refresh_str = secrets.token_urlsafe(32)
         old_refresh = RefreshToken(
             token=old_refresh_str,
@@ -639,7 +639,7 @@ class TestOAuthProviderUnit:
         )
         provider._refresh_tokens[old_refresh_str] = old_refresh
 
-        # Exchange
+        # 交换
         token = await provider.exchange_refresh_token(
             client, old_refresh, ["read", "write"]
         )
@@ -647,12 +647,12 @@ class TestOAuthProviderUnit:
         assert token.refresh_token
         assert token.refresh_token != old_refresh_str
 
-        # Old token should be removed
+        # 旧 token 应被移除
         assert old_refresh_str not in provider._refresh_tokens
 
     @pytest.mark.asyncio
     async def test_revoke_refresh_token(self, provider):
-        """revoke_token should remove refresh token from store."""
+        """revoke_token 应从存储中移除 refresh token。"""
         from mcp.server.auth.provider import RefreshToken
 
         refresh = RefreshToken(
@@ -667,7 +667,7 @@ class TestOAuthProviderUnit:
 
 
 # ---------------------------------------------------------------------------
-# In-memory state TTL / lazy cleanup tests
+# 内存态 TTL / 惰性清理测试
 # ---------------------------------------------------------------------------
 
 
@@ -851,12 +851,12 @@ class TestMemoryStateTTL:
 
 
 # ---------------------------------------------------------------------------
-# Consent + CSRF Tests (T3)
+# consent + CSRF 测试（T3）
 # ---------------------------------------------------------------------------
 
 
 class TestConsentFlow:
-    """Tests for consent page and CSRF protection."""
+    """consent 页面与 CSRF 保护的测试。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -885,7 +885,7 @@ class TestConsentFlow:
 
     @pytest.mark.asyncio
     async def test_consent_allow_without_csrf_rejected(self, provider):
-        """handle_consent_allow should reject request without CSRF token."""
+        """handle_consent_allow 应拒绝不带 CSRF token 的请求。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -895,7 +895,7 @@ class TestConsentFlow:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -908,7 +908,7 @@ class TestConsentFlow:
         await provider.authorize(client, params)
         request_token = next(iter(provider._pending_auths))
 
-        # Try to allow without CSRF token
+        # 尝试不带 CSRF token 进行 allow
         with pytest.raises(ValueError, match="CSRF"):
             await provider.handle_consent_allow(
                 request_token, csrf_token="", username="admin"
@@ -916,7 +916,7 @@ class TestConsentFlow:
 
     @pytest.mark.asyncio
     async def test_consent_allow_with_wrong_csrf_rejected(self, provider):
-        """handle_consent_allow should reject request with wrong CSRF token."""
+        """handle_consent_allow 应拒绝带错误 CSRF token 的请求。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -926,7 +926,7 @@ class TestConsentFlow:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -939,7 +939,7 @@ class TestConsentFlow:
         await provider.authorize(client, params)
         request_token = next(iter(provider._pending_auths))
 
-        # Try to allow with wrong CSRF token
+        # 尝试带错误的 CSRF token 进行 allow
         with pytest.raises(ValueError, match="CSRF"):
             await provider.handle_consent_allow(
                 request_token, csrf_token="wrong-token", username="admin"
@@ -947,7 +947,7 @@ class TestConsentFlow:
 
     @pytest.mark.asyncio
     async def test_consent_allow_with_correct_csrf_succeeds(self, provider):
-        """handle_consent_allow should succeed with correct CSRF token."""
+        """handle_consent_allow 在 CSRF token 正确时应成功。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -957,7 +957,7 @@ class TestConsentFlow:
             grant_types=["authorization_code"],
             token_endpoint_auth_method="none",
         )
-        # Register client first
+        # 先注册 client
         await provider.register_client(client)
 
         params = AuthorizationParams(
@@ -971,7 +971,7 @@ class TestConsentFlow:
         request_token = next(iter(provider._pending_auths))
         csrf_token = provider._pending_auths[request_token]["csrf_token"]
 
-        # Should succeed
+        # 应成功
         auth_code = await provider.handle_consent_allow(
             request_token, csrf_token=csrf_token, username="admin"
         )
@@ -980,7 +980,7 @@ class TestConsentFlow:
 
     @pytest.mark.asyncio
     async def test_consent_form_rendered_with_csrf_and_escaping(self, provider):
-        """_render_consent_form should include CSRF token and escape HTML."""
+        """_render_consent_form 应包含 CSRF token 并转义 HTML。"""
         context = {
             "request_token": "tok123",
             "client_id": "<script>alert(1)</script>",
@@ -989,20 +989,20 @@ class TestConsentFlow:
             "csrf_token": "csrf456",
         }
         html = provider._render_consent_form(context)
-        # CSRF token should be present
+        # CSRF token 应存在
         assert "csrf456" in html
-        # Client_id should be escaped
+        # client_id 应被转义
         assert "<script>" not in html
         assert "&lt;script&gt;" in html
 
 
 # ---------------------------------------------------------------------------
-# CIMD Tests (T4)
+# CIMD 测试（T4）
 # ---------------------------------------------------------------------------
 
 
 class TestCIMDIntegration:
-    """Tests for CIMD (Client ID Metadata Document) integration."""
+    """CIMD（Client ID Metadata Document）集成的测试。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -1030,26 +1030,26 @@ class TestCIMDIntegration:
         )
 
     def test_is_cimd_detects_url_client_id(self, provider):
-        """is_cimd_client_id should detect HTTPS URL as CIMD."""
+        """is_cimd_client_id 应把 HTTPS URL 识别为 CIMD。"""
         assert provider.cimd.is_cimd_client_id(
             "https://claude.ai/oauth/claude-code-client-metadata"
         )
 
     def test_is_cimd_rejects_plain_client_id(self, provider):
-        """is_cimd_client_id should reject plain string client_id."""
+        """is_cimd_client_id 应拒绝普通的字符串 client_id。"""
         assert not provider.cimd.is_cimd_client_id("my-random-client")
 
     def test_is_cimd_rejects_http_url(self, provider):
-        """is_cimd_client_id should reject HTTP (non-SSL) URLs."""
+        """is_cimd_client_id 应拒绝 HTTP（非 SSL）URL。"""
         assert not provider.cimd.is_cimd_client_id("http://example.com/metadata")
 
     @pytest.mark.asyncio
     async def test_get_client_cimd_branch_with_mock(self, provider):
-        """get_client should delegate to CIMD for URL client_id."""
+        """get_client 对 URL 形式的 client_id 应委托给 CIMD。"""
         from fastmcp.server.auth.cimd import CIMDDocument
         from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
 
-        # Create a mock CIMD client
+        # 创建一个 mock 的 CIMD client
         cimd_doc = CIMDDocument(
             client_id=AnyHttpUrl("https://claude.ai/oauth/claude-code-client-metadata"),
             client_name="Claude Code",
@@ -1070,7 +1070,7 @@ class TestCIMDIntegration:
             cimd_fetched_at=time.time(),
         )
 
-        # Mock the CIMD get_client method (must be async)
+        # mock CIMD 的 get_client 方法（必须是 async）
         async def mock_get_client(url):
             return mock_client
 
@@ -1084,7 +1084,7 @@ class TestCIMDIntegration:
 
     @pytest.mark.asyncio
     async def test_get_client_dcr_branch(self, provider):
-        """get_client should return DCR client for non-URL client_id."""
+        """get_client 对非 URL 的 client_id 应返回 DCR client。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
         client_info = OAuthClientInformationFull(
@@ -1101,27 +1101,27 @@ class TestCIMDIntegration:
 
     @pytest.mark.asyncio
     async def test_get_client_unknown_returns_none(self, provider):
-        """get_client should return None for unknown client_id."""
+        """get_client 对未知 client_id 应返回 None。"""
         result = await provider.get_client("totally-unknown-client")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_cimd_scope_injection(self, provider):
-        """CIMD client without scope gets the allowed scope set injected (validation)."""
+        """不带 scope 的 CIMD client 会被注入允许的 scope 集合（校验）。"""
         from fastmcp.server.auth.cimd import CIMDDocument
         from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
 
-        # CIMD doc without scope
+        # 不带 scope 的 CIMD doc
         cimd_doc = CIMDDocument(
             client_id=AnyHttpUrl("https://example.com/oauth/client-metadata"),
             client_name="Test App",
             redirect_uris=["http://localhost/callback"],
             token_endpoint_auth_method="none",
             grant_types=["authorization_code"],
-            scope=None,  # No scope in metadata
+            scope=None,  # 元数据中不带 scope
         )
 
-        # Simulate what CIMDClientManager.get_client does with default_scope
+        # 模拟 CIMDClientManager.get_client 借助 default_scope 的处理
         mock_client = ProxyDCRClient(
             client_id="https://example.com/oauth/client-metadata",
             client_secret=None,
@@ -1141,17 +1141,17 @@ class TestCIMDIntegration:
         assert mock_client.validate_scope("read write") == ["read", "write"]
 
     def test_cimd_default_scope_configuration(self, provider):
-        """CIMDClientManager default_scope should be the allowed scope set."""
+        """CIMDClientManager 的 default_scope 应为允许的 scope 集合。"""
         assert provider.cimd.default_scope == "read write"
 
 
 # ---------------------------------------------------------------------------
-# Metadata Injection Tests (T4)
+# 元数据注入测试（T4）
 # ---------------------------------------------------------------------------
 
 
 class TestMetadataInjection:
-    """Tests for client_id_metadata_document_supported injection."""
+    """client_id_metadata_document_supported 注入的测试。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -1179,9 +1179,9 @@ class TestMetadataInjection:
         )
 
     def test_metadata_includes_cimd_support(self, provider):
-        """get_routes should inject client_id_metadata_document_supported=True."""
+        """get_routes 应注入 client_id_metadata_document_supported=True。"""
         routes = provider.get_routes()
-        # Find the metadata route
+        # 找到 metadata 路由
         from starlette.routing import Route
 
         metadata_route = None
@@ -1195,22 +1195,22 @@ class TestMetadataInjection:
 
         assert metadata_route is not None, "Metadata route should exist"
 
-        # We can't easily inspect the metadata from the route directly,
-        # but we can verify the route exists and is properly configured
+        # 我们无法直接检查路由中的元数据，
+        # 但可以验证该路由存在且配置正确
         assert "GET" in (metadata_route.methods or [])
 
 
 # ---------------------------------------------------------------------------
-# Full Integration Tests (with TestClient)
+# 全流程集成测试（使用 TestClient）
 # ---------------------------------------------------------------------------
 
 
 class TestOAuthFullFlow:
-    """End-to-end OAuth flow tests using TestClient."""
+    """使用 TestClient 的端到端 OAuth 流程测试。"""
 
     @pytest.fixture
     def tmp_keys(self, tmp_path):
-        """Create temporary key files."""
+        """创建临时密钥文件。"""
         return {
             "private": str(tmp_path / "private.pem"),
             "public": str(tmp_path / "public.pem"),
@@ -1218,7 +1218,7 @@ class TestOAuthFullFlow:
 
     @pytest.fixture
     def server_app_auth_disabled(self, tmp_keys):
-        """Create a test server with auth.enabled=False."""
+        """创建 auth.enabled=False 的测试 server。"""
         from app.mcp.provider import create_auth_server
 
         app = create_auth_server(
@@ -1233,7 +1233,7 @@ class TestOAuthFullFlow:
 
     @pytest.fixture
     def server_app_auth_enabled(self, tmp_keys):
-        """Create a test server with auth.enabled=True."""
+        """创建 auth.enabled=True 的测试 server。"""
         from app.mcp.provider import create_auth_server
 
         app = create_auth_server(
@@ -1313,19 +1313,19 @@ class TestOAuthFullFlow:
     def test_metadata_endpoint_returns_authorization_server_metadata(
         self, server_app_auth_disabled
     ):
-        """GET /.well-known/oauth-authorization-server should return metadata."""
+        """GET /.well-known/oauth-authorization-server 应返回元数据。"""
         client = self._make_test_client(server_app_auth_disabled)
         response = client.get("/.well-known/oauth-authorization-server")
         assert response.status_code == 200
         data = response.json()
-        # AnyHttpUrl normalizes to trailing slash
+        # AnyHttpUrl 会规范化为带尾部斜杠
         assert data["issuer"] in ("http://localhost:8000", "http://localhost:8000/")
         assert "authorization_endpoint" in data
         assert "token_endpoint" in data
         assert "registration_endpoint" in data
 
     def test_metadata_includes_cimd_support_flag(self, server_app_auth_disabled):
-        """Metadata should advertise client_id_metadata_document_supported."""
+        """元数据应声明 client_id_metadata_document_supported。"""
         client = self._make_test_client(server_app_auth_disabled)
         response = client.get("/.well-known/oauth-authorization-server")
         assert response.status_code == 200
@@ -1333,7 +1333,7 @@ class TestOAuthFullFlow:
         assert data.get("client_id_metadata_document_supported") is True
 
     def test_dcr_register_client(self, server_app_auth_disabled):
-        """POST /register should register a new client."""
+        """POST /register 应注册一个新 client。"""
         client = self._make_test_client(server_app_auth_disabled)
         response = client.post(
             "/register",
@@ -1350,10 +1350,10 @@ class TestOAuthFullFlow:
         assert data["client_id_issued_at"] is not None
 
     def test_full_flow_auth_disabled(self, server_app_auth_disabled):
-        """Full OAuth flow with auth.enabled=False: authorize → consent → token."""
+        """auth.enabled=False 的完整 OAuth 流程：authorize → consent → token。"""
         client = self._make_test_client(server_app_auth_disabled)
 
-        # Step 1: DCR（显式注册 read write scope，因默认 scope 已改为 read）
+        # 步骤 1：DCR（显式注册 read write scope，因默认 scope 已改为 read）
         reg_response = client.post(
             "/register",
             json={
@@ -1366,7 +1366,7 @@ class TestOAuthFullFlow:
         assert reg_response.status_code == 201
         client_id = reg_response.json()["client_id"]
 
-        # Step 2: Authorize
+        # 步骤 2：authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1386,15 +1386,15 @@ class TestOAuthFullFlow:
         consent_url = auth_response.headers["location"]
         assert "/consent" in consent_url
 
-        # Step 3: Consent page (GET)
+        # 步骤 3：consent 页面（GET）
         consent_get = client.get(consent_url)
         assert consent_get.status_code == 200
 
-        # Step 4: Consent allow (POST)
-        # Parse request_token from consent URL
+        # 步骤 4：consent allow（POST）
+        # 从 consent URL 解析 request_token
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
-        # Extract CSRF token from consent form
+        # 从 consent 表单中提取 CSRF token
         csrf_token = _extract_csrf_token(consent_get.text)
 
         consent_post = client.post(
@@ -1410,11 +1410,11 @@ class TestOAuthFullFlow:
         redirect_url = consent_post.headers["location"]
         assert "code=" in redirect_url
 
-        # Extract code
+        # 提取 code
         parsed_redirect = urlparse(redirect_url)
         code = parse_qs(parsed_redirect.query)["code"][0]
 
-        # Step 5: Token exchange
+        # 步骤 5：token 交换
         token_response = client.post(
             "/token",
             data={
@@ -1431,21 +1431,21 @@ class TestOAuthFullFlow:
         assert token_data["access_token"]
         assert token_data["refresh_token"]
 
-        # Verify JWT claims
+        # 校验 JWT claims
         access_token = token_data["access_token"]
-        # Load public key to verify
+        # 加载公钥用于验签
         public_pem = server_app_auth_disabled.state.public_key_pem
         decoded = jwt.decode(
             access_token, public_pem, algorithms=["RS256"], audience="bs"
         )
-        assert decoded["sub"] == "admin"  # auth.username when auth.enabled=False
+        assert decoded["sub"] == "admin"  # auth.enabled=False 时使用 auth.username
         assert decoded["scope"] == "read write"
         assert decoded["iss"] == "http://localhost:8000"
         assert decoded["aud"] == "bs"
         assert decoded["exp"] > time.time()
 
     def test_consent_deny_returns_error(self, server_app_auth_disabled):
-        """User clicking deny should redirect with error."""
+        """用户点击 deny 应带 error 重定向。"""
         client = self._make_test_client(server_app_auth_disabled)
 
         # DCR
@@ -1459,7 +1459,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Authorize
+        # authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1477,12 +1477,12 @@ class TestOAuthFullFlow:
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # Get consent form to extract CSRF token
+        # 获取 consent 表单以提取 CSRF token
         consent_get = client.get(consent_url)
         assert consent_get.status_code == 200
         csrf_token = _extract_csrf_token(consent_get.text)
 
-        # Deny
+        # 拒绝
         consent_post = client.post(
             "/consent",
             data={
@@ -1498,7 +1498,7 @@ class TestOAuthFullFlow:
         assert "access_denied" in redirect_url
 
     def test_consent_post_without_csrf_rejected(self, server_app_auth_disabled):
-        """POST /consent without CSRF token should return 403."""
+        """不带 CSRF token 的 POST /consent 应返回 403。"""
         client = self._make_test_client(server_app_auth_disabled)
 
         # DCR
@@ -1512,7 +1512,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Authorize
+        # authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1530,20 +1530,20 @@ class TestOAuthFullFlow:
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # POST without CSRF token
+        # 不带 CSRF token 的 POST
         consent_post = client.post(
             "/consent",
             data={
                 "action": "allow",
                 "request_token": request_token,
-                # No csrf_token
+                # 不带 csrf_token
             },
             follow_redirects=False,
         )
         assert consent_post.status_code == 403
 
     def test_consent_post_with_wrong_csrf_rejected(self, server_app_auth_disabled):
-        """POST /consent with wrong CSRF token should return 403."""
+        """带错误 CSRF token 的 POST /consent 应返回 403。"""
         client = self._make_test_client(server_app_auth_disabled)
 
         # DCR
@@ -1557,7 +1557,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Authorize
+        # authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1575,7 +1575,7 @@ class TestOAuthFullFlow:
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # POST with wrong CSRF token
+        # 带错误 CSRF token 的 POST
         consent_post = client.post(
             "/consent",
             data={
@@ -1588,10 +1588,10 @@ class TestOAuthFullFlow:
         assert consent_post.status_code == 403
 
     def test_token_with_invalid_code_returns_error(self, server_app_auth_disabled):
-        """Token endpoint with invalid code should return error.
+        """token 端点使用无效 code 时应返回 error。
 
-        Note: FastMCP's TokenHandler transforms 400 invalid_grant -> 401
-        per MCP spec ("Invalid or expired tokens MUST receive a HTTP 401 response").
+        注意：按 MCP 规范，FastMCP 的 TokenHandler 会把 invalid_grant 的 400 转为 401
+        （"Invalid or expired tokens MUST receive a HTTP 401 response"）。
         """
         client = self._make_test_client(server_app_auth_disabled)
 
@@ -1606,7 +1606,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Try token with invalid code
+        # 用无效 code 尝试换取 token
         token_response = client.post(
             "/token",
             data={
@@ -1617,12 +1617,12 @@ class TestOAuthFullFlow:
                 "code_verifier": "verifier",
             },
         )
-        # FastMCP transforms 400 -> 401 for invalid_grant per MCP spec
+        # 按 MCP 规范，FastMCP 将 invalid_grant 的 400 转为 401
         assert token_response.status_code == 401
         assert token_response.json()["error"] == "invalid_grant"
 
     def test_refresh_token_flow(self, server_app_auth_disabled):
-        """Refresh token should grant a new access token."""
+        """refresh token 应换取新的 access token。"""
         client = self._make_test_client(server_app_auth_disabled)
 
         # DCR
@@ -1636,7 +1636,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Authorize
+        # authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1654,12 +1654,12 @@ class TestOAuthFullFlow:
         parsed = urlparse(consent_url)
         request_token = parse_qs(parsed.query)["request_token"][0]
 
-        # Get consent form to extract CSRF token
+        # 获取 consent 表单以提取 CSRF token
         consent_get = client.get(consent_url)
         assert consent_get.status_code == 200
         csrf_token = _extract_csrf_token(consent_get.text)
 
-        # Consent allow
+        # consent 允许
         consent_post = client.post(
             "/consent",
             data={
@@ -1673,7 +1673,7 @@ class TestOAuthFullFlow:
         redirect_url = consent_post.headers["location"]
         code = parse_qs(urlparse(redirect_url).query)["code"][0]
 
-        # Token exchange
+        # token 交换
         token_response = client.post(
             "/token",
             data={
@@ -1687,7 +1687,7 @@ class TestOAuthFullFlow:
         assert token_response.status_code == 200
         refresh_token = token_response.json()["refresh_token"]
 
-        # Refresh
+        # 刷新
         refresh_response = client.post(
             "/token",
             data={
@@ -1732,7 +1732,7 @@ class TestOAuthFullFlow:
         assert refresh_response.json()["error"] == "invalid_grant"
 
     def test_revoke_token_endpoint(self, server_app_auth_disabled):
-        """POST /revoke should revoke a token."""
+        """POST /revoke 应吊销 token。"""
         client = self._make_test_client(server_app_auth_disabled)
 
         # DCR
@@ -1746,7 +1746,7 @@ class TestOAuthFullFlow:
         )
         client_id = reg_response.json()["client_id"]
 
-        # Authorize
+        # authorize
         code_verifier = secrets.token_urlsafe(32)
         code_challenge = _make_code_challenge_b64(code_verifier)
         auth_response = client.get(
@@ -1779,7 +1779,7 @@ class TestOAuthFullFlow:
         redirect_url = consent_post.headers["location"]
         code = parse_qs(urlparse(redirect_url).query)["code"][0]
 
-        # Token exchange
+        # token 交换
         token_response = client.post(
             "/token",
             data={
@@ -1793,7 +1793,7 @@ class TestOAuthFullFlow:
         assert token_response.status_code == 200
         refresh_token = token_response.json()["refresh_token"]
 
-        # Revoke (client_secret required by SDK RevocationRequest model)
+        # 吊销（SDK 的 RevocationRequest 模型要求 client_secret）
         revoke_response = client.post(
             "/revoke",
             data={
@@ -1808,10 +1808,10 @@ class TestOAuthFullFlow:
     async def test_full_flow_auth_enabled_with_mock_security(
         self, server_app_auth_enabled, monkeypatch
     ):
-        """Full OAuth flow with auth.enabled=True and mocked security_manager."""
+        """auth.enabled=True 且 mock security_manager 的完整 OAuth 流程。"""
         from app.mcp import provider as provider_module
 
-        # Mock security_manager.validate_session to return a session
+        # mock security_manager.validate_session 使其返回一个 session
         mock_session = {"username": "testuser", "created_at": time.time()}
         monkeypatch.setattr(
             provider_module.security_manager,
@@ -1835,7 +1835,7 @@ class TestOAuthFullFlow:
             assert reg_response.status_code == 201
             client_id = reg_response.json()["client_id"]
 
-            # Authorize
+            # authorize
             code_verifier = secrets.token_urlsafe(32)
             code_challenge = _make_code_challenge_b64(code_verifier)
             auth_response = client.get(
@@ -1853,15 +1853,15 @@ class TestOAuthFullFlow:
             assert auth_response.status_code == 302
             consent_url = auth_response.headers["location"]
 
-            # Consent GET (checks BS session via security_manager)
-            # Send session_token cookie so the handler can validate it
+            # consent GET（通过 security_manager 校验 BS session）
+            # 发送 session_token cookie 以便处理器校验
             consent_get = client.get(
                 consent_url,
                 cookies={"session_token": "valid-session-token"},
             )
             assert consent_get.status_code == 200
 
-            # Consent allow
+            # consent 允许
             parsed = urlparse(consent_url)
             request_token = parse_qs(parsed.query)["request_token"][0]
             csrf_token = _extract_csrf_token(consent_get.text)
@@ -1879,7 +1879,7 @@ class TestOAuthFullFlow:
             redirect_url = consent_post.headers["location"]
             code = parse_qs(urlparse(redirect_url).query)["code"][0]
 
-            # Token exchange
+            # token 交换
             token_response = client.post(
                 "/token",
                 data={
@@ -1893,7 +1893,7 @@ class TestOAuthFullFlow:
             assert token_response.status_code == 200
             token_data = token_response.json()
 
-            # Verify JWT sub = testuser (from security_manager session)
+            # 校验 JWT sub = testuser（来自 security_manager session）
             public_pem = server_app_auth_enabled.state.public_key_pem
             decoded = jwt.decode(
                 token_data["access_token"],
@@ -1908,10 +1908,10 @@ class TestOAuthFullFlow:
     async def test_auth_enabled_no_session_redirects_to_login(
         self, server_app_auth_enabled, monkeypatch
     ):
-        """When auth.enabled=True and no session, consent GET should indicate login needed."""
+        """当 auth.enabled=True 且无 session 时，consent GET 应表明需要登录。"""
         from app.mcp import provider as provider_module
 
-        # Mock security_manager.validate_session to return None (no session)
+        # mock security_manager.validate_session 使其返回 None（无 session）
         monkeypatch.setattr(
             provider_module.security_manager,
             "validate_session",
@@ -1932,7 +1932,7 @@ class TestOAuthFullFlow:
             )
             client_id = reg_response.json()["client_id"]
 
-            # Authorize
+            # authorize
             code_verifier = secrets.token_urlsafe(32)
             code_challenge = _make_code_challenge_b64(code_verifier)
             auth_response = client.get(
@@ -1948,19 +1948,19 @@ class TestOAuthFullFlow:
             )
             consent_url = auth_response.headers["location"]
 
-            # Consent GET - should indicate login needed (not 200 with form)
+            # consent GET：应表明需要登录（而不是返回 200 表单）
             consent_get = client.get(consent_url)
-            # Either redirect to login or show error - not the consent form
+            # 要么重定向到登录，要么显示错误，而不是 consent 表单
             assert consent_get.status_code in (302, 401)
 
 
 # ---------------------------------------------------------------------------
-# DCR Fallback Tests (T5)
+# DCR 回退测试（T5）
 # ---------------------------------------------------------------------------
 
 
 class TestDCRFallback:
-    """Tests for DCR fallback behavior."""
+    """DCR 回退行为的测试。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -1989,11 +1989,11 @@ class TestDCRFallback:
 
     @pytest.mark.asyncio
     async def test_unknown_client_id_rejected_in_authorize(self, provider):
-        """authorize should reject unknown client_id with unauthorized_client."""
+        """authorize 对未知 client_id 应以 unauthorized_client 拒绝。"""
         from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
         from mcp.shared.auth import OAuthClientInformationFull
 
-        # Create a client object but don't register it
+        # 创建 client 对象但不注册它
         client = OAuthClientInformationFull(
             client_id="unregistered-client",
             redirect_uris=[AnyHttpUrl("http://localhost/callback")],
@@ -2015,7 +2015,7 @@ class TestDCRFallback:
 
     @pytest.mark.asyncio
     async def test_authorize_validates_redirect_uri(self, provider):
-        """authorize should reject mismatched redirect_uri with invalid_request."""
+        """authorize 对不匹配的 redirect_uri 应以 invalid_request 拒绝。"""
         from mcp.server.auth.provider import AuthorizationParams, AuthorizeError
         from mcp.shared.auth import OAuthClientInformationFull
 
@@ -2027,7 +2027,7 @@ class TestDCRFallback:
         )
         await provider.register_client(client_info)
 
-        # Try authorize with different redirect_uri
+        # 用不同的 redirect_uri 尝试 authorize
         params = AuthorizationParams(
             state=None,
             scopes=["read"],
@@ -2042,7 +2042,7 @@ class TestDCRFallback:
         assert "redirect_uri" in (exc_info.value.error_description or "")
 
     def test_matches_redirect_uri_loopback_port_flexible(self):
-        """Loopback redirect_uri should match regardless of port (RFC 8252)."""
+        """Loopback redirect_uri 应忽略端口匹配（RFC 8252）。"""
         from app.mcp.provider import BangumiOAuthProvider
 
         assert (
@@ -2054,7 +2054,7 @@ class TestDCRFallback:
         )
 
     def test_matches_redirect_uri_non_loopback_port_must_match(self):
-        """Non-loopback redirect_uri should require the exact port."""
+        """非 loopback redirect_uri 应要求端口精确匹配。"""
         from app.mcp.provider import BangumiOAuthProvider
 
         assert (
@@ -2067,11 +2067,11 @@ class TestDCRFallback:
 
     @pytest.mark.asyncio
     async def test_register_client_validates_redirect_uris(self, provider):
-        """register_client should validate redirect_uris are provided."""
+        """register_client 应校验提供了 redirect_uris。"""
         from mcp.shared.auth import OAuthClientInformationFull
 
-        # Client without redirect_uris should still be registerable
-        # (some clients may not have them initially)
+        # 不带 redirect_uris 的 client 也应可注册
+        # （有些 client 初始可能没有它们）
         client_info = OAuthClientInformationFull(
             client_id="test-client",
             redirect_uris=[],
@@ -2079,18 +2079,18 @@ class TestDCRFallback:
             token_endpoint_auth_method="none",
         )
         await provider.register_client(client_info)
-        # Should succeed (empty list is valid)
+        # 应成功（空列表是合法的）
         retrieved = await provider.get_client("test-client")
         assert retrieved is not None
 
 
 # ---------------------------------------------------------------------------
-# Security Fix Tests (Roundtable Review)
+# 安全修复测试（圆桌评审）
 # ---------------------------------------------------------------------------
 
 
 class TestSecurityFixes:
-    """Tests for P0/P1/P2 security fixes from roundtable review."""
+    """圆桌评审中 P0/P1/P2 安全修复的测试。"""
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
@@ -2117,17 +2117,17 @@ class TestSecurityFixes:
             auth_username="admin",
         )
 
-    # --- P0-1: CIMD redirect_uri validation ---
+    # --- P0-1: CIMD redirect_uri 校验 ---
 
     @pytest.mark.asyncio
     async def test_cimd_authorize_rejects_malicious_redirect_uri(self, provider):
-        """CIMD client with malicious redirect_uri should be rejected (P0-1)."""
+        """带恶意 redirect_uri 的 CIMD client 应被拒绝（P0-1）。"""
         from fastmcp.server.auth.cimd import CIMDDocument
         from fastmcp.server.auth.oauth_proxy.models import ProxyDCRClient
         from mcp.server.auth.provider import AuthorizationParams
         from pydantic import AnyHttpUrl
 
-        # Create a CIMD client with a known redirect_uri
+        # 创建一个带已知 redirect_uri 的 CIMD client
         cimd_doc = CIMDDocument(
             client_id=AnyHttpUrl("https://claude.ai/oauth/claude-code-client-metadata"),
             client_name="Claude Code",
@@ -2148,13 +2148,13 @@ class TestSecurityFixes:
             cimd_fetched_at=time.time(),
         )
 
-        # Mock CIMD get_client to return our mock
+        # mock CIMD 的 get_client 使其返回我们的 mock
         async def mock_get_client(url):
             return mock_client
 
         provider.cimd.get_client = mock_get_client
 
-        # Try authorize with attacker-controlled redirect_uri
+        # 用攻击者控制的 redirect_uri 尝试 authorize
         params = AuthorizationParams(
             state="test-state",
             scopes=["read", "write"],
@@ -2170,11 +2170,11 @@ class TestSecurityFixes:
         assert exc_info.value.error == "invalid_request"
         assert "redirect_uri" in (exc_info.value.error_description or "")
 
-    # --- P0-2: DCR prefix bypass ---
+    # --- P0-2: DCR 前缀绕过 ---
 
     @pytest.mark.asyncio
     async def test_dcr_authorize_rejects_prefix_bypass_subdomain(self, provider):
-        """DCR client redirect_uri prefix bypass via subdomain should be rejected (P0-2)."""
+        """通过子域的 DCR client redirect_uri 前缀绕过应被拒绝（P0-2）。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
         from pydantic import AnyHttpUrl
@@ -2187,7 +2187,7 @@ class TestSecurityFixes:
         )
         await provider.register_client(client_info)
 
-        # Attack: cb.attacker.com matches startswith("...example.com/cb") but is different host
+        # 攻击：cb.attacker.com 能匹配 startswith("...example.com/cb")，但主机不同
         params = AuthorizationParams(
             state=None,
             scopes=["read"],
@@ -2205,7 +2205,7 @@ class TestSecurityFixes:
 
     @pytest.mark.asyncio
     async def test_dcr_authorize_rejects_prefix_bypass_dot_segments(self, provider):
-        """DCR client redirect_uri bypass via dot-segments should be rejected (P0-2)."""
+        """通过 dot-segments 的 DCR client redirect_uri 绕过应被拒绝（P0-2）。"""
         from mcp.server.auth.provider import AuthorizationParams
         from mcp.shared.auth import OAuthClientInformationFull
         from pydantic import AnyHttpUrl
@@ -2218,7 +2218,7 @@ class TestSecurityFixes:
         )
         await provider.register_client(client_info)
 
-        # Attack: path traversal via dot-segments
+        # 攻击：通过 dot-segments 进行路径穿越
         params = AuthorizationParams(
             state=None,
             scopes=["read"],
@@ -2237,10 +2237,10 @@ class TestSecurityFixes:
     # --- P1-1: issuer_url ---
 
     def test_metadata_issuer_matches_jwt_iss(self, provider):
-        """Metadata issuer should match JWT iss claim (P1-1)."""
+        """元数据 issuer 应匹配 JWT 的 iss claim（P1-1）。"""
         from starlette.testclient import TestClient
 
-        # Create a full server to test metadata
+        # 创建完整 server 以测试元数据
         from app.mcp.provider import create_auth_server
 
         app = create_auth_server(
@@ -2256,17 +2256,17 @@ class TestSecurityFixes:
         response = client.get("/.well-known/oauth-authorization-server")
         assert response.status_code == 200
         metadata = response.json()
-        # issuer in metadata should match the configured issuer
+        # 元数据中的 issuer 应匹配配置的 issuer
         assert metadata["issuer"] in ("http://localhost:8000", "http://localhost:8000/")
 
-    # --- P1-2: revoke access token ---
+    # --- P1-2: 吊销 access token ---
 
     @pytest.mark.asyncio
     async def test_revoke_access_token_invalidates_it(self, provider):
-        """Revoking an access token should make load_access_token return None (P1-2)."""
+        """吊销 access token 后应使 load_access_token 返回 None（P1-2）。"""
         from mcp.server.auth.provider import AccessToken
 
-        # Create a valid access token
+        # 创建一个有效的 access token
         claims = {
             "sub": "user1",
             "scope": "read write",
@@ -2277,21 +2277,21 @@ class TestSecurityFixes:
         }
         token_str = provider.rsa_manager.sign_jwt(claims)
 
-        # Load it first to confirm it's valid
+        # 先加载它以确认有效
         access_token = await provider.load_access_token(token_str)
         assert access_token is not None
         assert isinstance(access_token, AccessToken)
 
-        # Revoke it
+        # 吊销它
         await provider.revoke_token(access_token)
 
-        # After revocation, load_access_token should return None
+        # 吊销后 load_access_token 应返回 None
         result = await provider.load_access_token(token_str)
         assert result is None
 
     # --- P2: valid_scopes ---
 
     def test_client_registration_options_has_valid_scopes(self, provider):
-        """ClientRegistrationOptions should declare valid_scopes (P2)."""
+        """ClientRegistrationOptions 应声明 valid_scopes（P2）。"""
         assert provider.client_registration_options is not None
         assert provider.client_registration_options.valid_scopes == ["read", "write"]
