@@ -1,12 +1,12 @@
-"""FastMCP OAuthProvider implementation for Bangumi-syncer.
+"""Bangumi-syncer 的 FastMCP OAuthProvider 实现。
 
-Implements:
-- RSA key management (RS256 JWT signing)
-- OAuthProvider (FastMCP 4) with authorize/token/register
-- auth.enabled branching (BS session check via security_manager vs configured username)
-- Consent page (allow/deny) with CSRF protection
-- Dynamic Client Registration (RFC 7591)
-- CIMD (Client ID Metadata Document) integration
+实现内容：
+- RSA 密钥管理（RS256 JWT 签名）
+- OAuthProvider（FastMCP 4），含 authorize/token/register
+- auth.enabled 分支（通过 security_manager 校验 BS 会话，或使用配置的用户名）
+- consent 页面（允许/拒绝），带 CSRF 保护
+- Dynamic Client Registration（RFC 7591）
+- CIMD（Client ID Metadata Document）集成
 """
 
 from __future__ import annotations
@@ -47,11 +47,11 @@ from app.core.security import security_manager
 
 logger = logging.getLogger(__name__)
 
-# Constants
+# 常量
 MAX_CLIENTS = 1000
-PENDING_AUTH_TTL = 600  # 10 minutes
-AUTH_CODE_TTL = 300  # 5 minutes
-REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 days
+PENDING_AUTH_TTL = 600  # 10 分钟
+AUTH_CODE_TTL = 300  # 5 分钟
+REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 天
 
 # 客户端允许的 scope 全集（校验用），与 ClientRegistrationOptions.valid_scopes 对齐。
 # CIMD 合成 client 用它作为允许集：MCP SDK 的 validate_scope() 会据此校验请求 scope，
@@ -61,7 +61,7 @@ _ALLOWED_SCOPES = ("read", "write")
 
 
 class RSAKeyManager:
-    """Manages RSA key pair for JWT signing (RS256)."""
+    """管理用于 JWT 签名（RS256）的 RSA 密钥对。"""
 
     def __init__(
         self,
@@ -74,7 +74,7 @@ class RSAKeyManager:
         self._public_key: rsa.RSAPublicKey | None = None
 
     def generate_keys(self) -> None:
-        """Generate a new RSA key pair and save to disk."""
+        """生成新的 RSA 密钥对并保存到磁盘。"""
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
@@ -88,22 +88,22 @@ class RSAKeyManager:
             encryption_algorithm=serialization.NoEncryption(),
         )
 
-        # Ensure directories exist
+        # 确保目录存在
         os.makedirs(os.path.dirname(self.private_key_path) or ".", exist_ok=True)
 
         with open(self.private_key_path, "wb") as f:
             f.write(private_pem)
-        # Set private key to owner-only read/write (chmod 600)
+        # 将私钥权限设为仅属主可读写（chmod 600）
         os.chmod(self.private_key_path, 0o600)
         self._write_public_key()
 
     def load_or_generate(self) -> None:
-        """Load existing keys from disk, or generate new ones if not found.
+        """从磁盘加载已有密钥；未找到则生成新密钥对。
 
-        If only the private key is present, the public key is re-derived from it
-        (the private key is never replaced). Only a missing private key triggers
-        generation of a new key pair, so an accidentally deleted public key does
-        not invalidate previously issued JWTs.
+        若仅存在私钥，则会从该私钥重新派生公钥（私钥绝不会被替换）。只有私钥
+        缺失才会触发生成新密钥对，因此意外删除公钥不会使此前已签发的 JWT
+        失效；只要私钥仍在，公钥就能随时按需重建，既有 token 的有效性
+        不受影响。
         """
         if os.path.exists(self.private_key_path):
             self._load_private_key()
@@ -125,19 +125,19 @@ class RSAKeyManager:
             self.generate_keys()
 
     def _load_private_key(self) -> None:
-        """Load the private key from disk."""
+        """从磁盘加载私钥。"""
         with open(self.private_key_path, "rb") as f:
             self._private_key = serialization.load_pem_private_key(
                 f.read(), password=None
             )
 
     def _load_public_key(self) -> None:
-        """Load the public key from disk."""
+        """从磁盘加载公钥。"""
         with open(self.public_key_path, "rb") as f:
             self._public_key = serialization.load_pem_public_key(f.read())
 
     def _ensure_private_key_permissions(self) -> None:
-        """Enforce owner-only (0o600) permissions on the existing private key."""
+        """对已有私钥强制设置仅属主（0o600）权限。"""
         current_mode = os.stat(self.private_key_path).st_mode & 0o777
         if current_mode != 0o600:
             logger.warning(
@@ -148,7 +148,7 @@ class RSAKeyManager:
             os.chmod(self.private_key_path, 0o600)
 
     def _write_public_key(self) -> None:
-        """Derive the public key from the loaded private key and persist it."""
+        """从已加载的私钥派生公钥并持久化。"""
         self._public_key = self.private_key.public_key()
         public_pem = self._public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
@@ -171,7 +171,7 @@ class RSAKeyManager:
         return self._public_key
 
     def get_private_key_pem(self) -> bytes:
-        """Get private key in PEM format."""
+        """获取 PEM 格式的私钥。"""
         return self.private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -179,14 +179,14 @@ class RSAKeyManager:
         )
 
     def get_public_key_pem(self) -> bytes:
-        """Get public key in PEM format."""
+        """获取 PEM 格式的公钥。"""
         return self.public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
 
     def sign_jwt(self, claims: dict[str, Any]) -> str:
-        """Sign a JWT with RS256. Adds jti for uniqueness if not present."""
+        """用 RS256 对 JWT 签名；若缺失 jti 则补充以保证唯一性。"""
         if "jti" not in claims:
             claims["jti"] = secrets.token_urlsafe(16)
         return jwt.encode(claims, self.get_private_key_pem(), algorithm="RS256")
@@ -194,7 +194,7 @@ class RSAKeyManager:
     def verify_jwt(
         self, token: str, audience: str | None = None
     ) -> dict[str, Any] | None:
-        """Verify a JWT with the public key. Returns claims or None if invalid."""
+        """用公钥验证 JWT，返回 claims；无效则返回 None。"""
         try:
             return jwt.decode(
                 token,
@@ -208,14 +208,14 @@ class RSAKeyManager:
 
 
 class BangumiOAuthProvider(OAuthProvider):
-    """OAuth Authorization Server Provider for Bangumi-syncer.
+    """Bangumi-syncer 的 OAuth 授权服务器 Provider。
 
-    Implements the FastMCP 4 OAuthProvider with:
-    - CIMD (Client ID Metadata Document) support via CIMDClientManager
-    - auth.enabled branching (BS session check vs configured username)
-    - Consent page flow with CSRF protection
-    - JWT token issuance (RS256)
-    - Dynamic Client Registration (RFC 7591)
+    基于 FastMCP 4 OAuthProvider 实现：
+    - 通过 CIMDClientManager 支持 CIMD（Client ID Metadata Document）
+    - auth.enabled 分支（校验 BS 会话，或使用配置的用户名）
+    - 带 CSRF 保护的 consent 页面流程
+    - 签发 JWT token（RS256）
+    - Dynamic Client Registration（RFC 7591）
     """
 
     def __init__(
@@ -254,7 +254,7 @@ class BangumiOAuthProvider(OAuthProvider):
         self._default_scopes = ["read"]
         self.MAX_CLIENTS = MAX_CLIENTS
 
-        # In-memory stores
+        # 内存态存储
         self._clients: dict[str, OAuthClientInformationFull] = {}
         self._auth_codes: dict[str, AuthorizationCode] = {}
         self._refresh_tokens: dict[str, RefreshToken] = {}
@@ -271,13 +271,13 @@ class BangumiOAuthProvider(OAuthProvider):
         )
 
     # ------------------------------------------------------------------
-    # OAuthProvider interface
+    # OAuthProvider 接口
     # ------------------------------------------------------------------
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
-        """Override to inject client_id_metadata_document_supported=True."""
+        """重写以注入 client_id_metadata_document_supported=True。"""
         routes = super().get_routes(mcp_path)
-        # Rebuild metadata with CIMD support advertised
+        # 重建 metadata 并声明支持 CIMD
         for i, route in enumerate(routes):
             if (
                 isinstance(route, Route)
@@ -305,19 +305,19 @@ class BangumiOAuthProvider(OAuthProvider):
         return routes
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
-        """Retrieve client by ID.
+        """按 ID 获取 client。
 
-        CIMD branch: URL client_id → CIMDClientManager
-        DCR branch: static registry
+        CIMD 分支：URL 形式的 client_id → CIMDClientManager
+        DCR 分支：静态注册表
         """
-        # CIMD branch: URL client_id
+        # CIMD 分支：URL 形式的 client_id
         if self.cimd.is_cimd_client_id(client_id):
             return await self.cimd.get_client(client_id)
-        # DCR fallback: static registry
+        # DCR 回退：静态注册表
         return self._clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        """Register a new client (DCR). Enforces max client limit."""
+        """注册新 client（DCR），并强制执行 client 数量上限。"""
         if not client_info.client_id:
             client_info.client_id = secrets.token_urlsafe(16)
         if (
@@ -325,10 +325,10 @@ class BangumiOAuthProvider(OAuthProvider):
             and not client_info.client_secret
         ):
             client_info.client_secret = secrets.token_hex(32)
-        # Assign default scope if not specified
+        # 未指定 scope 时分配默认 scope
         if not client_info.scope:
             client_info.scope = " ".join(self._default_scopes)
-        # Enforce max client limit
+        # 强制执行 client 数量上限
         if len(self._clients) >= self.MAX_CLIENTS:
             raise RegistrationError(
                 f"Client registration limit reached ({self.MAX_CLIENTS}). "
@@ -341,14 +341,14 @@ class BangumiOAuthProvider(OAuthProvider):
         client: OAuthClientInformationFull,
         params: AuthorizationParams,
     ) -> str:
-        """Handle /authorize - store pending request and return consent URL.
+        """处理 /authorize：暂存待处理请求并返回 consent URL。
 
-        Validates that the client is registered and redirect_uri matches.
+        校验 client 已注册且 redirect_uri 匹配。
         """
-        # Validate client is known
+        # 校验 client 已注册
         client_id = client.client_id
         if self.cimd.is_cimd_client_id(client_id):
-            # CIMD clients are validated via CIMD, skip registry check
+            # CIMD client 通过 CIMD 校验，跳过注册表检查
             pass
         elif client_id not in self._clients:
             raise AuthorizeError(
@@ -356,19 +356,19 @@ class BangumiOAuthProvider(OAuthProvider):
                 error_description=f"Unknown client: {client_id}",
             )
 
-        # Validate redirect_uri
+        # 校验 redirect_uri
         redirect_uri_str = str(params.redirect_uri)
         if params.redirect_uri_provided_explicitly:
             if self.cimd.is_cimd_client_id(client_id):
-                # P0-1: CIMD clients MUST have redirect_uri validated against
-                # their CIMD document's redirect_uris via component-level matching
+                # P0-1：CIMD client 必须按组件级匹配，用其 CIMD 文档的
+                # redirect_uris 校验 redirect_uri
                 cimd_client = await self.cimd.get_client(client_id)
                 if (
                     cimd_client is not None
                     and hasattr(cimd_client, "cimd_document")
                     and cimd_client.cimd_document is not None
                 ):
-                    # validate_redirect_uri lives on CIMDFetcher (self.cimd._fetcher)
+                    # validate_redirect_uri 位于 CIMDFetcher（self.cimd._fetcher）
                     if not self.cimd._fetcher.validate_redirect_uri(
                         cimd_client.cimd_document, redirect_uri_str
                     ):
@@ -388,7 +388,7 @@ class BangumiOAuthProvider(OAuthProvider):
                         ),
                     )
             elif client_id in self._clients:
-                # P0-2: DCR clients use component-level exact matching
+                # P0-2：DCR client 使用组件级精确匹配
                 registered_client = self._clients[client_id]
                 allowed_uris = [str(u) for u in (registered_client.redirect_uris or [])]
                 if allowed_uris and not self._matches_redirect_uri(
@@ -402,10 +402,10 @@ class BangumiOAuthProvider(OAuthProvider):
                         ),
                     )
 
-        # Trigger lazy cleanup of expired in-memory state to prevent unbounded growth
+        # 触发过期内存态数据的惰性清理，避免无限制增长
         self._cleanup_expired_state()
         request_token = secrets.token_urlsafe(32)
-        # Generate CSRF token bound to this pending auth
+        # 生成与该待处理 auth 绑定的 CSRF token
         csrf_token = secrets.token_urlsafe(32)
         self._pending_auths[request_token] = {
             "client_id": client_id,
@@ -422,27 +422,27 @@ class BangumiOAuthProvider(OAuthProvider):
 
     @staticmethod
     def _matches_redirect_uri(redirect_uri: str, allowed_uris: list[str]) -> bool:
-        """Component-level exact matching for redirect URIs.
+        """redirect URI 的组件级精确匹配。
 
-        Compares (scheme, netloc, path) components. For loopback hosts
-        (localhost/127.0.0.1), port flexibility is allowed per RFC 8252 §7.3.
+        比较 (scheme, netloc, path) 各组成部分。对 loopback 主机
+        （localhost/127.0.0.1），按 RFC 8252 §7.3 允许端口灵活变化。
         """
         parsed = urlsplit(redirect_uri)
         for allowed in allowed_uris:
             allowed_parsed = urlsplit(allowed)
-            # Scheme must match exactly
+            # scheme 必须完全匹配
             if parsed.scheme != allowed_parsed.scheme:
                 continue
-            # Path must match exactly
+            # path 必须完全匹配
             if parsed.path.rstrip("/") != allowed_parsed.path.rstrip("/"):
                 continue
-            # Host must match exactly
+            # host 必须完全匹配
             if parsed.hostname != allowed_parsed.hostname:
                 continue
-            # Port: allow flexibility only for loopback hosts
+            # 端口：仅对 loopback 主机允许灵活变化
             if is_loopback_host(parsed.hostname):
                 return True
-            # Non-loopback: port must match exactly
+            # 非 loopback：端口必须完全匹配
             if parsed.port == allowed_parsed.port:
                 return True
         return False
@@ -452,7 +452,7 @@ class BangumiOAuthProvider(OAuthProvider):
         client: OAuthClientInformationFull,
         authorization_code: str,
     ) -> AuthorizationCode | None:
-        """Load authorization code by its string."""
+        """按字符串加载 authorization code。"""
         return self._auth_codes.get(authorization_code)
 
     def _build_jwt_claims(
@@ -462,7 +462,7 @@ class BangumiOAuthProvider(OAuthProvider):
         resource: str | None = None,
         client_id: str | None = None,
     ) -> tuple[dict[str, Any], str]:
-        """Build JWT claims and sign. Returns (claims, access_token).
+        """构建 JWT claims 并签名，返回 (claims, access_token)。
 
         client_id 写入 JWT claims，使 load_access_token 可回填到 AccessToken.client_id，
         从而让 SDK RevocationHandler 的 ``token.client_id == client.client_id`` 门槛成立。
@@ -488,7 +488,7 @@ class BangumiOAuthProvider(OAuthProvider):
         client: OAuthClientInformationFull,
         authorization_code: AuthorizationCode,
     ) -> OAuthToken:
-        """Exchange authorization code for access token + refresh token."""
+        """用 authorization code 换取 access token + refresh token。"""
         self._cleanup_expired_state()
         _, access_token = self._build_jwt_claims(
             subject=authorization_code.subject or self.auth_username,
@@ -498,7 +498,7 @@ class BangumiOAuthProvider(OAuthProvider):
         )
         refresh_token_str = secrets.token_urlsafe(32)
 
-        # Store refresh token
+        # 存储 refresh token
         refresh_token = RefreshToken(
             token=refresh_token_str,
             client_id=client.client_id,
@@ -508,7 +508,7 @@ class BangumiOAuthProvider(OAuthProvider):
         )
         self._refresh_tokens[refresh_token_str] = refresh_token
 
-        # Clean up auth code (one-time use)
+        # 清理 auth code（一次性使用）
         self._auth_codes.pop(authorization_code.code, None)
 
         return OAuthToken(
@@ -520,15 +520,15 @@ class BangumiOAuthProvider(OAuthProvider):
         )
 
     async def load_access_token(self, token: str) -> AccessToken | None:
-        """Verify JWT access token and return AccessToken.
+        """验证 JWT access token 并返回 AccessToken。
 
-        Also checks the token's jti against the revocation set (P1-2).
+        同时对照吊销集合检查 token 的 jti（P1-2）。
         """
         claims = self.rsa_manager.verify_jwt(token, audience=self.audience)
         if claims is None:
             return None
 
-        # P1-2: Check if this token has been revoked
+        # P1-2：检查该 token 是否已被吊销
         jti = claims.get("jti")
         if jti and jti in self._revoked_tokens:
             return None
@@ -547,7 +547,7 @@ class BangumiOAuthProvider(OAuthProvider):
         client: OAuthClientInformationFull,
         refresh_token: str,
     ) -> RefreshToken | None:
-        """Load refresh token by its string."""
+        """按字符串加载 refresh token。"""
         token_obj = self._refresh_tokens.get(refresh_token)
         if token_obj is None or token_obj.client_id != client.client_id:
             return None
@@ -559,7 +559,7 @@ class BangumiOAuthProvider(OAuthProvider):
         refresh_token: RefreshToken,
         scopes: list[str],
     ) -> OAuthToken:
-        """Exchange refresh token for new access token + refresh token (rotation)."""
+        """用 refresh token 换取新的 access token + refresh token（轮换）。"""
         self._cleanup_expired_state()
         _, access_token = self._build_jwt_claims(
             subject=refresh_token.subject or self.auth_username,
@@ -567,8 +567,8 @@ class BangumiOAuthProvider(OAuthProvider):
             client_id=client.client_id,
         )
 
-        # Rotate refresh token (new one). Expiry restarts on every rotation
-        # (sliding window): an actively used session never expires.
+        # 轮换 refresh token（生成新的）。每次轮换都会重置过期时间
+        # （滑动窗口）：活跃使用的会话永不过期。
         new_refresh_token_str = secrets.token_urlsafe(32)
         new_refresh_token = RefreshToken(
             token=new_refresh_token_str,
@@ -579,7 +579,7 @@ class BangumiOAuthProvider(OAuthProvider):
         )
         self._refresh_tokens[new_refresh_token_str] = new_refresh_token
 
-        # Remove old refresh token
+        # 移除旧的 refresh token
         self._refresh_tokens.pop(refresh_token.token, None)
 
         return OAuthToken(
@@ -594,15 +594,15 @@ class BangumiOAuthProvider(OAuthProvider):
         self,
         token: AccessToken | RefreshToken,
     ) -> None:
-        """Revoke an access or refresh token.
+        """吊销 access token 或 refresh token。
 
-        For AccessToken: records the jti (+ its exp) in the revocation map (P1-2).
-        For RefreshToken: removes from the refresh tokens store.
+        对 AccessToken：在吊销表中记录 jti（及其 exp）（P1-2）。
+        对 RefreshToken：从 refresh token 存储中移除。
         """
         self._cleanup_expired_state()
         if isinstance(token, AccessToken):
-            # P1-2: Record jti in revocation set so verify_token rejects it.
-            # Store the token's exp so the record can be lazily pruned later.
+            # P1-2：在吊销集合中记录 jti，使 verify_token 拒绝该 token。
+            # 同时存储该 token 的 exp，以便之后惰性清理该记录。
             jti = token.claims.get("jti")
             if jti:
                 self._revoked_tokens[jti] = float(
@@ -612,17 +612,17 @@ class BangumiOAuthProvider(OAuthProvider):
             self._refresh_tokens.pop(token.token, None)
 
     # ------------------------------------------------------------------
-    # Consent flow helpers
+    # consent 流程辅助方法
     # ------------------------------------------------------------------
 
     def _cleanup_expired_state(self) -> None:
-        """Remove expired in-memory state (lazy TTL enforcement).
+        """移除过期的内存态数据（惰性 TTL 强制）。
 
-        Cleans four stores so unclaimed/expired entries do not accumulate:
-        - pending auth requests: PENDING_AUTH_TTL after creation
-        - authorization codes: after their ``expires_at``
-        - refresh tokens: after their ``expires_at`` (None = never expires)
-        - revoked jti records: after the access token's exp
+        清理四个存储，避免未被认领/已过期的条目持续累积：
+        - 待处理 auth 请求：创建后经过 PENDING_AUTH_TTL
+        - authorization code：超过其 ``expires_at`` 后
+        - refresh token：超过其 ``expires_at`` 后（None = 永不过期）
+        - 已吊销 jti 记录：超过该 access token 的 exp 后
         """
         now = time.time()
         expired_pending = [
@@ -665,21 +665,21 @@ class BangumiOAuthProvider(OAuthProvider):
     async def get_consent_context(
         self, request_token: str, session_token: str | None = None
     ) -> dict[str, Any] | None:
-        """Get context for the consent page.
+        """获取 consent 页面所需的上下文。
 
         Args:
-            request_token: The pending auth request token.
-            session_token: Optional session token to validate via security_manager.
+            request_token: 待处理 auth 请求的 token。
+            session_token: 可选的 session token，用于通过 security_manager 校验。
         """
         self._cleanup_expired_state()
         pending = self._pending_auths.get(request_token)
         if pending is None:
             return None
 
-        # Determine username based on auth.enabled
+        # 依据 auth.enabled 决定用户名
         username = self.auth_username
         if self.auth_enabled:
-            # Check BS session via security_manager (same process, not HTTP)
+            # 通过 security_manager 校验 BS 会话（同进程，非 HTTP）
             if session_token:
                 session = security_manager.validate_session(session_token)
                 if session:
@@ -700,19 +700,19 @@ class BangumiOAuthProvider(OAuthProvider):
         username: str | None = None,
         csrf_token: str | None = None,
     ) -> str:
-        """Handle consent allow - validate CSRF and generate authorization code.
+        """处理 consent 允许操作：校验 CSRF 并生成 authorization code。
 
         Args:
-            request_token: The pending auth request token.
-            username: Optional username override.
-            csrf_token: CSRF token from the form submission.
+            request_token: 待处理 auth 请求的 token。
+            username: 可选的用户名覆盖值。
+            csrf_token: 表单提交中的 CSRF token。
         """
         self._cleanup_expired_state()
         pending_info = self._pending_auths.get(request_token)
         if pending_info is None:
             raise ValueError("Invalid or expired request_token")
 
-        # Validate CSRF token (one-time use, bound to pending auth)
+        # 校验 CSRF token（一次性使用，绑定到该待处理 auth）
         expected_csrf = pending_info.get("csrf_token", "")
         if not csrf_token or not hmac.compare_digest(
             str(csrf_token), str(expected_csrf)
@@ -723,7 +723,7 @@ class BangumiOAuthProvider(OAuthProvider):
         code_obj = AuthorizationCode(
             code=auth_code,
             scopes=pending_info["scopes"],
-            expires_at=time.time() + AUTH_CODE_TTL,  # 5 min expiry
+            expires_at=time.time() + AUTH_CODE_TTL,  # 5 分钟过期
             client_id=pending_info["client_id"],
             code_challenge=pending_info["code_challenge"],
             redirect_uri=AnyUrl(pending_info["redirect_uri"]),
@@ -735,18 +735,18 @@ class BangumiOAuthProvider(OAuthProvider):
         )
         self._auth_codes[auth_code] = code_obj
 
-        # Clean up pending
+        # 清理待处理请求
         del self._pending_auths[request_token]
 
         return auth_code
 
     async def handle_consent_deny(self, request_token: str) -> None:
-        """Handle consent deny - clean up pending request."""
+        """处理 consent 拒绝操作：清理待处理请求。"""
         self._pending_auths.pop(request_token, None)
 
     def _render_consent_form(self, context: dict[str, Any]) -> str:
-        """Render HTML consent form with proper HTML escaping (XSS prevention)."""
-        # Escape all dynamic fields to prevent XSS
+        """渲染 HTML consent 表单，进行恰当的 HTML 转义（防止 XSS）。"""
+        # 转义所有动态字段以防止 XSS
         request_token = html.escape(str(context["request_token"]))
         client_id = html.escape(str(context["client_id"]))
         scopes = context.get("scopes", [])
@@ -774,7 +774,7 @@ class BangumiOAuthProvider(OAuthProvider):
 
 
 # ------------------------------------------------------------------
-# Server factory
+# server 工厂
 # ------------------------------------------------------------------
 
 
@@ -789,22 +789,22 @@ def create_auth_server(
     auth_username: str = "admin",
     base_url: str | None = None,
 ) -> Any:
-    """Create a full auth-enabled Starlette app for testing.
+    """创建一个完整的、启用 auth 的 Starlette app，用于测试。
 
-    Returns a Starlette app with OAuth endpoints (authorize, token, register)
-    and consent page.
+    返回带 OAuth 端点（authorize、token、register）和 consent 页面的
+    Starlette app。
     """
     from fastmcp import FastMCP
     from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 
-    # Initialize RSA keys
+    # 初始化 RSA 密钥
     rsa_manager = RSAKeyManager(
         private_key_path=private_key_path,
         public_key_path=public_key_path,
     )
     rsa_manager.load_or_generate()
 
-    # Create provider
+    # 创建 provider
     provider = BangumiOAuthProvider(
         base_url=base_url or issuer,
         rsa_manager=rsa_manager,
@@ -819,18 +819,18 @@ def create_auth_server(
         revocation_options=RevocationOptions(enabled=True),
     )
 
-    # Create MCP server with auth
+    # 创建带 auth 的 MCP server
     mcp = FastMCP(name="bangumi-syncer-mcp", auth=provider)
 
-    # Register consent route BEFORE calling http_app
+    # 在调用 http_app 之前注册 consent 路由
     @mcp.custom_route("/consent", methods=["GET", "POST"])
     async def consent_route(request: Request) -> Response:
         return await handle_consent(request, provider)
 
-    # Get the Starlette app
+    # 获取 Starlette app
     app = mcp.http_app(path="/mcp")
 
-    # Store public key and provider on app state for testing
+    # 将公钥和 provider 存入 app.state 供测试使用
     app.state.public_key_pem = rsa_manager.get_public_key_pem()
     app.state.provider = provider
 
@@ -838,8 +838,8 @@ def create_auth_server(
 
 
 async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Response:
-    """Handle consent page GET/POST. Usable as a custom_route handler."""
-    # Get request_token from query (GET) or form (POST)
+    """处理 consent 页面的 GET/POST，可作为 custom_route 处理器使用。"""
+    # 从 query（GET）或 form（POST）获取 request_token
     if request.method == "GET":
         request_token = request.query_params.get("request_token")
     else:
@@ -849,11 +849,11 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
     if not request_token:
         return HTMLResponse("<h1>Error: missing request_token</h1>", status_code=400)
 
-    # Extract session token from cookie
+    # 从 cookie 中提取 session token
     session_token = None
     cookie = request.headers.get("cookie")
     if cookie:
-        # Parse cookie to find session token
+        # 解析 cookie 以查找 session token
         for part in cookie.split(";"):
             part = part.strip()
             if part.startswith("session_token="):
@@ -861,7 +861,7 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
                 break
 
     if request.method == "GET":
-        # When auth.enabled=True, check session first
+        # 当 auth.enabled=True 时先校验会话
         if provider.auth_enabled:
             if session_token:
                 session = security_manager.validate_session(session_token)
@@ -885,20 +885,20 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
             )
         return HTMLResponse(provider._render_consent_form(context))
 
-    # POST - Validate CSRF token
+    # POST：校验 CSRF token
     form = await request.form()
     action = form.get("action", "deny")
     rt = str(request_token)
     submitted_csrf = form.get("csrf_token")
 
-    # Look up pending auth BEFORE any deletion
+    # 在任何删除操作之前查找待处理 auth
     pending_info = provider._pending_auths.get(rt)
     if pending_info is None:
         return HTMLResponse(
             "<h1>Error: invalid or expired request</h1>", status_code=400
         )
 
-    # Validate CSRF token (one-time use, bound to pending auth)
+    # 校验 CSRF token（一次性使用，绑定到该待处理 auth）
     expected_csrf = pending_info.get("csrf_token", "")
     if not submitted_csrf or not hmac.compare_digest(
         str(submitted_csrf), str(expected_csrf)
@@ -909,7 +909,7 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
     state = pending_info.get("state")
 
     if action == "allow":
-        # When auth_enabled=True, re-check session on POST allow
+        # 当 auth_enabled=True 时，在 POST 允许时重新校验会话
         username = provider.auth_username
         if provider.auth_enabled:
             if session_token:
