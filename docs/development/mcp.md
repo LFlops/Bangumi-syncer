@@ -12,7 +12,7 @@ MCP Server 是 Bangumi-syncer 的**内置模块**，通过 MCP 协议（Model Co
 - **Python**：`>=3.10`（与 BS 主项目一致，全仓已升级至 3.10）
 - **MCP SDK**：[`fastmcp>=4.0.3`](https://github.com/jlowin/fastmcp)（Streamable HTTP 传输，见根 `pyproject.toml`）
 - **认证**：`cryptography`（RSA 密钥对）+ `PyJWT`（RS256 JWT 签发）
-- **测试**：`pytest` + `pytest-asyncio`（嵌入路由用 `httpx.AsyncClient` + `ASGITransport` 验证）
+- **测试**：`pytest` + `pytest-asyncio`（嵌入用 `TestClient` 做端点行为验证）
 
 ---
 
@@ -58,7 +58,7 @@ tests/
 | `app/mcp/server.py` | FastMCP 服务工厂 + 工具注册 |
 | `app/mcp/provider.py` | OAuth AS（authorize/token/register）+ RSA 密钥管理 + CIMD |
 | `app/mcp/tools.py` | 工具实现（get_logs / get_current_config / update_config） |
-| `app/main.py` | FastAPI 应用入口，嵌入 FastMCP 路由 + combine_lifespans |
+| `app/main.py` | FastAPI 应用入口，`app.mount("/", mcp_app)` 挂载 FastMCP 子应用 + `combine_lifespans` |
 
 ::: warning 状态均为进程内存储，当前仅支持单进程
 `BangumiOAuthProvider`（`app/mcp/provider.py`）的客户端注册表、授权码、Refresh Token、待授权请求与吊销记录全部保存在**进程内存**中。仓库启动方式（`start.bat`、Dockerfile `CMD`）均为 `uvicorn app.main:app` 单进程，**不支持 `--workers N` / gunicorn 多进程**：否则授权码 / Refresh Token 会因请求落到不同进程而失效，吊销状态也会各进程不一致。Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响。
@@ -134,7 +134,7 @@ JWT claims：
 
 ### 5. 动态客户端注册（DCR）
 
-`BangumiOAuthProvider` 默认传入 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`（`provider.py`），因此 `/register`（RFC 7591）默认开启且未认证可达（路由在 `app/main.py` 中平铺注册）。
+`BangumiOAuthProvider` 默认传入 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`（`provider.py`），因此 `/register`（RFC 7591）默认开启且未认证可达（子应用在 `app/main.py` 中通过 `app.mount("/", mcp_app)` 挂载）。
 
 - **注册 ≠ 授权**：注册只登记客户端元数据，不授予任何数据权限；仍需 BS 登录会话（`auth.enabled=true` 时）+ consent 页点 Allow 才能拿到 Token
 - **存储与上限**：已注册客户端存于进程内存 `_clients`，上限 `MAX_CLIENTS=1000`，达到上限后注册抛 `RegistrationError`
@@ -217,7 +217,7 @@ JWT claims：
 
 ### 嵌入测试
 
-`tests/test_mcp_embed.py` 验证 FastMCP 路由正确嵌入 FastAPI app（`httpx.AsyncClient` + `ASGITransport`）。
+`tests/test_mcp_embed.py` 以 `TestClient` 行为断言验证 FastMCP 子应用正确挂载到 FastAPI app：根路径端点可达、未认证/无效 Bearer 返回 401、未匹配路径返回 JSON 404。
 
 ### 集成测试
 

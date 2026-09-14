@@ -2,50 +2,73 @@
 FastMCP 嵌入骨架测试
 
 覆盖 BDD 场景：
-1. /mcp 端点存在（未认证时不 404）
-2. /.well-known/oauth-authorization-server 在根路径可达（200）
-3. /authorize 在根路径存在（不 404）
-4. /token 在根路径存在（不 404）
-5. 现有路由（/health）未被破坏
+1. /mcp 端点存在（未认证 / 无效 Bearer → 401）
+2. 未匹配路径返回 JSON 404（与 FastAPI 语义一致）
+3. /.well-known/oauth-authorization-server 在根路径可达（200）
+4. /authorize、/token 在根路径存在（不 404）、/consent 缺参返回 400（可达）
+5. 现有路由（/health、/openapi.json、/docs、/redoc）未被 catch-all 破坏
 6. lifespan 合并后可正常启停
+7. 生产组合携带合法 Bearer 可调用 /mcp
 """
 
 import base64
 import hashlib
 import re
 import secrets
-from contextlib import ExitStack, asynccontextmanager, contextmanager
-from unittest.mock import AsyncMock, patch
+from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi.testclient import TestClient  # noqa: I001
 
 # ---------------------------------------------------------------------------
-# 1. /mcp 端点存在
+# 1. /mcp 端点存在且鉴权链路生效
 # ---------------------------------------------------------------------------
 
 
 class TestMcpEndpointExists:
-    """验证 /mcp 端点注册到 FastAPI app。"""
+    """验证 /mcp 端点注册到生产 app，且未认证 / 未匹配路径语义正确。"""
 
-    def test_mcp_endpoint_not_404(self):
-        """FastAPI app 应注册 /mcp 端点，访问时不返回 404。"""
-        with _embed_mocks():
+    def test_mcp_endpoint_no_bearer_returns_401(self, embed_mocks):
+        """不带 Authorization 请求 /mcp 应返回 401（Mount 后鉴权链路生效）。"""
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
                 response = client.get("/mcp")
-            assert response.status_code != 404, "/mcp 不应返回 404"
+            assert response.status_code == 401, (
+                f"/mcp 未认证应返回 401，实际: {response.status_code}"
+            )
 
-    def test_mcp_endpoint_responds(self):
-        """GET /mcp 应返回响应（200 或 401，但不 404）。"""
-        with _embed_mocks():
+    def test_mcp_endpoint_invalid_bearer_returns_401(self, embed_mocks):
+        """携带无效 Bearer 请求 /mcp 应返回 401。"""
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
-                response = client.get("/mcp")
-            assert response.status_code != 404, "/mcp 不应返回 404"
+                response = client.get(
+                    "/mcp", headers={"Authorization": "Bearer invalid-token"}
+                )
+            assert response.status_code == 401, (
+                f"/mcp 无效 Bearer 应返回 401，实际: {response.status_code}"
+            )
+
+    def test_unmatched_path_returns_json_404(self, embed_mocks):
+        """未匹配路径应返回与 FastAPI 一致的 JSON 404（非 text/plain）。"""
+        with embed_mocks():
+            from app.main import app
+
+            with TestClient(app) as client:
+                response = client.get("/no-such-route-xyz")
+            assert response.status_code == 404, (
+                f"未匹配路径应返回 404，实际: {response.status_code}"
+            )
+            assert response.headers.get("content-type", "").startswith(
+                "application/json"
+            ), (
+                f"应为 JSON 404，实际 content-type: {response.headers.get('content-type')}"
+            )
+            assert response.json() == {"detail": "Not Found"}
 
 
 # ---------------------------------------------------------------------------
@@ -56,9 +79,9 @@ class TestMcpEndpointExists:
 class TestWellKnownRoutesAtRoot:
     """验证 OAuth 发现文档在根路径可达。"""
 
-    def test_oauth_authorization_server_metadata_at_root(self):
+    def test_oauth_authorization_server_metadata_at_root(self, embed_mocks):
         """/.well-known/oauth-authorization-server 在根路径返回 200。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
@@ -67,9 +90,9 @@ class TestWellKnownRoutesAtRoot:
                 f"应在根路径返回 200，实际: {response.status_code}"
             )
 
-    def test_oauth_protected_resource_metadata_at_root(self):
+    def test_oauth_protected_resource_metadata_at_root(self, embed_mocks):
         """/.well-known/oauth-protected-resource/mcp 在根路径返回 200。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
@@ -85,25 +108,36 @@ class TestWellKnownRoutesAtRoot:
 
 
 class TestOperationalRoutesAtRoot:
-    """验证 /authorize 和 /token 在根路径存在。"""
+    """验证 /authorize、/token 和 /consent 在根路径存在。"""
 
-    def test_authorize_not_404(self):
+    def test_authorize_not_404(self, embed_mocks):
         """/authorize 在根路径存在（不 404）。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
                 response = client.get("/authorize")
             assert response.status_code != 404, "/authorize 不应返回 404"
 
-    def test_token_not_404(self):
+    def test_token_not_404(self, embed_mocks):
         """/token 在根路径存在（不 404）。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
                 response = client.get("/token")
             assert response.status_code != 404, "/token 不应返回 404"
+
+    def test_consent_get_without_request_token_returns_400(self, embed_mocks):
+        """GET /consent（缺 request_token）应返回 400，确认端点未被 Mount 吞掉。"""
+        with embed_mocks():
+            from app.main import app
+
+            with TestClient(app) as client:
+                response = client.get("/consent")
+            assert response.status_code == 400, (
+                f"/consent 缺参应返回 400（可达但缺参），实际: {response.status_code}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +148,9 @@ class TestOperationalRoutesAtRoot:
 class TestExistingRoutesNotBroken:
     """验证现有 25 个 router + 中间件未被破坏。"""
 
-    def test_health_endpoint_still_works(self):
+    def test_health_endpoint_still_works(self, embed_mocks):
         """GET /health 仍返回 200。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app) as client:
@@ -124,14 +158,27 @@ class TestExistingRoutesNotBroken:
             assert response.status_code == 200
             assert response.json().get("status") == "healthy"
 
-    def test_app_has_many_routes(self):
+    def test_app_has_many_routes(self, embed_mocks):
         """app 应保留大量现有路由（远多于新增的 MCP 路由）。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             paths = [route.path for route in app.routes if hasattr(route, "path")]
-            # 现有 + MCP 路由应远超 10 个（实际约 10 个：openapi/docs/static + MCP 路由）
-            assert len(paths) >= 10, f"路由数量应 >= 10，实际: {len(paths)}"
+            # 实测 0bc1293 之后 len(paths) 约 164（25 个 router + 静态/文档 + MCP 子应用）。
+            # 阈值取 100：贴近实际，且 catch-all 意外吞掉整批路由时能真正报警。
+            assert len(paths) >= 100, f"路由数量应 >= 100，实际: {len(paths)}"
+
+    def test_fastapi_builtin_doc_routes_not_swallowed(self, embed_mocks):
+        """GET /openapi.json、/docs、/redoc 均返回 200，确认 root catch-all 未吞掉自带路由。"""
+        with embed_mocks():
+            from app.main import app
+
+            with TestClient(app) as client:
+                for path in ("/openapi.json", "/docs", "/redoc"):
+                    response = client.get(path)
+                    assert response.status_code == 200, (
+                        f"{path} 应返回 200，实际: {response.status_code}"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +190,9 @@ class TestLifespanCombination:
     """验证 lifespan 合并后正常启停。"""
 
     @pytest.mark.asyncio
-    async def test_combined_lifespan_starts_and_stops(self):
+    async def test_combined_lifespan_starts_and_stops(self, embed_mocks):
         """合并后的 lifespan 应能正常进入和退出。"""
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import lifespan
 
             @asynccontextmanager
@@ -158,11 +205,6 @@ class TestLifespanCombination:
 
             async with lifespan(test_app):
                 pass
-
-
-# ---------------------------------------------------------------------------
-# 辅助函数
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +305,9 @@ def _do_full_oauth_flow(client, session_token: str | None = None) -> str:
 
 
 class TestProductionAppMcpCall:
-    """验证生产组合（app.main.app 摊平路由后）携带合法 Bearer 能调用 /mcp。"""
+    """验证生产组合（app.main.app 挂载 MCP 子应用后）携带合法 Bearer 能调用 /mcp。"""
 
-    def test_生产App_携带合法Bearer_调用mcp成功(self, monkeypatch):
+    def test_生产App_携带合法Bearer_调用mcp成功(self, monkeypatch, embed_mocks):
         """生产 app 上走完 OAuth 后，携带 Bearer 调 /mcp initialize 应返回 200。
 
         修复前：由于 mcp_app.user_middleware 未迁移，/mcp 端点的
@@ -281,7 +323,7 @@ class TestProductionAppMcpCall:
             lambda token: {"username": "admin", "created_at": 0},
         )
 
-        with _embed_mocks():
+        with embed_mocks():
             from app.main import app
 
             with TestClient(app, raise_server_exceptions=False) as client:
@@ -331,30 +373,3 @@ class TestProductionAppMcpCall:
             f"携带合法 Bearer 调用 tools/call 应返回 200，实际: {tool_response.status_code}, "
             f"body: {tool_response.text[:300]}"
         )
-
-
-@contextmanager
-def _embed_mocks():
-    """为 MCP 嵌入测试打桩 lifespan 中的外部依赖。"""
-    defaults = {
-        "app.main.startup_info.print_info": {},
-        "app.main.startup_info.print_separator": {},
-        "app.main.startup_info.print_success": {},
-        "app.main.startup_info.print_error": {},
-        "app.main.startup_info.print_startup_complete": {},
-        "app.main.config_manager.get_bangumi_configs": {"return_value": {}},
-        "app.main.mapping_service.get_all_mappings": {"return_value": {}},
-        "app.main.ensure_feiniu_startup_watermark": {},
-        "app.main.database_manager.cleanup_pending_sync_queue": {},
-        "app.main.config_manager.get_scheduler_config": {
-            "return_value": {"startup_delay": 0}
-        },
-        "app.main.register_schedulers": {},
-        "app.main.scheduler_registry.start_all": {"new": AsyncMock()},
-        "app.main.scheduler_registry.stop_all": {"new": AsyncMock()},
-        "asyncio.sleep": {"new": AsyncMock()},
-    }
-    with ExitStack() as stack:
-        for path, kw in defaults.items():
-            stack.enter_context(patch(path, **kw))
-        yield
