@@ -137,6 +137,25 @@ class TestIsSensitiveField:
         assert not config_schema.is_sensitive_field("feiniu", "db_path")
         assert not config_schema.is_sensitive_field("notify-webhook-1", "url")
 
+    def test_underscore_section_names(self):
+        """get_all_config 输出的下划线段名也须正确判定敏感字段。
+
+        回归 E2E 泄露：get_all_config 将段名规范化为下划线
+        （bangumi_oauth / notify_email_1），若仅识别连字符形态则掩码失效。
+        """
+        # 下划线形态 → 敏感
+        assert config_schema.is_sensitive_field("bangumi_oauth", "client_secret")
+        assert config_schema.is_sensitive_field("notify_email_1", "smtp_password")
+        assert config_schema.is_sensitive_field("notify_wecom_1", "key")
+        assert config_schema.is_sensitive_field("notify_dingtalk_1", "access_token")
+        assert config_schema.is_sensitive_field("notify_dingtalk_1", "secret")
+        assert config_schema.is_sensitive_field("bangumi_user1", "access_token")
+        # 下划线形态 → 非敏感
+        assert not config_schema.is_sensitive_field("bangumi_oauth", "client_id")
+        assert not config_schema.is_sensitive_field("bangumi_data", "access_token")
+        assert not config_schema.is_sensitive_field("notify_email_1", "smtp_host")
+        assert not config_schema.is_sensitive_field("notify_wecom_1", "url")
+
     def test_legacy_parity(self):
         """与改造前原逻辑对比：常见场景结果一致
 
