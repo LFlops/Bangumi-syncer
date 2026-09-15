@@ -416,6 +416,9 @@ def is_sensitive_field(section: str, option: str) -> bool:
 
     支持多实例段：webhook-1 / email-2 等通过前缀匹配父段 sensitive_fields。
     """
+    # get_all_config 输出为下划线形态（如 bangumi_oauth / notify_email_1），
+    # 而注册表与 INI 段名用连字符，故入口统一归一化；对已传连字符的调用方无操作。
+    section = section.replace("_", "-")
     # 直接命中
     meta = SECTIONS.get(section)
     if meta and option in meta.sensitive_fields:
