@@ -219,7 +219,7 @@ JWT claims：
 
 ### 嵌入测试
 
-`tests/test_mcp_embed.py` 以 `TestClient` 行为断言验证 FastMCP 子应用正确挂载到 FastAPI app：根路径端点可达、未认证/无效 Bearer 返回 401、未匹配路径返回 JSON 404。
+`tests/test_mcp_embed.py` 以 `TestClient` 行为断言验证 FastMCP 子应用正确挂载到 FastAPI app：根路径端点可达、未认证/无效 Bearer 返回 401、未匹配路径返回 JSON 404；另覆盖传输层 scope 准入——仅含 `write`（无 `read`）的合法 token 请求 `/mcp` → 403 `insufficient_scope`（携带 scope 挑战头，指引客户端补足 `read`）。
 
 ### 集成测试
 
@@ -227,7 +227,6 @@ JWT claims：
 - `list_tools` → 3 工具且 schema 正确
 - 未认证调工具 → 401
 - 走完授权流程 → token → 调工具成功
-- 仅含 `write`（无 `read`）的合法 token 调 `/mcp` → 403 `insufficient_scope`（传输层 `required_scopes=["read"]` 准入）
 - `/.well-known/oauth-authorization-server` 含 `client_id_metadata_document_supported: true`
 
 ---
