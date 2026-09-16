@@ -107,6 +107,8 @@ JWT claims：
 上面的 `"scope": "read write"` 仅为示例。实际实现中 `_default_scopes = ["read"]`（`provider.py`）：客户端**不请求 scope** 时只发放 `read`（authorize 的 `params.scopes or self._default_scopes`、DCR 注册时未声明 scope 也回填 `read`、CIMD 的 `default_scope` 同为 `read`）。`write` 需客户端在授权请求中**显式请求**，且 SDK（`OAuthClientInformationFull.validate_scope`）会校验请求的 scope 属于客户端已注册/声明的 scope，否则返回 `invalid_scope`。
 
 权限对照：`read` → `get_logs` / `get_current_config`（敏感字段已掩码）；`write` → `update_config`（`auth` 段始终禁写）。
+
+`BangumiOAuthProvider` 默认另声明 `required_scopes=["read"]`（`provider.py`），它是 `/mcp` 的**传输层准入底线**：FastMCP `RequireAuthMiddleware` 据此校验 access token 的 scope，**仅含 `write` 的 token 会被 403 `insufficient_scope` 拒绝**。因此 `write` 建立在 `read` 之上，不存在只含 `write` 的可用 token；工具侧 `_require_read_scope` 与 `update_config` 的 write 校验保留为 defense-in-depth。
 :::
 
 ### 2. auth.enabled 分流
@@ -134,7 +136,7 @@ JWT claims：
 
 ### 5. 动态客户端注册（DCR）
 
-`BangumiOAuthProvider` 默认传入 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`（`provider.py`），因此 `/register`（RFC 7591）默认开启且未认证可达（子应用在 `app/main.py` 中通过 `app.mount("/", mcp_app)` 挂载）。
+`BangumiOAuthProvider` 默认传入 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`（`provider.py`），因此 `/register`（RFC 7591）默认开启且未认证可达（子应用在 `app/main.py` 中通过 `app.mount("/", mcp_app)` 挂载）。同一处 provider 还默认声明 `required_scopes=["read"]` 作为 `/mcp` 准入底线——它与 `valid_scopes`（scope 允许集）、`_default_scopes`（发放默认值）是三个独立概念，不要混用。
 
 - **注册 ≠ 授权**：注册只登记客户端元数据，不授予任何数据权限；仍需 BS 登录会话（`auth.enabled=true` 时）+ consent 页点 Allow 才能拿到 Token
 - **存储与上限**：已注册客户端存于进程内存 `_clients`，上限 `MAX_CLIENTS=1000`，达到上限后注册抛 `RegistrationError`
@@ -225,6 +227,7 @@ JWT claims：
 - `list_tools` → 3 工具且 schema 正确
 - 未认证调工具 → 401
 - 走完授权流程 → token → 调工具成功
+- 仅含 `write`（无 `read`）的合法 token 调 `/mcp` → 403 `insufficient_scope`（传输层 `required_scopes=["read"]` 准入）
 - `/.well-known/oauth-authorization-server` 含 `client_id_metadata_document_supported: true`
 
 ---

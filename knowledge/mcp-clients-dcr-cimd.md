@@ -30,7 +30,7 @@
 
 - 当前无配置开关；需在装配处传入 `ClientRegistrationOptions(enabled=False)`；
 - 关闭后仅 CIMD 客户端可授权，依赖 DCR 的客户端不可用；
-- 代码默认：`BangumiOAuthProvider.__init__` 中 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`。
+- 代码默认：`BangumiOAuthProvider.__init__` 中 `ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`；同时 provider 默认 `required_scopes=["read"]`（`/mcp` 准入底线，与本节的注册/允许集无关）。
 
 ## 代码索引
 

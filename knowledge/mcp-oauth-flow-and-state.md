@@ -71,5 +71,6 @@
 ## 五、代码索引
 
 - `BangumiOAuthProvider`（provider.py）：`authorize` / `register_client` / `exchange_authorization_code` / `exchange_refresh_token` / `load_access_token` / `revoke_token` / `_cleanup_expired_state`
+- 构造参数 `required_scopes`（默认 `["read"]`）：传给基类作为 `/mcp` 传输层准入——access token 不含 `read` 时 `RequireAuthMiddleware` 返回 403 `insufficient_scope`（与发放默认值 `_default_scopes` 无关）
 - 常量：`PENDING_AUTH_TTL=600`、`AUTH_CODE_TTL=300`、`REFRESH_TOKEN_TTL=30d`、`MAX_CLIENTS=1000`
 - 装配：`app/mcp/server.py::_create_provider`（env：`MCP_BASE_URL`、`MCP_REFRESH_TOKEN_TTL`、`MCP_RSA_PRIVATE_KEY/PUBLIC_KEY`）
