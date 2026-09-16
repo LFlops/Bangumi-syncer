@@ -1257,9 +1257,9 @@ class TestOAuthFullFlow:
     @pytest.fixture
     def server_app_auth_disabled(self, tmp_keys):
         """创建 auth.enabled=False 的测试 server。"""
-        from app.mcp.provider import create_auth_server
+        from tests.mcp_helpers import build_test_mcp_app
 
-        app = create_auth_server(
+        app = build_test_mcp_app(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
             issuer="http://localhost:8000",
@@ -1272,9 +1272,9 @@ class TestOAuthFullFlow:
     @pytest.fixture
     def server_app_auth_enabled(self, tmp_keys):
         """创建 auth.enabled=True 的测试 server。"""
-        from app.mcp.provider import create_auth_server
+        from tests.mcp_helpers import build_test_mcp_app
 
-        app = create_auth_server(
+        app = build_test_mcp_app(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
             issuer="http://localhost:8000",
@@ -2279,9 +2279,9 @@ class TestSecurityFixes:
         from starlette.testclient import TestClient
 
         # 创建完整 server 以测试元数据
-        from app.mcp.provider import create_auth_server
+        from tests.mcp_helpers import build_test_mcp_app
 
-        app = create_auth_server(
+        app = build_test_mcp_app(
             private_key_path=provider.rsa_manager.private_key_path,
             public_key_path=provider.rsa_manager.public_key_path,
             issuer="http://localhost:8000",
