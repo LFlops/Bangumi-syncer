@@ -231,7 +231,14 @@ class BangumiOAuthProvider(OAuthProvider):
         refresh_token_ttl: int = REFRESH_TOKEN_TTL,
         client_registration_options: ClientRegistrationOptions | None = None,
         revocation_options: RevocationOptions | None = None,
+        required_scopes: list[str] | None = None,
     ) -> None:
+        # required_scopes 是「/mcp 传输层准入底线」：FastMCP 的 RequireAuthMiddleware
+        # 会用它校验 access token 的 scopes；为空时只认证不授权（完全跳过 scope 校验），
+        # 故默认设为 ["read"] 作为纵深防御的最低门槛。
+        # 与另外两个概念的区分：
+        #   - _ALLOWED_SCOPES：校验允许集，SDK validate_scope() 用它判断请求 scope 是否合法；
+        #   - _default_scopes：发放默认值，客户端未显式请求 scope 时实际签发 "read"。
         super().__init__(
             base_url=base_url,
             issuer_url=issuer,
@@ -240,6 +247,7 @@ class BangumiOAuthProvider(OAuthProvider):
                 enabled=True, valid_scopes=list(_ALLOWED_SCOPES)
             ),
             revocation_options=revocation_options or RevocationOptions(enabled=True),
+            required_scopes=["read"] if required_scopes is None else required_scopes,
         )
         self.rsa_manager = rsa_manager
         self.issuer = issuer

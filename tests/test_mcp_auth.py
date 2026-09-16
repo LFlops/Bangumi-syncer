@@ -665,6 +665,44 @@ class TestOAuthProviderUnit:
         await provider.revoke_token(refresh)
         assert "test-refresh" not in provider._refresh_tokens
 
+    def test_默认required_scopes为read(self, rsa_manager):
+        """未显式传入 required_scopes 时，传输层准入底线应默认为 ["read"]。"""
+        from app.mcp.provider import BangumiOAuthProvider
+
+        provider = BangumiOAuthProvider(
+            base_url="http://localhost:8000",
+            rsa_manager=rsa_manager,
+            issuer="http://localhost:8000",
+            audience="bs",
+        )
+        assert provider.required_scopes == ["read"]
+
+    def test_显式required_scopes透传给基类(self, rsa_manager):
+        """显式传入 required_scopes 时应原样透传给基类。"""
+        from app.mcp.provider import BangumiOAuthProvider
+
+        provider = BangumiOAuthProvider(
+            base_url="http://localhost:8000",
+            rsa_manager=rsa_manager,
+            issuer="http://localhost:8000",
+            audience="bs",
+            required_scopes=["read", "write"],
+        )
+        assert provider.required_scopes == ["read", "write"]
+
+    def test_空required_scopes不做默认值兜底(self, rsa_manager):
+        """显式传入空列表时应保持为空，便于显式关闭 scope 门槛。"""
+        from app.mcp.provider import BangumiOAuthProvider
+
+        provider = BangumiOAuthProvider(
+            base_url="http://localhost:8000",
+            rsa_manager=rsa_manager,
+            issuer="http://localhost:8000",
+            audience="bs",
+            required_scopes=[],
+        )
+        assert provider.required_scopes == []
+
 
 # ---------------------------------------------------------------------------
 # 内存态 TTL / 惰性清理测试
