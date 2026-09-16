@@ -5,7 +5,6 @@ FastMCP server 工厂
 """
 
 import os
-import tempfile
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -22,16 +21,37 @@ from .provider import (
 )
 from .tools import get_current_config, get_logs, update_config
 
+# RSA 密钥默认存放目录（相对 cwd 的项目数据目录）：Docker 镜像 WORKDIR=/app
+# 且已预建 /app/data，故容器内即 /app/data；该目录已加入 .gitignore。
+_DATA_DIR = "data"
+
+_DEFAULT_PRIVATE_KEY_FILENAME = "mcp_private.pem"
+_DEFAULT_PUBLIC_KEY_FILENAME = "mcp_public.pem"
+
 # base_url 占位：生产环境应从配置读取公共 URL
 _DEFAULT_BASE_URL = "http://localhost:8000"
 
-# RSA 密钥路径（可通过环境变量配置）
-_PRIVATE_KEY_PATH = os.environ.get(
-    "MCP_RSA_PRIVATE_KEY", os.path.join(tempfile.gettempdir(), "mcp_private.pem")
-)
-_PUBLIC_KEY_PATH = os.environ.get(
-    "MCP_RSA_PUBLIC_KEY", os.path.join(tempfile.gettempdir(), "mcp_public.pem")
-)
+
+def _resolve_key_paths() -> tuple[str, str]:
+    """解析 RSA 密钥对路径：环境变量优先，否则默认落项目数据目录 data/。
+
+    默认落 ``data/``（相对 cwd；Docker 部署 WORKDIR=/app 即 ``/app/data``），
+    避免容器重建或系统清理临时目录后重新生成密钥对，导致此前已签发的
+    Access Token 全部验签失败、客户端被迫重新授权。
+    ``MCP_RSA_PRIVATE_KEY`` / ``MCP_RSA_PUBLIC_KEY`` 仍可覆盖完整路径。
+
+    Returns:
+        (private_key_path, public_key_path)
+    """
+    private_key_path = os.environ.get(
+        "MCP_RSA_PRIVATE_KEY",
+        os.path.join(_DATA_DIR, _DEFAULT_PRIVATE_KEY_FILENAME),
+    )
+    public_key_path = os.environ.get(
+        "MCP_RSA_PUBLIC_KEY",
+        os.path.join(_DATA_DIR, _DEFAULT_PUBLIC_KEY_FILENAME),
+    )
+    return private_key_path, public_key_path
 
 
 def _resolve_base_url(base_url: str | None = None) -> str:
@@ -57,9 +77,10 @@ def _create_provider(base_url: str | None = None) -> BangumiOAuthProvider:
     resolved_base_url = _resolve_base_url(base_url)
     auth_config = security_manager.get_auth_config()
 
+    private_key_path, public_key_path = _resolve_key_paths()
     rsa_manager = RSAKeyManager(
-        private_key_path=_PRIVATE_KEY_PATH,
-        public_key_path=_PUBLIC_KEY_PATH,
+        private_key_path=private_key_path,
+        public_key_path=public_key_path,
     )
     rsa_manager.load_or_generate()
 

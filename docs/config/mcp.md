@@ -101,8 +101,8 @@ MCP 服务随 BS 主进程启动，下面几个变量通过**启动 BS 的进程
 | 变量 | 默认值 | 不设的后果 |
 | --- | --- | --- |
 | `MCP_BASE_URL` | `http://localhost:8000` | 授权页返回的 issuer、metadata、authorize / token 端点地址全部基于它生成。反代、局域网、域名访问时客户端会拿到 `localhost` 地址，OAuth 发现失败、连接被拒 |
-| `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | 容器重建或系统清理临时目录后会重新生成密钥对，此前签发的 Access Token 全部验签失败，客户端被迫重新授权 |
-| `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | 同上，与私钥成对使用；建议把两把密钥挂载到持久化目录 |
+| `MCP_RSA_PRIVATE_KEY` | `data/mcp_private.pem`（Docker 下即 `/app/data/mcp_private.pem`） | 密钥默认落项目数据目录 `data/`，容器重建不会丢失；**若未挂载该目录**，重建后仍会重新生成密钥对，此前签发的 Access Token 全部验签失败，客户端被迫重新授权。建议挂载 `data/` 以持久化密钥 |
+| `MCP_RSA_PUBLIC_KEY` | `data/mcp_public.pem`（Docker 下即 `/app/data/mcp_public.pem`） | 同上，与私钥成对使用；建议把 `data/` 目录挂载到持久卷 |
 | `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，单位秒；每次轮换后重新计时（滑动窗口）。不设即使用 30 天默认值 |
 
 ::: tip MCP_BASE_URL 的取值优先级

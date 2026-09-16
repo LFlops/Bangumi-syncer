@@ -73,6 +73,14 @@ class RSAKeyManager:
         self._private_key: rsa.RSAPrivateKey | None = None
         self._public_key: rsa.RSAPublicKey | None = None
 
+    @staticmethod
+    def _ensure_parent_dir(path: str) -> None:
+        """确保目标文件的父目录存在（任意自定义路径均可写入）。
+
+        路径不含目录部分时回退到当前目录 ``.``。
+        """
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
     def generate_keys(self) -> None:
         """生成新的 RSA 密钥对并保存到磁盘。"""
         private_key = rsa.generate_private_key(
@@ -89,7 +97,7 @@ class RSAKeyManager:
         )
 
         # 确保目录存在
-        os.makedirs(os.path.dirname(self.private_key_path) or ".", exist_ok=True)
+        self._ensure_parent_dir(self.private_key_path)
 
         with open(self.private_key_path, "wb") as f:
             f.write(private_pem)
@@ -154,7 +162,7 @@ class RSAKeyManager:
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo,
         )
-        os.makedirs(os.path.dirname(self.public_key_path) or ".", exist_ok=True)
+        self._ensure_parent_dir(self.public_key_path)
         with open(self.public_key_path, "wb") as f:
             f.write(public_pem)
 
