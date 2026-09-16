@@ -297,6 +297,15 @@ class TestFieldMeta:
             == "https://dns.alidns.com/resolve"
         )
 
+    def test_dev_mcp_base_url_registered_with_empty_default(self):
+        """MCP 服务公共 URL 应在 dev 段登记且默认空串。
+
+        Web 配置页依赖 SectionMeta.fields 回填；空串约定「不覆盖」，
+        由 app/mcp/server.py 按 参数 > MCP_BASE_URL > dev.mcp_base_url > 默认值 解析。
+        """
+        assert config_schema.field_meta("dev", "mcp_base_url") is not None
+        assert config_schema.field_default("dev", "mcp_base_url") == ""
+
     def test_auth_default_session_timeout(self):
         assert config_schema.field_default("auth", "session_timeout") == 3600
 

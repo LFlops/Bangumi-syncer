@@ -94,6 +94,23 @@ BS 内置的 MCP 服务随主进程启动（同一进程，并非独立 sidecar�
 - v2 配置结构不同：为 `"mcp": { "servers": { "<name>": { ... } } }`，OAuth 字段用 snake_case（`client_id` / `client_secret` / `scope` / `callback_port`）
 - 注册表与 Refresh Token 为进程内存态：BS 重启后需重新 `opencode mcp auth`（已签发的 Access Token 在 1 小时有效期内仍可用）
 
+## 环境变量（部署相关）
+
+MCP 服务随 BS 主进程启动，下面几个变量通过**启动 BS 的进程环境**传入（Docker 用 `-e` / `environment`，裸机用 shell 环境变量或 `.env`）。它们决定客户端能否正确发现并授权，反向代理、局域网、域名访问场景请务必检查。
+
+| 变量 | 默认值 | 不设的后果 |
+| --- | --- | --- |
+| `MCP_BASE_URL` | `http://localhost:8000` | 授权页返回的 issuer、metadata、authorize / token 端点地址全部基于它生成。反代、局域网、域名访问时客户端会拿到 `localhost` 地址，OAuth 发现失败、连接被拒 |
+| `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | 容器重建或系统清理临时目录后会重新生成密钥对，此前签发的 Access Token 全部验签失败，客户端被迫重新授权 |
+| `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | 同上，与私钥成对使用；建议把两把密钥挂载到持久化目录 |
+| `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，单位秒；每次轮换后重新计时（滑动窗口）。不设即使用 30 天默认值 |
+
+::: tip MCP_BASE_URL 的取值优先级
+`MCP_BASE_URL` 环境变量 > 配置项 `[dev] mcp_base_url` > 默认值 `http://localhost:8000`。
+
+不想改环境变量时，也可以在 Web 管理页的「开发与代理」段填写 `mcp_base_url`，效果相同（环境变量优先级更高，两者都设时以环境变量为准）。
+:::
+
 ## 常见问题
 
 | 现象 | 处理 |

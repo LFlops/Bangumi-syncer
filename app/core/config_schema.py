@@ -160,6 +160,10 @@ SECTIONS: dict[str, SectionMeta] = {
                 default="bgm.tv,chii.in,next.bgm.tv,lain.bgm.tv",
             ),
             FieldMeta(name="ech_ech_config", default=""),
+            # MCP 服务公共 URL：反代 / 局域网 / 域名访问时填写对外可达地址。
+            # 留空表示不覆盖，由 app/mcp/server.py 按 参数 > MCP_BASE_URL
+            # 环境变量 > 本配置 > 默认值 http://localhost:8000 解析。
+            FieldMeta(name="mcp_base_url", default=""),
         ),
     ),
     # ── 媒体源驱动（order 100-199）──
