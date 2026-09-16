@@ -1,4 +1,9 @@
-# MCP OAuth 授权流程与内存状态表
+---
+title: 🔁 MCP OAuth 授权流程与内存状态
+order: 15
+---
+
+# 🔁 MCP OAuth 授权流程与内存状态
 
 > 代码：`app/mcp/provider.py`（`BangumiOAuthProvider`）。全部状态为**进程内存态**，重启即清空。
 
@@ -66,7 +71,7 @@
 - **吊销名单清空 ⇒ 已吊销 access token 会"复活"到自然过期（≤1h）**；
 - 唯一落盘的 MCP 认证状态：RSA 密钥对（页面按 `MCP_RSA_PRIVATE_KEY` 路径）。
 
-持久化方案与触发条件见 `remain/mcp-oauth-state-persistence.md`。
+持久化方案与触发条件见本地记录 `remain/mcp-oauth-state-persistence.md`（未纳入仓库）。
 
 ## 五、代码索引
 

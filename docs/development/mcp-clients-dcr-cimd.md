@@ -1,4 +1,9 @@
-# MCP 客户端接入：DCR 与 CIMD
+---
+title: 🔑 MCP 客户端接入：DCR 与 CIMD
+order: 14
+---
+
+# 🔑 MCP 客户端接入：DCR 与 CIMD
 
 > 代码：`app/mcp/provider.py`；用户文档：`docs/config/mcp.md`「动态客户端注册（DCR）」。
 
@@ -24,7 +29,7 @@
 
 - **不应做成 MCP 工具**：MCP 不应管理自身会话与授权；
 - 若未来实现，应挂 BS 会话鉴权的 Web API（列表/重置/计数展示）；
-- 详见 `remain/mcp-dcr-reset-web-api.md`。
+- 详见本地记录 `remain/mcp-dcr-reset-web-api.md`（未纳入仓库）。
 
 ## 关闭 DCR
 

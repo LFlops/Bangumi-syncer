@@ -1,4 +1,9 @@
-# MCP Scope 模型与权限边界
+---
+title: 🛡️ MCP Scope 模型与权限边界
+order: 16
+---
+
+# 🛡️ MCP Scope 模型与权限边界
 
 > 代码：`app/mcp/provider.py`、`app/mcp/tools.py`；用户文档：`docs/config/mcp.md`「授权与权限」「安全建议」。
 
@@ -37,7 +42,7 @@
 
 ## 决策记录
 
-- 2026-09-12：暂缓分级，保留现状（write 可写敏感字段）。实施要点与恢复条件见 `remain/mcp-scope-tiering.md`。
+- 2026-09-12：暂缓分级，保留现状（write 可写敏感字段）。实施要点与恢复条件见本地记录 `remain/mcp-scope-tiering.md`（未纳入仓库）。
 
 ## 代码索引
 
