@@ -226,10 +226,14 @@ def _extract_csrf_token(html_content: str) -> str:
     return match.group(1)
 
 
-def _do_full_oauth_flow(client, session_token: str | None = None) -> str:
+def _do_full_oauth_flow(
+    client, session_token: str | None = None, scope: str = "read write"
+) -> str:
     """在生产组合上走完 OAuth 流程，返回 access_token。
 
     session_token 仅用于 auth.enabled=True 时通过 /consent 的 Web 会话校验。
+    scope 同时用于 DCR 注册与 /authorize 请求，据此可构造只含特定 scope 的
+    合法 token（如 scope="write" 得到仅含 write 的 token）。
     """
     reg_response = client.post(
         "/register",
@@ -237,7 +241,7 @@ def _do_full_oauth_flow(client, session_token: str | None = None) -> str:
             "redirect_uris": ["http://localhost/callback"],
             "grant_types": ["authorization_code"],
             "token_endpoint_auth_method": "none",
-            "scope": "read write",
+            "scope": scope,
         },
     )
     assert reg_response.status_code == 201, (
@@ -255,7 +259,7 @@ def _do_full_oauth_flow(client, session_token: str | None = None) -> str:
             "response_type": "code",
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
-            "scope": "read write",
+            "scope": scope,
             "state": "test-state",
         },
         follow_redirects=False,
@@ -372,4 +376,73 @@ class TestProductionAppMcpCall:
         assert tool_response.status_code == 200, (
             f"携带合法 Bearer 调用 tools/call 应返回 200，实际: {tool_response.status_code}, "
             f"body: {tool_response.text[:300]}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 7. 生产组合：传输层 scope 准入（write-only token 必须被 403 拒绝）
+# ---------------------------------------------------------------------------
+
+
+class TestMcpTransportScopeAdmission:
+    """验证 /mcp 传输层的 scope 准入底线为 read。
+
+    仅含 write 的 token 是「认证通过但授权不足」——必须返回 403
+    （而非 401，也不是放行 200），并携带 scope 挑战头指引客户端补足 read。
+    """
+
+    def test_仅含write的合法token_访问mcp_返回403且挑战read(
+        self, monkeypatch, embed_mocks
+    ):
+        """仅含 write 的合法 JWT 请求 /mcp → 403 + insufficient_scope + scope="read" 挑战头。
+
+        403（而非 401）证明 token 验签通过，只是 scope 不满足 required_scopes=["read"]；
+        WWW-Authenticate 必须同时给出 error 与 scope 挑战，客户端才能据此重新授权。
+        """
+        from app.mcp import provider as provider_module
+
+        # 生产配置 auth.enabled=True，/consent 需要 Web 会话；打桩会话校验，
+        # 仅绕过 Web 会话检查，不影响 Bearer JWT 的验签链路。
+        monkeypatch.setattr(
+            provider_module.security_manager,
+            "validate_session",
+            lambda token: {"username": "admin", "created_at": 0},
+        )
+
+        with embed_mocks():
+            from app.main import app
+
+            with TestClient(app, raise_server_exceptions=False) as client:
+                write_only_token = _do_full_oauth_flow(
+                    client, session_token="valid-session-token", scope="write"
+                )
+
+                response = client.post(
+                    "/mcp",
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 0,
+                        "method": "initialize",
+                        "params": {
+                            "protocolVersion": "2024-11-05",
+                            "capabilities": {},
+                            "clientInfo": {"name": "test-client", "version": "1.0"},
+                        },
+                    },
+                    headers={"Authorization": f"Bearer {write_only_token}"},
+                )
+
+        assert response.status_code == 403, (
+            "仅含 write 的合法 Bearer 应因 scope 不足返回 403，实际: "
+            f"{response.status_code}, body: {response.text[:300]}"
+        )
+        assert response.json().get("error") == "insufficient_scope", (
+            f"403 响应体应携带 error=insufficient_scope，实际: {response.text[:300]}"
+        )
+        www_authenticate = response.headers.get("www-authenticate", "")
+        assert www_authenticate.startswith("Bearer"), (
+            f"401/403 响应应携带 Bearer 挑战头，实际: {www_authenticate!r}"
+        )
+        assert 'scope="read"' in www_authenticate, (
+            f'挑战头应声明 scope="read"，实际: {www_authenticate!r}'
         )
