@@ -89,17 +89,30 @@ def _register_tools(mcp: FastMCP) -> None:
     mcp.add_tool(update_config)
 
 
-def create_mcp_server(base_url: str | None = None) -> FastMCP:
+def create_mcp_server(
+    base_url: str | None = None,
+    *,
+    provider: BangumiOAuthProvider | None = None,
+) -> FastMCP:
     """创建 FastMCP 实例，使用 BangumiOAuthProvider 并注册工具。
+
+    **这是全仓库唯一装配 MCP app 的入口**：`/consent` 路由必须在
+    `http_app()` 调用之前通过 `custom_route()` 注册，一旦装配逻辑散落到
+    多个工厂，这条隐蔽约束极易被漏掉（历史上生产路径曾因此漏注册
+    `/consent`）。所有调用方（含测试工厂）都应经由此函数装配。
 
     Args:
         base_url: 服务公共 URL，用于 OAuth metadata 中的 issuer / endpoint。
-                  None 时从配置/环境变量自动解析。
+                  None 时从配置/环境变量自动解析。仅在 provider 为 None 时生效。
+        provider: 可选注入的自定义 provider。提供时完全跳过
+                  `_resolve_base_url` / `_create_provider` 的配置解析，
+                  便于测试复用同一装配逻辑。
 
     Returns:
         FastMCP 实例（已配置 auth、注册 /consent 路由、注册 3 个工具）。
     """
-    provider = _create_provider(base_url=base_url)
+    if provider is None:
+        provider = _create_provider(base_url=base_url)
     mcp = FastMCP(name="bangumi-syncer", auth=provider)
 
     # 注册 /consent 路由（必须在 http_app() 调用前完成）
@@ -111,11 +124,19 @@ def create_mcp_server(base_url: str | None = None) -> FastMCP:
     return mcp
 
 
-def create_mcp_app(base_url: str | None = None):
+def create_mcp_app(
+    base_url: str | None = None,
+    *,
+    provider: BangumiOAuthProvider | None = None,
+):
     """创建 FastMCP http_app（Starlette app），用于路由提取与 lifespan 合并。
+
+    内部委托给 `create_mcp_server`——后者是唯一装配入口，负责在
+    `http_app()` 之前注册 `/consent`（这是本函数不直接构造 FastMCP 的原因）。
 
     Args:
         base_url: 服务公共 URL。None 时从配置/环境变量自动解析。
+        provider: 可选注入的自定义 provider，透传给 `create_mcp_server`。
 
     Returns:
         StarletteWithLifespan 实例，包含：
@@ -126,7 +147,7 @@ def create_mcp_app(base_url: str | None = None):
         - /consent
         - /mcp（工具端点，含 3 个注册工具）
     """
-    mcp = create_mcp_server(base_url=base_url)
+    mcp = create_mcp_server(base_url=base_url, provider=provider)
     return mcp.http_app(path="/mcp")
 
 

@@ -803,6 +803,74 @@ class TestProductionConsentRoute:
 
 
 # ---------------------------------------------------------------------------
+# 6. 生产装配支持注入自定义 provider
+# ---------------------------------------------------------------------------
+
+
+class TestProviderInjection:
+    """验证 create_mcp_server / create_mcp_app 支持注入自定义 provider。
+
+    注入后必须完全绕过 _resolve_base_url / _create_provider 的配置解析，
+    同时仍走同一处装配逻辑注册 /consent 路由。
+    """
+
+    @pytest.fixture
+    def custom_provider(self, tmp_path):
+        """构造 issuer 为可辨识自定义值的 BangumiOAuthProvider。"""
+        from app.mcp.provider import BangumiOAuthProvider, RSAKeyManager
+
+        rsa_manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        rsa_manager.load_or_generate()
+        # 自定义 issuer 取一个既合法（SDK 要求非 loopback 必须 HTTPS）又
+        # 与默认解析值（http://localhost:8000）可区分的主机。
+        return BangumiOAuthProvider(
+            base_url="https://custom-issuer.test:9000",
+            rsa_manager=rsa_manager,
+            issuer="https://custom-issuer.test:9000",
+            audience="bangumi-syncer",
+            auth_enabled=False,
+            auth_username="admin",
+        )
+
+    def test_create_mcp_server_注入provider_返回FastMCP(self, custom_provider):
+        """create_mcp_server(provider=...) 应接受注入并返回 FastMCP。"""
+        from fastmcp import FastMCP
+
+        from app.mcp.server import create_mcp_server
+
+        mcp = create_mcp_server(provider=custom_provider)
+        assert isinstance(mcp, FastMCP)
+
+    @pytest.mark.asyncio
+    async def test_注入provider_metadata使用自定义issuer(self, custom_provider):
+        """注入 provider 后 metadata.issuer 应来自注入对象，而非配置/默认值。"""
+        from app.mcp.server import create_mcp_app
+
+        app = create_mcp_app(provider=custom_provider)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/.well-known/oauth-authorization-server")
+
+        assert response.status_code == 200
+        # AnyHttpUrl 会补尾斜杠，比较时归一化；关键是它未被默认解析值覆盖。
+        issuer = response.json()["issuer"].rstrip("/")
+        assert issuer == "https://custom-issuer.test:9000"
+
+    def test_注入provider_仍注册consent路由(self, custom_provider):
+        """即使注入 provider，create_mcp_app 返回的 app 仍应包含 /consent 路由。"""
+        from app.mcp.server import create_mcp_app
+
+        app = create_mcp_app(provider=custom_provider)
+        paths = [r.path for r in app.routes if hasattr(r, "path")]
+        assert "/consent" in paths, (
+            f"注入 provider 时也应注册 /consent，实际路径: {paths}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # S2: JWT 含 client_id → /revoke 生产路径可触发
 # ---------------------------------------------------------------------------
 
