@@ -60,6 +60,19 @@ tests/
 | `app/mcp/tools.py` | 工具实现（get_logs / get_current_config / update_config） |
 | `app/main.py` | FastAPI 应用入口，`app.mount("/", mcp_app)` 挂载 FastMCP 子应用 + `combine_lifespans` |
 
+### 挂载方式：独立 ASGI 子应用（mount，而非 include_router）
+
+MCP 与其它 API 的装配方式不同，这是 ASGI 嵌套语义决定的，不是代码设计缺陷：
+
+| 维度 | 其它 API（`app.include_router(...)`） | MCP（`app.mount("/", mcp_app)`） |
+| --- | --- | --- |
+| 本质 | 同一 app 内的**路由集合** | `mcp.http_app()` 产出的**独立 ASGI 子应用** |
+| lifespan | 天然共享外层 lifespan | 外层**不会**代跑子应用 lifespan，须 `combine_lifespans(lifespan, mcp_app.lifespan)`（`app/main.py`） |
+| 异常处理 | 共享外层 exception handler | 子应用 `Router.not_found` 在 `"app" in scope` 时自行 raise `HTTPException(404)`，由子应用自身中间件处理，外层 404 处理器拦不到；须 `mcp_app.add_exception_handler(404, _mcp_json_404)` 注册 JSON 404 |
+| middleware | 共享外层中间件栈 | 子应用有自己的中间件栈（`Mount` 自动生效的 `user_middleware` 除外） |
+
+挂载点必须是放在所有具体路由之后的 catch-all（`/`），以保持 MCP 的原始根路径端点（`/.well-known/*`、`/authorize`、`/token`、`/consent`、`/mcp`）不被前缀改写。
+
 ::: warning 状态均为进程内存储，当前仅支持单进程
 `BangumiOAuthProvider`（`app/mcp/provider.py`）的客户端注册表、授权码、Refresh Token、待授权请求与吊销记录全部保存在**进程内存**中。仓库启动方式（`start.bat`、Dockerfile `CMD`）均为 `uvicorn app.main:app` 单进程，**不支持 `--workers N` / gunicorn 多进程**：否则授权码 / Refresh Token 会因请求落到不同进程而失效，吊销状态也会各进程不一致。Access Token 的 JWT 验签本身无状态（RS256），不受进程数影响。
 :::
@@ -128,7 +141,7 @@ JWT claims：
 2. 检查 `aud`（必须为 `"bangumi-syncer"`）
 3. 公钥验签（RS256）
 
-公钥由 `RSAKeyManager` 本地生成/加载，路径可通过 `MCP_RSA_PUBLIC_KEY` 环境变量配置。
+公钥由 `RSAKeyManager` 本地生成/加载，默认路径为 `data/mcp_public.pem`（相对 cwd），可通过 `MCP_RSA_PUBLIC_KEY` 环境变量覆盖。
 
 ### 4. consent 未登录行为
 
@@ -158,13 +171,13 @@ JWT claims：
 
 | 密钥 | 路径（默认） | 说明 |
 | --- | --- | --- |
-| 私钥 | `<系统临时目录>/mcp_private.pem` | **仅 BS 持有**，本地磁盘 |
-| 公钥 | `<系统临时目录>/mcp_public.pem` | 本地生成，用于验签 JWT |
+| 私钥 | `data/mcp_private.pem` | **仅 BS 持有**，本地磁盘（相对 cwd） |
+| 公钥 | `data/mcp_public.pem` | 本地生成，用于验签 JWT（相对 cwd） |
 
-默认路径由 `tempfile.gettempdir()` 解析（`app/mcp/server.py`），因此会随操作系统不同而变化（Linux 通常为 `/tmp`，macOS 为 `$TMPDIR` 指向的目录）。路径可通过环境变量 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 配置。
+默认路径相对进程启动时的工作目录（cwd）解析，位于项目 `data/` 目录；Docker 镜像内即 `/app/data`（Dockerfile 已预建该目录）。路径可通过环境变量 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 配置。
 
-::: warning 默认路径不持久
-默认路径位于系统临时目录，容器重建或临时目录被清理会导致密钥丢失：已签发的 Access Token（有效期 1 小时）将验签失败，客户端需重新授权；多实例部署也需要各实例共享同一密钥。生产部署应将 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 指向持久卷/数据目录（如 `/app/data/mcp_private.pem`，镜像内已预建 `/app/data`）。
+::: warning 建议挂载 `data/` 以持久化密钥
+密钥默认写入项目 `data/` 目录，但**容器未挂载该目录时**，容器重建仍会导致密钥丢失：已签发的 Access Token（有效期 1 小时）将验签失败，客户端需重新授权。生产部署应将宿主机目录挂载到容器 `/app/data`（或把 `MCP_RSA_PRIVATE_KEY` / `MCP_RSA_PUBLIC_KEY` 指向持久卷）；多实例部署还需各实例共享同一密钥。
 :::
 
 ---
@@ -271,12 +284,14 @@ docker build -t bangumi-syncer:latest .
 
 BS 单容器部署，内置 MCP 服务。
 
+密钥默认写入容器内 `/app/data`（Dockerfile 已预建该目录）。**建议挂载宿主机目录到 `/app/data`** 以持久化 RSA 密钥——未挂载时容器重建会丢失密钥，已签发的 Access Token 验签失败、客户端被迫重新授权。
+
 环境变量：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MCP_RSA_PRIVATE_KEY` | `<系统临时目录>/mcp_private.pem` | RSA 私钥路径（本地磁盘） |
-| `MCP_RSA_PUBLIC_KEY` | `<系统临时目录>/mcp_public.pem` | RSA 公钥路径 |
+| `MCP_RSA_PRIVATE_KEY` | `data/mcp_private.pem`（Docker 内 `/app/data/mcp_private.pem`） | RSA 私钥路径（相对 cwd；建议挂载 `data/` 持久化） |
+| `MCP_RSA_PUBLIC_KEY` | `data/mcp_public.pem`（Docker 内 `/app/data/mcp_public.pem`） | RSA 公钥路径（相对 cwd；建议挂载 `data/` 持久化） |
 | `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点；解析优先级：`create_mcp_server(base_url=...)` 参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值 |
 | `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，单位：秒；每次轮换后重新计时（滑动窗口） |
 

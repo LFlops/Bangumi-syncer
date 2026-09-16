@@ -235,6 +235,15 @@ app.include_router(airing_calendar_router)
 # - user_middleware：由 Mount 自动生效，无需手动迁移。
 # - lifespan：嵌套子应用的 lifespan 不会被外层自动运行，必须经
 #   combine_lifespans(lifespan, mcp_app.lifespan) 合并（见上方 app 构造）。
+#
+# 为何只有 MCP 需要这两处额外装配？——router 与 mount 的 ASGI 语义不同：
+# - 上方 app.include_router(...) 注册的是"同一个 app 内"的路由集合，天然共享
+#   外层 lifespan / middleware / exception handler，无需额外接线。
+# - app.mount("/", mcp_app) 挂载的 mcp_app 是 mcp.http_app() 产出的"独立
+#   ASGI 子应用"，有自己的 Router / 中间件栈 / 异常处理：外层生命周期不会
+#   代跑子应用 lifespan，子应用内抛出的异常也不会冒泡到外层 FastAPI 处理器。
+# 因此上面合并 lifespan、下面注册 404 处理器都是 ASGI 嵌套语义的必然要求，
+# 不是代码设计缺陷，改动时不要把这两步当冗余删除。
 # ─────────────────────────────────────────────────────────────────────────
 # 根级 catch-all Mount 会把未匹配请求交给 mcp_app，其 Router.not_found 在
 # "app" in scope 时 raise HTTPException(404)，由子应用自身异常中间件处理，
