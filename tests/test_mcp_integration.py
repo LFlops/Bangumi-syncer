@@ -19,6 +19,8 @@ from fastmcp import Client
 from httpx import ASGITransport, AsyncClient
 from starlette.testclient import TestClient
 
+from tests.mcp_helpers import build_test_mcp_app
+
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
@@ -40,69 +42,6 @@ def _extract_csrf_token(html_content: str) -> str:
     if not match:
         raise ValueError("CSRF token not found in consent form")
     return match.group(1)
-
-
-def _create_test_server_with_tools(
-    private_key_path: str,
-    public_key_path: str,
-    issuer: str,
-    audience: str,
-    auth_enabled: bool = False,
-    auth_username: str = "admin",
-):
-    """创建同时注册 OAuth auth 与 MCP tools 的测试 server。
-
-    组合了 create_auth_server（consent flow）与 create_mcp_server（tools）。
-    """
-    from fastmcp import FastMCP
-    from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
-
-    from app.mcp.provider import (
-        BangumiOAuthProvider,
-        RSAKeyManager,
-        handle_consent,
-    )
-    from app.mcp.server import _register_tools
-
-    # 初始化 RSA 密钥
-    rsa_manager = RSAKeyManager(
-        private_key_path=private_key_path,
-        public_key_path=public_key_path,
-    )
-    rsa_manager.load_or_generate()
-
-    # 创建 provider
-    provider = BangumiOAuthProvider(
-        base_url=issuer,
-        rsa_manager=rsa_manager,
-        issuer=issuer,
-        audience=audience,
-        token_expiry_seconds=3600,
-        auth_enabled=auth_enabled,
-        auth_username=auth_username,
-        client_registration_options=ClientRegistrationOptions(enabled=True),
-        revocation_options=RevocationOptions(enabled=True),
-    )
-
-    # 创建带 auth 的 MCP server
-    mcp = FastMCP(name="bangumi-syncer-mcp", auth=provider)
-
-    # 注册工具
-    _register_tools(mcp)
-
-    # 在调用 http_app 之前注册 consent 路由
-    @mcp.custom_route("/consent", methods=["GET", "POST"])
-    async def consent_route(request):
-        return await handle_consent(request, provider)
-
-    # 获取 Starlette app
-    app = mcp.http_app(path="/mcp")
-
-    # 将公钥和 provider 存入 app state 供测试使用
-    app.state.public_key_pem = rsa_manager.get_public_key_pem()
-    app.state.provider = provider
-
-    return app
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +290,7 @@ class TestFullOAuthFlowWithToolCall:
     @pytest.fixture
     def server_app(self, tmp_keys):
         """创建 auth.enabled=False 且注册了 tools 的测试 server。"""
-        return _create_test_server_with_tools(
+        return build_test_mcp_app(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
             issuer="http://localhost:8000",
@@ -497,7 +436,7 @@ class TestRealHttpEndToEnd:
     @pytest.fixture
     def server_app(self, tmp_keys):
         """创建 auth.enabled=False 且注册了 tools 的测试 server。"""
-        return _create_test_server_with_tools(
+        return build_test_mcp_app(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
             issuer="http://localhost:8000",
@@ -887,7 +826,7 @@ class TestRevocationFlow:
 
     @pytest.fixture
     def server_app(self, tmp_keys):
-        return _create_test_server_with_tools(
+        return build_test_mcp_app(
             private_key_path=tmp_keys["private"],
             public_key_path=tmp_keys["public"],
             issuer="http://localhost:8000",
