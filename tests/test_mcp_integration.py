@@ -696,6 +696,35 @@ class TestWellKnownEndpoints:
         assert "registration_endpoint" in data
 
     @pytest.mark.asyncio
+    async def test_metadata_声明scopes_supported为read_write(self):
+        """AS metadata 与 PRM metadata 均应声明 scopes_supported == ["read", "write"]。
+
+        ``scopes_supported`` 来自 provider 默认的
+        ``ClientRegistrationOptions(valid_scopes=["read", "write"])``，是客户端发现
+        可用 scope 的依据；两处（授权服务器 metadata 与受保护资源 metadata）必须同值，
+        否则客户端拿到的 scope 契约会自相矛盾。此处用精确相等锁住契约，防止默认允许集
+        被无声改动。
+        """
+        from app.mcp.server import create_mcp_app
+
+        app = create_mcp_app()
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            as_response = await client.get("/.well-known/oauth-authorization-server")
+            prm_response = await client.get("/.well-known/oauth-protected-resource/mcp")
+
+        assert as_response.status_code == 200
+        assert prm_response.status_code == 200
+        assert as_response.json().get("scopes_supported") == ["read", "write"], (
+            "AS metadata.scopes_supported 应为 ['read', 'write']，实际: "
+            f"{as_response.json().get('scopes_supported')}"
+        )
+        assert prm_response.json().get("scopes_supported") == ["read", "write"], (
+            "PRM metadata.scopes_supported 应为 ['read', 'write']，实际: "
+            f"{prm_response.json().get('scopes_supported')}"
+        )
+
+    @pytest.mark.asyncio
     async def test_protected_resource_metadata_可达(self):
         """/.well-known/oauth-protected-resource/mcp 应返回 200。"""
         from app.mcp.server import create_mcp_app

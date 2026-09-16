@@ -21,6 +21,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from fastapi.testclient import TestClient  # noqa: I001
 
+from tests.mcp_helpers import build_test_mcp_app
+
 # ---------------------------------------------------------------------------
 # 1. /mcp 端点存在且鉴权链路生效
 # ---------------------------------------------------------------------------
@@ -385,10 +387,14 @@ class TestProductionAppMcpCall:
 
 
 class TestMcpTransportScopeAdmission:
-    """验证 /mcp 传输层的 scope 准入底线为 read。
+    """验证 /mcp 传输层的 scope 准入门槛（默认 read，可显式关闭）。
 
-    仅含 write 的 token 是「认证通过但授权不足」——必须返回 403
-    （而非 401，也不是放行 200），并携带 scope 挑战头指引客户端补足 read。
+    默认（生产单例 ``app.main``）required_scopes=["read"]：仅含 write 的 token 是
+    「认证通过但授权不足」——必须返回 403（而非 401，也不是放行 200），并携带
+    scope 挑战头指引客户端补足 read。
+
+    对照方向：provider 以 ``required_scopes=[]`` 显式关闭门槛时，同一枚仅含 write
+    的合法 token 必须被放行（非 403），证明 ``[]`` 是真正的关闭开关而非被默认值兜底。
     """
 
     def test_仅含write的合法token_访问mcp_返回403且挑战read(
@@ -445,4 +451,49 @@ class TestMcpTransportScopeAdmission:
         )
         assert 'scope="read"' in www_authenticate, (
             f'挑战头应声明 scope="read"，实际: {www_authenticate!r}'
+        )
+
+    def test_空required_scopes时_仅含write的合法token_访问mcp不被403(self, tmp_path):
+        """provider 以 required_scopes=[] 挂载时，仅含 write 的合法 token 应放行 /mcp。
+
+        与上方「默认 required_scopes=["read"] → write-only 403」形成正反对照：
+        证明 ``required_scopes=[]`` 确实关闭了传输层 scope 门槛（认证仍生效，
+        只是跳过 scope 校验），而不是被默认值兜底成 ``["read"]``。
+
+        装配走 ``tests.mcp_helpers.build_test_mcp_app(required_scopes=[])``：它复用
+        生产装配入口 ``create_mcp_app``，且能表达生产单例 ``app.main``（固定
+        required_scopes=["read"]）无法表达的 ``[]`` 配置。token 经完整 OAuth 链路
+        （DCR → authorize → consent → token）真实签发，scope 为 write，不做 mock。
+        """
+        app = build_test_mcp_app(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+            issuer="http://localhost:8000",
+            audience="bangumi-syncer",
+            auth_enabled=False,
+            auth_username="admin",
+            required_scopes=[],
+        )
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            write_only_token = _do_full_oauth_flow(client, scope="write")
+
+            response = client.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": 0,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test-client", "version": "1.0"},
+                    },
+                },
+                headers={"Authorization": f"Bearer {write_only_token}"},
+            )
+
+        assert response.status_code == 200, (
+            "required_scopes=[] 应放行仅含 write 的合法 token（非 403），实际: "
+            f"{response.status_code}, body: {response.text[:300]}"
         )

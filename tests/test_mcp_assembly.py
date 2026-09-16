@@ -89,7 +89,7 @@ def test_测试helper复用生产装配入口(tmp_path, monkeypatch):
 
     monkeypatch.setattr(helpers, "create_mcp_app", _spy_create_mcp_app)
 
-    helpers.build_test_mcp_app(
+    app = helpers.build_test_mcp_app(
         private_key_path=str(tmp_path / "private.pem"),
         public_key_path=str(tmp_path / "public.pem"),
         issuer="https://custom-issuer.test:9000",
@@ -99,4 +99,10 @@ def test_测试helper复用生产装配入口(tmp_path, monkeypatch):
     assert "provider" in called_kwargs, (
         "build_test_mcp_app 应经 create_mcp_app(provider=...) 装配，"
         f"实际调用参数: {called_kwargs}"
+    )
+    # helper 会把自建的 provider 挂到返回 app 的 state.provider 上；
+    # 校验透传给 create_mcp_app 的正是该对象，而非另造的 provider。
+    assert called_kwargs["provider"] is app.state.provider, (
+        "build_test_mcp_app 应把自建 provider 原样透传给 create_mcp_app，"
+        f"实际调用参数与 app.state.provider 不一致: {called_kwargs}"
     )

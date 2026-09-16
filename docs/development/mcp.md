@@ -141,7 +141,7 @@ JWT claims：
 - **注册 ≠ 授权**：注册只登记客户端元数据，不授予任何数据权限；仍需 BS 登录会话（`auth.enabled=true` 时）+ consent 页点 Allow 才能拿到 Token
 - **存储与上限**：已注册客户端存于进程内存 `_clients`，上限 `MAX_CLIENTS=1000`，达到上限后注册抛 `RegistrationError`
 - **兜底**：重启进程即清空 `_clients`（及 `_auth_codes` / `_refresh_tokens` / `_pending_auths` / `_revoked_tokens`）；RSA 密钥若已持久化则保留。已签发 Access Token 在 1 小时有效期内仍有效（JWT 自包含验签，不查注册表）
-- **关闭方式**：当前无配置开关，需在装配代码（`_create_provider` / `create_auth_server`）传入 `ClientRegistrationOptions(enabled=False)`；关闭后仅 CIMD 客户端可授权（`get_client` / `authorize` 对 CIMD client_id 走独立分支，不依赖 `_clients`）
+- **关闭方式**：当前无配置开关。DCR 选项的实际来源是 `app/mcp/provider.py::BangumiOAuthProvider.__init__` 的默认值（`client_registration_options or ClientRegistrationOptions(enabled=True, valid_scopes=["read", "write"])`）；装配侧 `app/mcp/server.py::_create_provider` 目前不显式传入该选项，因此以 provider 默认值为准。要关闭需改该默认值（或在构造 provider 时显式传 `ClientRegistrationOptions(enabled=False)`）。关闭后仅 CIMD 客户端可授权（`get_client` / `authorize` 对 CIMD client_id 走独立分支，不依赖 `_clients`）
 
 ---
 
@@ -215,7 +215,7 @@ JWT claims：
 
 ### OAuth 测试
 
-`tests/test_mcp_auth.py` 使用 `create_auth_server()` 工厂创建带认证的 Starlette app，直接测试 authorize/token/consent 流程。
+`tests/test_mcp_auth.py` 使用 `tests.mcp_helpers.build_test_mcp_app()`（复用生产入口 `create_mcp_app`）创建带认证的 Starlette app，直接测试 authorize/token/consent 流程。
 
 ### 嵌入测试
 
