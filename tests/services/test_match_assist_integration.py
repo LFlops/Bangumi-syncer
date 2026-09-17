@@ -61,6 +61,30 @@ def _make_orchestrator() -> SyncOrchestrator:
     return SyncOrchestrator(sync)
 
 
+def _make_orchestrator_agent_runs(
+    *, decision: str = "created", run_id: str = "generated-run"
+) -> MagicMock:
+    """构造带 enqueue_match_run 返回值的 agent_runs mock"""
+    agent_runs = MagicMock()
+    agent_runs.enqueue_match_run.return_value = {"decision": decision, "run_id": run_id}
+    return agent_runs
+
+
+def _assist_steps(steps: list) -> list:
+    """从 trace steps 中筛出 llm_assist step"""
+    return [s for s in steps if s["stage"] == "llm_assist"]
+
+
+def _capturing_persist(store: dict, record_id: int = 123):
+    """返回捕获 persist 时刻 trace 序列化结果的 fake_persist"""
+
+    def fake_persist(t, *a, **k):
+        store["steps"] = t.to_dict()["steps"]
+        return record_id
+
+    return fake_persist
+
+
 # ----------------------------------------------------------------------
 # _handle_match_failure 接入 + 去重
 # ----------------------------------------------------------------------
@@ -108,7 +132,8 @@ def test_handle_match_failure_enqueues_when_enabled(
 
     agent_runs.enqueue_match_run.assert_called_once()
     kwargs = agent_runs.enqueue_match_run.call_args.kwargs
-    assert kwargs["sync_record_id"] == 123
+    # 入队前移：persist 之前入队，尚无 sync_record_id
+    assert kwargs["sync_record_id"] is None
     assert kwargs["run_id"]
     assert kwargs["business_key"]  # 业务键非空
     assert kwargs["accepted_mapping_valid"] is False  # 映射未命中 → 无效
@@ -117,6 +142,11 @@ def test_handle_match_failure_enqueues_when_enabled(
         s["stage"] == "llm_assist" and s["status"] == "pending"
         for s in captured["steps"]
     )
+    # persist 后写关联表 + 刷新主指针（created 回填 sync_record_id）
+    agent_runs.add_run_sync_record_link.assert_called_once_with(
+        "generated-run", 123, "created"
+    )
+    agent_runs.update_run_sync_record_id.assert_called_once_with("generated-run", 123)
 
 
 @patch("app.services.sync_service.notification_service")
@@ -221,6 +251,275 @@ def test_enqueue_decision_reuse_holding_logged(mock_db, mock_cfg, mock_notify, c
 
     agent_runs.enqueue_match_run.assert_called_once()
     assert "reuse_holding" in capsys.readouterr().out
+
+
+# ----------------------------------------------------------------------
+# T6：入队前移 + trace 记录实际 run_id + run↔record 关联 + 文案
+# ----------------------------------------------------------------------
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_trace_records_actual_new_run_id_when_created(mock_db, mock_cfg, mock_notify):
+    """S1：created → persist 的 trace 里 llm_assist.step.run_id == 实际新建 run
+
+    入队前移：enqueue 在 persist 之前调用，此时尚无 sync_record_id。
+    """
+    orch = _make_orchestrator()
+    agent_runs = MagicMock()
+    # created 语义：仓库回显传入的 run_id
+    agent_runs.enqueue_match_run.side_effect = lambda **kw: {
+        "decision": "created",
+        "run_id": kw["run_id"],
+    }
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+    captured: dict = {}
+
+    with (
+        patch.object(
+            orch, "_persist_sync_record", side_effect=_capturing_persist(captured)
+        ),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
+        orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    kwargs = agent_runs.enqueue_match_run.call_args.kwargs
+    assert kwargs["run_id"]
+    # 入队前移：persist 尚未发生，不携带 sync_record_id
+    assert kwargs["sync_record_id"] is None
+    assist = _assist_steps(captured["steps"])
+    assert len(assist) == 1
+    assert assist[0]["processed_payload"] == {
+        "run_id": kwargs["run_id"],
+        "decision": "created",
+    }
+
+
+@pytest.mark.parametrize("decision", ["in_flight", "reuse_holding"])
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_trace_records_actual_reused_run_id(mock_db, mock_cfg, mock_notify, decision):
+    """S2：复用/在途 → trace 记录的是实际承担评估的已有 run B（非预生成 id）"""
+    orch = _make_orchestrator()
+    agent_runs = _make_orchestrator_agent_runs(decision=decision, run_id="run-B")
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+    captured: dict = {}
+
+    with (
+        patch.object(
+            orch, "_persist_sync_record", side_effect=_capturing_persist(captured)
+        ),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
+        orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    assist = _assist_steps(captured["steps"])
+    assert len(assist) == 1
+    assert assist[0]["processed_payload"]["run_id"] == "run-B"
+    assert assist[0]["processed_payload"]["decision"] == decision
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+def test_run_link_and_pointer_written_after_persist(mock_cfg, mock_notify, tmp_path):
+    """S3：persist 后写关联表 + 刷新 run 主指针 sync_record_id（真实 DB）"""
+    from app.core.database import DatabaseManager
+
+    dbm = DatabaseManager(str(tmp_path / "t6_link.db"))
+    try:
+        orch = _make_orchestrator()
+        mock_cfg.get.return_value = "true"
+        mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+
+        item = _make_item()
+        trace = _make_trace()
+
+        with (
+            patch("app.services.sync_service.database_manager", dbm),
+            patch.object(orch, "_persist_sync_record", return_value=777),
+            patch("app.services.mapping_service.mapping_service") as mock_mapping,
+        ):
+            mock_mapping.find_mapping.return_value = ("", "", "")
+            orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+        conn = dbm._connection._conn
+        rows = conn.execute(
+            "SELECT run_id, sync_record_id, decision FROM agent_run_sync_records"
+        ).fetchall()
+        assert len(rows) == 1
+        run_id, record_id, decision = rows[0]
+        assert record_id == 777
+        assert decision == "created"
+        run = dbm.agent_runs.get_run(run_id)
+        assert run is not None
+        assert run["sync_record_id"] == 777
+    finally:
+        dbm._connection._conn.close()
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_llm_assist_step_after_result_step(mock_db, mock_cfg, mock_notify):
+    """S4：llm_assist step 出现在 result 之后，且通过公开接口挂入"""
+    orch = _make_orchestrator()
+    agent_runs = _make_orchestrator_agent_runs()
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+    captured: dict = {}
+
+    with (
+        patch.object(
+            orch, "_persist_sync_record", side_effect=_capturing_persist(captured)
+        ),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
+        orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    stages = [s["stage"] for s in captured["steps"]]
+    assert "result" in stages and "llm_assist" in stages
+    assert stages.index("llm_assist") > stages.index("result")
+
+
+def test_orchestrator_no_private_step_finish_call():
+    """S4：orchestrator 不再调用 trace 私有收尾方法 _finish_current_step"""
+    import inspect
+
+    from app.services.sync_service import orchestrator as orch_mod
+
+    assert "_finish_current_step" not in inspect.getsource(orch_mod)
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_existing_llm_assist_step_not_reenqueued(mock_db, mock_cfg, mock_notify):
+    """S5：trace 已含 llm_assist（异常重入）→ 不重复 enqueue、不重复挂 step、不写关联"""
+    orch = _make_orchestrator()
+    agent_runs = _make_orchestrator_agent_runs()
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+    step = trace.start_step("llm_assist")
+    step.status = "pending"
+    step.processed_payload = {"run_id": "old-run", "decision": "created"}
+    trace.finish()
+    captured: dict = {}
+
+    with patch.object(
+        orch, "_persist_sync_record", side_effect=_capturing_persist(captured)
+    ):
+        orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    agent_runs.enqueue_match_run.assert_not_called()
+    agent_runs.add_run_sync_record_link.assert_not_called()
+    assist = _assist_steps(captured["steps"])
+    assert len(assist) == 1
+    assert assist[0]["processed_payload"]["run_id"] == "old-run"
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_message_and_notify_mention_ai_assist_when_enabled(
+    mock_db, mock_cfg, mock_notify
+):
+    """S6：启用时 SyncResponse.message 与 anime_not_found 通知含启用说明"""
+    orch = _make_orchestrator()
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = _make_orchestrator_agent_runs()
+
+    item = _make_item()
+    trace = _make_trace()
+
+    with (
+        patch.object(orch, "_persist_sync_record", return_value=123),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
+        resp = orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    assert "已启用 AI 匹配评估" in resp.message
+    call = mock_notify.notify.call_args
+    assert call.args[0] == "anime_not_found"
+    assert "已启用 AI 匹配评估" in call.kwargs["error_message"]
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_message_plain_when_assist_disabled(mock_db, mock_cfg, mock_notify):
+    """S6：未启用时保持原文案，不含启用说明"""
+    orch = _make_orchestrator()
+    mock_cfg.get.return_value = "false"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = _make_orchestrator_agent_runs()
+
+    item = _make_item()
+    trace = _make_trace()
+
+    with patch.object(orch, "_persist_sync_record", return_value=123):
+        resp = orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    assert resp.message == "未找到匹配的番剧"
+    assert "已启用 AI 匹配评估" not in resp.message
+    assert mock_notify.notify.call_args.kwargs["error_message"] == "未找到匹配的番剧"
+
+
+@patch("app.services.sync_service.notification_service")
+@patch("app.services.sync_service.config_manager")
+@patch("app.services.sync_service.database_manager")
+def test_enqueue_exception_degrades_without_blocking(
+    mock_db, mock_cfg, mock_notify, capsys
+):
+    """S7：enqueue 抛异常 → 主流程正常返回 error、warning 日志、decision=enqueue_failed、不写关联"""
+    orch = _make_orchestrator()
+    agent_runs = MagicMock()
+    agent_runs.enqueue_match_run.side_effect = RuntimeError("db down")
+    mock_cfg.get.return_value = "true"
+    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
+    mock_db.agent_runs = agent_runs
+
+    item = _make_item()
+    trace = _make_trace()
+    captured: dict = {}
+
+    with patch.object(
+        orch, "_persist_sync_record", side_effect=_capturing_persist(captured)
+    ):
+        resp = orch._handle_match_failure(item, "plex", trace, "err", [""])
+
+    assert resp.status == "error"
+    assist = _assist_steps(captured["steps"])
+    assert len(assist) == 1
+    assert assist[0]["processed_payload"]["decision"] == "enqueue_failed"
+    assert assist[0]["processed_payload"]["run_id"]
+    agent_runs.add_run_sync_record_link.assert_not_called()
+    agent_runs.update_run_sync_record_id.assert_not_called()
+    assert "匹配增强任务入队失败" in capsys.readouterr().out
 
 
 # ----------------------------------------------------------------------

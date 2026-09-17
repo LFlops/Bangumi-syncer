@@ -354,25 +354,62 @@ class SyncOrchestrator:
             }
             trace.final_status = "error"
             trace.final_message = "未找到匹配的番剧"
-        trace.finish()
 
         # ===== 匹配增强接入：开关开 + LLM 可用时提交 AI 评估任务 =====
-        # 决定前先读取开关与 LLM 配置；trace step 必须在 _persist_sync_record
-        # 之前追加（trace 入库后不可改），LLM 评估结论异步承载于 agent_runs。
-        assist_enabled = self._match_assist_enabled()
-        run_id: str | None = None
+        # 顺序契约：入队决策前移到 trace 写入之前，trace 记录的 run_id 必须等于
+        # 实际承担本次评估的 run（新建 or 复用在途/历史 run）。
+        # 幂等：同一 trace 已含 llm_assist step（异常重入）则跳过整个增强。
+        assist_configured = self._match_assist_enabled()
+        assist_enabled = assist_configured and not any(
+            s.stage == "llm_assist" for s in trace.steps
+        )
+
+        actual_run_id: str | None = None
+        decision = ""
         if assist_enabled:
-            # 幂等：同一 trace 已含 llm_assist step（异常重入）则跳过整个增强
-            if any(s.stage == "llm_assist" for s in trace.steps):
-                assist_enabled = False
-            else:
-                run_id = str(uuid.uuid4())
-                llm_step = trace.start_step("llm_assist")
-                llm_step.status = "pending"
-                llm_step.reason = "已提交 AI 评估"
-                llm_step.processed_payload = {"run_id": run_id}
-                # 立即提交到 trace.steps，确保 persist 序列化时含该 step
-                trace._finish_current_step()
+            from ..matching.identity import build_match_business_key
+            from . import database_manager
+
+            business_key = build_match_business_key(
+                user_name=item.user_name,
+                title=item.title,
+                season=item.season,
+            )
+            new_run_id = str(uuid.uuid4())
+            try:
+                result = database_manager.agent_runs.enqueue_match_run(
+                    run_id=new_run_id,
+                    business_key=business_key,
+                    sync_record_id=None,
+                    accepted_mapping_valid=self._accepted_mapping_valid(item),
+                )
+                decision = result.get("decision", "")
+                actual_run_id = result.get("run_id", new_run_id)
+                logger.info(
+                    f"匹配增强任务入队: decision={decision}, run_id={actual_run_id}, "
+                    f"business_key={business_key}"
+                )
+            except Exception as e:
+                # 降级：入队失败不阻塞主匹配流程，trace 仍记录失败决策便于排查
+                decision = "enqueue_failed"
+                actual_run_id = new_run_id
+                logger.warning(f"匹配增强任务入队失败（不影响主流程）: {e}")
+            llm_step = trace.start_step("llm_assist")
+            llm_step.status = "pending"
+            llm_step.reason = "已提交 AI 评估"
+            llm_step.processed_payload = {
+                "run_id": actual_run_id,
+                "decision": decision,
+            }
+
+        # llm_assist step 已在 finish 前挂入；to_dict 与 finish 会自动收尾当前 step
+        trace.finish()
+
+        not_found_message = (
+            "未找到匹配的番剧（已启用 AI 匹配评估，稍后可在「待确认」页查看建议）"
+            if assist_configured
+            else "未找到匹配的番剧"
+        )
 
         sync_record_id = self._persist_sync_record(
             trace,
@@ -386,6 +423,10 @@ class SyncOrchestrator:
             ),
         )
 
+        # persist 后关联落库：created 为回填主指针，in_flight/复用为刷新主指针
+        if assist_enabled and decision != "enqueue_failed" and actual_run_id:
+            self._link_run_sync_record(actual_run_id, sync_record_id, decision)
+
         from . import notification_service
 
         notification_service.notify(
@@ -393,17 +434,14 @@ class SyncOrchestrator:
             item,
             actual_source,
             in_app_ref_id=sync_record_id,
-            error_message="未找到匹配的番剧",
+            error_message=not_found_message,
         )
         # 匹配失败且有候选时，沉淀到 pending_candidates 供用户手动确认
         self._sync._sediment_pending_candidate(
             item, actual_source, trace, sync_record_id=sync_record_id
         )
-        # 提交 AI 评估任务（去重 + 落库，失败不阻塞主流程）
-        if assist_enabled and run_id:
-            self._enqueue_match_assist_run(run_id, item, sync_record_id, trace)
         status_holder[0] = "error"
-        return SyncResponse(status="error", message="未找到匹配的番剧")
+        return SyncResponse(status="error", message=not_found_message)
 
     # ------------------------------------------------------------------
     # 匹配增强接入辅助：开关/配置判定 + 任务去重落库
@@ -420,67 +458,37 @@ class SyncOrchestrator:
 
             raw = config_manager.get("sync", "llm_match_assist", fallback=False)
             enabled = str(raw).strip().lower() in ("true", "1", "yes", "on")
-        except Exception:
-            enabled = False
-        if not enabled:
-            return False
-        try:
-            from . import config_manager as cm
-
-            llm_cfg = cm.get_llm_config() or {}
+            if not enabled:
+                return False
+            llm_cfg = config_manager.get_llm_config() or {}
             api_key = llm_cfg.get("api_key", "")
-        except Exception:
-            api_key = ""
+        except Exception as e:
+            logger.warning(f"读取匹配增强配置失败（按未启用处理）: {e}")
+            return False
         if not api_key:
             logger.info("LLM 配置缺失，匹配增强已禁用")
             return False
         return True
 
-    def _enqueue_match_assist_run(
-        self, run_id: str, item: CustomItem, sync_record_id: int, trace: MatchTrace
+    def _link_run_sync_record(
+        self, run_id: str, sync_record_id: int, decision: str
     ) -> None:
-        """向 agent_runs 提交一条 match 任务（业务键决策，失败每次新建 run）。
+        """persist 后回填 run↔sync_record 关联与调度主指针（失败不阻塞主流程）。
 
-        决策由 :meth:`AgentRunsRepository.enqueue_match_run` 在单事务内完成：
-        - created：新建 pending（无历史 / failed 未超限 / 候选出窗或映射失效）
-        - in_flight：同键在途 → 复用该 run 并刷新主指针
-        - reuse_accepted / reuse_holding：业务子状态命中 → 复用已有 run 结果
-        - exhausted：累计失败达上限 → 不再新建
-
-        accepted_mapping_valid 由 mapping_service 现有查询接口校验（accepted
-        候选的映射是否仍有效），供 confirmed 候选的复用判定使用。
-        任何落库异常仅日志，不阻塞主匹配流程。
+        - created：run 入库时无 sync_record_id，此处回填主指针
+        - in_flight / reuse_*：刷新主指针，并补一条关联（多对一，幂等）
         """
-        try:
-            from ..matching.identity import build_match_business_key
-            from . import database_manager
+        from . import database_manager
 
-            business_key = build_match_business_key(
-                user_name=item.user_name,
-                title=item.title,
-                season=item.season,
+        try:
+            database_manager.agent_runs.add_run_sync_record_link(
+                run_id, sync_record_id, decision
             )
-            result = database_manager.agent_runs.enqueue_match_run(
-                run_id=run_id,
-                business_key=business_key,
-                sync_record_id=sync_record_id,
-                accepted_mapping_valid=self._accepted_mapping_valid(item),
+            database_manager.agent_runs.update_run_sync_record_id(
+                run_id, sync_record_id
             )
-            decision = result.get("decision", "")
-            actual_run_id = result.get("run_id", run_id)
-            logger.info(
-                f"匹配增强任务落库: decision={decision}, run_id={actual_run_id}, "
-                f"business_key={business_key}, sync_record_id={sync_record_id}"
-            )
-            if actual_run_id != run_id:
-                # trace step 里记录的 run_id 与最终复用的 run_id 可能不一致
-                # （trace 已持久化无法回写，属已知展示层小瑕疵）
-                logger.debug(
-                    f"trace step 记录的 run_id={run_id} 与最终复用的 run_id="
-                    f"{actual_run_id} 不一致（trace 已持久化无法回写）"
-                )
         except Exception as e:
-            logger.warning(f"匹配增强任务落库失败（不影响主流程）: {e}")
+            logger.warning(f"写入 run↔sync_record 关联失败（不影响主流程）: {e}")
 
     def _accepted_mapping_valid(self, item: CustomItem) -> bool:
         """校验 accepted（候选已确认）的映射是否仍有效（能查到 subject_id）。
