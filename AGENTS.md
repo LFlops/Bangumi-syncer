@@ -106,3 +106,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **去重/重试键必须用稳定业务键，禁止用每次新生成的记录 id 做历史匹配**：每次新生成的 `sync_record_id` 是单调递增的，用它查 `agent_runs` 做 dedup/requeue 永远 miss。反面案例：`_enqueue_match_assist_run` 用刚 INSERT 的 `sync_record_id` 查 `agent_runs` 决定在途/重入队，导致同一剧集反复新建 run、失败无法重入（P0）。正确做法：用 `business_key`（`{task_type}|{user}|{normalized_title}|{season}`）作为身份，来源（`source`/`retry-*`）不参与。
 - **外部依赖失败不得折叠为业务结论**：LLM client 重试耗尽返回空响应时，不得当作 `end_turn` 处理为 `no_suggestion`（丢失故障信号、误判为无建议）。反面案例：client 重试耗尽空响应 → 当作 `end_turn` → `no_suggestion`，后续调度器看不到失败、不再重试（P0）。正确做法：client 层抛 `LLMCallError(retryable=...)`，`llm_assist.run` 按 `retryable` 分流：`False` → 立即 `mark_failed(stop_reason='llm_error')`；`True` → `increment_attempts`，达 3 次转 `failed`。
 - **生产代码禁止跨层直接赋值私有属性**：调度器跨层直接写 `span_recorder._next_iteration = ...` 绕过公开方法，破坏封装且易在恢复路径遗漏同步。反面案例：scheduler `span_recorder._next_iteration = ...`，恢复续跑时 `begin_replayed_round` 已设 `_next_iteration = iteration + 1`，两侧不一致导致 tool span iteration 错乱（P1）。正确做法：所有状态推进走公开方法（`begin_replayed_round` / `wrap_chat_fn`），禁止外部直接赋值 `_` 前缀属性。
+
+## 评审复盘沉淀（2026-09-17，agent 匹配增强第三轮验收）
+
+圆桌验收高频问题与规避规则，规划与编码时直接遵守：
+
+- **限速/等待类原语必须"锁内检查、锁外休眠"**：持锁休眠会阻塞通知路径，使自适应机制失效（如 429 冻结延长无法生效、并发请求被串行拖垮）。反面案例：`RateLimiter.acquire()` 在 `with self._cond` 内 `time.sleep`，`notify_rate_limited` 无法更新 `_frozen_until`（P1，`app/utils/bangumi_api/rate_limit.py`）。正确做法：锁内只做状态检查与令牌扣减，休眠在锁外执行，醒来后重新进锁复查。
+- **状态流转 SQL 必须带源状态守卫（`WHERE status IN (...)`）**：无守卫的 UPDATE 可改写终态行并导致计数双计。反面案例：`mark_failed` 无守卫，同一 run 可被重复置 failed 且 `total_attempts` 多计（P2，`app/core/database/agent_runs.py`）。正确做法：所有状态流转 WHERE 限定源状态集合，rowcount=0 返回 False。
+- **策略/配置类参数禁止默认值兜底，由调用方显式传具名常量**：默认值会掩盖"调用方必须显式决策"的契约，漏传时静默回退到错误语义。反面案例：`enqueue_match_run(accepted_mapping_valid=True)` 漏传时把已删除映射误判为有效、无限期复用（P2）。正确做法：策略参数无默认值 + 调用方传具名常量（如 `MATCH_ASSIST_REUSE_WINDOW_DAYS = 30`），漏传即 `TypeError`。
+- **函数内 import 全部提升到模块头部，AST 白名单测试守卫**：函数内 import 使 mock patch 路径不稳定、绕过导入环检测。反面案例：`llm_assist.py` 函数内 `get_llm_client` 导致 `patch("app.services.matching.llm_assist.get_llm_client")` 无法命中（P2）。正确做法：import 提头部；确有豁免需求（避免导入环）时用 AST 白名单测试登记（白名单为空 = 全禁），新豁免必须显式登记。
+- **跨进程重入需 DB 级 CAS 抢占，进程内集合仅作单进程防护**：模块级 `set` 防不住多实例/多进程同轮双跑；恢复类操作应以读取到的状态值做 CAS（`UPDATE ... WHERE started_at=?`），仅一个执行者成功。反面案例：两进程同轮 `list_stale_processing` 各自恢复同一 run（P2）。配套：进程级共享状态（模块级集合/单例）必须在 `tests/conftest.py` 用 autouse fixture 前后清理，防跨测试污染。
