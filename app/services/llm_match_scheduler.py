@@ -6,7 +6,8 @@
 每轮流程（recover 与 pending 共享并发限额并发消费）：
 1. **清理**：终态且 ended_at 超保留期 → 先删 agent_steps 再删 agent_runs（级联）+ 日志
 2. **恢复扫描**：``processing`` 且 started_at 超时的遗留 run → 刷新 started_at
-   → sync_record 缺失则 mark_failed；否则重建种子 + 重放 replay_delta → 续跑 loop
+   → sync_record 缺失则 mark_failed；否则构造 bgm 后交由场景层公开入口
+   ``llm_assist.continue_run`` 完成 replay 重建与续跑（本调度器不触碰场景内部符号）
 3. **正常处理**：逐条原子拾取（由 llm_assist.run 内部 atomic_claim 负责）→
     调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
 
@@ -23,7 +24,6 @@ recover 与 pending 统一入列后经 ``asyncio.Semaphore(llm_match_concurrency
 from __future__ import annotations
 
 import asyncio
-import functools
 import time
 from typing import Any
 
@@ -31,14 +31,8 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.base.scheduler import BaseScheduler
-from app.services.llm.client import LLMCallError
-from app.services.llm.models import Message, ToolResultBlock
 from app.services.matching import llm_assist as llm_assist_module
 from app.services.notification_service import get_notification_service
-
-# 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
-# ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
-_SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
 
 # ---------------------------------------------------------------------------
 # 进程级 active run 防护
@@ -212,7 +206,10 @@ class LlmMatchScheduler(BaseScheduler):
         1. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
         2. 以**统一时间戳**刷新 started_at（防下一轮重复恢复）
         3. sync_record 缺失 → mark_failed(error)
-        4. 否则重建种子 + 重放 → 续跑 loop
+        4. 否则构造 bgm → 调用场景层单一公开入口 ``llm_assist.continue_run``
+           （replay / 补执行 / 续跑 / 落库与失败分流均在场景层内部完成）
+
+        本方法只负责调度与兜底日志，不触碰场景层私有符号。
         """
         run_id = run["run_id"]
         # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
@@ -239,307 +236,22 @@ class LlmMatchScheduler(BaseScheduler):
                 )
                 return
 
-            await self._continue_replay(run, sync_record)
-        finally:
-            _release_run(run_id)
-
-    async def _continue_replay(self, run: dict, sync_record: dict) -> None:
-        """断点恢复续跑。
-
-        重建种子消息 → trace.replay 重建可续跑消息列表 + 终局响应：
-        - ``last_response`` 为 None → 全部轮次已完整记录 → 以剩余轮次续跑通用循环
-        - ``last_response`` 非 None（F2）：
-          * stop_reason=end_turn → 直接 mark_no_suggestion（不调 LLM）
-          * 捕获 submit_suggestion（含 tool_calls 中的 terminal 工具）→ 走校验落库
-          * 含 tool_use（非终局，缺失工具）→ 补执行缺失只读工具 + 回填结果后
-            进入下一轮 loop（remaining 已减 1，因为该轮 LLM 已经发生过）
-        """
-        from app.services.agent import trace
-        from app.services.agent.budget import get_max_iterations
-        from app.services.agent.loop import RunResult, run as loop_run
-        from app.services.llm.tools import get_tool_registry
-
-        run_id = run["run_id"]
-        repo = get_database_manager().agent_runs
-
-        try:
-            # F5：thinking_level 与 config_override 统一从集中配置读取
-            # G3：非法 / 非正数覆盖值由 resolve_max_iterations_override 统一告警并回退 None
-            match_cfg = config_manager.get_sync_llm_match_config()
-            thinking_level = match_cfg["llm_match_thinking_level"]
-            config_override = llm_assist_module.resolve_max_iterations_override(
-                match_cfg.get("llm_match_max_iterations"), log=logger
-            )
-
-            max_iterations = get_max_iterations(
-                "match", thinking_level, config_override=config_override
-            )
-
-            # seed 由 replay 从 agent_steps 的 seed 行提取，无需此处重建
-            replay_result = trace.replay(run_id)
-            remaining = max_iterations - replay_result.executed_iterations
-            if remaining <= 0:
-                # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
-                # 下一轮恢复扫描又会重复捞起）→ 落终态 no_suggestion/exhausted
-                logger.warning(
-                    f"🤖 恢复(replay)路径预算耗尽，run {run_id} 已无剩余轮次，"
-                    f"标记 no_suggestion"
-                )
-                repo.mark_no_suggestion(run_id, stop_reason="exhausted")
-                return
-
-            last_response = replay_result.last_response
-
-            # F2：终局响应直接分派，避免无谓重调 LLM
-            if last_response is not None:
-                stop = last_response.get("stop_reason")
-                tcs = last_response.get("tool_calls") or []
-
-                if stop == "end_turn":
-                    # 无建议：直接标记，不调 LLM
-                    repo.mark_no_suggestion(run_id, stop_reason="end_turn")
-                    return
-
-                # 捕获 submit_suggestion（终局）→ 走校验落库路径
-                submit_tc = next(
-                    (tc for tc in tcs if tc.get("name") == "submit_suggestion"), None
-                )
-                if stop == "submit_suggestion" or submit_tc is not None:
-                    sug = (submit_tc or {}).get("input") or {}
-                    result = RunResult(
-                        stop_reason="submit_suggestion",
-                        suggestion=sug,
-                        last_response=None,
-                    )
-                    bgm = self._build_bgm(sync_record)
-                    llm_assist_module._handle_result(
-                        get_database_manager(),
-                        run_id,
-                        result,
-                        sync_record=sync_record,
-                        sync_record_id=sync_record.get("id"),
-                        bgm=bgm,
-                        notification_service=get_notification_service(),
-                    )
-                    return
-
-                # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
-                # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
-                remaining = max(0, remaining - 1)
-                if remaining <= 0:
-                    # G4：同上，补执行后预算耗尽也必须落终态而非静默返回
-                    logger.warning(
-                        f"🤖 恢复(replay)路径预算耗尽，run {run_id} 补执行后已无"
-                        f"剩余轮次，标记 no_suggestion"
-                    )
-                    repo.mark_no_suggestion(run_id, stop_reason="exhausted")
-                    return
-
-                bgm = self._build_bgm(sync_record)
-                registry = get_tool_registry()
-                # 先确保工具已注册（恢复路径可能尚未在正常路径注册过），否则补执行时
-                # registry.get 找不到工具；同时注册后才能拿到 tools_schemas 供 loop 续跑。
-                defns = llm_assist_module.register_match_tools(registry, bgm)
-                tools_schemas = [d.to_schema() for d in defns]
-
-                # 创建 recorder 并锚定到正确轮次：
-                # last_response 非 None → 既有 chat 在 executed_iterations，
-                # 补执行 tool span 同轮；续跑 chat 从 executed_iterations+1 开始。
-                span_recorder = llm_assist_module.TraceRecorder(
-                    run_id, start_iteration=replay_result.executed_iterations
-                )
-                span_recorder.begin_replayed_round(replay_result.executed_iterations)
-                # 补执行缺失工具并落 tool_execute span（二次 replay 不再判缺失）
-                seq = 0
-                for tc in replay_result.missing_tool_calls:
-                    await self._replay_missing_tool(
-                        tc,
-                        registry,
-                        replay_result.messages,
-                        span_recorder=span_recorder,
-                        sequence=seq,
-                    )
-                    seq += 1
-                wrapped_chat_fn = span_recorder.wrap_chat_fn(
-                    llm_assist_module._build_default_chat_fn(thinking_level)
-                )
-                result = await loop_run(
-                    chat_fn=wrapped_chat_fn,
-                    tools_schemas=tools_schemas,
-                    tool_calls_fn=functools.partial(
-                        registry.execute_batch, recorder=span_recorder
-                    ),
-                    max_iterations=remaining,
-                    tool_choice_terminal="submit_suggestion",
-                    seed_messages=replay_result.messages,
-                    recorder=span_recorder,
-                )
-                llm_assist_module._handle_result(
-                    get_database_manager(),
+            bgm = self._build_bgm(sync_record)
+            try:
+                # 续跑的场景内部逻辑（replay / 补执行 / loop / 落库 / 失败分流）
+                # 全部收敛在 continue_run 内；此处不再触碰其私有符号。
+                await llm_assist_module.continue_run(
                     run_id,
-                    result,
-                    sync_record=sync_record,
-                    sync_record_id=sync_record.get("id"),
-                    bgm=bgm,
+                    sync_record,
+                    bgm,
                     notification_service=get_notification_service(),
                 )
-                return
-
-            # last_response 为 None：全部轮次已完整记录 → 续跑通用循环
-            bgm = self._build_bgm(sync_record)
-            registry = get_tool_registry()
-            defns = llm_assist_module.register_match_tools(registry, bgm)
-            tools_schemas = [d.to_schema() for d in defns]
-
-            # 创建 recorder 并锚定：executed_iterations 为下一轮起始
-            start_iter = replay_result.executed_iterations
-            span_recorder = llm_assist_module.TraceRecorder(
-                run_id, start_iteration=start_iter
-            )
-            # 缺失工具补执行并落 tool_execute span
-            if replay_result.missing_tool_calls:
-                # begin_replayed_round 内部已设 _next_iteration = iteration + 1，
-                # 无需再手动推进（避免私有属性赋值封装泄露）
-                span_recorder.begin_replayed_round(replay_result.executed_iterations)
-                seq = 0
-                for tc in replay_result.missing_tool_calls:
-                    await self._replay_missing_tool(
-                        tc,
-                        registry,
-                        replay_result.messages,
-                        span_recorder=span_recorder,
-                        sequence=seq,
-                    )
-                    seq += 1
-
-            # 续跑 loop（从 replay 重建消息续跑）
-            wrapped_chat_fn = span_recorder.wrap_chat_fn(
-                llm_assist_module._build_default_chat_fn(thinking_level)
-            )
-            result = await loop_run(
-                chat_fn=wrapped_chat_fn,
-                tools_schemas=tools_schemas,
-                tool_calls_fn=functools.partial(
-                    registry.execute_batch, recorder=span_recorder
-                ),
-                max_iterations=remaining,
-                tool_choice_terminal="submit_suggestion",
-                seed_messages=replay_result.messages,
-                recorder=span_recorder,
-            )
-            llm_assist_module._handle_result(
-                get_database_manager(),
-                run_id,
-                result,
-                sync_record=sync_record,
-                sync_record_id=sync_record.get("id"),
-                bgm=bgm,
-                notification_service=get_notification_service(),
-            )
-        except LLMCallError as e:
-            # LLM 调用失败：按可重试性分流
-            if not e.retryable:
-                logger.error(f"🤖 恢复续跑 {run_id} 确定性 LLM 失败: {e}")
-                repo.mark_failed(
-                    run_id, stop_reason="llm_error", last_error=str(e)[:500]
-                )
-            else:
-                logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
-                repo.increment_attempts(run_id, last_error=str(e)[:500])
-        except Exception as e:
-            logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
-            repo.increment_attempts(run_id, last_error=str(e)[:500])
-
-    async def _replay_missing_tool(
-        self,
-        tool_call: dict,
-        registry,
-        messages: list,
-        *,
-        span_recorder=None,
-        sequence: int = 0,
-    ) -> None:
-        """补执行单条缺失的只读工具调用（readonly 校验）。
-
-        F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
-        追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
-        符合会话协议（每条 tool_use 有且仅有一条 tool_result）。
-
-        G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
-        tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
-        真实调用留给续跑 loop 自然触发。
-
-        当 ``span_recorder`` 不为 None 时，为每条缺失工具写 ``tool_execute`` span
-        （iteration 由调用方通过 ``begin_replayed_round`` 锚定），保证二次 replay
-        不再判缺失（replay 自包含）。
-        """
-        name = (tool_call or {}).get("name")
-        if not name:
-            return
-        args = (tool_call or {}).get("input") or {}
-        tool_use_id = (tool_call or {}).get("id", "")
-        defn = registry.get(name)
-
-        # 落 tool_execute span（如果提供了 recorder）
-        tool_use_block = None
-        span_id = None
-        if span_recorder is not None:
-            from app.services.llm.models import ToolUseBlock
-
-            tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
-            span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
-
-        if defn is None or defn.access != "read":
-            logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
-            self._append_tool_result(
-                messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
-            )
-            if span_id is not None:
-                from app.services.llm.models import ToolResultBlock
-
-                span_recorder.end_tool(
-                    span_id,
-                    result=ToolResultBlock(
-                        tool_use_id=tool_use_id,
-                        content=_SKIP_PLACEHOLDER_CONTENT,
-                        is_error=False,
-                    ),
-                )
-            return
-        try:
-            result = await registry.execute(name, args)
-            content = str(result)
-            is_error = False
-        except Exception as e:
-            logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
-            content = f"工具执行失败: {type(e).__name__}"
-            is_error = True
-        self._append_tool_result(messages, tool_use_id, content, is_error=is_error)
-        if span_id is not None:
-            from app.services.llm.models import ToolResultBlock
-
-            span_recorder.end_tool(
-                span_id,
-                result=ToolResultBlock(
-                    tool_use_id=tool_use_id, content=content, is_error=is_error
-                ),
-            )
-
-    @staticmethod
-    def _append_tool_result(
-        messages: list, tool_use_id: str, content: str, *, is_error: bool
-    ) -> None:
-        """追加一条 tool_result 消息（闭合 assistant 的 tool_use，F4/G5）。"""
-        messages.append(
-            Message(
-                role="user",
-                content=[
-                    ToolResultBlock(
-                        tool_use_id=tool_use_id, content=content, is_error=is_error
-                    )
-                ],
-            )
-        )
+            except Exception as e:
+                # 兜底：continue_run 内部已按可重试性完成计数/置终态（不向调用方抛），
+                # 走到这里说明出现未预期的外层异常，仅记录日志、不重复计数。
+                logger.error(f"🤖 恢复续跑 {run_id} 未预期异常: {e}")
+        finally:
+            _release_run(run_id)
 
     # ------------------------------------------------------------------
     # 正常处理

@@ -5,6 +5,8 @@
 - ``build_seed_messages``：从 sync_records 还原请求上下文 + 候选摘要，注入
   Prompt 注入防护，用户输入以 ``---`` 分隔符隔离
 - ``run``：原子抢占 → 调通用循环 → 结果处理（校验 / 落库 / 通知 / 兜底）
+- ``continue_run``：崩溃恢复续跑单一公开入口（replay → 补执行 → 续跑 → 落库），
+  调度器只调用本入口，不触碰本模块 ``_`` 前缀私有符号
 
 事务：候选写入（pending_candidates 两列）与 agent_runs 状态更新在
 **单一数据库事务**内完成（``database_manager._execute_with_lock`` 包裹两条
@@ -24,6 +26,7 @@ from typing import Any, Callable
 from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
+from app.services.agent import trace
 from app.services.agent.budget import get_max_iterations
 from app.services.agent.loop import ChatFn, RunResult, run as loop_run
 from app.services.agent.trace import (
@@ -73,6 +76,10 @@ DEFAULT_SYSTEM_TEMPLATE = (
     "你是 Bangumi 番组计划的匹配助手，负责为匹配失败的媒体条目"
     "推荐正确的 Bangumi 条目 ID。请综合工具检索结果做出判断。"
 )
+
+# 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
+# ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
+_SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
 
 
 # ---------------------------------------------------------------------------
@@ -821,21 +828,15 @@ async def run(
                 run_id, stop_reason="llm_error", last_error=str(e)[:500]
             )
             return "failed"
-        # 可重试（429/5xx/超时）→ 累加 attempts，达 3 → failed
+        # 可重试（429/5xx/超时）→ 累加 attempts；达上限时由仓储在**同一次调用事务内**
+        # 单点置终态（status='failed' + last_error），此处不得再 mark_failed（避免双写）。
         logger.error(f"[llm_assist] run {run_id} 可重试 LLM 失败: {e}")
-        attempts = dbm.agent_runs.increment_attempts(run_id)
-        if attempts >= 3:
-            dbm.agent_runs.mark_failed(
-                run_id, stop_reason="llm_error", last_error=str(e)[:500]
-            )
-            return "failed"
-        return "processing"
+        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e)[:500])
+        return "failed" if attempts >= 3 else "processing"
     except Exception as e:
         logger.error(f"[llm_assist] run {run_id} LLM 调用异常: {e}")
-        attempts = dbm.agent_runs.increment_attempts(run_id)
-        if attempts >= 3:
-            return "failed"
-        return "processing"
+        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e)[:500])
+        return "failed" if attempts >= 3 else "processing"
 
     return _handle_result(
         dbm,
@@ -845,6 +846,298 @@ async def run(
         sync_record_id=sync_record_id,
         bgm=bgm,
         notification_service=notification_service,
+    )
+
+
+async def continue_run(
+    run_id: str,
+    sync_record: dict,
+    bgm,
+    *,
+    notification_service=None,
+) -> None:
+    """恢复续跑单一入口：replay → 补执行 → 续跑 → 落库（LLM 失败按可重试性分流）。
+
+    由调度器在崩溃遗留 run 的恢复路径调用，是场景层对外开放的唯一续跑入口
+    （调度器不触碰本模块任何 ``_`` 前缀私有符号）。
+
+    流程：
+    1. 读集中配置（thinking_level / config_override / max_iterations）
+    2. ``trace.replay`` 重建可续跑消息列表与终局响应
+    3. ``remaining <= 0`` → 落终态 no_suggestion/exhausted（否则 run 永久滞留 processing）
+    4. ``last_response`` 分派：
+       - ``end_turn`` → 直接 mark_no_suggestion（不调 LLM）
+       - ``submit_suggestion`` / tool_calls 含 submit → 走校验落库 ``_handle_result``
+       - 含 tool_use → 补执行缺失只读工具 + 回填结果后续跑 loop
+    5. ``last_response`` 为 None → 全部轮次已完整记录，直接续跑 loop
+
+    失败分流（与既有语义一致）：
+    - ``LLMCallError(retryable=False)`` → ``mark_failed(stop_reason='llm_error')``
+    - ``LLMCallError(retryable=True)`` → ``increment_attempts(last_error=...)``
+    - 其他异常 → error 日志 + ``increment_attempts(last_error=...)``
+
+    异常在本函数内部消化，不向调用方抛出（调用方仅负责执行权释放与兜底日志）。
+    """
+    dbm = get_database_manager()
+    repo = dbm.agent_runs
+    sync_record_id = sync_record.get("id")
+
+    try:
+        # F5：thinking_level 与 config_override 统一从集中配置读取
+        # G3：非法 / 非正数覆盖值由 resolve_max_iterations_override 统一告警并回退 None
+        match_cfg = config_manager.get_sync_llm_match_config()
+        thinking_level = match_cfg["llm_match_thinking_level"]
+        config_override = resolve_max_iterations_override(
+            match_cfg.get("llm_match_max_iterations"), log=logger
+        )
+        max_iterations = get_max_iterations(
+            "match", thinking_level, config_override=config_override
+        )
+
+        # seed 由 replay 从 agent_steps 的 seed 行提取，无需此处重建
+        replay_result = trace.replay(run_id)
+        remaining = max_iterations - replay_result.executed_iterations
+        if remaining <= 0:
+            # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
+            # 下一轮恢复扫描又会重复捞起）→ 落终态 no_suggestion/exhausted
+            logger.warning(
+                f"🤖 恢复(replay)路径预算耗尽，run {run_id} 已无剩余轮次，"
+                f"标记 no_suggestion"
+            )
+            repo.mark_no_suggestion(run_id, stop_reason="exhausted")
+            return
+
+        last_response = replay_result.last_response
+        if last_response is None:
+            # 全部轮次已完整记录 → 以剩余轮次续跑通用循环
+            await _execute_continuation(
+                dbm,
+                run_id,
+                replay_result,
+                thinking_level,
+                remaining=remaining,
+                bgm=bgm,
+                sync_record=sync_record,
+                sync_record_id=sync_record_id,
+                notification_service=notification_service,
+                anchor_replayed_round=bool(replay_result.missing_tool_calls),
+            )
+            return
+
+        # F2：终局响应直接分派，避免无谓重调 LLM
+        stop = last_response.get("stop_reason")
+        tcs = last_response.get("tool_calls") or []
+
+        if stop == "end_turn":
+            # 无建议：直接标记，不调 LLM
+            repo.mark_no_suggestion(run_id, stop_reason="end_turn")
+            return
+
+        # 捕获 submit_suggestion（终局）→ 走校验落库路径
+        submit_tc = next(
+            (tc for tc in tcs if tc.get("name") == "submit_suggestion"), None
+        )
+        if stop == "submit_suggestion" or submit_tc is not None:
+            sug = (submit_tc or {}).get("input") or {}
+            result = RunResult(
+                stop_reason="submit_suggestion",
+                suggestion=sug,
+                last_response=None,
+            )
+            _handle_result(
+                dbm,
+                run_id,
+                result,
+                sync_record=sync_record,
+                sync_record_id=sync_record_id,
+                bgm=bgm,
+                notification_service=notification_service,
+            )
+            return
+
+        # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
+        # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
+        remaining = max(0, remaining - 1)
+        if remaining <= 0:
+            # G4：同上，补执行后预算耗尽也必须落终态而非静默返回
+            logger.warning(
+                f"🤖 恢复(replay)路径预算耗尽，run {run_id} 补执行后已无"
+                f"剩余轮次，标记 no_suggestion"
+            )
+            repo.mark_no_suggestion(run_id, stop_reason="exhausted")
+            return
+
+        await _execute_continuation(
+            dbm,
+            run_id,
+            replay_result,
+            thinking_level,
+            remaining=remaining,
+            bgm=bgm,
+            sync_record=sync_record,
+            sync_record_id=sync_record_id,
+            notification_service=notification_service,
+            anchor_replayed_round=True,
+        )
+    except LLMCallError as e:
+        # LLM 调用失败：按可重试性分流
+        if not e.retryable:
+            logger.error(f"🤖 恢复续跑 {run_id} 确定性 LLM 失败: {e}")
+            repo.mark_failed(run_id, stop_reason="llm_error", last_error=str(e)[:500])
+        else:
+            logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
+            repo.increment_attempts(run_id, last_error=str(e)[:500])
+    except Exception as e:
+        logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
+        repo.increment_attempts(run_id, last_error=str(e)[:500])
+
+
+async def _execute_continuation(
+    dbm,
+    run_id: str,
+    replay_result,
+    thinking_level: str,
+    *,
+    remaining: int,
+    bgm: Any,
+    sync_record: dict,
+    sync_record_id: int | None,
+    notification_service: Any | None,
+    anchor_replayed_round: bool,
+) -> None:
+    """注册工具 → 建 recorder → 补执行缺失工具 → 续跑 loop → 落库。
+
+    ``anchor_replayed_round=True`` 用于 last_response 非 None 的补执行场景：
+    recorder 需锚定到已发生的轮次（补执行 tool span 与既有 chat span 同轮），
+    并让续跑 chat 从 ``executed_iterations + 1`` 开始。
+    """
+    registry = get_tool_registry()
+    defns = register_match_tools(registry, bgm)
+    tools_schemas = [d.to_schema() for d in defns]
+
+    span_recorder = TraceRecorder(
+        run_id, start_iteration=replay_result.executed_iterations
+    )
+    if anchor_replayed_round:
+        # begin_replayed_round 内部已设 _next_iteration = iteration + 1，
+        # 无需再手动推进（避免私有属性赋值封装泄露）
+        span_recorder.begin_replayed_round(replay_result.executed_iterations)
+
+    # 补执行缺失工具并落 tool_execute span（二次 replay 不再判缺失）
+    seq = 0
+    for tc in replay_result.missing_tool_calls:
+        await _replay_missing_tool(
+            tc,
+            registry,
+            replay_result.messages,
+            span_recorder=span_recorder,
+            sequence=seq,
+        )
+        seq += 1
+
+    wrapped_chat_fn = span_recorder.wrap_chat_fn(_build_default_chat_fn(thinking_level))
+    result = await loop_run(
+        chat_fn=wrapped_chat_fn,
+        tools_schemas=tools_schemas,
+        tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),
+        max_iterations=remaining,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=replay_result.messages,
+        recorder=span_recorder,
+    )
+    _handle_result(
+        dbm,
+        run_id,
+        result,
+        sync_record=sync_record,
+        sync_record_id=sync_record_id,
+        bgm=bgm,
+        notification_service=notification_service,
+    )
+
+
+async def _replay_missing_tool(
+    tool_call: dict,
+    registry,
+    messages: list,
+    *,
+    span_recorder=None,
+    sequence: int = 0,
+) -> None:
+    """补执行单条缺失的只读工具调用（readonly 校验）。
+
+    F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
+    追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
+    符合会话协议（每条 tool_use 有且仅有一条 tool_result）。
+
+    G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
+    tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
+    真实调用留给续跑 loop 自然触发。
+
+    当 ``span_recorder`` 不为 None 时，为每条缺失工具写 ``tool_execute`` span
+    （iteration 由调用方通过 ``begin_replayed_round`` 锚定），保证二次 replay
+    不再判缺失（replay 自包含）。
+    """
+    name = (tool_call or {}).get("name")
+    if not name:
+        return
+    args = (tool_call or {}).get("input") or {}
+    tool_use_id = (tool_call or {}).get("id", "")
+    defn = registry.get(name)
+
+    # 落 tool_execute span（如果提供了 recorder）
+    span_id = None
+    if span_recorder is not None:
+        tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
+        span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
+
+    if defn is None or defn.access != "read":
+        logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
+        _append_tool_result(
+            messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
+        )
+        if span_id is not None:
+            span_recorder.end_tool(
+                span_id,
+                result=ToolResultBlock(
+                    tool_use_id=tool_use_id,
+                    content=_SKIP_PLACEHOLDER_CONTENT,
+                    is_error=False,
+                ),
+            )
+        return
+
+    try:
+        result = await registry.execute(name, args)
+        content = str(result)
+        is_error = False
+    except Exception as e:
+        logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
+        content = f"工具执行失败: {type(e).__name__}"
+        is_error = True
+    _append_tool_result(messages, tool_use_id, content, is_error=is_error)
+    if span_id is not None:
+        span_recorder.end_tool(
+            span_id,
+            result=ToolResultBlock(
+                tool_use_id=tool_use_id, content=content, is_error=is_error
+            ),
+        )
+
+
+def _append_tool_result(
+    messages: list, tool_use_id: str, content: str, *, is_error: bool
+) -> None:
+    """追加一条 tool_result 消息（闭合 assistant 的 tool_use，F4/G5）。"""
+    messages.append(
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(
+                    tool_use_id=tool_use_id, content=content, is_error=is_error
+                )
+            ],
+        )
     )
 
 

@@ -4,13 +4,28 @@
 LLM 调用、bgm、校验、通知均以 mock 注入，保证单测稳定与行为精确断言。
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.core.database import database_manager, set_database_manager
-from app.services.llm.models import ChatResponse, ToolUseBlock
-from app.services.llm.tools import reset_tool_registry
+from app.services.agent.loop import RunResult
+from app.services.agent.trace import ReplayResult
+from app.services.llm.models import (
+    ChatResponse,
+    Message,
+    ToolResultBlock,
+    ToolUseBlock,
+)
+from app.services.llm.tools import (
+    ToolDefinition,
+    ToolRegistry,
+    reset_tool_registry,
+)
 from app.services.matching import llm_assist
 from app.services.matching.llm_assist import build_seed_messages
 
@@ -1592,7 +1607,7 @@ async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch
 
 @pytest.mark.asyncio
 async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch):
-    """LLMCallError(retryable=True) 连续 3 次 → mark_failed。"""
+    """LLMCallError(retryable=True) 连续 3 次 → increment_attempts 单点置终态 failed。"""
     from app.services.llm.client import LLMCallError
 
     run_id = "run-e-retry3"
@@ -1642,7 +1657,8 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
     assert status3 == "failed"
     run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "failed"
-    assert run_row["stop_reason"] == "llm_error"
+    # 终态由 increment_attempts 单点事务写入（stop_reason='failed'），外层不再二次 mark_failed
+    assert run_row["stop_reason"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -1788,3 +1804,1062 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
     )
     row = cur.fetchone()
     assert row[0] == "integer", f"SQLite typeof(ended_at) 应为 'integer'，实际 {row[0]}"
+
+
+# ---------------------------------------------------------------------------
+# 恢复续跑单一入口 continue_run
+# （由调度器 _recover_run 调用：replay → 补执行 → 续跑 → 落库）
+# ---------------------------------------------------------------------------
+
+
+def _make_continuation_repo() -> MagicMock:
+    """恢复续跑测试用 agent_runs repo mock（increment_attempts 默认未达上限）。"""
+    repo = MagicMock()
+    repo.increment_attempts.return_value = 1
+    return repo
+
+
+def _make_continuation_dbm(repo: MagicMock) -> MagicMock:
+    dbm = MagicMock()
+    dbm.agent_runs = repo
+    return dbm
+
+
+def _make_replay_result(
+    *,
+    executed: int = 0,
+    missing: list | None = None,
+    last_response: dict | None = None,
+    messages: list | None = None,
+) -> ReplayResult:
+    return ReplayResult(
+        messages=messages or [Message(role="system", content="s")],
+        executed_iterations=executed,
+        missing_tool_calls=missing or [],
+        last_response=last_response,
+    )
+
+
+def _medium_cfg(raw_max: str = "") -> dict:
+    return {
+        "llm_match_thinking_level": "medium",
+        "llm_match_max_iterations": raw_max,
+    }
+
+
+# S3：end_turn 分派 ---------------------------------------------------------
+
+
+def test_continue_run_end_turn_marks_no_suggestion_without_llm():
+    """last_response=end_turn → 直接 mark_no_suggestion，不调 LLM（loop_run）。"""
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(
+        executed=1,
+        last_response={"stop_reason": "end_turn", "content": "x", "tool_calls": []},
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="end_turn")
+    loop.assert_not_awaited()
+
+
+# S4：submit 分派 -----------------------------------------------------------
+
+
+def test_continue_run_submit_suggestion_dispatches_to_handle_result():
+    """last_response=submit_suggestion → 捕获参数走校验落库路径（_handle_result）。"""
+    repo = _make_continuation_repo()
+    handle = MagicMock()
+    fake_svc = MagicMock()
+    rr = _make_replay_result(
+        executed=1,
+        last_response={
+            "stop_reason": "submit_suggestion",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "s1",
+                    "name": "submit_suggestion",
+                    "input": {"subject_id": "123", "reason": "跨季匹配"},
+                }
+            ],
+        },
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.matching.llm_assist._handle_result", handle),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(
+            llm_assist.continue_run(
+                "r", {"id": 1}, MagicMock(), notification_service=fake_svc
+            )
+        )
+
+    handle.assert_called_once()
+    result_arg = handle.call_args[0][2]  # _handle_result(dbm, run_id, result, ...)
+    assert result_arg.stop_reason == "submit_suggestion"
+    assert result_arg.suggestion == {"subject_id": "123", "reason": "跨季匹配"}
+    # 接线断言：notification_service 必须透传（生产链路真正发送站内信）
+    assert handle.call_args[1].get("notification_service") is fake_svc
+    loop.assert_not_awaited()
+
+
+# S5：补执行缺失工具 ---------------------------------------------------------
+
+
+def test_continue_run_tool_use_backfills_and_continues_loop():
+    """last_response 含 tool_use（缺失工具）→ 补执行缺失工具 + 回填后继续 loop_run。"""
+    repo = _make_continuation_repo()
+    missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
+    rr = _make_replay_result(
+        executed=0,
+        missing=[missing],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "go",
+            "tool_calls": [missing],
+        },
+    )
+    backfill = AsyncMock()
+    loop = AsyncMock(return_value=RunResult(stop_reason="end_turn"))
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.matching.llm_assist._replay_missing_tool", backfill),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    # 缺失工具补执行一次，并锚定同轮 span（sequence=0）
+    backfill.assert_awaited_once()
+    assert backfill.await_args.args[0] == missing
+    assert backfill.await_args.kwargs.get("sequence") == 0
+    assert backfill.await_args.kwargs.get("span_recorder") is not None
+    # 回填后进入下一轮 loop_run 续跑（1 次 LLM 调用）
+    loop.assert_awaited_once()
+
+
+# S6：last_response=None 完整续跑 -------------------------------------------
+
+
+def test_continue_run_last_response_none_runs_loop_and_lands_result():
+    """last_response=None → loop 从 executed_iterations 续跑并落 RunResult。"""
+    repo = _make_continuation_repo()
+    handle = MagicMock()
+    seed = [Message(role="system", content="s"), Message(role="user", content="u")]
+    rr = _make_replay_result(executed=2, missing=[], last_response=None, messages=seed)
+    loop = AsyncMock(return_value=RunResult(stop_reason="end_turn"))
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.matching.llm_assist._handle_result", handle),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    loop.assert_awaited_once()
+    assert loop.await_args.kwargs["seed_messages"] is seed
+    # medium=3，executed=2 → 剩余 1 轮
+    assert loop.await_args.kwargs["max_iterations"] == 1
+    handle.assert_called_once()
+    assert handle.call_args[0][2].stop_reason == "end_turn"
+
+
+# G3：config_override 非正数回退 None ---------------------------------------
+
+
+def _run_continue_run_with_config(raw_max: str):
+    """以指定 llm_match_max_iterations 跑一次 continue_run，返回捕获的 config_override。"""
+    repo = _make_continuation_repo()
+    captured: dict = {}
+
+    def _gmi(task_type, thinking_level, config_override=None):
+        captured["config_override"] = config_override
+        return 3
+
+    log = MagicMock()
+    rr = _make_replay_result(
+        executed=0,
+        last_response={"stop_reason": "end_turn", "content": "x", "tool_calls": []},
+    )
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.get_max_iterations", _gmi),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.logger", log),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg(raw_max)
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+    return captured.get("config_override"), log
+
+
+def test_continue_run_zero_config_override_falls_back_to_none():
+    override, log = _run_continue_run_with_config("0")
+    assert override is None, "0 应回退 None（避免 max_iterations=0 空跑）"
+    assert log.warning.called
+
+
+def test_continue_run_negative_config_override_falls_back_to_none():
+    override, log = _run_continue_run_with_config("-3")
+    assert override is None, "负值应回退 None"
+    assert log.warning.called
+
+
+def test_continue_run_positive_config_override_is_passed_through():
+    override, _ = _run_continue_run_with_config("7")
+    assert override == 7
+
+
+# G4：预算耗尽必须落终态 -----------------------------------------------------
+
+
+def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
+    """tool_use 补执行后 remaining<=0 → 落 no_suggestion/exhausted，不续跑。"""
+    repo = _make_continuation_repo()
+    missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
+    rr = _make_replay_result(
+        executed=2,  # medium=3 → remaining=1；补执行后 -1 → 0
+        missing=[missing],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "go",
+            "tool_calls": [missing],
+        },
+    )
+    loop = AsyncMock()
+    backfill = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist._replay_missing_tool", backfill),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    # 不再续跑 loop，但必须落终态（否则 run 永久 processing）
+    loop.assert_not_awaited()
+    backfill.assert_not_awaited()
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+
+
+def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
+    """replay 后剩余轮次已耗尽（remaining<=0）同样必须落终态。"""
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(
+        executed=3,  # medium=3 → remaining=0
+        missing=[],
+        last_response=None,
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    loop.assert_not_awaited()
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+
+
+def test_continue_run_replay_exhausted_logs_warning():
+    """预算耗尽（replay 前）→ warning 且注明恢复(replay)路径，不得停留在 debug。"""
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(executed=3, missing=[], last_response=None)
+    log = MagicMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.logger", log),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+    warnings = [str(c.args[0]) for c in log.warning.call_args_list]
+    assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
+        f"预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("已无剩余轮次" in m for m in debugs), (
+        "预算耗尽日志不应停留在 debug 级"
+    )
+
+
+def test_continue_run_replay_exhausted_after_backfill_logs_warning():
+    """补执行后预算耗尽 → warning 且注明恢复(replay)路径。"""
+    repo = _make_continuation_repo()
+    missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
+    rr = _make_replay_result(
+        executed=2,
+        missing=[missing],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "go",
+            "tool_calls": [missing],
+        },
+    )
+    log = MagicMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.logger", log),
+        patch("app.services.matching.llm_assist._replay_missing_tool", new=AsyncMock()),
+        patch("app.services.matching.llm_assist.loop_run", new=AsyncMock()),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r2", {"id": 1}, MagicMock()))
+
+    repo.mark_no_suggestion.assert_called_once_with("r2", stop_reason="exhausted")
+    warnings = [str(c.args[0]) for c in log.warning.call_args_list]
+    assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
+        f"补执行后预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("已无剩余轮次" in m for m in debugs), (
+        "补执行后预算耗尽日志不应停留在 debug 级"
+    )
+
+
+# S7：LLM 调用失败按可重试性分流 --------------------------------------------
+
+
+def test_continue_run_llm_call_error_retryable_false_marks_failed():
+    """LLMCallError(retryable=False) → mark_failed(stop_reason='llm_error')。"""
+    from app.services.llm.client import LLMCallError
+
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("401 Unauthorized", retryable=False)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_chat_fn",
+            return_value=_boom,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-err-terminal", {"id": 1}, MagicMock()))
+
+    repo.mark_failed.assert_called_once()
+    call_kwargs = repo.mark_failed.call_args[1]
+    assert call_kwargs.get("stop_reason") == "llm_error"
+    assert "401" in call_kwargs.get("last_error", "")
+    repo.increment_attempts.assert_not_called()
+
+
+def test_continue_run_llm_call_error_retryable_true_increments_attempts():
+    """LLMCallError(retryable=True) → increment_attempts 并携带 last_error。"""
+    from app.services.llm.client import LLMCallError
+
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("500 Internal Server Error", retryable=True)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_chat_fn",
+            return_value=_boom,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-err-retry", {"id": 1}, MagicMock()))
+
+    repo.increment_attempts.assert_called_once_with(
+        "r-err-retry", last_error="500 Internal Server Error"
+    )
+    repo.mark_failed.assert_not_called()
+
+
+# F4 / G5：缺失工具补执行（readonly 执行 / 非 read 占位闭合协议） -------------
+
+
+def test_replay_missing_tool_appends_tool_result_to_messages():
+    """缺失的 read 工具补执行 → 结果回填 messages（assistant 后有 tool_result）。"""
+
+    def _handler(args):
+        return "SEARCH-RESULT"
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="get_subject_detail",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=_handler,
+            access="read",
+        )
+    )
+
+    messages = [
+        Message(role="system", content="sys"),
+        Message(role="user", content="ctx"),
+        Message(
+            role="assistant",
+            content=[
+                ToolUseBlock(
+                    id="t2", name="get_subject_detail", input={"subject_id": "2"}
+                )
+            ],
+        ),
+        Message(
+            role="user",
+            content=[ToolResultBlock(tool_use_id="t1", content="r1", is_error=False)],
+        ),
+    ]
+
+    def _count_tool_results(msgs):
+        return sum(
+            1
+            for m in msgs
+            if m.role == "user"
+            and isinstance(m.content, list)
+            and any(isinstance(b, ToolResultBlock) for b in m.content)
+        )
+
+    before = _count_tool_results(messages)
+    asyncio.run(
+        llm_assist._replay_missing_tool(
+            {"id": "t2", "name": "get_subject_detail", "input": {"subject_id": "2"}},
+            registry,
+            messages,
+        )
+    )
+
+    after = _count_tool_results(messages)
+    assert after == before + 1 == 2  # t1（已记录）+ t2（补执行）
+    trs = [
+        m.content[0]
+        for m in messages
+        if m.role == "user"
+        and isinstance(m.content, list)
+        and any(isinstance(b, ToolResultBlock) for b in m.content)
+    ]
+    assert any(t.tool_use_id == "t2" and t.content == "SEARCH-RESULT" for t in trs), (
+        "补执行的 tool_result 应对应缺失的 tool_use t2"
+    )
+
+
+_SKIP_PLACEHOLDER = "skipped: will be re-invoked in continuation"
+
+
+def _last_tool_result(messages: list) -> ToolResultBlock | None:
+    for m in reversed(messages):
+        if m.role == "user" and isinstance(m.content, list) and m.content:
+            blk = m.content[0]
+            if isinstance(blk, ToolResultBlock):
+                return blk
+    return None
+
+
+def _registry_with(name: str, access: str, called: list) -> ToolRegistry:
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name=name,
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda args: called.append(name) or "X",
+            access=access,
+        )
+    )
+    return registry
+
+
+def test_replay_missing_write_tool_appends_placeholder_tool_result():
+    """write 缺失工具不重放副作用，但回填占位 tool_result 闭合协议。"""
+    called: list = []
+    registry = _registry_with("write_mapping", "write", called)
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="w1", name="write_mapping", input={})],
+        )
+    ]
+
+    asyncio.run(
+        llm_assist._replay_missing_tool(
+            {"id": "w1", "name": "write_mapping", "input": {}}, registry, messages
+        )
+    )
+
+    assert called == []
+    blk = _last_tool_result(messages)
+    assert blk is not None, "write 缺失工具也必须回填 tool_result 闭合协议"
+    assert blk.tool_use_id == "w1"
+    assert blk.is_error is False
+    assert blk.content == _SKIP_PLACEHOLDER
+
+
+def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
+    """terminal 缺失工具不重放，回填占位 tool_result。"""
+    called: list = []
+    registry = _registry_with("submit_suggestion", "terminal", called)
+    messages: list = []
+
+    asyncio.run(
+        llm_assist._replay_missing_tool(
+            {"id": "s1", "name": "submit_suggestion", "input": {"subject_id": "1"}},
+            registry,
+            messages,
+        )
+    )
+
+    assert called == []
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.tool_use_id == "s1"
+    assert blk.content == _SKIP_PLACEHOLDER
+    assert blk.is_error is False
+
+
+def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
+    """未注册工具同样回填占位，避免 tool_use 悬空。"""
+    registry = ToolRegistry()
+    messages: list = []
+
+    asyncio.run(
+        llm_assist._replay_missing_tool(
+            {"id": "u1", "name": "ghost_tool", "input": {}}, registry, messages
+        )
+    )
+
+    blk = _last_tool_result(messages)
+    assert blk is not None, "未注册工具同样需回填占位，避免 tool_use 悬空"
+    assert blk.tool_use_id == "u1"
+    assert blk.content == _SKIP_PLACEHOLDER
+
+
+# P1-c：补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
+
+
+def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):
+    """补执行缺失工具后写 tool_execute span，二次 replay 不再判缺失。"""
+    from app.services.agent.trace import replay as real_replay
+    from app.services.llm.tools import get_tool_registry
+
+    run_id = "run-continue-replay-span"
+    sr_id = 401
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    call_count = {"n": 0}
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return ChatResponse(
+                content="",
+                stop_reason="tool_use",
+                blocks=[
+                    ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+                ],
+            )
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    class _Bgm:
+        def search(self, **kwargs):
+            return [{"id": 1, "name": "result"}]
+
+        def get_subject(self, sid):
+            return {"name": f"s-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    bgm = _Bgm()
+    reg = get_tool_registry()
+    eb_calls = {"n": 0}
+
+    async def _eb(tool_calls, *, recorder=None):
+        eb_calls["n"] += 1
+        if eb_calls["n"] == 1:
+            raise RuntimeError("crash mid-exec")
+        return {
+            tc.id: ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
+            for tc in tool_calls
+        }
+
+    monkeypatch.setattr(reg, "execute_batch", _eb)
+
+    async def _go():
+        # 初始正常运行至崩溃（记录 1 条 llm_chat span，但 tool_execute 缺失）
+        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+        # 恢复续跑：真实 trace.replay + 真实 loop_run
+        await llm_assist.continue_run(run_id, sr, bgm)
+
+    asyncio.run(_go())
+
+    steps = database_manager.agent_runs.get_steps(run_id)
+    tool_steps = [s for s in steps if s["name"] == "tool_execute"]
+    assert len(tool_steps) >= 1, (
+        f"补执行应产生至少 1 条 tool_execute span，实际 {len(tool_steps)}"
+    )
+
+    rr2 = real_replay(run_id)
+    assert len(rr2.missing_tool_calls) == 0, (
+        f"二次 replay 不应再判缺失，实际 missing={rr2.missing_tool_calls}"
+    )
+
+
+# 端到端断点恢复：恢复续跑不重复调 LLM ---------------------------------------
+
+
+def test_continue_run_recovery_no_double_llm_call(monkeypatch):
+    """崩溃前 1 次 + 恢复后 1 次 → 累计 LLM 调用 2，run 落 no_suggestion。"""
+    from app.services.llm.tools import get_tool_registry
+
+    run_id = "run-continue-m22"
+    sr_id = 992
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    spy_calls = {"n": 0}
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        spy_calls["n"] += 1
+        if spy_calls["n"] == 1:
+            return ChatResponse(
+                content="",
+                stop_reason="tool_use",
+                blocks=[
+                    ToolUseBlock(id="t1", name="search_bangumi", input={"title": "foo"})
+                ],
+            )
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    chat = AsyncMock(side_effect=_chat)
+    client = MagicMock()
+    client.chat = chat
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    class _Bgm:
+        def search(self, **kwargs):
+            return [{"id": 1, "name": "foo"}]
+
+        def get_subject(self, sid):
+            return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    bgm = _Bgm()
+    reg = get_tool_registry()
+    eb_calls = {"n": 0}
+
+    async def _eb(tool_calls, *, recorder=None):
+        eb_calls["n"] += 1
+        if eb_calls["n"] == 1:
+            raise RuntimeError("crash mid-exec")
+        return {
+            tc.id: ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
+            for tc in tool_calls
+        }
+
+    monkeypatch.setattr(reg, "execute_batch", _eb)
+
+    async def _go():
+        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+        await llm_assist.continue_run(run_id, sr, bgm)
+
+    asyncio.run(_go())
+
+    assert chat.call_count == 2, f"期望累计 2 次 LLM 调用，实际 {chat.call_count}"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "no_suggestion"
+
+
+# P0-3：恢复续跑写 chat span + thinking_level 透传 -------------------------
+
+
+def test_continue_run_writes_chat_span(monkeypatch):
+    """续跑轮应产生 chat span（last_response=None 进入通用循环）。"""
+    run_id = "run-continue-chat-span"
+    sr_id = 993
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    rr = _make_replay_result(
+        executed=0,
+        missing=[],
+        last_response=None,
+        messages=[
+            Message(role="system", content="s"),
+            Message(role="user", content="u"),
+        ],
+    )
+    monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
+
+    asyncio.run(llm_assist.continue_run(run_id, sr, MagicMock()))
+
+    steps = database_manager.agent_runs.get_steps(run_id)
+    chat_steps = [s for s in steps if s["name"] == "llm_chat"]
+    assert len(chat_steps) >= 1, (
+        f"恢复路径应产生至少 1 条 chat span，实际 {len(chat_steps)}"
+    )
+
+
+def test_continue_run_respects_thinking_level(monkeypatch):
+    """配置 thinking_level='high' → _build_default_chat_fn 收到 'high'。"""
+    repo = _make_continuation_repo()
+    captured: dict = {}
+
+    def _fake_build(thinking_level):
+        captured["thinking_level"] = thinking_level
+
+        async def chat_fn(messages, *, tools=None, tool_choice=None):
+            return ChatResponse(content="done", stop_reason="end_turn")
+
+        return chat_fn
+
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_chat_fn",
+            side_effect=_fake_build,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "high",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(llm_assist.continue_run("r-think", {"id": 1}, MagicMock()))
+
+    assert captured.get("thinking_level") == "high", (
+        f"恢复路径应透传 thinking_level='high'，实际 {captured}"
+    )
+
+
+def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
+    """ini 配 'HIGH' → 集中配置归一化为 'high' → 恢复路径透传 'high'。"""
+    from app.core.config import ConfigManager
+
+    ini = tmp_path / "config.ini"
+    ini.write_text("[sync]\nllm_match_thinking_level = HIGH\n", encoding="utf-8")
+    cm = ConfigManager.__new__(ConfigManager)
+    cm.platform = "Test"
+    cm.cwd = tmp_path
+    cm.config_paths = {
+        "env": None,
+        "mounted": tmp_path / "__no_mounted__.ini",
+        "dev": tmp_path / "__no_dev__.ini",
+        "default": ini,
+    }
+    cm.active_config_path = ini
+    cm._config_cache = None
+    cm._last_modified = 0
+    cm._load_config()
+
+    # 前置断言：真实 config 已完成归一化（否则后续透传断言无意义）
+    assert cm.get_sync_llm_match_config()["llm_match_thinking_level"] == "high"
+
+    repo = _make_continuation_repo()
+    captured: dict = {}
+
+    def _fake_build(thinking_level):
+        captured["thinking_level"] = thinking_level
+
+        async def chat_fn(messages, *, tools=None, tool_choice=None):
+            return ChatResponse(content="done", stop_reason="end_turn")
+
+        return chat_fn
+
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager", cm),
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_chat_fn",
+            side_effect=_fake_build,
+        ),
+    ):
+        asyncio.run(
+            llm_assist.continue_run("r-think-normalize", {"id": 1}, MagicMock())
+        )
+
+    assert captured.get("thinking_level") == "high", (
+        f"恢复路径应透传归一化后的 thinking_level='high'，实际 {captured}"
+    )
+
+
+# P1-b：续跑新 span iteration 严格大于既有最大 iteration ----------------------
+
+
+def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
+    """executed_iterations=2（既有最大 1）→ 续跑 chat span iteration >= 2。"""
+    run_id = "run-continue-iter"
+    sr_id = 994
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    rr = _make_replay_result(
+        executed=2,
+        missing=[],
+        last_response=None,
+        messages=[
+            Message(role="system", content="s"),
+            Message(role="user", content="u"),
+        ],
+    )
+    monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
+
+    asyncio.run(llm_assist.continue_run(run_id, sr, MagicMock()))
+
+    steps = database_manager.agent_runs.get_steps(run_id)
+    chat_steps = [s for s in steps if s["name"] == "llm_chat"]
+    assert len(chat_steps) >= 1, "恢复路径应产生至少 1 条 chat span"
+    min_chat_iter = min(s["iteration"] for s in chat_steps)
+    assert min_chat_iter >= 2, (
+        f"续跑 chat span 的最小 iteration 应 >= 2（接续 executed_iterations=2），"
+        f"实际最小 iteration={min_chat_iter}"
+    )
+
+
+# P1-e2e：二次恢复不产生额外 LLM 调用，且 chat span 无撞号 --------------------
+
+
+@pytest.mark.asyncio
+async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
+    """崩溃 → 恢复完成 → 再次重置 processing → 第二次恢复不再额外调 LLM。"""
+    from app.services.agent.trace import replay as real_replay
+    from app.services.llm.tools import get_tool_registry
+
+    run_id = "run-continue-double"
+    sr_id = 995
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    chat_calls = {"n": 0}
+
+    async def _chat(
+        messages, *, tools=None, tool_choice=None, job_name=None, thinking_level=None
+    ):
+        chat_calls["n"] += 1
+        if chat_calls["n"] == 1:
+            return ChatResponse(
+                content="",
+                stop_reason="tool_use",
+                blocks=[
+                    ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
+                ],
+            )
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    client = MagicMock()
+    client.chat = AsyncMock(side_effect=_chat)
+    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+
+    class _Bgm:
+        def search(self, **kwargs):
+            return [{"id": 1, "name": "result"}]
+
+        def get_subject(self, sid):
+            return {"name": f"s-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    bgm = _Bgm()
+    reg = get_tool_registry()
+
+    eb_calls = {"n": 0}
+
+    async def _eb(tool_calls, *, recorder=None):
+        """模拟 execute_batch：写 tool_execute span（同真实实现），首次调用抛错。"""
+        eb_calls["n"] += 1
+        if eb_calls["n"] == 1:
+            if recorder is not None:
+                for i, tc in enumerate(tool_calls):
+                    sid = recorder.start_tool(tc, sequence=i)
+                    recorder.end_tool(sid, error="crash")
+            raise RuntimeError(f"crash #{eb_calls['n']}")
+        results = {}
+        for i, tc in enumerate(tool_calls):
+            sid = recorder.start_tool(tc, sequence=i) if recorder else None
+            blk = ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
+            results[tc.id] = blk
+            if sid is not None:
+                recorder.end_tool(sid, result=blk)
+        return results
+
+    monkeypatch.setattr(reg, "execute_batch", _eb)
+
+    # 第一次 run → 崩溃
+    await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+    # 第一次恢复（完成对话）
+    await llm_assist.continue_run(run_id, sr, bgm)
+
+    steps_after_first = database_manager.agent_runs.get_steps(run_id)
+    chat_iters_after_first = [
+        s["iteration"] for s in steps_after_first if s["name"] == "llm_chat"
+    ]
+    assert len(chat_iters_after_first) == len(set(chat_iters_after_first)), (
+        f"第一次恢复后 chat span iteration 存在撞号：{chat_iters_after_first}"
+    )
+
+    # 模拟二次崩溃：改回 processing
+    database_manager.agent_runs.update_run_status(run_id, "processing")
+
+    # 第二次恢复（应直接 mark_no_suggestion，无额外 LLM 调用）
+    await llm_assist.continue_run(run_id, sr, bgm)
+
+    assert chat_calls["n"] == 2, (
+        f"期望累计 2 次 LLM 调用（第二次恢复不应额外调 LLM），实际 {chat_calls['n']}"
+    )
+
+    steps_final = database_manager.agent_runs.get_steps(run_id)
+    chat_iters_final = [s["iteration"] for s in steps_final if s["name"] == "llm_chat"]
+    assert len(chat_iters_final) == len(set(chat_iters_final)), (
+        f"最终 chat span iteration 存在撞号：{chat_iters_final}"
+    )
+
+    rr_final = real_replay(run_id)
+    assert len(rr_final.missing_tool_calls) == 0, (
+        f"二次 replay 不应再判缺失，实际 missing={rr_final.missing_tool_calls}"
+    )
+
+
+# S8：run() 可重试失败达上限单点置终态（无双写） -----------------------------
+
+
+def test_run_retryable_llm_error_at_limit_single_terminal_write():
+    """可重试 LLM 失败达上限 → 仅 increment_attempts 单点（内部置终态），不再 mark_failed。"""
+    from app.services.llm.client import LLMCallError
+
+    repo = MagicMock()
+    repo.atomic_claim.return_value = True
+    repo.increment_attempts.return_value = 3
+    dbm = MagicMock()
+    dbm.agent_runs = repo
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("500 boom", retryable=True)
+
+    with (
+        patch(
+            "app.services.matching.llm_assist.get_database_manager", return_value=dbm
+        ),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        status = asyncio.run(
+            llm_assist.run(
+                "run-double-write",
+                sync_record=_make_sync_record(sync_record_id=520),
+                bgm=MagicMock(),
+                thinking_level="medium",
+                chat_fn=_boom,
+            )
+        )
+
+    assert status == "failed"
+    repo.increment_attempts.assert_called_once_with(
+        "run-double-write", last_error="500 boom"
+    )
+    # 终态写入收敛到 increment_attempts 单点事务，外层不得二次 mark_failed
+    repo.mark_failed.assert_not_called()
