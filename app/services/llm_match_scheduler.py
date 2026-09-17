@@ -3,12 +3,16 @@
 继承 BaseScheduler，同构 bangumi_replay_scheduler，按 ``[sync] llm_match_cron``
 （默认 ``*/1 * * * *``）定时轮询 agent_runs 处理 match 任务。
 
-每轮顺序（串行处理）：
+每轮流程（recover 与 pending 共享并发限额并发消费）：
 1. **清理**：终态且 ended_at 超保留期 → 先删 agent_steps 再删 agent_runs（级联）+ 日志
 2. **恢复扫描**：``processing`` 且 started_at 超时的遗留 run → 刷新 started_at
    → sync_record 缺失则 mark_failed；否则重建种子 + 重放 replay_delta → 续跑 loop
 3. **正常处理**：逐条原子拾取（由 llm_assist.run 内部 atomic_claim 负责）→
-   调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
+    调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
+
+recover 与 pending 统一入列后经 ``asyncio.Semaphore(llm_match_concurrency)`` 并发消费，
+单条 run 异常在包装层隔离记录，不影响同批其他 run。sync_record_id 尚未回填
+（入队前移的毫秒级窗口）的 run 本轮跳过，等回填后下一轮处理。
 
 去重落在落任务入口（sync_service 的 _handle_match_failure），本调度器只处理已存在任务。
 重入防护：本进程正在处理的 run 记入模块级 ``_active_run_ids``，恢复扫描与正常处理
@@ -18,6 +22,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import time
 from typing import Any
@@ -128,7 +133,11 @@ class LlmMatchScheduler(BaseScheduler):
         }
 
     async def _run_sync_job(self) -> None:
-        """单轮调度：清理 → 恢复扫描 → 正常处理（串行、limit 防堆积）。"""
+        """单轮调度：清理 → 恢复扫描 → pending 共享信号量并发消费。
+
+        recover 任务先入列（保证崩溃遗留优先被接管），与 pending 任务共用同一
+        并发限额；单条 run 的异常在消费包装层被隔离并记录，不影响同批其他 run。
+        """
         if not self._is_enabled():
             return
 
@@ -142,12 +151,12 @@ class LlmMatchScheduler(BaseScheduler):
         try:
             deleted = repo.cleanup_expired(retention_days=retention_days)
         except Exception as e:
-            logger.debug(f"🤖 清理过期 agent_run 失败: {e}")
+            logger.error(f"🤖 清理过期 agent_run 失败: {e}")
             deleted = 0
         if deleted and deleted > 0:
             logger.info(f"🤖 清理过期 agent_run {deleted} 条")
 
-        # 2. 恢复扫描
+        # 2. 恢复扫描（本进程已在处理（活着但慢）的 run 不得被重复捞起）
         recovery_timeout = _cfg_int(
             config_manager.get("sync", "llm_match_recovery_timeout_s", fallback=120),
             120,
@@ -155,29 +164,42 @@ class LlmMatchScheduler(BaseScheduler):
         try:
             stale = repo.list_stale_processing(timeout_seconds=recovery_timeout)
         except Exception as e:
-            logger.debug(f"🤖 恢复扫描失败: {e}")
+            logger.error(f"🤖 恢复扫描失败: {e}")
             stale = []
-        for run in stale:
-            # 本进程已在处理（活着但慢）的 run 不得被恢复扫描重复捞起
-            if run.get("run_id") in _active_run_ids:
-                logger.debug(f"🤖 恢复扫描跳过 run {run.get('run_id')}：本进程已在处理")
-                continue
-            try:
-                await self._recover_run(run)
-            except Exception as e:
-                logger.error(f"🤖 恢复 run {run.get('run_id')} 异常: {e}")
+        stale = [run for run in stale if run.get("run_id") not in _active_run_ids]
 
         # 3. 正常处理（limit 防堆积；切片双保险，避免上层 mock 返回超量）
         try:
             pending = repo.list_pending(limit=self.BATCH_SIZE)[: self.BATCH_SIZE]
         except Exception as e:
-            logger.debug(f"🤖 列出 pending agent_run 失败: {e}")
+            logger.error(f"🤖 列出 pending agent_run 失败: {e}")
             pending = []
-        for run in pending:
-            try:
-                await self._process_run(run)
-            except Exception as e:
-                logger.error(f"🤖 处理 run {run.get('run_id')} 异常: {e}")
+
+        # 4. 并发消费：recover 先入列，与 pending 共享并发限额（信号量结构化并发）
+        limit = max(
+            1,
+            _cfg_int(
+                config_manager.get("sync", "llm_match_concurrency", fallback=3), 3
+            ),
+        )
+        sem = asyncio.Semaphore(limit)
+        failures = 0
+
+        async def _consume(fn, run: dict) -> None:
+            """单条消费包装：受共享信号量约束，异常隔离不影响同批其他 run。"""
+            nonlocal failures
+            async with sem:
+                try:
+                    await fn(run)
+                except Exception as e:
+                    failures += 1
+                    logger.error(f"🤖 处理 run {run.get('run_id')} 异常: {e}")
+
+        tasks = [(self._recover_run, run) for run in stale]
+        tasks += [(self._process_run, run) for run in pending]
+        await asyncio.gather(*(_consume(fn, run) for fn, run in tasks))
+        if failures:
+            logger.error(f"🤖 本轮并发消费有 {failures} 条 run 处理异常")
 
     # ------------------------------------------------------------------
     # 恢复扫描
@@ -186,12 +208,19 @@ class LlmMatchScheduler(BaseScheduler):
     async def _recover_run(self, run: dict) -> None:
         """恢复单条崩溃遗留的 processing run。
 
-        0. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
-        1. 以**统一时间戳**刷新 started_at（防下一轮重复恢复）
-        2. sync_record 缺失 → mark_failed(error)
-        3. 否则重建种子 + 重放 → 续跑 loop
+        0. sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮，不占用执行权
+        1. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
+        2. 以**统一时间戳**刷新 started_at（防下一轮重复恢复）
+        3. sync_record 缺失 → mark_failed(error)
+        4. 否则重建种子 + 重放 → 续跑 loop
         """
         run_id = run["run_id"]
+        # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
+        # （不 mark_failed，等回填后下一轮再处理），且必须在 acquire 之前判断，
+        # 避免占用（并随后释放）执行权造成同轮 pending 被误跳过。
+        if not run.get("sync_record_id"):
+            logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
+            return
         if not _try_acquire_run(run_id):
             logger.debug(f"🤖 恢复 run {run_id} 跳过：本进程已在处理")
             return
@@ -252,7 +281,10 @@ class LlmMatchScheduler(BaseScheduler):
             if remaining <= 0:
                 # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
                 # 下一轮恢复扫描又会重复捞起）→ 落终态 no_suggestion/exhausted
-                logger.debug(f"🤖 恢复 {run_id} 已无剩余轮次，标记 no_suggestion")
+                logger.warning(
+                    f"🤖 恢复(replay)路径预算耗尽，run {run_id} 已无剩余轮次，"
+                    f"标记 no_suggestion"
+                )
                 repo.mark_no_suggestion(run_id, stop_reason="exhausted")
                 return
 
@@ -296,8 +328,9 @@ class LlmMatchScheduler(BaseScheduler):
                 remaining = max(0, remaining - 1)
                 if remaining <= 0:
                     # G4：同上，补执行后预算耗尽也必须落终态而非静默返回
-                    logger.debug(
-                        f"🤖 恢复 {run_id} 补执行后已无剩余轮次，标记 no_suggestion"
+                    logger.warning(
+                        f"🤖 恢复(replay)路径预算耗尽，run {run_id} 补执行后已无"
+                        f"剩余轮次，标记 no_suggestion"
                     )
                     repo.mark_no_suggestion(run_id, stop_reason="exhausted")
                     return
@@ -519,6 +552,11 @@ class LlmMatchScheduler(BaseScheduler):
         未取得执行权（本进程已有协程在处理）直接跳过，且不释放他人持有的执行权。
         """
         run_id = run["run_id"]
+        # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
+        # （不 mark_failed，等回填后下一轮再处理），避免无意义地占用执行权。
+        if not run.get("sync_record_id"):
+            logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
+            return
         if not _try_acquire_run(run_id):
             logger.debug(f"🤖 处理 run {run_id} 跳过：本进程已在处理")
             return

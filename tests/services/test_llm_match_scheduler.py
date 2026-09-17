@@ -267,8 +267,9 @@ def test_process_pending_respects_batch_limit_five():
     cm = _make_config()
     repo = _make_repo()
     # 即便 repo 返回 7 条，调度器也只处理 5 条
+    # （sync_record_id 用正数：0/空 现表示"尚未回填"，会按 T7 规则跳过）
     repo.list_pending.return_value = [
-        {"run_id": f"r{i}", "sync_record_id": i} for i in range(7)
+        {"run_id": f"r{i}", "sync_record_id": i + 1} for i in range(7)
     ]
     run_mock = AsyncMock(return_value="succeeded")
     with (
@@ -1721,3 +1722,409 @@ def test_process_run_skips_active_run():
 
     run_mock.assert_not_awaited()
     assert "A" in sched_module._active_run_ids, "跳过时不应误删他人持有的执行权"
+
+
+# ---------------------------------------------------------------------------
+# T7：recover/pending 共享信号量并发消费
+# ---------------------------------------------------------------------------
+
+
+def _patch_concurrency(cm: MagicMock, value):
+    """在 config mock 上叠加 llm_match_concurrency 返回值。"""
+    base_get = cm.get.side_effect
+
+    def _get(section, key, fallback=None):
+        if key == "llm_match_concurrency":
+            return value
+        return base_get(section, key, fallback)
+
+    cm.get.side_effect = _get
+
+
+def test_stale_and_pending_share_concurrency_limit():
+    """S1：1 stale + 3 pending，limit=2 → 并发峰值恰好 2，且 4 条都被处理。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    _patch_concurrency(cm, "2")
+    repo = _make_repo()
+    repo.list_stale_processing.return_value = [{"run_id": "s1", "sync_record_id": 10}]
+    repo.list_pending.return_value = [
+        {"run_id": f"p{i}", "sync_record_id": i + 1} for i in range(3)
+    ]
+    state = {"current": 0, "peak": 0}
+    processed: list[str] = []
+
+    async def _fn(run):
+        state["current"] += 1
+        state["peak"] = max(state["peak"], state["current"])
+        await asyncio.sleep(0)
+        state["current"] -= 1
+        processed.append(run["run_id"])
+
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_recover_run", side_effect=_fn),
+        patch.object(sched, "_process_run", side_effect=_fn),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert state["peak"] == 2, f"共享限额并发峰值应恰好为 2，实际 {state['peak']}"
+    assert sorted(processed) == ["p0", "p1", "p2", "s1"], (
+        f"4 条 run 都应被处理，实际 {sorted(processed)}"
+    )
+
+
+def test_recover_and_pending_consume_concurrently():
+    """S2：recover 任务尚未结束时 pending 任务已开始执行（非严格先后）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_stale_processing.return_value = [
+        {"run_id": "stale1", "sync_record_id": 1}
+    ]
+    repo.list_pending.return_value = [{"run_id": "p1", "sync_record_id": 2}]
+
+    observed = {"recover_saw_pending_start": False}
+
+    async def _go():
+        recover_entered = asyncio.Event()
+        pending_entered = asyncio.Event()
+
+        async def _recover(run):
+            recover_entered.set()
+            try:
+                await asyncio.wait_for(pending_entered.wait(), timeout=2.0)
+                observed["recover_saw_pending_start"] = True
+            except asyncio.TimeoutError:
+                observed["recover_saw_pending_start"] = False
+
+        async def _process(run):
+            await recover_entered.wait()
+            pending_entered.set()
+
+        with (
+            patch("app.services.llm_match_scheduler.config_manager", cm),
+            patch(
+                "app.services.llm_match_scheduler.get_database_manager",
+                return_value=_make_dbm(repo),
+            ),
+            patch.object(sched, "_recover_run", side_effect=_recover),
+            patch.object(sched, "_process_run", side_effect=_process),
+        ):
+            await sched._run_sync_job()
+
+    asyncio.run(_go())
+
+    assert observed["recover_saw_pending_start"] is True, (
+        "recover 与 pending 应并发消费：pending 开始时 recover 尚未结束"
+    )
+
+
+def test_consume_exception_isolated_and_logged_error():
+    """S3：某 run 处理抛异常 → 记 error 且不影响同批其他 run 完成。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_pending.return_value = [
+        {"run_id": "a", "sync_record_id": 1},
+        {"run_id": "b", "sync_record_id": 2},
+    ]
+    finished: list[str] = []
+
+    async def _fn(run):
+        if run["run_id"] == "a":
+            raise RuntimeError("boom")
+        finished.append(run["run_id"])
+
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_process_run", side_effect=_fn),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert finished == ["b"], "同批其他 run 不应被异常中断"
+    error_msgs = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("boom" in m for m in error_msgs), (
+        f"异常应被 error 级记录，实际 {error_msgs}"
+    )
+    assert any("1 条" in m for m in error_msgs), (
+        f"应对本轮失败数计数并记录，实际 {error_msgs}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T7：S7 并发配置解析（非法/缺失回退 3，非正数下限 1）
+# ---------------------------------------------------------------------------
+
+
+def _measure_peak_concurrency(concurrency_value, n_pending: int = 3) -> int:
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    _patch_concurrency(cm, concurrency_value)
+    repo = _make_repo()
+    repo.list_pending.return_value = [
+        {"run_id": f"p{i}", "sync_record_id": i + 1} for i in range(n_pending)
+    ]
+    state = {"current": 0, "peak": 0}
+
+    async def _fn(run):
+        state["current"] += 1
+        state["peak"] = max(state["peak"], state["current"])
+        await asyncio.sleep(0)
+        state["current"] -= 1
+
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_process_run", side_effect=_fn),
+    ):
+        asyncio.run(sched._run_sync_job())
+    return state["peak"]
+
+
+@pytest.mark.parametrize(
+    "value,expected_peak",
+    [
+        (None, 3),  # 缺失 → 回退 3
+        ("", 3),  # 空串非法 → 回退 3
+        ("abc", 3),  # 非法 → 回退 3
+        ("0", 1),  # 0 → 下限 1
+        ("-4", 1),  # 负数 → 下限 1
+        ("2", 2),  # 合法值生效
+        ("9", 3),  # 大于任务数 → 峰值受任务数限制
+    ],
+)
+def test_concurrency_config_parsing(value, expected_peak):
+    """S7：llm_match_concurrency 非法/缺失回退 3，非正数下限 1。"""
+    assert _measure_peak_concurrency(value, n_pending=3) == expected_peak
+
+
+# ---------------------------------------------------------------------------
+# T7：S4 三处调度失败日志应为 error 级
+# ---------------------------------------------------------------------------
+
+
+def _run_job_with_logger(repo: MagicMock) -> MagicMock:
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        asyncio.run(sched._run_sync_job())
+    return log
+
+
+def test_cleanup_failure_logged_at_error_level():
+    repo = _make_repo()
+    repo.cleanup_expired.side_effect = RuntimeError("cleanup down")
+    log = _run_job_with_logger(repo)
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("清理过期" in m and "cleanup down" in m for m in errors), (
+        f"清理失败应记 error，实际 {errors}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("清理过期" in m for m in debugs), "清理失败不应停留在 debug 级"
+
+
+def test_stale_scan_failure_logged_at_error_level():
+    repo = _make_repo()
+    repo.list_stale_processing.side_effect = RuntimeError("stale down")
+    log = _run_job_with_logger(repo)
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("恢复扫描" in m and "stale down" in m for m in errors), (
+        f"恢复扫描失败应记 error，实际 {errors}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("恢复扫描" in m for m in debugs), "恢复扫描失败不应停留在 debug 级"
+
+
+def test_list_pending_failure_logged_at_error_level():
+    repo = _make_repo()
+    repo.list_pending.side_effect = RuntimeError("pending down")
+    log = _run_job_with_logger(repo)
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("pending" in m and "pending down" in m for m in errors), (
+        f"list_pending 失败应记 error，实际 {errors}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("pending" in m for m in debugs), (
+        "list_pending 失败不应停留在 debug 级"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T7：S5 replay 预算耗尽日志应为 warning 且注明恢复(replay)路径
+# ---------------------------------------------------------------------------
+
+
+def test_replay_exhausted_before_continue_logs_warning():
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=3,  # medium=3 → remaining=0
+        missing_tool_calls=[],
+        last_response=None,
+    )
+    log = MagicMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay({"run_id": "r", "sync_record_id": 1}, {"id": 1})
+        )
+
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+    warnings = [str(c.args[0]) for c in log.warning.call_args_list]
+    assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
+        f"预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("已无剩余轮次" in m for m in debugs), (
+        "预算耗尽日志不应停留在 debug 级"
+    )
+
+
+def test_replay_exhausted_after_backfill_logs_warning():
+    sched = LlmMatchScheduler()
+    repo = _make_repo()
+    missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
+    rr = ReplayResult(
+        messages=[Message(role="system", content="s")],
+        executed_iterations=2,  # medium=3 → remaining=1 → 补执行后 0
+        missing_tool_calls=[missing],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "go",
+            "tool_calls": [missing],
+        },
+    )
+    log = MagicMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.llm_match_scheduler.config_manager") as cm,
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch.object(sched, "_replay_missing_tool", new=AsyncMock()),
+        patch("app.services.agent.loop.run", new=AsyncMock()),
+    ):
+        cm.get_sync_llm_match_config.return_value = {
+            "llm_match_thinking_level": "medium",
+            "llm_match_max_iterations": "",
+        }
+        asyncio.run(
+            sched._continue_replay({"run_id": "r2", "sync_record_id": 1}, {"id": 1})
+        )
+
+    repo.mark_no_suggestion.assert_called_once_with("r2", stop_reason="exhausted")
+    warnings = [str(c.args[0]) for c in log.warning.call_args_list]
+    assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
+        f"补执行后预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
+    )
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert not any("已无剩余轮次" in m for m in debugs), (
+        "补执行后预算耗尽日志不应停留在 debug 级"
+    )
+
+
+# ---------------------------------------------------------------------------
+# T7：S6 sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("empty_id", [None, 0, ""])
+def test_process_run_skips_run_without_sync_record_id(empty_id):
+    """_process_run：sync_record_id 空 → 跳过，不 acquire、不 mark_failed、不调 run。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    acquire_spy = MagicMock(return_value=True)
+    run_mock = AsyncMock(return_value="succeeded")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch("app.services.llm_match_scheduler._try_acquire_run", acquire_spy),
+        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+    ):
+        asyncio.run(sched._process_run({"run_id": "a", "sync_record_id": empty_id}))
+
+    acquire_spy.assert_not_called()
+    run_mock.assert_not_awaited()
+    repo.mark_failed.assert_not_called()
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert any("sync_record_id" in m for m in debugs), (
+        f"跳过时应记 debug 说明原因，实际 {debugs}"
+    )
+
+
+@pytest.mark.parametrize("empty_id", [None, 0, ""])
+def test_recover_run_skips_run_without_sync_record_id(empty_id):
+    """_recover_run：sync_record_id 空 → 在 acquire 前跳过，不刷新、不 mark_failed。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    acquire_spy = MagicMock(return_value=True)
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch("app.services.llm_match_scheduler._try_acquire_run", acquire_spy),
+        patch.object(sched, "_continue_replay", new=AsyncMock()),
+        patch.object(sched, "_get_sync_record", return_value={"id": 1}),
+    ):
+        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": empty_id}))
+
+    acquire_spy.assert_not_called()
+    repo.refresh_started_at.assert_not_called()
+    repo.mark_failed.assert_not_called()
+    assert "A" not in sched_module._active_run_ids
+    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
+    assert any("sync_record_id" in m for m in debugs), (
+        f"跳过时应记 debug 说明原因，实际 {debugs}"
+    )
