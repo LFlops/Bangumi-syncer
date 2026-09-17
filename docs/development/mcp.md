@@ -100,7 +100,7 @@ MCP 与其它 API 的装配方式不同，这是 ASGI 嵌套语义决定的，�
 | `/token` | 用 authorization code 换 JWT access_token |
 | `/register` | 动态客户端注册（RFC 7591） |
 | `/revoke` | 吊销 access / refresh token（`RevocationOptions(enabled=True)`） |
-| `/consent` | 用户确认页面（allow/deny） |
+| `/consent` | 用户确认页面（allow/deny）；未登录时 302 到 `/login`（登录后回跳） |
 
 JWT claims：
 
@@ -145,7 +145,7 @@ JWT claims：
 
 ### 4. consent 未登录行为
 
-`auth.enabled=true` 且请求未携带有效 `session_token` 时，`handle_consent`（GET 与 POST allow）**直接返回 HTTP 401**，并不会跳转到 BS 登录页。用户需先在 BS Web 端登录，再重新触发授权。
+`auth.enabled=true` 且请求未携带有效 `session_token` 时，`handle_consent`（GET 与 POST allow）返回 **302**，`Location` 为 `/login?next=<urlencode(/consent?request_token=...)>`；其中 `next` 为**不含 base_path** 的站内路径，整体 urlencode，登录成功后由前端 `static/js/auth.js` 校验并自动回跳 consent 页继续授权，**无需手动重新触发**。这是复用 BS 页面级登录重定向约定（`app/api/pages.py::_login_redirect`）。
 
 ### 5. 动态客户端注册（DCR）
 
