@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import app.services.llm_match_scheduler as sched_module
 from app.services.agent.trace import ReplayResult
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 from app.services.llm.tools import ToolDefinition, ToolRegistry
@@ -19,6 +20,14 @@ from app.services.matching import llm_assist
 # ---------------------------------------------------------------------------
 # 辅助
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_active_runs():
+    """每测试前后清空模块级 active run 集合，避免跨测试状态污染。"""
+    sched_module._clear_active_runs()
+    yield
+    sched_module._clear_active_runs()
 
 
 def _make_config(enabled: bool = True, api_key: str = "k", cron: str = "*/2 * * * *"):
@@ -185,7 +194,10 @@ def test_recovery_missing_sync_record_marks_failed():
 
         asyncio.run(sched._run_sync_job())
 
-    repo.refresh_started_at.assert_called_once_with("r1")
+    repo.refresh_started_at.assert_called_once()
+    ts_call_args = repo.refresh_started_at.call_args[0]
+    assert ts_call_args[0] == "r1"
+    assert isinstance(ts_call_args[1], int)
     repo.mark_failed.assert_called_once_with(
         "r1", stop_reason="error", last_error="sync_record missing"
     )
@@ -210,7 +222,10 @@ def test_recovery_present_sync_record_continues():
 
         asyncio.run(sched._run_sync_job())
 
-    repo.refresh_started_at.assert_called_once_with("r1")
+    repo.refresh_started_at.assert_called_once()
+    ts_call_args = repo.refresh_started_at.call_args[0]
+    assert ts_call_args[0] == "r1"
+    assert isinstance(ts_call_args[1], int)
     cont.assert_awaited_once()
 
 
@@ -1570,3 +1585,139 @@ async def test_double_recovery_no_extra_llm_call(monkeypatch):
     assert len(rr_final.missing_tool_calls) == 0, (
         f"二次 replay 不应再判缺失，实际 missing={rr_final.missing_tool_calls}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T5：模块级 active run 重入防护（跳过运行中 run / 统一时间戳抢占 / 互斥 / 释放）
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_scan_skips_active_run():
+    """场景1：run A 在本进程 active 集合 → 恢复扫描不调用 _recover_run。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_stale_processing.return_value = [{"run_id": "A", "sync_record_id": 42}]
+    sched_module._active_run_ids.add("A")
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_recover_run", new=AsyncMock()) as recover,
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    recover.assert_not_awaited()
+    repo.refresh_started_at.assert_not_called()
+
+
+def test_recover_run_passes_caller_timestamp_to_refresh():
+    """场景2：恢复开始以调用方统一时间戳刷新，而非仓储内部取 now。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.time.time", return_value=1700000000),
+        patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
+        patch.object(sched, "_continue_replay", new=AsyncMock()),
+    ):
+        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": 42}))
+
+    repo.refresh_started_at.assert_called_once_with("A", 1700000000)
+
+
+def test_concurrent_recover_same_run_only_one_acquires():
+    """场景3：同一 run 被两个并发恢复触发 → 仅一个取得执行权，续跑只发生一次。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+
+    cont_calls = {"n": 0}
+    events: dict = {}
+
+    async def _gated_continue(run, sync_record):
+        cont_calls["n"] += 1
+        events["started"].set()
+        await events["release"].wait()
+
+    async def _go():
+        # Event 必须在运行中的 loop 内创建（Python 3.9 会绑定创建时的 loop）
+        events["started"] = asyncio.Event()
+        events["release"] = asyncio.Event()
+        tasks = asyncio.gather(
+            sched._recover_run({"run_id": "A", "sync_record_id": 42}),
+            sched._recover_run({"run_id": "A", "sync_record_id": 42}),
+        )
+        await events["started"].wait()
+        events["release"].set()
+        await tasks
+
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.time.time", return_value=1700000001),
+        patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
+        patch.object(sched, "_continue_replay", side_effect=_gated_continue),
+    ):
+        asyncio.run(_go())
+
+    assert cont_calls["n"] == 1, "并发恢复同一 run 只应有一次续跑"
+    repo.refresh_started_at.assert_called_once_with("A", 1700000001)
+    assert "A" not in sched_module._active_run_ids
+
+
+def test_recover_run_releases_after_exception():
+    """场景4：_recover_run 抛异常后释放执行权，下一轮可再次恢复。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.time.time", return_value=1700000002),
+        patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
+        patch.object(
+            sched, "_continue_replay", new=AsyncMock(side_effect=RuntimeError("boom"))
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": 42}))
+
+    assert "A" not in sched_module._active_run_ids, "异常后必须释放执行权"
+    # 释放后可再次取得执行权（下一轮可恢复）
+    assert sched_module._try_acquire_run("A") is True
+
+
+def test_process_run_skips_active_run():
+    """_process_run 对正在本进程处理的 run 也应跳过，防恢复误捞双跑。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    sched_module._active_run_ids.add("A")
+    run_mock = AsyncMock(return_value="succeeded")
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
+        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+    ):
+        asyncio.run(sched._process_run({"run_id": "A", "sync_record_id": 42}))
+
+    run_mock.assert_not_awaited()
+    assert "A" in sched_module._active_run_ids, "跳过时不应误删他人持有的执行权"

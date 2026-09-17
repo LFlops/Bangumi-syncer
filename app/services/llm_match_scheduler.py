@@ -11,12 +11,15 @@
    调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
 
 去重落在落任务入口（sync_service 的 _handle_match_failure），本调度器只处理已存在任务。
-幂等：恢复中崩溃 → 下次再扫（list_stale_processing 按 started_at 超时判定）。
+重入防护：本进程正在处理的 run 记入模块级 ``_active_run_ids``，恢复扫描与正常处理
+均跳过，避免「进程活着但处理慢」被误判为崩溃遗留而双跑；恢复开始时以统一时间戳
+抢占刷新 started_at。跨进程死进程恢复仍由 list_stale_processing 超时判定兜底。
 """
 
 from __future__ import annotations
 
 import functools
+import time
 from typing import Any
 
 from app.core.config import config_manager
@@ -31,6 +34,39 @@ from app.services.notification_service import get_notification_service
 # 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
 _SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
+
+# ---------------------------------------------------------------------------
+# 进程级 active run 防护
+#
+# 定时任务仅凭 started_at 超时无法区分「进程已死（应恢复）」与「进程活着但处理慢
+# （不应恢复）」，多实例/重入下会双跑同一 run。本进程内已取得执行权的 run 记入
+# ``_active_run_ids``，恢复扫描与正常处理均据此跳过。
+# ---------------------------------------------------------------------------
+
+_active_run_ids: set[str] = set()
+
+
+def _try_acquire_run(run_id: str) -> bool:
+    """尝试取得 run 在本进程的执行权；已持有返回 False。
+
+    原子性依据：CPython 事件循环单线程调度协程，本函数为**不含 await 的同步
+    check-and-set**，执行期间不会发生协程切换，因此 "in + add" 两步对其它协程
+    而言是原子的。无需 asyncio.Lock（后者还带来跨 event loop 绑定风险）。
+    """
+    if run_id in _active_run_ids:
+        return False
+    _active_run_ids.add(run_id)
+    return True
+
+
+def _release_run(run_id: str) -> None:
+    """释放 run 的本进程执行权（幂等）。"""
+    _active_run_ids.discard(run_id)
+
+
+def _clear_active_runs() -> None:
+    """清空 active 集合（测试隔离用，避免模块级状态跨测试污染）。"""
+    _active_run_ids.clear()
 
 
 def _cfg_bool(value: Any) -> bool:
@@ -122,6 +158,10 @@ class LlmMatchScheduler(BaseScheduler):
             logger.debug(f"🤖 恢复扫描失败: {e}")
             stale = []
         for run in stale:
+            # 本进程已在处理（活着但慢）的 run 不得被恢复扫描重复捞起
+            if run.get("run_id") in _active_run_ids:
+                logger.debug(f"🤖 恢复扫描跳过 run {run.get('run_id')}：本进程已在处理")
+                continue
             try:
                 await self._recover_run(run)
             except Exception as e:
@@ -146,25 +186,33 @@ class LlmMatchScheduler(BaseScheduler):
     async def _recover_run(self, run: dict) -> None:
         """恢复单条崩溃遗留的 processing run。
 
-        1. 刷新 started_at（防下一轮重复恢复）
+        0. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
+        1. 以**统一时间戳**刷新 started_at（防下一轮重复恢复）
         2. sync_record 缺失 → mark_failed(error)
         3. 否则重建种子 + 重放 → 续跑 loop
         """
         run_id = run["run_id"]
-        repo = get_database_manager().agent_runs
-
-        # 恢复开始即刷新 started_at（B-3）
-        repo.refresh_started_at(run_id)
-
-        sync_record = self._get_sync_record(run.get("sync_record_id"))
-        if sync_record is None:
-            logger.warning(f"🤖 恢复 run {run_id} 关联 sync_record 缺失，标记失败")
-            repo.mark_failed(
-                run_id, stop_reason="error", last_error="sync_record missing"
-            )
+        if not _try_acquire_run(run_id):
+            logger.debug(f"🤖 恢复 run {run_id} 跳过：本进程已在处理")
             return
+        try:
+            repo = get_database_manager().agent_runs
 
-        await self._continue_replay(run, sync_record)
+            # 恢复开始即刷新 started_at；统一时间戳由调用方注入（单一时钟基准）
+            ts = int(time.time())
+            repo.refresh_started_at(run_id, ts)
+
+            sync_record = self._get_sync_record(run.get("sync_record_id"))
+            if sync_record is None:
+                logger.warning(f"🤖 恢复 run {run_id} 关联 sync_record 缺失，标记失败")
+                repo.mark_failed(
+                    run_id, stop_reason="error", last_error="sync_record missing"
+                )
+                return
+
+            await self._continue_replay(run, sync_record)
+        finally:
+            _release_run(run_id)
 
     async def _continue_replay(self, run: dict, sync_record: dict) -> None:
         """断点恢复续跑。
@@ -465,36 +513,46 @@ class LlmMatchScheduler(BaseScheduler):
     # ------------------------------------------------------------------
 
     async def _process_run(self, run: dict) -> None:
-        """处理单条 pending run：查 sync_record → llm_assist.run → 异常重试。"""
+        """处理单条 pending run：查 sync_record → llm_assist.run → 异常重试。
+
+        入口取得本进程执行权，防止恢复扫描误捞正在处理的 run（T7 并发化后尤为关键）；
+        未取得执行权（本进程已有协程在处理）直接跳过，且不释放他人持有的执行权。
+        """
         run_id = run["run_id"]
-        repo = get_database_manager().agent_runs
-
-        sync_record = self._get_sync_record(run.get("sync_record_id"))
-        if sync_record is None:
-            logger.warning(f"🤖 run {run_id} 关联 sync_record 缺失，标记失败")
-            repo.mark_failed(
-                run_id, stop_reason="error", last_error="sync_record missing"
-            )
+        if not _try_acquire_run(run_id):
+            logger.debug(f"🤖 处理 run {run_id} 跳过：本进程已在处理")
             return
-
-        bgm = self._build_bgm(sync_record)
         try:
-            # F5：thinking_level 统一从集中配置读取并透传给 llm_assist.run
-            # （config_override 由 llm_assist.run 内部从同一配置读取）。
-            match_cfg = config_manager.get_sync_llm_match_config()
-            thinking_level = match_cfg["llm_match_thinking_level"]
-            # atomic_claim / 状态流转 / 落库均在 llm_assist.run 内部完成
-            await llm_assist_module.run(
-                run_id,
-                sync_record=sync_record,
-                bgm=bgm,
-                thinking_level=thinking_level,
-                notification_service=get_notification_service(),
-            )
-        except Exception as e:
-            logger.error(f"🤖 处理 run {run_id} 异常: {e}")
-            # 计数与达上限置终态在 repo 内单点事务完成，携带 last_error 供排查
-            repo.increment_attempts(run_id, last_error=str(e)[:500])
+            repo = get_database_manager().agent_runs
+
+            sync_record = self._get_sync_record(run.get("sync_record_id"))
+            if sync_record is None:
+                logger.warning(f"🤖 run {run_id} 关联 sync_record 缺失，标记失败")
+                repo.mark_failed(
+                    run_id, stop_reason="error", last_error="sync_record missing"
+                )
+                return
+
+            bgm = self._build_bgm(sync_record)
+            try:
+                # F5：thinking_level 统一从集中配置读取并透传给 llm_assist.run
+                # （config_override 由 llm_assist.run 内部从同一配置读取）。
+                match_cfg = config_manager.get_sync_llm_match_config()
+                thinking_level = match_cfg["llm_match_thinking_level"]
+                # atomic_claim / 状态流转 / 落库均在 llm_assist.run 内部完成
+                await llm_assist_module.run(
+                    run_id,
+                    sync_record=sync_record,
+                    bgm=bgm,
+                    thinking_level=thinking_level,
+                    notification_service=get_notification_service(),
+                )
+            except Exception as e:
+                logger.error(f"🤖 处理 run {run_id} 异常: {e}")
+                # 计数与达上限置终态在 repo 内单点事务完成，携带 last_error 供排查
+                repo.increment_attempts(run_id, last_error=str(e)[:500])
+        finally:
+            _release_run(run_id)
 
     # ------------------------------------------------------------------
     # 辅助
