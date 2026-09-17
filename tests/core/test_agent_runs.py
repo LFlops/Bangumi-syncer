@@ -16,14 +16,42 @@
 from pathlib import Path
 from typing import Optional
 
+import pytest
+
 from app.core.database import DatabaseManager
 from app.core.database.agent_runs import AgentRunsRepository
+
+# enqueue_match_run 决策策略参数（配置类参数，必填；测试统一显式传入）
+_REUSE_WINDOW_DAYS = 30
+_MAX_TOTAL_ATTEMPTS = 10
+_ACCEPTED_MAPPING_VALID = True
 
 
 def _make_db(tmp_path: Path) -> DatabaseManager:
     """创建指向临时路径的 DatabaseManager 实例"""
     db_path = str(tmp_path / "test_agent_runs.db")
     return DatabaseManager(db_path)
+
+
+def _enqueue(
+    dbm: DatabaseManager,
+    run_id: str,
+    business_key: str,
+    sync_record_id: Optional[int] = None,
+    accepted_mapping_valid: bool = _ACCEPTED_MAPPING_VALID,
+) -> dict:
+    """测试辅助：显式传入决策策略参数调用 enqueue_match_run（无默认值兜底）。
+
+    策略值：复用窗口 30 天、累计失败上限 10、映射校验由用例显式指定。
+    """
+    return dbm.agent_runs.enqueue_match_run(
+        run_id=run_id,
+        business_key=business_key,
+        sync_record_id=sync_record_id,
+        reuse_window_days=_REUSE_WINDOW_DAYS,
+        max_total_attempts=_MAX_TOTAL_ATTEMPTS,
+        accepted_mapping_valid=accepted_mapping_valid,
+    )
 
 
 def _set_status(dbm, run_id: str, status: str, ended_at: Optional[int] = None) -> None:
@@ -179,15 +207,36 @@ class TestStatusTransitions:
             dbm._connection._conn.close()
 
     def test_mark_failed_idempotent_when_already_failed(self, tmp_path):
-        """已 failed 的 run 再次 mark_failed 不重复累计（一个 run 只计 1 次失败）"""
+        """已 failed 的 run 再次 mark_failed 被状态守卫拒绝（返回 False，不重复累计）"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("rf2", "match", 1)
             assert dbm.agent_runs.mark_failed("rf2", "failed", "boom") is True
             assert dbm.agent_runs.get_run("rf2")["total_attempts"] == 1
-            # 重复调用（如 llm_assist 重试耗尽后又 mark_failed）
-            dbm.agent_runs.mark_failed("rf2", "failed", "boom-again")
+            # 重复调用（如 llm_assist 重试耗尽后又 mark_failed）→ 守卫拒绝
+            assert dbm.agent_runs.mark_failed("rf2", "failed", "boom-again") is False
             assert dbm.agent_runs.get_run("rf2")["total_attempts"] == 1
+        finally:
+            dbm._connection._conn.close()
+
+    @pytest.mark.parametrize("terminal", ["succeeded", "no_suggestion", "cancelled"])
+    def test_mark_failed_guard_rejects_terminal_states(self, tmp_path, terminal):
+        """状态守卫：非 pending/processing 终态不被 mark_failed 改写（返回 False）"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("guard", "match", 1)
+            dbm.agent_runs.atomic_claim("guard")
+            if terminal == "succeeded":
+                dbm.agent_runs.mark_succeeded("guard")
+            elif terminal == "no_suggestion":
+                dbm.agent_runs.mark_no_suggestion("guard")
+            else:
+                dbm.agent_runs.update_run_status("guard", "cancelled")
+
+            assert dbm.agent_runs.mark_failed("guard", "failed", "boom") is False
+            run = dbm.agent_runs.get_run("guard")
+            assert run["status"] == terminal
+            assert run["total_attempts"] == 0
         finally:
             dbm._connection._conn.close()
 
@@ -318,6 +367,27 @@ class TestRefreshStartedAt:
             assert dbm.agent_runs.refresh_started_at("rf-now") is True
             after = int(time.time())
             started_at = dbm.agent_runs.get_run("rf-now")["started_at"]
+            assert before <= started_at <= after
+        finally:
+            dbm._connection._conn.close()
+
+    @pytest.mark.parametrize("bad_ts", [0, -100])
+    def test_refresh_started_at_non_positive_ts_falls_back_to_now(
+        self, tmp_path, bad_ts
+    ):
+        """ts<=0 → 取当前时间（保证 started_at>0，可被 list_stale_processing 拾取）"""
+        import time
+
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rf-bad", "match", 1)
+            dbm.agent_runs.atomic_claim("rf-bad")
+
+            before = int(time.time())
+            assert dbm.agent_runs.refresh_started_at("rf-bad", bad_ts) is True
+            after = int(time.time())
+            started_at = dbm.agent_runs.get_run("rf-bad")["started_at"]
+            assert started_at > 0
             assert before <= started_at <= after
         finally:
             dbm._connection._conn.close()
@@ -599,7 +669,7 @@ class TestCleanupExpired:
 
 
 class TestStepsOrdering:
-    """get_steps 按 (iteration, sequence) 排序"""
+    """get_steps 按 (iteration, sequence, id) 排序"""
 
     def test_steps_sorted_by_iteration_sequence(self, tmp_path):
         dbm = _make_db(tmp_path)
@@ -647,6 +717,56 @@ class TestStepsOrdering:
             # 首项应为 (0,1) 那条
             assert steps[0]["span_id"] == "z"
             assert steps[-1]["span_id"] == "x"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_steps_tie_break_by_id(self, tmp_path):
+        """get_steps SQL 末级按 id 排序（同 (iteration, sequence) 稳定，replay 承诺）"""
+        dbm = _make_db(tmp_path)
+
+        class _RecordingConn:
+            """记录 execute 语句的代理连接（SQLite 同键并列的顺序不可外部观测，故断言 SQL 契约）。"""
+
+            def __init__(self, real):
+                self._real = real
+                self.statements: list[str] = []
+
+            def execute(self, sql, *args, **kwargs):
+                self.statements.append(sql)
+                return self._real.execute(sql, *args, **kwargs)
+
+            def commit(self):
+                return self._real.commit()
+
+            def rollback(self):
+                return self._real.rollback()
+
+            def cursor(self):
+                return self._real.cursor()
+
+            def close(self):
+                return self._real.close()
+
+        try:
+            dbm.agent_runs.create_pending("sort-tie", "match", 1)
+            for span_id in ("t1", "t2", "t3"):
+                dbm.agent_runs.add_step(
+                    {
+                        "run_id": "sort-tie",
+                        "span_id": span_id,
+                        "name": "n",
+                        "iteration": 0,
+                        "sequence": 0,
+                    }
+                )
+            recorder = _RecordingConn(dbm._connection._conn)
+            dbm._connection._conn = recorder
+
+            steps = dbm.agent_runs.get_steps("sort-tie")
+            assert [s["span_id"] for s in steps] == ["t1", "t2", "t3"]
+            stmt = next(s for s in recorder.statements if "FROM agent_steps" in s)
+            normalized = " ".join(stmt.split())
+            assert normalized.endswith("ORDER BY iteration ASC, sequence ASC, id ASC")
         finally:
             dbm._connection._conn.close()
 
@@ -733,8 +853,8 @@ def _seed_succeeded_run(
     dbm, run_id: str, business_key: str, sync_record_id: int
 ) -> None:
     """测试辅助：构造一条 succeeded 终态 run"""
-    dbm.agent_runs.enqueue_match_run(
-        run_id=run_id, business_key=business_key, sync_record_id=sync_record_id
+    _enqueue(
+        dbm, run_id=run_id, business_key=business_key, sync_record_id=sync_record_id
     )
     dbm.agent_runs.atomic_claim(run_id)
     dbm.agent_runs.mark_succeeded(run_id)
@@ -749,8 +869,8 @@ class TestEnqueueMatchRun:
         """S1 无历史 → created，返回传入 run_id，库中新增 pending run"""
         dbm = _make_db(tmp_path)
         try:
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="new-run", business_key=self.BK, sync_record_id=100
+            res = _enqueue(
+                dbm, run_id="new-run", business_key=self.BK, sync_record_id=100
             )
             assert res == {"decision": "created", "run_id": "new-run"}
             run = dbm.agent_runs.get_run("new-run")
@@ -766,13 +886,11 @@ class TestEnqueueMatchRun:
         """S2 同键在途 processing → in_flight，返回已有 run_id，不新建并刷新主指针"""
         dbm = _make_db(tmp_path)
         try:
-            dbm.agent_runs.enqueue_match_run(
-                run_id="run-b", business_key=self.BK, sync_record_id=100
-            )
+            _enqueue(dbm, run_id="run-b", business_key=self.BK, sync_record_id=100)
             dbm.agent_runs.atomic_claim("run-b")
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="run-c", business_key=self.BK, sync_record_id=200
+            res = _enqueue(
+                dbm, run_id="run-c", business_key=self.BK, sync_record_id=200
             )
             assert res == {"decision": "in_flight", "run_id": "run-b"}
             assert dbm.agent_runs.get_run("run-c") is None
@@ -786,11 +904,9 @@ class TestEnqueueMatchRun:
         """S2 同键 pending → in_flight，返回已有 run_id，不新建"""
         dbm = _make_db(tmp_path)
         try:
-            dbm.agent_runs.enqueue_match_run(
-                run_id="run-a", business_key=self.BK, sync_record_id=100
-            )
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="run-a2", business_key=self.BK, sync_record_id=200
+            _enqueue(dbm, run_id="run-a", business_key=self.BK, sync_record_id=100)
+            res = _enqueue(
+                dbm, run_id="run-a2", business_key=self.BK, sync_record_id=200
             )
             assert res == {"decision": "in_flight", "run_id": "run-a"}
             assert dbm.agent_runs.get_run("run-a2") is None
@@ -807,14 +923,10 @@ class TestEnqueueMatchRun:
         dbm = _make_db(tmp_path)
         try:
             for rid in ("f1", "f2"):
-                dbm.agent_runs.enqueue_match_run(
-                    run_id=rid, business_key=self.BK, sync_record_id=1
-                )
+                _enqueue(dbm, run_id=rid, business_key=self.BK, sync_record_id=1)
                 dbm.agent_runs.mark_failed(rid, "failed", "e")
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="f3", business_key=self.BK, sync_record_id=300
-            )
+            res = _enqueue(dbm, run_id="f3", business_key=self.BK, sync_record_id=300)
             assert res == {"decision": "created", "run_id": "f3"}
             new_run = dbm.agent_runs.get_run("f3")
             assert new_run["status"] == "pending"
@@ -836,13 +948,11 @@ class TestEnqueueMatchRun:
         try:
             for i in range(10):
                 rid = f"f{i}"
-                dbm.agent_runs.enqueue_match_run(
-                    run_id=rid, business_key=self.BK, sync_record_id=i
-                )
+                _enqueue(dbm, run_id=rid, business_key=self.BK, sync_record_id=i)
                 dbm.agent_runs.mark_failed(rid, "failed", "e")
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="f-new", business_key=self.BK, sync_record_id=999
+            res = _enqueue(
+                dbm, run_id="f-new", business_key=self.BK, sync_record_id=999
             )
             assert res == {"decision": "exhausted", "run_id": "f9"}
             assert dbm.agent_runs.get_run("f-new") is None
@@ -863,9 +973,7 @@ class TestEnqueueMatchRun:
             cid = _add_pending_candidate(dbm, self.BK)
             _set_candidate_status(dbm, cid, "pending", resolved_at=_local_days_ago(365))
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "reuse_holding", "run_id": "r1"}
             assert dbm.agent_runs.get_run("r2") is None
             assert dbm.agent_runs.get_run("r1")["sync_record_id"] == 200
@@ -880,9 +988,7 @@ class TestEnqueueMatchRun:
             cid = _add_pending_candidate(dbm, self.BK)
             _set_candidate_status(dbm, cid, "rejected", resolved_at=_local_days_ago(20))
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "reuse_holding", "run_id": "r1"}
             assert dbm.agent_runs.get_run("r2") is None
         finally:
@@ -896,9 +1002,7 @@ class TestEnqueueMatchRun:
             cid = _add_pending_candidate(dbm, self.BK)
             _set_candidate_status(dbm, cid, "rejected", resolved_at=_local_days_ago(40))
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
             assert dbm.agent_runs.get_run("r2")["status"] == "pending"
         finally:
@@ -916,7 +1020,8 @@ class TestEnqueueMatchRun:
                 dbm, cid, "confirmed", resolved_at=_local_days_ago(900)
             )
 
-            res = dbm.agent_runs.enqueue_match_run(
+            res = _enqueue(
+                dbm,
                 run_id="r2",
                 business_key=self.BK,
                 sync_record_id=200,
@@ -935,7 +1040,8 @@ class TestEnqueueMatchRun:
             cid = _add_pending_candidate(dbm, self.BK)
             _set_candidate_status(dbm, cid, "confirmed", resolved_at=_local_days_ago(5))
 
-            res = dbm.agent_runs.enqueue_match_run(
+            res = _enqueue(
+                dbm,
                 run_id="r2",
                 business_key=self.BK,
                 sync_record_id=200,
@@ -951,9 +1057,7 @@ class TestEnqueueMatchRun:
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
             dbm._connection._conn.close()
@@ -964,9 +1068,7 @@ class TestEnqueueMatchRun:
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
             _add_pending_candidate(dbm, "match|bob|other|1")
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
             dbm._connection._conn.close()
@@ -975,14 +1077,10 @@ class TestEnqueueMatchRun:
         """cancelled / 其他终态 → created"""
         dbm = _make_db(tmp_path)
         try:
-            dbm.agent_runs.enqueue_match_run(
-                run_id="r1", business_key=self.BK, sync_record_id=100
-            )
+            _enqueue(dbm, run_id="r1", business_key=self.BK, sync_record_id=100)
             _set_status(dbm, "r1", "cancelled", ended_at=946684800)
 
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key=self.BK, sync_record_id=200
-            )
+            res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
             dbm._connection._conn.close()
@@ -991,12 +1089,8 @@ class TestEnqueueMatchRun:
         """business_key 为空（去重禁用）→ 每次 created，不去重"""
         dbm = _make_db(tmp_path)
         try:
-            res1 = dbm.agent_runs.enqueue_match_run(
-                run_id="r1", business_key="", sync_record_id=100
-            )
-            res2 = dbm.agent_runs.enqueue_match_run(
-                run_id="r2", business_key="", sync_record_id=200
-            )
+            res1 = _enqueue(dbm, run_id="r1", business_key="", sync_record_id=100)
+            res2 = _enqueue(dbm, run_id="r2", business_key="", sync_record_id=200)
             assert res1 == {"decision": "created", "run_id": "r1"}
             assert res2 == {"decision": "created", "run_id": "r2"}
             conn = dbm._connection._conn
@@ -1009,13 +1103,81 @@ class TestEnqueueMatchRun:
         """in_flight 且 sync_record_id=None（前移场景）→ 主指针不变"""
         dbm = _make_db(tmp_path)
         try:
-            dbm.agent_runs.enqueue_match_run(
-                run_id="run-a", business_key=self.BK, sync_record_id=100
-            )
-            res = dbm.agent_runs.enqueue_match_run(
-                run_id="run-a2", business_key=self.BK, sync_record_id=None
+            _enqueue(dbm, run_id="run-a", business_key=self.BK, sync_record_id=100)
+            res = _enqueue(
+                dbm, run_id="run-a2", business_key=self.BK, sync_record_id=None
             )
             assert res == {"decision": "in_flight", "run_id": "run-a"}
             assert dbm.agent_runs.get_run("run-a")["sync_record_id"] == 100
+        finally:
+            dbm._connection._conn.close()
+
+    def test_policy_params_are_required_keywords(self, tmp_path):
+        """P2-5 决策策略参数必填（禁默认值兜底）：任一缺失 → TypeError"""
+        dbm = _make_db(tmp_path)
+        try:
+            with pytest.raises(TypeError):
+                dbm.agent_runs.enqueue_match_run(run_id="r", business_key=self.BK)
+            with pytest.raises(TypeError):
+                dbm.agent_runs.enqueue_match_run(
+                    run_id="r",
+                    business_key=self.BK,
+                    reuse_window_days=_REUSE_WINDOW_DAYS,
+                    max_total_attempts=_MAX_TOTAL_ATTEMPTS,
+                )
+            with pytest.raises(TypeError):
+                dbm.agent_runs.enqueue_match_run(
+                    run_id="r",
+                    business_key=self.BK,
+                    reuse_window_days=_REUSE_WINDOW_DAYS,
+                    accepted_mapping_valid=True,
+                )
+        finally:
+            dbm._connection._conn.close()
+
+    def test_internal_exception_propagates_not_fake_created(
+        self, tmp_path, monkeypatch
+    ):
+        """P2-1 内部异常必须抛出（不得谎报 created），由调用方降级 enqueue_failed"""
+        dbm = _make_db(tmp_path)
+        try:
+
+            def _boom(conn, business_key):
+                raise RuntimeError("db down")
+
+            monkeypatch.setattr(
+                AgentRunsRepository,
+                "_find_latest_by_business_key",
+                staticmethod(_boom),
+            )
+            with pytest.raises(RuntimeError, match="db down"):
+                _enqueue(dbm, run_id="r", business_key=self.BK)
+            assert dbm.agent_runs.get_run("r") is None
+        finally:
+            dbm._connection._conn.close()
+
+    def test_integrity_error_falls_back_to_in_flight(self, tmp_path, monkeypatch):
+        """P2-1 并发唯一索引冲突（IntegrityError）→ 兜底复用已在途 run，不抛出"""
+        dbm = _make_db(tmp_path)
+        try:
+            conn = dbm._connection._conn
+            conn.execute(
+                "INSERT INTO agent_runs "
+                "(run_id, task_type, sync_record_id, business_key, status, "
+                " attempts, total_attempts, created_at, last_attempt_at) "
+                "VALUES ('concurrent-run', 'match', 100, ?, 'pending', 0, 0, 1000, 1000)",
+                (self.BK,),
+            )
+            conn.commit()
+            # 模拟并发决策：本连接查询看不到并发写入的在途行 → INSERT 触发唯一索引冲突
+            monkeypatch.setattr(
+                AgentRunsRepository,
+                "_find_latest_by_business_key",
+                staticmethod(lambda conn, business_key: None),
+            )
+
+            res = _enqueue(dbm, run_id="new-run", business_key=self.BK)
+            assert res == {"decision": "in_flight", "run_id": "concurrent-run"}
+            assert dbm.agent_runs.get_run("new-run") is None
         finally:
             dbm._connection._conn.close()

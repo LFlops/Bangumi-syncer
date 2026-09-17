@@ -20,7 +20,11 @@ from httpx import ASGITransport, AsyncClient
 from app.models.sync import CustomItem
 from app.services.sync_service import SyncService
 from app.services.sync_service.match_trace import MatchTrace
-from app.services.sync_service.orchestrator import SyncOrchestrator
+from app.services.sync_service.orchestrator import (
+    MATCH_ASSIST_MAX_TOTAL_ATTEMPTS,
+    MATCH_ASSIST_REUSE_WINDOW_DAYS,
+    SyncOrchestrator,
+)
 
 # ----------------------------------------------------------------------
 # 测试夹具
@@ -136,6 +140,9 @@ def test_handle_match_failure_enqueues_when_enabled(
     assert kwargs["sync_record_id"] is None
     assert kwargs["run_id"]
     assert kwargs["business_key"]  # 业务键非空
+    # 决策策略参数显式传入（无默认值兜底）
+    assert kwargs["reuse_window_days"] == MATCH_ASSIST_REUSE_WINDOW_DAYS
+    assert kwargs["max_total_attempts"] == MATCH_ASSIST_MAX_TOTAL_ATTEMPTS
     assert kwargs["accepted_mapping_valid"] is False  # 映射未命中 → 无效
     # trace step 在 persist 前已存在
     assert any(

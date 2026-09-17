@@ -29,6 +29,10 @@ from .retry import MARK_QUEUED
 if TYPE_CHECKING:
     from . import SyncService
 
+# 匹配增强入队决策策略参数（配置类参数，禁止默认值兜底，调用处显式传入）
+MATCH_ASSIST_REUSE_WINDOW_DAYS = 30  # rejected 候选复用窗口（天）
+MATCH_ASSIST_MAX_TOTAL_ATTEMPTS = 10  # 同键累计失败上限（达上限不再新建 run）
+
 
 class SyncOrchestrator:
     """同步编排器：请求处理 → 匹配 → 集数解析 → 标记 → 持久化"""
@@ -377,10 +381,14 @@ class SyncOrchestrator:
             )
             new_run_id = str(uuid.uuid4())
             try:
+                # 决策策略参数显式传入（配置类参数，禁止默认值兜底）；
+                # reuse_*/in_flight 仅刷新关联与主指针，不重跑 LLM、不重写候选展示。
                 result = database_manager.agent_runs.enqueue_match_run(
                     run_id=new_run_id,
                     business_key=business_key,
                     sync_record_id=None,
+                    reuse_window_days=MATCH_ASSIST_REUSE_WINDOW_DAYS,
+                    max_total_attempts=MATCH_ASSIST_MAX_TOTAL_ATTEMPTS,
                     accepted_mapping_valid=self._accepted_mapping_valid(item),
                 )
                 decision = result.get("decision", "")

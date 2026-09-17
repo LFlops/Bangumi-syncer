@@ -2,7 +2,8 @@
 
 承载通用 Agent 会话状态机与可重放 span 日志：
 - agent_runs：一次会话（pending -> processing -> succeeded / no_suggestion / failed ...）
-- agent_steps：每轮 LLM 调用 / 每次工具执行的 span（按 iteration, sequence 排序）
+- agent_steps：每轮 LLM 调用 / 每次工具执行的 span
+  （按 iteration, sequence, id 排序）
 - agent_run_sync_records：run ↔ sync_record 关联（多对一：N 条集级 record 关联 1 个剧集级 run）
 
 设计要点：
@@ -16,8 +17,11 @@
 关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - increment_attempts：调度轮次失败计数，>=3 单点置 failed（同事务携带 last_error）
-- enqueue_match_run：单事务内完成 created / in_flight / 复用 / exhausted 决策
- - cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps / 关联行）
+- mark_failed：状态守卫（仅 pending/processing 可转 failed，非活性态 rowcount=0）
+- refresh_started_at：ts 为空/非正值取当前时间（保证 started_at>0 可被恢复扫描拾取）
+- enqueue_match_run：单事务内完成 created / in_flight / 复用 / exhausted 决策；
+  内部异常向上抛出（仅并发唯一索引冲突兜底复用），决策策略参数必填
+- cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps / 关联行）
 """
 
 import json
@@ -138,9 +142,9 @@ class AgentRunsRepository(BaseRepository):
         business_key: str,
         *,
         sync_record_id: Optional[int] = None,
-        reuse_window_days: int = 30,
-        max_total_attempts: int = 10,
-        accepted_mapping_valid: bool = True,
+        reuse_window_days: int,
+        max_total_attempts: int,
+        accepted_mapping_valid: bool,
     ) -> dict:
         """按 business_key 决策入队（created / in_flight / 复用 / exhausted）。
 
@@ -159,7 +163,21 @@ class AgentRunsRepository(BaseRepository):
 
         复用/在途时 ``sync_record_id`` 非空会刷新该 run 的主指针；
         ``business_key`` 为空时保持去重禁用语义（每次直接新建）。
-        落库异常不抛出，记日志后返回（避免拖垮主匹配流程）。
+
+        **决策策略参数（配置类，禁止默认值兜底，由调用方显式传入）**：
+        ``reuse_window_days``（rejected 候选复用窗口天数）、
+        ``max_total_attempts``（同键累计失败上限）、
+        ``accepted_mapping_valid``（accepted 候选映射是否仍有效；漏传会被
+        误判为有效 → 无限期复用，故不设默认值）。
+
+        **复用语义（reuse_accepted / reuse_holding）**：仅刷新 run↔record 关联与
+        主指针，**不重跑 LLM、不重写历史候选展示**；候选由 ``business_key``
+        唯一行承载，rejected 候选不复活展示。这是预期行为（复用=跳过重复评估）。
+
+        落库异常**向上抛出**（``_run_write(reraise=True)``）：由调用方降级处理
+        （orchestrator 捕获后走 ``enqueue_failed``），禁止谎报 ``created`` 导致
+        任务静默丢失。唯一例外是并发唯一索引冲突（``sqlite3.IntegrityError``），
+        此时兜底复用已在途 run 返回 ``in_flight``。
         """
         if not business_key:
             self.create_pending(
@@ -245,6 +263,9 @@ class AgentRunsRepository(BaseRepository):
             _insert_pending(conn)
             result_holder.append({"decision": "created", "run_id": run_id})
 
+        # 内部异常不吞并：_run_write(reraise=True) 记录日志后向上抛出，
+        # 由调用方（orchestrator）走 enqueue_failed 降级，禁止谎报 created
+        # 导致任务静默丢失。唯一例外是并发唯一索引冲突的兜底复用。
         try:
             self._run_write(_write, error_msg="匹配任务入队决策失败", reraise=True)
         except sqlite3.IntegrityError:
@@ -255,9 +276,6 @@ class AgentRunsRepository(BaseRepository):
                 f"business_key={business_key}, run_id={active_run_id or run_id}"
             )
             return {"decision": "in_flight", "run_id": active_run_id or run_id}
-        except Exception as e:
-            logger.error(f"匹配任务入队决策异常（未落库，按 created 返回）: {e}")
-            return {"decision": "created", "run_id": run_id}
 
         if not result_holder:
             # 防御兜底：事务未产出决策（理论不可达），显式告警便于排查
@@ -406,10 +424,14 @@ class AgentRunsRepository(BaseRepository):
     ) -> bool:
         """标记失败（LLM 调用失败 attempts 达上限），记录终态时间。
 
+        **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 failed；
+        对 ``succeeded`` / ``no_suggestion`` / ``cancelled`` / 已 ``failed``
+        等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
+
         失败累计：转终态时 ``total_attempts += 1``（同键 failed 行的
-        ``SUM(total_attempts)`` 即累计失败次数）。已 failed 的 run 再次调用
-        不重复累计（保证「一个 run 只计 1 次失败」，避免 increment_attempts
-        达上限置终态后调用方再 mark_failed 造成双计）。
+        ``SUM(total_attempts)`` 即累计失败次数）。守卫保证同一 run 仅在
+        活性态首次调用时 +1（「一个 run 只计 1 次失败」），避免
+        increment_attempts 达上限置终态后调用方再 mark_failed 造成双计。
         """
 
         def _write(conn):
@@ -418,9 +440,8 @@ class AgentRunsRepository(BaseRepository):
                 UPDATE agent_runs
                 SET status='failed', stop_reason=?, last_error=?, total_tokens=?,
                     ended_at=?,
-                    total_attempts = total_attempts
-                        + CASE WHEN status='failed' THEN 0 ELSE 1 END
-                WHERE run_id=?
+                    total_attempts = total_attempts + 1
+                WHERE run_id=? AND status IN ('pending','processing')
                 """,
                 (stop_reason, last_error, total_tokens, _now(), run_id),
             )
@@ -470,16 +491,18 @@ class AgentRunsRepository(BaseRepository):
         """恢复扫描时刷新 started_at（仅 processing 态有效）。
 
         ``ts`` 由调用方注入统一时间戳（重入防护抢占时保持同一时钟基准）；
-        缺省（None）取当前时间。
+        ``ts`` 为 None 或 <=0 时取当前时间——``list_stale_processing`` 以
+        ``started_at > 0`` 为恢复扫描前提，写入非正值会使该 run 永不入选。
 
         防止下一轮重复恢复同一崩溃遗留 run；行数=0（非 processing）返回 False。
         """
 
         def _write(conn):
+            ts_value = _now() if ts is None or ts <= 0 else ts
             cursor = conn.execute(
                 "UPDATE agent_runs SET started_at=? "
                 "WHERE run_id=? AND status='processing'",
-                (_now() if ts is None else ts, run_id),
+                (ts_value, run_id),
             )
             return cursor.rowcount > 0
 
@@ -752,7 +775,10 @@ class AgentRunsRepository(BaseRepository):
         return self._run_write(_write, error_msg="更新 agent_step 失败", default=False)
 
     def get_steps(self, run_id: str) -> list:
-        """按 run_id 查询 span 列表，按 (iteration, sequence) 排序。
+        """按 run_id 查询 span 列表，按 (iteration, sequence, id) 排序。
+
+        末级 ``id`` 作为 tie-break：同一 (iteration, sequence) 内保持写入顺序，
+        与 trace.replay 的 ``(iteration, sequence, id)`` 排序契约一致。
 
         replay_delta 读取时统一解密（容错无前缀明文：原样返回）。
         """
@@ -760,7 +786,7 @@ class AgentRunsRepository(BaseRepository):
         def _read(conn):
             cursor = conn.execute(
                 "SELECT * FROM agent_steps WHERE run_id=? "
-                "ORDER BY iteration ASC, sequence ASC",
+                "ORDER BY iteration ASC, sequence ASC, id ASC",
                 (run_id,),
             )
             cols = [d[0] for d in cursor.description]
