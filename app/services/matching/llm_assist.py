@@ -355,6 +355,8 @@ class TraceRecorder:
         self._current_iteration: int = 0
         self._chat_span_id: str | None = None
         self._last_tool_span_id: str | None = None
+        # 全轮累计 token 用量（每轮 chat 响应 usage 累加，供终态落库使用）
+        self.total_tokens: int = 0
         # span_id → (tool_use, t0)，供 end_tool 检索后清除（幂等）
         self._tool_state: dict[str, tuple] = {}
 
@@ -392,6 +394,8 @@ class TraceRecorder:
                 latency_ms = int((recorder._clock() - t0) * 1000)
                 if resp is not None:
                     tokens = resp.usage.total_tokens if resp.usage is not None else 0
+                    # 全轮累计：终态落库取累计值而非仅末轮
+                    recorder.total_tokens += tokens
                     tool_calls = [
                         b.model_dump() if hasattr(b, "model_dump") else asdict(b)
                         for b in resp.blocks
@@ -825,7 +829,10 @@ async def run(
             # 确定性失败（401/403/400/refusal）→ 立即标记 failed，不浪费重试次数
             logger.error(f"[llm_assist] run {run_id} 确定性 LLM 失败: {e}")
             dbm.agent_runs.mark_failed(
-                run_id, stop_reason="llm_error", last_error=str(e)[:500]
+                run_id,
+                stop_reason="llm_error",
+                last_error=str(e)[:500],
+                total_tokens=span_recorder.total_tokens,
             )
             return "failed"
         # 可重试（429/5xx/超时）→ 累加 attempts；达上限时由仓储在**同一次调用事务内**
@@ -846,6 +853,7 @@ async def run(
         sync_record_id=sync_record_id,
         bgm=bgm,
         notification_service=notification_service,
+        total_tokens=span_recorder.total_tokens,
     )
 
 
@@ -952,6 +960,9 @@ async def continue_run(
                 sync_record_id=sync_record_id,
                 bgm=bgm,
                 notification_service=notification_service,
+                # 恢复路径无实时 recorder：已发生轮次的 tokens 未随 replay 携带，
+                # 与旧实现（last_response=None → 0）行为一致。
+                total_tokens=0,
             )
             return
 
@@ -1053,6 +1064,7 @@ async def _execute_continuation(
         sync_record_id=sync_record_id,
         bgm=bgm,
         notification_service=notification_service,
+        total_tokens=span_recorder.total_tokens,
     )
 
 
@@ -1150,8 +1162,13 @@ def _handle_result(
     sync_record_id: int | None,
     bgm: Any,
     notification_service: Any | None,
+    total_tokens: int,
 ) -> str:
-    """根据循环结果处理后处理（校验 / 落库 / 通知 / 兜底）。"""
+    """根据循环结果处理后处理（校验 / 落库 / 通知 / 兜底）。
+
+    ``total_tokens`` 由调用方传入**全轮累计值**（来自 ``TraceRecorder.total_tokens``），
+    不再从 ``result.last_response`` 取末轮值。恢复路径无实时 recorder 时显式传 0。
+    """
     stop = result.stop_reason
 
     if stop == "submit_suggestion":
@@ -1169,7 +1186,7 @@ def _handle_result(
                 subject_id=sid,
                 reason=reason,
                 stop_reason="submit_suggestion",
-                total_tokens=_total_tokens(result),
+                total_tokens=total_tokens,
                 notification_service=notification_service,
             )
             return "succeeded"
@@ -1195,7 +1212,7 @@ def _handle_result(
                     subject_id=suggestion.subject_id,
                     reason=suggestion.reason,
                     stop_reason="exhausted",
-                    total_tokens=_total_tokens(result),
+                    total_tokens=total_tokens,
                     notification_service=notification_service,
                 )
                 return "succeeded"
@@ -1208,19 +1225,16 @@ def _handle_result(
     if stop in ("llm_error", "max_tokens"):
         # LLM 调用失败 / 生成长度超限 → 显式标记 failed（不再伪装 no_suggestion）
         dbm.agent_runs.mark_failed(
-            run_id, stop_reason=stop, last_error=f"循环终止原因: {stop}"
+            run_id,
+            stop_reason=stop,
+            last_error=f"循环终止原因: {stop}",
+            total_tokens=total_tokens,
         )
         return "failed"
 
     # end_turn：直接终止，无建议
     dbm.agent_runs.mark_no_suggestion(run_id, stop_reason="end_turn")
     return "no_suggestion"
-
-
-def _total_tokens(result: RunResult) -> int:
-    if result.last_response is not None and result.last_response.usage is not None:
-        return result.last_response.usage.total_tokens
-    return 0
 
 
 def _persist_and_notify(

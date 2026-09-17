@@ -20,6 +20,7 @@ from app.services.llm.models import (
     Message,
     ToolResultBlock,
     ToolUseBlock,
+    Usage,
 )
 from app.services.llm.tools import (
     ToolDefinition,
@@ -1679,6 +1680,7 @@ async def test_handle_result_llm_error_marks_failed(monkeypatch):
         sync_record_id=510,
         bgm=None,
         notification_service=None,
+        total_tokens=0,
     )
 
     assert status == "failed"
@@ -1705,6 +1707,7 @@ async def test_handle_result_max_tokens_marks_failed(monkeypatch):
         sync_record_id=511,
         bgm=None,
         notification_service=None,
+        total_tokens=0,
     )
 
     assert status == "failed"
@@ -1731,6 +1734,7 @@ async def test_handle_result_end_turn_still_no_suggestion(monkeypatch):
         sync_record_id=512,
         bgm=None,
         notification_service=None,
+        total_tokens=0,
     )
 
     assert status == "no_suggestion"
@@ -2863,3 +2867,121 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
     )
     # 终态写入收敛到 increment_attempts 单点事务，外层不得二次 mark_failed
     repo.mark_failed.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# T8b：total_tokens 全轮累计（非仅末轮）
+# ---------------------------------------------------------------------------
+
+
+def _search_response_with_usage(tokens: int) -> ChatResponse:
+    """带 usage 的搜索响应（tool_use），供多轮累计测试用。"""
+    return ChatResponse(
+        content="",
+        stop_reason="tool_use",
+        blocks=[
+            ToolUseBlock(id="t1", name="search_bangumi", input={"title": "花开伊吕波"})
+        ],
+        usage=Usage(total_tokens=tokens),
+    )
+
+
+def _submit_response_with_usage(tokens: int, subject_id="123", reason="跨季匹配"):
+    """带 usage 的 submit_suggestion 响应。"""
+    return ChatResponse(
+        content="",
+        stop_reason="tool_use",
+        blocks=[
+            ToolUseBlock(
+                id="s1",
+                name="submit_suggestion",
+                input={"subject_id": subject_id, "reason": reason},
+            )
+        ],
+        usage=Usage(total_tokens=tokens),
+    )
+
+
+def test_trace_recorder_accumulates_total_tokens_across_rounds():
+    """S2：wrap_chat_fn 逐轮累计 usage.total_tokens。"""
+    import asyncio
+    from unittest.mock import patch
+
+    recorder = llm_assist.TraceRecorder("run-tok-rec", start_iteration=0)
+    responses = [
+        ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
+        ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
+    ]
+    chat = _chat_side_effect(responses)
+    wrapped = recorder.wrap_chat_fn(chat)
+
+    with (
+        patch.object(llm_assist, "trace_start_span", return_value="span-x"),
+        patch.object(llm_assist, "trace_end_span"),
+    ):
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+    assert recorder.total_tokens == 200, (
+        f"应累计 2 轮 tokens=200，实际 {recorder.total_tokens}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
+    """S2：2 轮 chat 各 100 tokens → 终态 agent_runs.total_tokens == 200。"""
+    run_id = "run-tokens-accum"
+    sr_id = 520
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect(
+        [
+            _search_response_with_usage(100),
+            _submit_response_with_usage(100),
+        ]
+    )
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        notification_service=None,
+    )
+
+    assert status == "succeeded"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["total_tokens"] == 200, (
+        f"应累计全部轮次 tokens=200，实际 {run_row['total_tokens']}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_total_tokens_zero_when_no_usage():
+    """S2：响应无 usage 时累计为 0（不报错、不误记）。"""
+    run_id = "run-tokens-zero"
+    sr_id = 521
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    with patch.object(llm_assist, "_validate_subject_id", return_value=(True, "")):
+        chat = _chat_side_effect(
+            [_search_response(), _submit_response("123", "跨季匹配")]
+        )
+        status = await llm_assist.run(
+            run_id,
+            sync_record=sr,
+            bgm=_make_bgm(),
+            thinking_level="medium",
+            chat_fn=chat,
+            notification_service=None,
+        )
+
+    assert status == "succeeded"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["total_tokens"] == 0, (
+        f"无 usage 应记 0，实际 {run_row['total_tokens']}"
+    )

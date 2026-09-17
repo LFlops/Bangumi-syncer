@@ -27,12 +27,17 @@ import asyncio
 import time
 from typing import Any
 
+from pydantic import ValidationError
+
+from app.core.accounts import get_active_bangumi_config
 from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
+from app.models.agent import AgentRunRecord
 from app.services.base.scheduler import BaseScheduler
 from app.services.matching import llm_assist as llm_assist_module
 from app.services.notification_service import get_notification_service
+from app.utils.bangumi_api import BangumiApi
 
 # ---------------------------------------------------------------------------
 # 进程级 active run 防护
@@ -85,6 +90,23 @@ def _cfg_int(value: Any, fallback: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _parse_run_rows(raw_rows: list, *, source: str) -> list[AgentRunRecord]:
+    """把 repo 返回的 dict 行转换为 ``AgentRunRecord``。
+
+    单行构造失败（缺必填列 / 类型不符）时记 error 并跳过该行，不中断整轮调度；
+    返回可安全进行属性访问的模型列表。
+    """
+    records: list[AgentRunRecord] = []
+    for raw in raw_rows:
+        try:
+            records.append(AgentRunRecord.model_validate(raw))
+        except ValidationError as e:
+            logger.error(
+                f"🤖 {source} 行解析为 AgentRunRecord 失败，已跳过: {raw!r}: {e}"
+            )
+    return records
 
 
 class LlmMatchScheduler(BaseScheduler):
@@ -156,18 +178,23 @@ class LlmMatchScheduler(BaseScheduler):
             120,
         )
         try:
-            stale = repo.list_stale_processing(timeout_seconds=recovery_timeout)
+            stale_raw = repo.list_stale_processing(timeout_seconds=recovery_timeout)
         except Exception as e:
             logger.error(f"🤖 恢复扫描失败: {e}")
-            stale = []
-        stale = [run for run in stale if run.get("run_id") not in _active_run_ids]
+            stale_raw = []
+        stale = [
+            run
+            for run in _parse_run_rows(stale_raw, source="恢复扫描")
+            if run.run_id not in _active_run_ids
+        ]
 
         # 3. 正常处理（limit 防堆积；切片双保险，避免上层 mock 返回超量）
         try:
-            pending = repo.list_pending(limit=self.BATCH_SIZE)[: self.BATCH_SIZE]
+            pending_raw = repo.list_pending(limit=self.BATCH_SIZE)[: self.BATCH_SIZE]
         except Exception as e:
             logger.error(f"🤖 列出 pending agent_run 失败: {e}")
-            pending = []
+            pending_raw = []
+        pending = _parse_run_rows(pending_raw, source="pending")
 
         # 4. 并发消费：recover 先入列，与 pending 共享并发限额（信号量结构化并发）
         limit = max(
@@ -179,7 +206,7 @@ class LlmMatchScheduler(BaseScheduler):
         sem = asyncio.Semaphore(limit)
         failures = 0
 
-        async def _consume(fn, run: dict) -> None:
+        async def _consume(fn, run: AgentRunRecord) -> None:
             """单条消费包装：受共享信号量约束，异常隔离不影响同批其他 run。"""
             nonlocal failures
             async with sem:
@@ -187,7 +214,7 @@ class LlmMatchScheduler(BaseScheduler):
                     await fn(run)
                 except Exception as e:
                     failures += 1
-                    logger.error(f"🤖 处理 run {run.get('run_id')} 异常: {e}")
+                    logger.error(f"🤖 处理 run {run.run_id} 异常: {e}")
 
         tasks = [(self._recover_run, run) for run in stale]
         tasks += [(self._process_run, run) for run in pending]
@@ -199,7 +226,7 @@ class LlmMatchScheduler(BaseScheduler):
     # 恢复扫描
     # ------------------------------------------------------------------
 
-    async def _recover_run(self, run: dict) -> None:
+    async def _recover_run(self, run: AgentRunRecord) -> None:
         """恢复单条崩溃遗留的 processing run。
 
         0. sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮，不占用执行权
@@ -211,11 +238,11 @@ class LlmMatchScheduler(BaseScheduler):
 
         本方法只负责调度与兜底日志，不触碰场景层私有符号。
         """
-        run_id = run["run_id"]
+        run_id = run.run_id
         # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
         # （不 mark_failed，等回填后下一轮再处理），且必须在 acquire 之前判断，
         # 避免占用（并随后释放）执行权造成同轮 pending 被误跳过。
-        if not run.get("sync_record_id"):
+        if not run.sync_record_id:
             logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
             return
         if not _try_acquire_run(run_id):
@@ -228,7 +255,7 @@ class LlmMatchScheduler(BaseScheduler):
             ts = int(time.time())
             repo.refresh_started_at(run_id, ts)
 
-            sync_record = self._get_sync_record(run.get("sync_record_id"))
+            sync_record = self._get_sync_record(run.sync_record_id)
             if sync_record is None:
                 logger.warning(f"🤖 恢复 run {run_id} 关联 sync_record 缺失，标记失败")
                 repo.mark_failed(
@@ -257,16 +284,16 @@ class LlmMatchScheduler(BaseScheduler):
     # 正常处理
     # ------------------------------------------------------------------
 
-    async def _process_run(self, run: dict) -> None:
+    async def _process_run(self, run: AgentRunRecord) -> None:
         """处理单条 pending run：查 sync_record → llm_assist.run → 异常重试。
 
         入口取得本进程执行权，防止恢复扫描误捞正在处理的 run（T7 并发化后尤为关键）；
         未取得执行权（本进程已有协程在处理）直接跳过，且不释放他人持有的执行权。
         """
-        run_id = run["run_id"]
+        run_id = run.run_id
         # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
         # （不 mark_failed，等回填后下一轮再处理），避免无意义地占用执行权。
-        if not run.get("sync_record_id"):
+        if not run.sync_record_id:
             logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
             return
         if not _try_acquire_run(run_id):
@@ -275,7 +302,7 @@ class LlmMatchScheduler(BaseScheduler):
         try:
             repo = get_database_manager().agent_runs
 
-            sync_record = self._get_sync_record(run.get("sync_record_id"))
+            sync_record = self._get_sync_record(run.sync_record_id)
             if sync_record is None:
                 logger.warning(f"🤖 run {run_id} 关联 sync_record 缺失，标记失败")
                 repo.mark_failed(
@@ -321,9 +348,6 @@ class LlmMatchScheduler(BaseScheduler):
     def _build_bgm(self, sync_record: dict):
         """从用户配置构造 BangumiApi 实例（失败返回 None，交由场景层降级）。"""
         try:
-            from app.core.accounts import get_active_bangumi_config
-            from app.utils.bangumi_api import BangumiApi
-
             user_name = sync_record.get("user_name")
             cfg = get_active_bangumi_config(user_name)
             if not cfg or not cfg.get("username") or not cfg.get("access_token"):

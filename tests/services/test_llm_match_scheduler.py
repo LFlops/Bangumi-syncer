@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 import app.services.llm_match_scheduler as sched_module
+from app.models.agent import AgentRunRecord
 from app.services.llm_match_scheduler import LlmMatchScheduler
 
 # ---------------------------------------------------------------------------
@@ -24,6 +25,13 @@ def _clean_active_runs():
     sched_module._clear_active_runs()
     yield
     sched_module._clear_active_runs()
+
+
+def _run_model(**overrides) -> AgentRunRecord:
+    """构造合法的 AgentRunRecord（仅覆盖指定字段）。"""
+    data = {"run_id": "r", "task_type": "match", "sync_record_id": 1}
+    data.update(overrides)
+    return AgentRunRecord.model_validate(data)
 
 
 def _make_config(enabled: bool = True, api_key: str = "k", cron: str = "*/2 * * * *"):
@@ -176,7 +184,9 @@ def test_recovery_missing_sync_record_marks_failed():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.list_stale_processing.return_value = [{"run_id": "r1", "sync_record_id": 42}]
+    repo.list_stale_processing.return_value = [
+        {"run_id": "r1", "task_type": "match", "sync_record_id": 42}
+    ]
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
         patch(
@@ -207,7 +217,9 @@ def test_recovery_present_sync_record_continues():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.list_stale_processing.return_value = [{"run_id": "r1", "sync_record_id": 42}]
+    repo.list_stale_processing.return_value = [
+        {"run_id": "r1", "task_type": "match", "sync_record_id": 42}
+    ]
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
         patch(
@@ -256,7 +268,7 @@ def test_recover_run_calls_continue_run_single_entry():
             new=cont,
         ),
     ):
-        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": 42}))
+        asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=42)))
 
     cont.assert_awaited_once_with(
         "A",
@@ -298,9 +310,9 @@ def test_process_pending_calls_llm_assist_run_per_item():
     cm = _make_config()
     repo = _make_repo()
     runs = [
-        {"run_id": "a", "sync_record_id": 1},
-        {"run_id": "b", "sync_record_id": 2},
-        {"run_id": "c", "sync_record_id": 3},
+        {"run_id": "a", "task_type": "match", "sync_record_id": 1},
+        {"run_id": "b", "task_type": "match", "sync_record_id": 2},
+        {"run_id": "c", "task_type": "match", "sync_record_id": 3},
     ]
     repo.list_pending.return_value = runs
     run_mock = AsyncMock(return_value="succeeded")
@@ -328,7 +340,8 @@ def test_process_pending_respects_batch_limit_five():
     # 即便 repo 返回 7 条，调度器也只处理 5 条
     # （sync_record_id 用正数：0/空 现表示"尚未回填"，会按 T7 规则跳过）
     repo.list_pending.return_value = [
-        {"run_id": f"r{i}", "sync_record_id": i + 1} for i in range(7)
+        {"run_id": f"r{i}", "task_type": "match", "sync_record_id": i + 1}
+        for i in range(7)
     ]
     run_mock = AsyncMock(return_value="succeeded")
     with (
@@ -353,7 +366,9 @@ def test_run_exception_increments_attempts():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.list_pending.return_value = [{"run_id": "a", "sync_record_id": 1}]
+    repo.list_pending.return_value = [
+        {"run_id": "a", "task_type": "match", "sync_record_id": 1}
+    ]
     run_mock = AsyncMock(side_effect=Exception("boom"))
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -377,7 +392,9 @@ def test_run_exception_attempts_reach_three_single_point_no_double_mark_failed()
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.list_pending.return_value = [{"run_id": "a", "sync_record_id": 1}]
+    repo.list_pending.return_value = [
+        {"run_id": "a", "task_type": "match", "sync_record_id": 1}
+    ]
     repo.increment_attempts.return_value = 3
     run_mock = AsyncMock(side_effect=Exception("boom"))
     with (
@@ -404,8 +421,8 @@ def test_exception_in_one_run_does_not_stop_others():
     cm = _make_config()
     repo = _make_repo()
     runs = [
-        {"run_id": "a", "sync_record_id": 1},
-        {"run_id": "b", "sync_record_id": 2},
+        {"run_id": "a", "task_type": "match", "sync_record_id": 1},
+        {"run_id": "b", "task_type": "match", "sync_record_id": 2},
     ]
     repo.list_pending.return_value = runs
     # 第一条抛错，第二条成功；两条都应被处理
@@ -437,7 +454,7 @@ def test_exception_in_one_run_does_not_stop_others():
 def test_process_run_passes_thinking_level_from_config():
     sched = LlmMatchScheduler()
     repo = _make_repo()
-    run = {"run_id": "a", "sync_record_id": 1}
+    run = _run_model(run_id="a", sync_record_id=1)
 
     cm = MagicMock()
     cm.get_sync_llm_match_config.return_value = {
@@ -466,7 +483,7 @@ def test_process_run_passes_notification_service_to_llm_assist_run():
     """生产路径：_process_run 调 llm_assist.run 时必须传入非 None 的 notification_service。"""
     sched = LlmMatchScheduler()
     repo = _make_repo()
-    run = {"run_id": "a", "sync_record_id": 1}
+    run = _run_model(run_id="a", sync_record_id=1)
 
     cm = MagicMock()
     cm.get_sync_llm_match_config.return_value = {
@@ -506,7 +523,9 @@ def test_recovery_scan_skips_active_run():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    repo.list_stale_processing.return_value = [{"run_id": "A", "sync_record_id": 42}]
+    repo.list_stale_processing.return_value = [
+        {"run_id": "A", "task_type": "match", "sync_record_id": 42}
+    ]
     sched_module._active_run_ids.add("A")
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -541,7 +560,7 @@ def test_recover_run_passes_caller_timestamp_to_refresh():
             new=AsyncMock(),
         ),
     ):
-        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": 42}))
+        asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=42)))
 
     repo.refresh_started_at.assert_called_once_with("A", 1700000000)
 
@@ -564,9 +583,10 @@ def test_concurrent_recover_same_run_only_one_acquires():
         # Event 必须在运行中的 loop 内创建（Python 3.9 会绑定创建时的 loop）
         events["started"] = asyncio.Event()
         events["release"] = asyncio.Event()
+        run = _run_model(run_id="A", sync_record_id=42)
         tasks = asyncio.gather(
-            sched._recover_run({"run_id": "A", "sync_record_id": 42}),
-            sched._recover_run({"run_id": "A", "sync_record_id": 42}),
+            sched._recover_run(run),
+            sched._recover_run(run),
         )
         await events["started"].wait()
         events["release"].set()
@@ -615,7 +635,7 @@ def test_recover_run_releases_after_unexpected_exception():
         ),
     ):
         # 未预期异常被兜底消化，不向调用方抛出
-        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": 42}))
+        asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=42)))
 
     errors = [str(c.args[0]) for c in log.error.call_args_list]
     assert any("boom" in m for m in errors), f"兜底应记 error，实际 {errors}"
@@ -642,7 +662,7 @@ def test_process_run_skips_active_run():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
     ):
-        asyncio.run(sched._process_run({"run_id": "A", "sync_record_id": 42}))
+        asyncio.run(sched._process_run(_run_model(run_id="A", sync_record_id=42)))
 
     run_mock.assert_not_awaited()
     assert "A" in sched_module._active_run_ids, "跳过时不应误删他人持有的执行权"
@@ -671,9 +691,12 @@ def test_stale_and_pending_share_concurrency_limit():
     cm = _make_config()
     _patch_concurrency(cm, "2")
     repo = _make_repo()
-    repo.list_stale_processing.return_value = [{"run_id": "s1", "sync_record_id": 10}]
+    repo.list_stale_processing.return_value = [
+        {"run_id": "s1", "task_type": "match", "sync_record_id": 10}
+    ]
     repo.list_pending.return_value = [
-        {"run_id": f"p{i}", "sync_record_id": i + 1} for i in range(3)
+        {"run_id": f"p{i}", "task_type": "match", "sync_record_id": i + 1}
+        for i in range(3)
     ]
     state = {"current": 0, "peak": 0}
     processed: list[str] = []
@@ -683,7 +706,7 @@ def test_stale_and_pending_share_concurrency_limit():
         state["peak"] = max(state["peak"], state["current"])
         await asyncio.sleep(0)
         state["current"] -= 1
-        processed.append(run["run_id"])
+        processed.append(run.run_id)
 
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -708,9 +731,11 @@ def test_recover_and_pending_consume_concurrently():
     cm = _make_config()
     repo = _make_repo()
     repo.list_stale_processing.return_value = [
-        {"run_id": "stale1", "sync_record_id": 1}
+        {"run_id": "stale1", "task_type": "match", "sync_record_id": 1}
     ]
-    repo.list_pending.return_value = [{"run_id": "p1", "sync_record_id": 2}]
+    repo.list_pending.return_value = [
+        {"run_id": "p1", "task_type": "match", "sync_record_id": 2}
+    ]
 
     observed = {"recover_saw_pending_start": False}
 
@@ -754,15 +779,15 @@ def test_consume_exception_isolated_and_logged_error():
     cm = _make_config()
     repo = _make_repo()
     repo.list_pending.return_value = [
-        {"run_id": "a", "sync_record_id": 1},
-        {"run_id": "b", "sync_record_id": 2},
+        {"run_id": "a", "task_type": "match", "sync_record_id": 1},
+        {"run_id": "b", "task_type": "match", "sync_record_id": 2},
     ]
     finished: list[str] = []
 
     async def _fn(run):
-        if run["run_id"] == "a":
+        if run.run_id == "a":
             raise RuntimeError("boom")
-        finished.append(run["run_id"])
+        finished.append(run.run_id)
 
     log = MagicMock()
     with (
@@ -797,7 +822,8 @@ def _measure_peak_concurrency(concurrency_value, n_pending: int = 3) -> int:
     _patch_concurrency(cm, concurrency_value)
     repo = _make_repo()
     repo.list_pending.return_value = [
-        {"run_id": f"p{i}", "sync_record_id": i + 1} for i in range(n_pending)
+        {"run_id": f"p{i}", "task_type": "match", "sync_record_id": i + 1}
+        for i in range(n_pending)
     ]
     state = {"current": 0, "peak": 0}
 
@@ -903,7 +929,7 @@ def test_list_pending_failure_logged_at_error_level():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("empty_id", [None, 0, ""])
+@pytest.mark.parametrize("empty_id", [None, 0])
 def test_process_run_skips_run_without_sync_record_id(empty_id):
     """_process_run：sync_record_id 空 → 跳过，不 acquire、不 mark_failed、不调 run。"""
     sched = LlmMatchScheduler()
@@ -922,7 +948,7 @@ def test_process_run_skips_run_without_sync_record_id(empty_id):
         patch("app.services.llm_match_scheduler._try_acquire_run", acquire_spy),
         patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
     ):
-        asyncio.run(sched._process_run({"run_id": "a", "sync_record_id": empty_id}))
+        asyncio.run(sched._process_run(_run_model(run_id="a", sync_record_id=empty_id)))
 
     acquire_spy.assert_not_called()
     run_mock.assert_not_awaited()
@@ -933,7 +959,7 @@ def test_process_run_skips_run_without_sync_record_id(empty_id):
     )
 
 
-@pytest.mark.parametrize("empty_id", [None, 0, ""])
+@pytest.mark.parametrize("empty_id", [None, 0])
 def test_recover_run_skips_run_without_sync_record_id(empty_id):
     """_recover_run：sync_record_id 空 → 在 acquire 前跳过，不刷新、不 mark_failed。"""
     sched = LlmMatchScheduler()
@@ -955,7 +981,7 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1}),
     ):
-        asyncio.run(sched._recover_run({"run_id": "A", "sync_record_id": empty_id}))
+        asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=empty_id)))
 
     acquire_spy.assert_not_called()
     repo.refresh_started_at.assert_not_called()
@@ -965,3 +991,116 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
     assert any("sync_record_id" in m for m in debugs), (
         f"跳过时应记 debug 说明原因，实际 {debugs}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T8b：run 参数 BaseModel 化 + 行解析防御 + import 规范化
+# ---------------------------------------------------------------------------
+
+
+def test_agent_run_record_aligns_schema_allows_extra_and_null_sync_record():
+    """S1：AgentRunRecord 对齐 agent_runs 列，允许未来新增列，sync_record_id 可空。"""
+    rec = AgentRunRecord.model_validate(
+        {
+            "id": 1,
+            "run_id": "r1",
+            "task_type": "match",
+            "sync_record_id": None,
+            "business_key": "k",
+            "status": "pending",
+            "stop_reason": "",
+            "attempts": 0,
+            "total_attempts": 0,
+            "last_attempt_at": 0,
+            "last_error": None,
+            "total_tokens": 0,
+            "started_at": 0,
+            "ended_at": 0,
+            "created_at": 0,
+            "future_column": "x",  # 未来新增列不应导致校验失败
+        }
+    )
+    assert rec.run_id == "r1"
+    assert rec.task_type == "match"
+    assert rec.sync_record_id is None
+    assert rec.future_column == "x", "extra='allow' 应保留未来新增列"
+
+
+def test_run_sync_job_converts_rows_to_agent_run_record():
+    """S1：repo 返回的 dict 行被转换为 AgentRunRecord 后交给处理函数。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_stale_processing.return_value = [
+        {"run_id": "s1", "task_type": "match", "sync_record_id": 10}
+    ]
+    repo.list_pending.return_value = [
+        {"run_id": "p1", "task_type": "match", "sync_record_id": 11}
+    ]
+    seen: list = []
+
+    async def _capture(run):
+        seen.append(run)
+
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_recover_run", side_effect=_capture),
+        patch.object(sched, "_process_run", side_effect=_capture),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert len(seen) == 2
+    assert all(isinstance(r, AgentRunRecord) for r in seen), seen
+    assert {r.run_id for r in seen} == {"s1", "p1"}
+
+
+def test_run_sync_job_skips_unparseable_row_and_logs_error():
+    """S1：非法行构造失败 → error 日志 + 跳过，不影响同批其他 run。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    # 第二行缺 run_id/task_type → 校验失败
+    repo.list_pending.return_value = [
+        {"run_id": "good", "task_type": "match", "sync_record_id": 1},
+        {"sync_record_id": 2},
+    ]
+    processed: list[str] = []
+
+    async def _capture(run):
+        processed.append(run.run_id)
+
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_process_run", side_effect=_capture),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert processed == ["good"], "非法行应被跳过，合法行仍处理"
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("解析" in m for m in errors), f"非法行应记 error，实际 {errors}"
+
+
+def test_scheduler_module_has_no_function_level_imports():
+    """S3：调度器模块的 import 统一在头部，函数体内不得残留 import。"""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(sched_module))
+    offenders = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                offenders.append(f"{fn.name}: {ast.unparse(node)}")
+    assert offenders == [], f"函数内不应残留 import，实际：{offenders}"

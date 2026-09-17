@@ -11,9 +11,9 @@ from app.services.matching import llm_assist
 
 
 def test_requeue_failed_removed_from_agent_runs_repository():
-    """requeue_failed 已删除（enqueue_run_dedup 已覆盖其语义）。"""
+    """requeue_failed 已删除（enqueue_match_run 已覆盖其语义）。"""
     assert not hasattr(AgentRunsRepository, "requeue_failed"), (
-        "AgentRunsRepository.requeue_failed 应已删除（由 enqueue_run_dedup 的 requeued 决策替代）"
+        "AgentRunsRepository.requeue_failed 应已删除（由 enqueue_match_run 的 requeued 决策替代）"
     )
 
 
@@ -35,7 +35,7 @@ def test_ensure_llm_columns_removed_from_llm_assist():
 
 
 def test_llm_match_cross_call_cache_removed_from_config():
-    """llm_match_cross_call_cache 已删除（enqueue_run_dedup 的 reused 决策无条件实现）。"""
+    """llm_match_cross_call_cache 已删除（enqueue_match_run 的 reused 决策无条件实现）。"""
     import inspect
 
     source = inspect.getsource(ConfigManager.get_sync_llm_match_config)
