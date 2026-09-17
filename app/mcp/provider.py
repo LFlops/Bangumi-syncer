@@ -43,6 +43,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
+from app.core.public_url import redirect_public
 from app.core.security import security_manager
 
 logger = logging.getLogger(__name__)
@@ -789,6 +790,17 @@ class BangumiOAuthProvider(OAuthProvider):
         """
 
 
+def _consent_login_redirect(request_token: str) -> RedirectResponse:
+    """未登录访问 /consent 时重定向到登录页，登录成功后回跳 consent。
+
+    ``next`` 为**不含 base_path** 的站内路径（与 ``app.api.pages._login_redirect``
+    语义一致），且整体 urlencode，前端 ``static/js/auth.js`` 读取后会校验其为
+    站内路径再回跳（开放重定向护栏）。
+    """
+    consent_path = f"/consent?{urlencode({'request_token': request_token})}"
+    return redirect_public(f"/login?{urlencode({'next': consent_path})}")
+
+
 async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Response:
     """处理 consent 页面的 GET/POST，可作为 custom_route 处理器使用。"""
     # 从 query（GET）或 form（POST）获取 request_token
@@ -818,15 +830,9 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
             if session_token:
                 session = security_manager.validate_session(session_token)
                 if not session:
-                    return HTMLResponse(
-                        "<h1>Error: session invalid or expired. Please log in.</h1>",
-                        status_code=401,
-                    )
+                    return _consent_login_redirect(str(request_token))
             else:
-                return HTMLResponse(
-                    "<h1>Error: no session token. Please log in.</h1>",
-                    status_code=401,
-                )
+                return _consent_login_redirect(str(request_token))
 
         context = await provider.get_consent_context(
             request_token, session_token=session_token
@@ -867,16 +873,10 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
             if session_token:
                 session = security_manager.validate_session(session_token)
                 if not session:
-                    return HTMLResponse(
-                        "<h1>Error: BS session expired or invalid</h1>",
-                        status_code=401,
-                    )
+                    return _consent_login_redirect(rt)
                 username = session.get("username", provider.auth_username)
             else:
-                return HTMLResponse(
-                    "<h1>Error: no session token</h1>",
-                    status_code=401,
-                )
+                return _consent_login_redirect(rt)
         auth_code = await provider.handle_consent_allow(
             rt, username=username, csrf_token=submitted_csrf
         )

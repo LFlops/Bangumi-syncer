@@ -26,6 +26,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from pydantic import AnyHttpUrl
 from starlette.testclient import TestClient
 
+from app.core.public_url import get_public_base_path
+
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
@@ -1348,6 +1350,61 @@ class TestOAuthFullFlow:
         assert token_response.status_code == 200
         return client_id, token_response.json()
 
+    def _start_consent_flow(self, client):
+        """走 DCR + authorize，返回 (client_id, consent_url, request_token)。"""
+        reg_response = client.post(
+            "/register",
+            json={
+                "redirect_uris": ["http://localhost/callback"],
+                "grant_types": ["authorization_code"],
+                "token_endpoint_auth_method": "none",
+                "scope": "read write",
+            },
+        )
+        assert reg_response.status_code == 201
+        client_id = reg_response.json()["client_id"]
+
+        code_verifier = secrets.token_urlsafe(32)
+        code_challenge = _make_code_challenge_b64(code_verifier)
+        auth_response = client.get(
+            "/authorize",
+            params={
+                "client_id": client_id,
+                "redirect_uri": "http://localhost/callback",
+                "response_type": "code",
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "scope": "read write",
+            },
+            follow_redirects=False,
+        )
+        assert auth_response.status_code == 302
+        consent_url = auth_response.headers["location"]
+        request_token = parse_qs(urlparse(consent_url).query)["request_token"][0]
+        return client_id, consent_url, request_token
+
+    def _assert_login_redirect_points_to_consent(self, response, request_token):
+        """断言 302 登录页重定向，且 next 精确指向本站 consent 路径。"""
+        assert response.status_code == 302, (
+            f"无有效 session 时应 302 到登录页，实际: {response.status_code}, "
+            f"body: {response.text[:200]}"
+        )
+        parsed = urlparse(response.headers["location"])
+        assert parsed.path == "/login", f"应跳转 /login，实际: {parsed.path}"
+        next_value = parse_qs(parsed.query)["next"][0]
+        # next 为不含 base_path 的站内路径（JS 端 appUrl() 负责补 base）
+        assert next_value == f"/consent?request_token={request_token}", (
+            f"next 应精确回跳 consent，实际: {next_value!r}"
+        )
+        base = get_public_base_path()
+        if base:
+            assert not next_value.startswith(base), (
+                f"next 不应包含 base_path 前缀 {base!r}，实际: {next_value!r}"
+            )
+        # 开放重定向护栏：站内相对路径，既非绝对 URL 也非协议相对 URL
+        assert next_value.startswith("/")
+        assert not next_value.startswith("//")
+
     def test_metadata_endpoint_returns_authorization_server_metadata(
         self, server_app_auth_disabled
     ):
@@ -1943,10 +2000,10 @@ class TestOAuthFullFlow:
             assert decoded["scope"] == "read write"
 
     @pytest.mark.asyncio
-    async def test_auth_enabled_no_session_redirects_to_login(
+    async def test_consent_get_no_session_redirects_to_login(
         self, server_app_auth_enabled, monkeypatch
     ):
-        """当 auth.enabled=True 且无 session 时，consent GET 应表明需要登录。"""
+        """auth.enabled=True 且无 session cookie 时，consent GET 应 302 登录页。"""
         from app.mcp import provider as provider_module
 
         # mock security_manager.validate_session 使其返回 None（无 session）
@@ -1959,37 +2016,179 @@ class TestOAuthFullFlow:
         with TestClient(
             server_app_auth_enabled, raise_server_exceptions=False
         ) as client:
-            # DCR
-            reg_response = client.post(
-                "/register",
-                json={
-                    "redirect_uris": ["http://localhost/callback"],
-                    "grant_types": ["authorization_code"],
-                    "token_endpoint_auth_method": "none",
-                },
-            )
-            client_id = reg_response.json()["client_id"]
+            _, consent_url, request_token = self._start_consent_flow(client)
 
-            # authorize
-            code_verifier = secrets.token_urlsafe(32)
-            code_challenge = _make_code_challenge_b64(code_verifier)
-            auth_response = client.get(
-                "/authorize",
-                params={
-                    "client_id": client_id,
-                    "redirect_uri": "http://localhost/callback",
-                    "response_type": "code",
-                    "code_challenge": code_challenge,
-                    "code_challenge_method": "S256",
+            # 无 cookie → 应 302 到登录页并回跳 consent，而不是 401 纯文本
+            consent_get = client.get(consent_url, follow_redirects=False)
+            self._assert_login_redirect_points_to_consent(consent_get, request_token)
+
+    @pytest.mark.asyncio
+    async def test_consent_get_expired_session_redirects_to_login(
+        self, server_app_auth_enabled, monkeypatch
+    ):
+        """auth.enabled=True 且 session 失效/过期时，consent GET 应 302 登录页。"""
+        from app.mcp import provider as provider_module
+
+        monkeypatch.setattr(
+            provider_module.security_manager,
+            "validate_session",
+            lambda token: None,
+        )
+
+        with TestClient(
+            server_app_auth_enabled, raise_server_exceptions=False
+        ) as client:
+            _, consent_url, request_token = self._start_consent_flow(client)
+
+            consent_get = client.get(
+                consent_url,
+                cookies={"session_token": "expired-token"},
+                follow_redirects=False,
+            )
+            self._assert_login_redirect_points_to_consent(consent_get, request_token)
+
+    @pytest.mark.asyncio
+    async def test_consent_post_allow_no_session_redirects_without_issuing_code(
+        self, server_app_auth_enabled, monkeypatch
+    ):
+        """无 session 的 POST allow 应 302 登录页，且不签发 code、不删除 pending。"""
+        from app.mcp import provider as provider_module
+
+        mock_session = {"username": "testuser", "created_at": time.time()}
+        monkeypatch.setattr(
+            provider_module.security_manager,
+            "validate_session",
+            lambda token: mock_session,
+        )
+
+        with TestClient(
+            server_app_auth_enabled, raise_server_exceptions=False
+        ) as client:
+            _, consent_url, request_token = self._start_consent_flow(client)
+
+            # 先用有效 session 取到合法的 CSRF token（CSRF 校验先于 session 校验）
+            consent_get = client.get(
+                consent_url, cookies={"session_token": "valid-session-token"}
+            )
+            assert consent_get.status_code == 200
+            csrf_token = _extract_csrf_token(consent_get.text)
+
+            provider = server_app_auth_enabled.state.provider
+            assert request_token in provider._pending_auths
+
+            # 不带 session cookie 提交 allow
+            consent_post = client.post(
+                "/consent",
+                data={
+                    "action": "allow",
+                    "request_token": request_token,
+                    "csrf_token": csrf_token,
                 },
                 follow_redirects=False,
             )
-            consent_url = auth_response.headers["location"]
+            self._assert_login_redirect_points_to_consent(consent_post, request_token)
 
-            # consent GET：应表明需要登录（而不是返回 200 表单）
-            consent_get = client.get(consent_url)
-            # 要么重定向到登录，要么显示错误，而不是 consent 表单
-            assert consent_get.status_code in (302, 401)
+            # 不得签发 authorization code，也不得删除 pending auth
+            assert provider._auth_codes == {}
+            assert request_token in provider._pending_auths
+
+    @pytest.mark.asyncio
+    async def test_consent_login_redirect_back_with_session_renders_form(
+        self, server_app_auth_enabled, monkeypatch
+    ):
+        """302 登录后携带有效 session 回跳 consent，应 200 并渲染 allow/deny。"""
+        from app.mcp import provider as provider_module
+
+        mock_session = {"username": "testuser", "created_at": time.time()}
+        monkeypatch.setattr(
+            provider_module.security_manager,
+            "validate_session",
+            lambda token: mock_session,
+        )
+
+        with TestClient(
+            server_app_auth_enabled, raise_server_exceptions=False
+        ) as client:
+            _, consent_url, request_token = self._start_consent_flow(client)
+
+            consent_get = client.get(consent_url, follow_redirects=False)
+            self._assert_login_redirect_points_to_consent(consent_get, request_token)
+
+            next_value = parse_qs(urlparse(consent_get.headers["location"]).query)[
+                "next"
+            ][0]
+
+            # 模拟登录成功后 JS 回跳到 next（此时已带 session cookie）
+            back_get = client.get(
+                next_value, cookies={"session_token": "valid-session-token"}
+            )
+            assert back_get.status_code == 200, (
+                f"回跳后应 200 渲染表单，实际: {back_get.status_code}, "
+                f"body: {back_get.text[:200]}"
+            )
+            assert 'value="allow"' in back_get.text
+            assert 'value="deny"' in back_get.text
+
+    @pytest.mark.asyncio
+    async def test_consent_post_invalid_csrf_still_403_before_session_check(
+        self, server_app_auth_enabled, monkeypatch
+    ):
+        """CSRF 校验必须先于 session 校验：无 session 且 CSRF 错误应 403（非 302）。"""
+        from app.mcp import provider as provider_module
+
+        monkeypatch.setattr(
+            provider_module.security_manager,
+            "validate_session",
+            lambda token: None,
+        )
+
+        with TestClient(
+            server_app_auth_enabled, raise_server_exceptions=False
+        ) as client:
+            _, _, request_token = self._start_consent_flow(client)
+
+            provider = server_app_auth_enabled.state.provider
+            assert request_token in provider._pending_auths
+
+            consent_post = client.post(
+                "/consent",
+                data={
+                    "action": "allow",
+                    "request_token": request_token,
+                    "csrf_token": "wrong-token",
+                },
+                follow_redirects=False,
+            )
+            assert consent_post.status_code == 403, (
+                f"CSRF 错误应先于 session 校验返回 403，实际: "
+                f"{consent_post.status_code}"
+            )
+            assert provider._auth_codes == {}
+            assert request_token in provider._pending_auths
+
+    def test_consent_login_redirect_next_is_safe_relative_path(self):
+        """登录重定向 helper 构造的 next 始终是站内相对路径（开放重定向护栏）。"""
+        from app.mcp.provider import _consent_login_redirect
+
+        for raw_token in (
+            "plain-token",
+            "token-with-&-and-=-and-?",
+            "/evil/../token",
+            "//evil.com",
+        ):
+            response = _consent_login_redirect(raw_token)
+            assert response.status_code == 302
+            parsed = urlparse(response.headers["location"])
+            assert parsed.path == "/login"
+            next_value = parse_qs(parsed.query)["next"][0]
+            assert next_value.startswith("/"), (
+                f"next 必须以 / 开头，实际: {next_value!r}"
+            )
+            assert not next_value.startswith("//"), (
+                f"next 不得为协议相对 URL，实际: {next_value!r}"
+            )
+            # 原始 token 被整体 urlencode，不会被解释为额外 query 参数
+            assert parse_qs(urlparse(next_value).query)["request_token"] == [raw_token]
 
 
 # ---------------------------------------------------------------------------
