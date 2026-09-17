@@ -161,6 +161,12 @@ class AgentRunsRepository(BaseRepository):
           * rejected 出窗 / 无候选 → 新建 ``created``
         - 最新 run cancelled / 其他终态 → 新建 ``created``
 
+        **决策 ↔ 候选状态术语映射**（历史文档沿用旧称，此处统一对齐）：
+        ``pending_candidates.status`` 的 ``pending`` 即历史文档中的
+        ``waiting_accept``（候选待用户接受）→ ``reuse_holding``（无限期）；
+        ``confirmed``（用户已接受）→ ``reuse_accepted``；``rejected``（用户已拒绝）
+        → 保留窗口内 ``reuse_holding``、出窗重新评估。
+
         复用/在途时 ``sync_record_id`` 非空会刷新该 run 的主指针；
         ``business_key`` 为空时保持去重禁用语义（每次直接新建）。
 

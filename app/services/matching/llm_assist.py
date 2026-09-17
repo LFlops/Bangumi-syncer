@@ -1194,8 +1194,16 @@ def _handle_result(
 ) -> str:
     """根据循环结果处理后处理（校验 / 落库 / 通知 / 兜底）。
 
-    ``total_tokens`` 由调用方传入**全轮累计值**（来自 ``TraceRecorder.total_tokens``），
-    不再从 ``result.last_response`` 取末轮值。恢复路径无实时 recorder 时显式传 0。
+    ``total_tokens`` 由调用方传入**全轮累计值**，不再从 ``result.last_response``
+    取末轮值；三条路径的来源与口径如下：
+
+    - 首次执行（:func:`run`）：传实时 ``TraceRecorder.total_tokens``（本次全部轮次）。
+    - 恢复续跑 submit 分支（:func:`continue_run` 捕获到 ``submit_suggestion`` 终局）：
+      无实时 recorder 覆盖历史轮次，传 ``ReplayResult.total_tokens``（由
+      ``agent_steps`` 的 llm_chat span 累计重建的历史口径）。
+    - 恢复续跑 loop 分支（:func:`_execute_continuation`）：传
+      ``ReplayResult.total_tokens + TraceRecorder.total_tokens``
+      （历史轮次 + 本次新轮次，避免只记新轮丢历史）。
     """
     stop = result.stop_reason
 

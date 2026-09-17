@@ -144,9 +144,11 @@ def test_handle_match_failure_enqueues_when_enabled(
     assert kwargs["reuse_window_days"] == MATCH_ASSIST_REUSE_WINDOW_DAYS
     assert kwargs["max_total_attempts"] == MATCH_ASSIST_MAX_TOTAL_ATTEMPTS
     assert kwargs["accepted_mapping_valid"] is False  # 映射未命中 → 无效
-    # trace step 在 persist 前已存在
+    # trace step 在 persist 前已存在，reason 与实际入队成功语义一致
     assert any(
-        s["stage"] == "llm_assist" and s["status"] == "pending"
+        s["stage"] == "llm_assist"
+        and s["status"] == "pending"
+        and s["reason"] == "已提交 AI 评估"
         for s in captured["steps"]
     )
     # persist 后写关联表 + 刷新主指针（created 回填 sync_record_id）
@@ -524,6 +526,8 @@ def test_enqueue_exception_degrades_without_blocking(
     assert len(assist) == 1
     assert assist[0]["processed_payload"]["decision"] == "enqueue_failed"
     assert assist[0]["processed_payload"]["run_id"]
+    # 降级分支 reason 不得再谎报"已提交"，须与 decision 语义一致
+    assert assist[0]["reason"] == "评估任务入队失败"
     agent_runs.add_run_sync_record_link.assert_not_called()
     agent_runs.update_run_sync_record_id.assert_not_called()
     assert "匹配增强任务入队失败" in capsys.readouterr().out

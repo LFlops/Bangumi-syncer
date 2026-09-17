@@ -283,6 +283,7 @@ class LlmMatchScheduler(BaseScheduler):
             except Exception as e:
                 # 兜底：continue_run 内部已按可重试性完成计数/置终态（不向调用方抛），
                 # 走到这里说明出现未预期的外层异常，仅记录日志、不重复计数。
+                # 此处保留异常文本用于诊断（经评估该异常来自 LLM 处理链，不含凭据）。
                 logger.error(f"🤖 恢复续跑 {run_id} 未预期异常: {e}")
         finally:
             _release_run(run_id)

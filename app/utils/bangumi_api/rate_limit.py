@@ -78,7 +78,7 @@ class RateLimiter:
         self._clock = clock
         self._sleep = sleep
 
-        self._cond = threading.Condition(threading.Lock())
+        self._lock = threading.Lock()
         self._tokens = float(self.burst)
         self._last_refill = clock()
         # 429 自适应冷却
@@ -92,7 +92,7 @@ class RateLimiter:
     def acquire(self) -> float:
         """获取一个令牌，令牌不足或处于冷却期时阻塞等待
 
-        实现要点：**锁内检查、锁外休眠**。等待期间不持有条件变量锁，其他线程
+        实现要点：**锁内检查、锁外休眠**。等待期间不持有互斥锁，其他线程
         （含 429 通知路径 :meth:`notify_rate_limited` / :meth:`notify_success`）
         可立即更新冻结状态；本线程休眠结束后重新进入循环按最新状态复查，因此
         等待中收到的更长冻结同样生效（伪唤醒也由复查兜底）。
@@ -102,7 +102,7 @@ class RateLimiter:
         """
         total_wait = 0.0
         while True:
-            with self._cond:
+            with self._lock:
                 now = self._clock()
                 self._refill(now)
 
@@ -149,7 +149,7 @@ class RateLimiter:
         Returns:
             本次生效的冷却秒数。
         """
-        with self._cond:
+        with self._lock:
             now = self._clock()
             self._consecutive_429 += 1
             # 指数升级：60 → 120 → 240 …（上限 3600）
@@ -179,7 +179,7 @@ class RateLimiter:
 
     def notify_success(self) -> None:
         """请求成功时重置 429 指数升级计数"""
-        with self._cond:
+        with self._lock:
             self._consecutive_429 = 0
 
 

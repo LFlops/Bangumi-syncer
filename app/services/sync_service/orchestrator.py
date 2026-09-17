@@ -404,7 +404,10 @@ class SyncOrchestrator:
                 logger.warning(f"匹配增强任务入队失败（不影响主流程）: {e}")
             llm_step = trace.start_step("llm_assist")
             llm_step.status = "pending"
-            llm_step.reason = "已提交 AI 评估"
+            # reason 与 decision 语义保持一致：降级（enqueue_failed）时不得谎报已提交
+            llm_step.reason = (
+                "评估任务入队失败" if decision == "enqueue_failed" else "已提交 AI 评估"
+            )
             llm_step.processed_payload = {
                 "run_id": actual_run_id,
                 "decision": decision,
