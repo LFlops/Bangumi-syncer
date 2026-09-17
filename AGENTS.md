@@ -8,7 +8,7 @@ Bangumi-syncer 将常见媒体库（Plex、Emby、Jellyfin、Trakt、飞牛等�
 
 ## 技术栈与环境
 
-- **Python**：`>=3.9`（见 [pyproject.toml](https://github.com/SanaeMio/Bangumi-syncer/blob/main/pyproject.toml) 中 `requires-python`）。
+- **Python**：`>=3.10`（见 [pyproject.toml](https://github.com/SanaeMio/Bangumi-syncer/blob/main/pyproject.toml) 中 `requires-python`）。
 - **运行时**：FastAPI、Uvicorn、Jinja2、Pydantic、APScheduler 等（依赖见 `pyproject.toml`）。
 - **包管理**：推荐 [uv](https://docs.astral.sh/uv/)。
 
@@ -70,6 +70,13 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **分层**：新 HTTP 接口放在 `app/api/`；复杂业务放在 `app/services/`（可参考现有 `sync_service`、`mapping_service` 及各媒体子包）。体量小的只读端点可参考 [`app/api/health.py`](https://github.com/SanaeMio/Bangumi-syncer/blob/main/app/api/health.py) 的组织方式。
 - **文档**：配置项或面向用户的行为变更需同步更新 `docs/` 中对应 Markdown；图片放在 `docs/public/images/`，文内用根路径如 `![](/images/overview/xxx.png)`（见 CONTRIBUTING）。
 - **协作**：与邻近文件保持一致的命名与注释习惯；避免无关大范围格式化或重命名。
+
+## 评审沉淀：高频问题规避
+
+- **删除/重命名公共符号前先全仓 grep**（含 `docs/`）：删 `def`/`class` 前，先列出文档/注释/测试中的引用位置，改完 grep 确认零残留。例：删除 `create_auth_server` 后 `docs/development/mcp.md` 仍引用旧名，文档与实现漂移。
+- **「关闸/降级」类安全参数必须正反对照的端到端测试**：只断言 `provider.required_scopes == []` 属属性层，中间件即使忽略该属性也仍绿。凡开关安全门槛的参数，BDD 须同时覆盖「开启→拒绝」与「关闭→放行」，走完整链路、不 mock。
+- **测试 helper 封装生产入口时须断言参数对象同一性**：helper 构造 provider A 却把 provider B 传给 `create_mcp_app(...)` 时测试仍绿，未测到预期配置。至少一例用 spy/monkeypatch 断言 `called_kwargs["provider"] is <helper 构造的对象>`。
+- **契约字段（尤其 OAuth metadata）用精确相等断言，禁止子集断言**：断言 `"read" in scopes_supported` 在无声扩权为 `["read","write","admin"]` 时仍绿，必须写 `== ["read","write"]` 精确锁定。
 
 ## 安全与敏感信息
 
