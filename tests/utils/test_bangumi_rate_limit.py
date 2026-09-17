@@ -181,6 +181,27 @@ def test_two_bangumi_api_instances_share_same_bucket():
     assert sleeper.calls[0] == pytest.approx(1.0)
 
 
+def test_req_not_auth_session_shares_same_bucket():
+    """同一实例的 self.req 与 _req_not_auth 共用同一令牌桶"""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    shared = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
+    reset_bgm_rate_limiter(shared)
+
+    mock_resp = _mock_response(200)
+    with patch("app.utils.bangumi_api.httpx.Client") as mock_client_cls:
+        mock_client_cls.return_value.request.return_value = mock_resp
+        api = BangumiApi(access_token="t")
+
+        api.get("me")  # 经 self.req 消耗唯一令牌
+        assert sleeper.calls == []
+
+        api._request_with_retry("GET", api._req_not_auth, "https://api.bgm.tv/v0/me")
+
+    assert len(sleeper.calls) == 1
+    assert sleeper.calls[0] == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # 场景 3：直连回退路径同样限速
 # ---------------------------------------------------------------------------
