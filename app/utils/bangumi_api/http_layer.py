@@ -58,12 +58,20 @@ class HttpLayerMixin:
     """HTTP 请求层相关方法（供 BangumiApi 组合）"""
 
     def _apply_rate_limit_notification(self, res: httpx.Response) -> None:
-        """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）"""
+        """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）
+
+        仅 ``< 400``（成功）重置 429 升级计数；5xx 等服务端错误保持计数不变
+        （既不重置也不额外冻结），避免误重置弱化自适应冷却。
+        """
         limiter = get_bgm_rate_limiter()
         if res.status_code == 429:
             limiter.notify_rate_limited(_parse_retry_after(res))
-        else:
+        elif res.status_code < 400:
             limiter.notify_success()
+        else:
+            logger.debug(
+                f"⏳ HTTP {res.status_code} 非成功响应：保留 429 升级计数（不重置）"
+            )
 
     def _try_direct_connection(
         self, method: str, url: str, **kwargs: Any
@@ -196,6 +204,9 @@ class HttpLayerMixin:
             get_bgm_rate_limiter().acquire()
             res = session.request(method, url, **kwargs)
         except RETRY_EXCEPTIONS as e:
+            # 网络异常分支刻意不调用 notify_success、也不冻结令牌桶：
+            # 连接层错误既不能证明请求成功（不应重置 429 升级计数），
+            # 也不代表服务端限流（不应额外冻结）；升级计数保留到下次成功请求重置。
             # SyncHttpClient 重试耗尽后仍抛出异常
             dns_error = "Failed to resolve" in str(
                 e

@@ -148,6 +148,90 @@ def test_acquire_is_thread_safe_under_concurrency():
     assert len(results) == 8
 
 
+def test_acquire_waits_without_holding_lock():
+    """等待期间不持锁休眠：另一线程能在 sleep 进行中立即 notify
+
+    若 ``acquire`` 在锁内休眠，notify 会一直阻塞到等待结束（此处 5s 超时），
+    断言随即失败，可稳定暴露"持锁休眠"问题。
+    """
+    clock = FakeClock()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_sleep(seconds: float) -> None:
+        entered.set()
+        release.wait(timeout=5)
+        clock.advance(seconds)
+
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=slow_sleep)
+    limiter.acquire()  # 耗尽唯一令牌
+
+    worker = threading.Thread(target=lambda: limiter.acquire(), daemon=True)
+    worker.start()
+    assert entered.wait(timeout=5), "acquire 未进入等待"
+
+    notified = threading.Event()
+
+    def notifier() -> None:
+        limiter.notify_rate_limited(0.0)
+        limiter.notify_success()
+        notified.set()
+
+    notifier_thread = threading.Thread(target=notifier, daemon=True)
+    notifier_thread.start()
+    assert notified.wait(timeout=2.0), (
+        "notify 在 acquire 等待期间被阻塞（疑似持锁休眠）"
+    )
+
+    release.set()
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+
+
+def test_freeze_update_visible_during_wait():
+    """等待期间 notify_rate_limited 生效：等待者按新冻结时间重新计算"""
+    clock = FakeClock()
+    entered = threading.Event()
+    release = threading.Event()
+    waits: list[float] = []
+
+    def controlled_sleep(seconds: float) -> None:
+        waits.append(seconds)
+        entered.set()
+        release.wait(timeout=5)
+        clock.advance(seconds)
+
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=controlled_sleep)
+    limiter.acquire()  # 耗尽唯一令牌
+
+    total: list[float] = []
+    worker = threading.Thread(
+        target=lambda: total.append(limiter.acquire()), daemon=True
+    )
+    worker.start()
+    assert entered.wait(timeout=5), "acquire 未进入等待"
+
+    # 等待期间下发更长的 429 冻结（300s > 首轮 1s 的补令牌等待）
+    notified = threading.Event()
+
+    def notifier() -> None:
+        limiter.notify_rate_limited(300.0)
+        notified.set()
+
+    notifier_thread = threading.Thread(target=notifier, daemon=True)
+    notifier_thread.start()
+    assert notified.wait(timeout=2.0), "notify 在 acquire 等待期间被阻塞"
+
+    release.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    # 首轮按旧状态等 1s（补令牌），复查后按新冻结续等 299s，累计 300s
+    assert waits[0] == pytest.approx(1.0)
+    assert waits[1] == pytest.approx(299.0)
+    assert total == [pytest.approx(300.0)]
+
+
 # ---------------------------------------------------------------------------
 # 场景 2：多实例共享同一令牌桶
 # ---------------------------------------------------------------------------
@@ -266,6 +350,28 @@ def test_request_with_retry_acquires_before_sending_request():
     assert events == ["acquire", "request"]
 
 
+def test_direct_connection_error_warning_includes_status_code():
+    """直连回退遇 >=400 时 warning 带 status_code，便于排查"""
+    limiter = RecordingLimiter()
+    reset_bgm_rate_limiter(limiter)
+
+    api = BangumiApi(access_token="t")
+    mock_resp = _mock_response(503)
+
+    with (
+        patch("app.utils.bangumi_api.httpx.Client") as mock_client_cls,
+        patch("app.utils.bangumi_api.http_layer.logger") as mock_http_logger,
+    ):
+        mock_client_cls.return_value.request.return_value = mock_resp
+        result = api._try_direct_connection("GET", "https://api.bgm.tv/v0/me")
+
+    assert result is None
+    warnings = [
+        str(c.args[0]) for c in mock_http_logger.warning.call_args_list if c.args
+    ]
+    assert any("503" in msg for msg in warnings), warnings
+
+
 # ---------------------------------------------------------------------------
 # 场景 4：429 自适应冷却
 # ---------------------------------------------------------------------------
@@ -347,6 +453,33 @@ def test_notify_success_resets_escalation():
     limiter.acquire()
 
     assert sleeper.calls == [pytest.approx(60.0), pytest.approx(60.0)]
+
+
+def test_rate_limit_hint_capped_at_max_cooldown():
+    """Retry-After 超过上限时冻结封顶 3600s（不会无限冻结）"""
+    limiter, sleeper = _make_limiter()
+
+    limiter.notify_rate_limited(100000)
+    limiter.acquire()
+
+    assert sleeper.calls == [pytest.approx(3600.0)]
+
+
+def test_notify_success_not_called_for_5xx():
+    """500 响应不重置 429 升级计数：429→500→429 的冻结应为 120s 而非 60s"""
+    limiter, sleeper = _make_limiter()
+    reset_bgm_rate_limiter(limiter)
+    api = BangumiApi(access_token="t")
+
+    api._apply_rate_limit_notification(_mock_response(429, {}))
+    limiter.acquire()
+
+    api._apply_rate_limit_notification(_mock_response(500, {}))
+    api._apply_rate_limit_notification(_mock_response(429, {}))
+
+    limiter.acquire()
+
+    assert sleeper.calls == [pytest.approx(60.0), pytest.approx(120.0)]
 
 
 # ---------------------------------------------------------------------------

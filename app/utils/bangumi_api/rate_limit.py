@@ -7,6 +7,7 @@ Bangumi 官方公开 API 已限流（社区实测约 300 请求/分钟/IP，超�
 
 设计要点：
 - 同步、线程安全（``threading.Lock`` 保护），基于 ``time.monotonic``；
+  等待采用"锁内检查、锁外休眠"，休眠期间不持锁，不阻塞其他请求与 429 通知；
 - 构造支持注入 ``clock`` / ``sleep``，便于测试不真实等待；
 - 模块级惰性单例 :func:`get_bgm_rate_limiter`，从 ``[bangumi]`` 段读取
   ``api_rate_limit``（默认 1/s）与 ``api_rate_burst``（默认 3），解析失败回退默认；
@@ -91,12 +92,17 @@ class RateLimiter:
     def acquire(self) -> float:
         """获取一个令牌，令牌不足或处于冷却期时阻塞等待
 
+        实现要点：**锁内检查、锁外休眠**。等待期间不持有条件变量锁，其他线程
+        （含 429 通知路径 :meth:`notify_rate_limited` / :meth:`notify_success`）
+        可立即更新冻结状态；本线程休眠结束后重新进入循环按最新状态复查，因此
+        等待中收到的更长冻结同样生效（伪唤醒也由复查兜底）。
+
         Returns:
             本次实际等待的秒数（无需等待时为 0.0）。
         """
         total_wait = 0.0
-        with self._cond:
-            while True:
+        while True:
+            with self._cond:
                 now = self._clock()
                 self._refill(now)
 
@@ -111,8 +117,9 @@ class RateLimiter:
                     wait = (1.0 - self._tokens) / self.rate
                     reason = "Bangumi API 限速等待"
 
-                total_wait += wait
-                self._wait(wait, reason)
+            # 锁外休眠：避免长时间持锁阻塞其他请求/通知
+            total_wait += wait
+            self._wait(wait, reason)
 
     def _refill(self, now: float) -> None:
         """按经过时间补充令牌（上限为 burst）"""
@@ -166,7 +173,8 @@ class RateLimiter:
                 f"🚦 Bangumi API 返回 429，令牌桶冷却 {cooldown:.0f}s"
                 f"（连续第 {self._consecutive_429} 次）"
             )
-            self._cond.notify_all()
+            # 注：acquire 采用"锁内检查、锁外休眠 + 醒来复查"，
+            # 等待者无需唤醒即会按这里更新的 _frozen_until 重新计算等待时长。
             return cooldown
 
     def notify_success(self) -> None:
