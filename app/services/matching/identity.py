@@ -20,7 +20,7 @@ def build_match_business_key(
 
     - title 经 normalize_title_text 归一化后做 ``.strip().lower()``；
       归一化结果为空时退回 ``str(title).strip().lower()``。
-    - season 缺失（None / 空字符串 / 0）按 1 处理。
+    - season 缺失（None / 空字符串）按 1 处理；season=0（SP/特别篇）独立成键。
     - user_name 保持原样（写入与查询使用同一实现即可保证一致性）。
     """
     normalized = normalize_title_text(title)
@@ -34,11 +34,16 @@ def build_match_business_key(
 
 
 def _coerce_season(season: int | str | None) -> int:
-    """把 season 归一化为整数；缺失/非法值按 1 处理。"""
+    """把 season 归一化为整数。
+
+    - None / 空字符串 / 非法值 → 1（缺失语义）
+    - season=0（SP/特别篇）→ 0（独立成键，不与 S1 合并）
+    - 负数 → 1（非法）
+    """
     if season is None:
         return 1
     try:
         v = int(season)
-        return v if v > 0 else 1
     except (TypeError, ValueError):
         return 1
+    return v if v >= 0 else 1

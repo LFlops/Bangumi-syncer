@@ -241,6 +241,40 @@ class PendingCandidatesRepository(BaseRepository):
             _read, error_msg="按 sync_record_id 查候选失败", default=None
         )
 
+    def find_latest_by_business_key(
+        self, business_key: str
+    ) -> Optional[dict[str, Any]]:
+        """按 business_key 查最近一条候选（pending/confirmed/rejected，按 id DESC）。
+
+        供 run 入队决策的「结果复用由业务子状态驱动」判定：
+        - confirmed → 校验映射有效则复用（不限时间）；映射无效 → 重新评估
+        - pending → 复用（无限期）
+        - rejected → 保留窗口内复用，出窗重新评估
+
+        空 business_key 直接返回 None（不参与去重）。无匹配返回 None。
+        """
+        if not business_key:
+            return None
+
+        def _read(conn):
+            cursor = conn.execute(
+                """
+                SELECT * FROM pending_candidates
+                WHERE business_key = ? AND status IN ('pending', 'confirmed', 'rejected')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (business_key,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            cols = [d[0] for d in cursor.description]
+            return dict(zip(cols, row))
+
+        return self._run_read(
+            _read, error_msg="按 business_key 查候选失败", default=None
+        )
+
     def update_pending_candidate_status(
         self,
         candidate_id: int,

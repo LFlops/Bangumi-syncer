@@ -1,40 +1,70 @@
-"""Agent 通用会话仓库（agent_runs / agent_steps）
+"""Agent 通用会话仓库（agent_runs / agent_steps / agent_run_sync_records）
 
 承载通用 Agent 会话状态机与可重放 span 日志：
 - agent_runs：一次会话（pending -> processing -> succeeded / no_suggestion / failed ...）
 - agent_steps：每轮 LLM 调用 / 每次工具执行的 span（按 iteration, sequence 排序）
+- agent_run_sync_records：run ↔ sync_record 关联（多对一：N 条集级 record 关联 1 个剧集级 run）
+
+设计要点：
+- 业务无关：不持有 applied/rejected 等业务特化终态；用户处理结果由
+  pending_candidates（status + resolved_at）承载。
+- 失败重试「每次新建 run」：累计失败次数 = SUM(total_attempts) WHERE
+  business_key=? AND status='failed'，达上限不再新建；每个 run 失败转终态时
+  total_attempts += 1（同一 run 只计一次）。
+- 结果复用由业务子状态驱动（候选 pending/confirmed/rejected），非固定窗口一刀切。
 
 关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
-- mark_applied / mark_rejected：仅当 status='succeeded' 可流转（WHERE 守卫）
 - increment_attempts：调度轮次失败计数，>=3 单点置 failed（同事务携带 last_error）
- - cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps）
+- enqueue_match_run：单事务内完成 created / in_flight / 复用 / exhausted 决策
+ - cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps / 关联行）
 """
 
 import json
 import sqlite3
 import time
+from datetime import datetime
 from typing import Any, Optional
 
+from ..logging import logger
 from .base_repository import BaseRepository
 
-# 终态：除 pending / processing 外的全部状态
+# 终态：除 pending / processing 外的全部状态（业务无关，不含 applied/rejected）
 _TERMINAL_STATUSES = (
     "succeeded",
     "no_suggestion",
     "failed",
     "cancelled",
-    "applied",
-    "rejected",
 )
 
 # 活性态：pending / processing（cleanup_expired 的活性分支判断用）
 _ACTIVE_STATUSES = ("pending", "processing")
 
+# resolved_at / created_at 等 DATETIME 文本列的存储格式（本地时间）
+_DATETIME_FMT = "%Y-%m-%d %H:%M:%S"
+
 
 def _now() -> int:
     """当前 epoch 秒整数（与 agent_steps/agent_runs 时间列格式一致，便于整数比较）。"""
     return int(time.time())
+
+
+def _resolved_within_window(resolved_at: Any, window_days: int, now_ts: int) -> bool:
+    """resolved_at（本地时间字符串）是否落在 ``now_ts - window_days`` 之内。
+
+    解析失败 / 缺失按出窗处理（重新评估更安全），并记录告警便于排查。
+    """
+    if not resolved_at:
+        return False
+    try:
+        ts = int(datetime.strptime(str(resolved_at), _DATETIME_FMT).timestamp())
+    except (TypeError, ValueError) as e:
+        logger.warning(
+            f"pending_candidates.resolved_at 解析失败（按出窗处理）: "
+            f"{resolved_at!r}: {e}"
+        )
+        return False
+    return ts >= now_ts - window_days * 86400
 
 
 def _encrypt_replay_delta(raw: Any) -> str:
@@ -50,11 +80,7 @@ def _encrypt_replay_delta(raw: Any) -> str:
         text = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
         return encrypt(text)
     except Exception as e:  # best-effort：加密失败降级存明文
-        import logging
-
-        logging.getLogger(__name__).warning(
-            f"[agent_runs] replay_delta 加密失败（已降级存明文）: {e}"
-        )
+        logger.warning(f"[agent_runs] replay_delta 加密失败（已降级存明文）: {e}")
         return raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
 
 
@@ -87,7 +113,8 @@ class AgentRunsRepository(BaseRepository):
     ) -> int:
         """沉淀一条 pending 会话，返回记录 id（失败时 0）。
 
-        business_key 为业务键去重用（写入该列，默认空字符串保持向后兼容）。
+        通用原语：不做业务去重决策（业务入队请用 :meth:`enqueue_match_run`）。
+        business_key 为业务键（写入该列，默认空字符串保持向后兼容）。
         """
 
         def _write(conn):
@@ -105,118 +132,198 @@ class AgentRunsRepository(BaseRepository):
 
         return self._run_write(_write, error_msg="创建 agent_run 失败", default=0)
 
-    def enqueue_run_dedup(
+    def enqueue_match_run(
         self,
         run_id: str,
-        task_type: str,
-        sync_record_id: int,
-        business_key: str = "",
+        business_key: str,
         *,
-        dedup_window_days: int = 7,
+        sync_record_id: Optional[int] = None,
+        reuse_window_days: int = 30,
         max_total_attempts: int = 10,
-    ) -> str:
-        """按 business_key 决策去重/重入队/结果复用，返回决策结果字符串。
+        accepted_mapping_valid: bool = True,
+    ) -> dict:
+        """按 business_key 决策入队（created / in_flight / 复用 / exhausted）。
 
-        单个 _run_write 事务内完成决策，保证并发安全：
-        - "created"：无历史或需新建 → INSERT 新 pending
-        - "in_flight"：同键已有 pending/processing → 只刷新 sync_record_id
-        - "requeued"：同键 failed 且 total_attempts<=max → 复用（status=pending, attempts=0, total+1）
-        - "exhausted"：同键 failed 且 total_attempts>max → 不写库
-        - "reused"：同键 succeeded/no_suggestion 且 7 天内 → 只刷新 sync_record_id
+        在单个 ``_run_write`` 事务内完成决策（含候选子状态查询），返回
+        ``{"decision": str, "run_id": str}``：
+        - 无历史 run → 新建 pending → ``created``（返回传入 run_id）
+        - 最新 run pending/processing → ``in_flight``（返回已有 run_id）
+        - 最新 run failed → 累计失败 = SUM(total_attempts)（同键 failed 行）：
+          < max_total_attempts → 新建 ``created``；≥ 上限 → ``exhausted``（不写库）
+        - 最新 run succeeded/no_suggestion → 按候选子状态复用：
+          * confirmed + accepted_mapping_valid → ``reuse_accepted``（不限时间）
+          * pending → ``reuse_holding``（无限期）
+          * rejected 且 resolved_at 在保留窗口内 → ``reuse_holding``
+          * rejected 出窗 / 无候选 → 新建 ``created``
+        - 最新 run cancelled / 其他终态 → 新建 ``created``
 
-        business_key 为空时退回 create_pending 语义（不去重）。
+        复用/在途时 ``sync_record_id`` 非空会刷新该 run 的主指针；
+        ``business_key`` 为空时保持去重禁用语义（每次直接新建）。
+        落库异常不抛出，记日志后返回（避免拖垮主匹配流程）。
         """
         if not business_key:
             self.create_pending(
                 run_id=run_id,
-                task_type=task_type,
+                task_type="match",
                 sync_record_id=sync_record_id,
             )
-            return "created"
+            return {"decision": "created", "run_id": run_id}
 
-        result_holder: list[str] = ["created"]
+        result_holder: list[dict] = []
+        now_ts = _now()
 
-        def _write(conn):
-            row = self._find_latest_by_business_key(conn, business_key)
-            if row is None:
-                # 无历史 → 新建
-                ts = _now()
-                conn.execute(
-                    """
-                    INSERT INTO agent_runs
-                    (run_id, task_type, sync_record_id, business_key, status,
-                     attempts, total_attempts, created_at, last_attempt_at)
-                    VALUES (?, ?, ?, ?, 'pending', 0, 0, ?, ?)
-                    """,
-                    (run_id, task_type, sync_record_id, business_key, ts, ts),
-                )
-                result_holder[0] = "created"
-                return
-
-            status = row["status"]
-            ended_at = row["ended_at"] or 0
-
-            if status in ("pending", "processing"):
-                # 在途去重：只刷新 sync_record_id
-                conn.execute(
-                    "UPDATE agent_runs SET sync_record_id=? WHERE id=?",
-                    (sync_record_id, row["id"]),
-                )
-                result_holder[0] = "in_flight"
-                return
-
-            if status == "failed":
-                total = row["total_attempts"] or 0
-                if total <= max_total_attempts:
-                    # 复用：重置为 pending，total_attempts+1
-                    ts = _now()
-                    conn.execute(
-                        """
-                        UPDATE agent_runs
-                        SET status='pending', attempts=0,
-                            total_attempts=total_attempts + 1,
-                            created_at=?, last_attempt_at=?,
-                            started_at=0, ended_at=0,
-                            last_error='', sync_record_id=?
-                        WHERE id=?
-                        """,
-                        (ts, ts, sync_record_id, row["id"]),
-                    )
-                    result_holder[0] = "requeued"
-                else:
-                    result_holder[0] = "exhausted"
-                return
-
-            if status in ("succeeded", "no_suggestion"):
-                cutoff = _now() - dedup_window_days * 86400
-                if ended_at >= cutoff:
-                    # 结果复用：只刷新 sync_record_id
-                    conn.execute(
-                        "UPDATE agent_runs SET sync_record_id=? WHERE id=?",
-                        (sync_record_id, row["id"]),
-                    )
-                    result_holder[0] = "reused"
-                    return
-
-            # applied/rejected/cancelled、或已出窗的终态 → 走新建
-            ts = _now()
+        def _insert_pending(conn) -> None:
             conn.execute(
                 """
                 INSERT INTO agent_runs
                 (run_id, task_type, sync_record_id, business_key, status,
                  attempts, total_attempts, created_at, last_attempt_at)
-                VALUES (?, ?, ?, ?, 'pending', 0, 0, ?, ?)
+                VALUES (?, 'match', ?, ?, 'pending', 0, 0, ?, ?)
                 """,
-                (run_id, task_type, sync_record_id, business_key, ts, ts),
+                (run_id, sync_record_id, business_key, now_ts, now_ts),
             )
-            result_holder[0] = "created"
+
+        def _refresh_pointer(conn, target_run_id: str) -> None:
+            if sync_record_id is None:
+                return
+            conn.execute(
+                "UPDATE agent_runs SET sync_record_id=? WHERE run_id=?",
+                (sync_record_id, target_run_id),
+            )
+
+        def _write(conn):
+            row = self._find_latest_by_business_key(conn, business_key)
+            if row is None:
+                _insert_pending(conn)
+                result_holder.append({"decision": "created", "run_id": run_id})
+                return
+
+            status = row["status"]
+            existing_run_id = row["run_id"]
+
+            if status in _ACTIVE_STATUSES:
+                _refresh_pointer(conn, existing_run_id)
+                result_holder.append(
+                    {"decision": "in_flight", "run_id": existing_run_id}
+                )
+                return
+
+            if status == "failed":
+                total_failed = conn.execute(
+                    "SELECT COALESCE(SUM(total_attempts), 0) FROM agent_runs "
+                    "WHERE business_key=? AND status='failed'",
+                    (business_key,),
+                ).fetchone()[0]
+                if total_failed < max_total_attempts:
+                    _insert_pending(conn)
+                    result_holder.append({"decision": "created", "run_id": run_id})
+                else:
+                    result_holder.append(
+                        {"decision": "exhausted", "run_id": existing_run_id}
+                    )
+                return
+
+            if status in ("succeeded", "no_suggestion"):
+                reuse_decision = self._decide_reuse_from_candidate(
+                    conn,
+                    business_key,
+                    reuse_window_days=reuse_window_days,
+                    accepted_mapping_valid=accepted_mapping_valid,
+                    now_ts=now_ts,
+                )
+                if reuse_decision is None:
+                    _insert_pending(conn)
+                    result_holder.append({"decision": "created", "run_id": run_id})
+                else:
+                    _refresh_pointer(conn, existing_run_id)
+                    result_holder.append(
+                        {"decision": reuse_decision, "run_id": existing_run_id}
+                    )
+                return
+
+            # cancelled / 其他终态 → 新建重新评估
+            _insert_pending(conn)
+            result_holder.append({"decision": "created", "run_id": run_id})
 
         try:
-            self._run_write(_write, error_msg="enqueue_run_dedup 失败")
+            self._run_write(_write, error_msg="匹配任务入队决策失败", reraise=True)
         except sqlite3.IntegrityError:
-            # 唯一索引兜底：并发重复插入同键在途时，视为 in_flight
-            result_holder[0] = "in_flight"
+            # 并发兜底：同键在途重复插入被部分唯一索引拒绝 → 复用在途 run
+            active_run_id = self._find_active_run_id(business_key)
+            logger.warning(
+                "同一 business_key 存在并发在途 run（唯一索引冲突），按 in_flight 复用: "
+                f"business_key={business_key}, run_id={active_run_id or run_id}"
+            )
+            return {"decision": "in_flight", "run_id": active_run_id or run_id}
+        except Exception as e:
+            logger.error(f"匹配任务入队决策异常（未落库，按 created 返回）: {e}")
+            return {"decision": "created", "run_id": run_id}
+
+        if not result_holder:
+            # 防御兜底：事务未产出决策（理论不可达），显式告警便于排查
+            logger.warning(
+                "匹配任务入队决策未产出结果（按 created 返回）: "
+                f"business_key={business_key}, run_id={run_id}"
+            )
+            return {"decision": "created", "run_id": run_id}
         return result_holder[0]
+
+    @staticmethod
+    def _decide_reuse_from_candidate(
+        conn,
+        business_key: str,
+        *,
+        reuse_window_days: int,
+        accepted_mapping_valid: bool,
+        now_ts: int,
+    ) -> Optional[str]:
+        """按业务候选子状态给出复用决策；返回 None 表示需新建重新评估。
+
+        只读查询与主决策同事务执行（避免读写间隙竞态）。
+        """
+        candidate = conn.execute(
+            "SELECT status, resolved_at FROM pending_candidates "
+            "WHERE business_key=? AND status IN ('pending','confirmed','rejected') "
+            "ORDER BY id DESC LIMIT 1",
+            (business_key,),
+        ).fetchone()
+        if candidate is None:
+            return None
+
+        cand_status = candidate[0]
+        resolved_at = candidate[1]
+
+        if cand_status == "confirmed":
+            # accepted：映射仍有效 → 不限时间复用；映射已删除 → 重新评估
+            return "reuse_accepted" if accepted_mapping_valid else None
+        if cand_status == "pending":
+            # waiting_accept：候选存在即复用（无限期）
+            return "reuse_holding"
+        if cand_status == "rejected":
+            if _resolved_within_window(resolved_at, reuse_window_days, now_ts):
+                return "reuse_holding"
+            return None
+        # 防御兜底：SQL 已限定 status 枚举，理论不可达，显式告警便于排查
+        logger.warning(
+            f"pending_candidates 出现未预期 status={cand_status!r}（按重新评估处理）"
+        )
+        return None
+
+    def _find_active_run_id(self, business_key: str) -> Optional[str]:
+        """按 business_key 查在途（pending/processing）run_id，无则 None。
+
+        仅用于唯一索引并发冲突兜底（同键在途已存在时复用）。
+        """
+
+        def _read(conn):
+            row = conn.execute(
+                "SELECT run_id FROM agent_runs WHERE business_key=? "
+                "AND status IN ('pending','processing') ORDER BY id DESC LIMIT 1",
+                (business_key,),
+            ).fetchone()
+            return row[0] if row else None
+
+        return self._run_read(_read, error_msg="查询在途 agent_run 失败", default=None)
 
     @staticmethod
     def _find_latest_by_business_key(conn, business_key: str) -> Optional[dict]:
@@ -297,14 +404,22 @@ class AgentRunsRepository(BaseRepository):
     def mark_failed(
         self, run_id: str, stop_reason: str, last_error: str, total_tokens: int = 0
     ) -> bool:
-        """标记失败（LLM 调用失败 attempts 达上限），记录终态时间"""
+        """标记失败（LLM 调用失败 attempts 达上限），记录终态时间。
+
+        失败累计：转终态时 ``total_attempts += 1``（同键 failed 行的
+        ``SUM(total_attempts)`` 即累计失败次数）。已 failed 的 run 再次调用
+        不重复累计（保证「一个 run 只计 1 次失败」，避免 increment_attempts
+        达上限置终态后调用方再 mark_failed 造成双计）。
+        """
 
         def _write(conn):
             cursor = conn.execute(
                 """
                 UPDATE agent_runs
                 SET status='failed', stop_reason=?, last_error=?, total_tokens=?,
-                    ended_at=?
+                    ended_at=?,
+                    total_attempts = total_attempts
+                        + CASE WHEN status='failed' THEN 0 ELSE 1 END
                 WHERE run_id=?
                 """,
                 (stop_reason, last_error, total_tokens, _now(), run_id),
@@ -315,53 +430,12 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="标记 agent_run failed 失败", default=False
         )
 
-    def mark_applied(self, run_id: str) -> bool:
-        """标记建议被应用（用户确认建议）。
-
-        守卫：仅当 status='succeeded' 可流转，行数=0（非 succeeded）返回 False。
-        """
-
-        def _write(conn):
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='applied', ended_at=?
-                WHERE run_id=? AND status='succeeded'
-                """,
-                (_now(), run_id),
-            )
-            return cursor.rowcount > 0
-
-        return self._run_write(
-            _write, error_msg="标记 agent_run applied 失败", default=False
-        )
-
-    def mark_rejected(self, run_id: str) -> bool:
-        """标记建议被忽略（用户忽略）。
-
-        守卫：仅当 status='succeeded' 可流转，行数=0（非 succeeded）返回 False。
-        """
-
-        def _write(conn):
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='rejected', ended_at=?
-                WHERE run_id=? AND status='succeeded'
-                """,
-                (_now(), run_id),
-            )
-            return cursor.rowcount > 0
-
-        return self._run_write(
-            _write, error_msg="标记 agent_run rejected 失败", default=False
-        )
-
     def increment_attempts(self, run_id: str, last_error: str = "") -> int:
         """累加调度轮次失败次数（仅 processing 态有效），返回最新 attempts。
 
         达上限（attempts>=3）时在**同一次调用事务内**单点置终态：
-        status='failed'、stop_reason='failed'、last_error、ended_at。
+        status='failed'、stop_reason='failed'、last_error、ended_at，并
+        ``total_attempts += 1``（本次 run 计一次累计失败）。
         调用方无需再自行 mark_failed（避免"失败置终态"双写）。
 
         非 processing 态 / run 不存在 → 不计数，返回 0。
@@ -382,7 +456,8 @@ class AgentRunsRepository(BaseRepository):
             if attempts >= 3:
                 conn.execute(
                     "UPDATE agent_runs SET status='failed', stop_reason='failed', "
-                    "last_error=?, ended_at=? WHERE run_id=?",
+                    "last_error=?, ended_at=?, "
+                    "total_attempts = total_attempts + 1 WHERE run_id=?",
                     (last_error, _now(), run_id),
                 )
             return attempts
@@ -461,27 +536,65 @@ class AgentRunsRepository(BaseRepository):
         return self._run_write(_write, error_msg="清理过期 agent_run 失败", default=0)
 
     # ------------------------------------------------------------------
-    # 查询：去重 / 调度器辅助
+    # 查询：调度器辅助 / run ↔ sync_record 关联
     # ------------------------------------------------------------------
 
-    def find_active_by_sync_record(
-        self, sync_record_id: int, retention_days: int = 7
-    ) -> Optional[dict]:
-        """按 sync_record_id 查活跃会话（去重用）。
+    def add_run_sync_record_link(
+        self, run_id: str, sync_record_id: int, decision: str = ""
+    ) -> int:
+        """写入 run ↔ sync_record 关联（多对一），返回新增行数（已存在/失败为 0）。
 
-        命中：status IN (pending, processing, succeeded)；或 no_suggestion 且
-        ended_at 在保留期内（未超保留期也算活跃）。无则返回 None。
-        时间比较统一为 epoch 秒整数。
+        INSERT OR IGNORE：同一 (run_id, sync_record_id) 重复写入幂等。
+        decision 记录入队决策（created/in_flight/...），便于审计。
         """
-        cutoff = _now() - retention_days * 86400
+
+        def _write(conn):
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO agent_run_sync_records
+                (run_id, sync_record_id, decision, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, sync_record_id, decision, _now()),
+            )
+            return cursor.rowcount
+
+        return self._run_write(
+            _write, error_msg="写入 agent_run↔sync_record 关联失败", default=0
+        )
+
+    def update_run_sync_record_id(self, run_id: str, sync_record_id: int) -> bool:
+        """刷新 run 的调度主指针 sync_record_id，返回是否更新成功。"""
+
+        def _write(conn):
+            cursor = conn.execute(
+                "UPDATE agent_runs SET sync_record_id=? WHERE run_id=?",
+                (sync_record_id, run_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._run_write(
+            _write, error_msg="刷新 agent_run sync_record_id 失败", default=False
+        )
+
+    def find_latest_by_sync_record(self, sync_record_id: int) -> Optional[dict]:
+        """按 sync_record_id 查最新一条会话，无则 None。
+
+        优先走关联表 agent_run_sync_records（多对一：N 条集级 record 关联
+        1 个剧集级 run，按关联时间/run id 取最新）；无关联行时回退旧路径
+        （agent_runs.sync_record_id 主指针），兼容历史数据。
+
+        用于前端候选页：返回最新 agent run 的状态与 run_id（徽标 / 评估过程
+        折叠区），不过滤状态，以便 run 终态后仍可回看。
+        """
 
         def _read(conn):
             cursor = conn.execute(
                 """
-                SELECT * FROM agent_runs
-                WHERE sync_record_id=? AND status IN
-                    ('pending', 'processing', 'succeeded')
-                ORDER BY id DESC LIMIT 1
+                SELECT r.* FROM agent_run_sync_records l
+                JOIN agent_runs r ON r.run_id = l.run_id
+                WHERE l.sync_record_id = ?
+                ORDER BY l.created_at DESC, r.id DESC LIMIT 1
                 """,
                 (sync_record_id,),
             )
@@ -490,33 +603,7 @@ class AgentRunsRepository(BaseRepository):
                 cols = [d[0] for d in cursor.description]
                 return dict(zip(cols, row))
 
-            # no_suggestion 仅在保留期内算活跃
-            cursor = conn.execute(
-                """
-                SELECT * FROM agent_runs
-                WHERE sync_record_id=? AND status='no_suggestion'
-                  AND ended_at >= ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (sync_record_id, cutoff),
-            )
-            row = cursor.fetchone()
-            if row:
-                cols = [d[0] for d in cursor.description]
-                return dict(zip(cols, row))
-            return None
-
-        return self._run_read(_read, error_msg="查询活跃 agent_run 失败", default=None)
-
-    def find_latest_by_sync_record(self, sync_record_id: int) -> Optional[dict]:
-        """按 sync_record_id 查最新一条会话（任意状态，按 id DESC），无则 None。
-
-        用于前端候选页：返回最新 agent run 的状态与 run_id（徽标 / 评估过程折叠区）。
-        与 find_active_by_sync_record 不同，本方法不过滤状态，只要存在即返回，
-        以便「AI 评估过程」折叠区在 run 终态（succeeded/applied/failed 等）后仍可回看。
-        """
-
-        def _read(conn):
+            # 兼容历史数据：回退按 agent_runs.sync_record_id 主指针查询
             cursor = conn.execute(
                 "SELECT * FROM agent_runs WHERE sync_record_id=? "
                 "ORDER BY id DESC LIMIT 1",

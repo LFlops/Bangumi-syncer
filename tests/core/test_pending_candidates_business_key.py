@@ -401,3 +401,73 @@ class TestUniqueIndexGuard:
             assert result["total"] == 2
         finally:
             dbm._connection._conn.close()
+
+
+class TestFindLatestByBusinessKey:
+    """find_latest_by_business_key：run 入队复用判定用的只读查询"""
+
+    def test_returns_latest_candidate_by_status_priority(self, tmp_path):
+        """同键多条候选 → 返回 id 最大的一条（含 status / resolved_at）"""
+        dbm = _make_db(tmp_path)
+        try:
+            conn = dbm._connection._conn
+            conn.execute(
+                "DROP INDEX IF EXISTS idx_pending_candidates_business_key_active"
+            )
+            conn.execute(
+                """
+                INSERT INTO pending_candidates
+                (request_title, request_season, user_name, source, status,
+                 candidates_json, trace_json, business_key)
+                VALUES ('测试番剧', 1, 'user1', 'plex', 'rejected', '[]', '{}',
+                 'match|user1|测试番剧|1')
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO pending_candidates
+                (request_title, request_season, user_name, source, status,
+                 candidates_json, trace_json, business_key)
+                VALUES ('测试番剧', 1, 'user1', 'plex', 'pending', '[]', '{}',
+                 'match|user1|测试番剧|1')
+                """
+            )
+            conn.commit()
+
+            row = dbm._pending.find_latest_by_business_key("match|user1|测试番剧|1")
+            assert row is not None
+            assert row["status"] == "pending"
+            assert row["business_key"] == "match|user1|测试番剧|1"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_returns_none_for_unknown_or_empty_key(self, tmp_path):
+        """未知 business_key / 空 key → None"""
+        dbm = _make_db(tmp_path)
+        try:
+            assert dbm._pending.find_latest_by_business_key("match|nobody|无|1") is None
+            assert dbm._pending.find_latest_by_business_key("") is None
+        finally:
+            dbm._connection._conn.close()
+
+    def test_ignores_status_outside_pending_confirmed_rejected(self, tmp_path):
+        """已被物理删除状态之外的行不参与复用判定"""
+        dbm = _make_db(tmp_path)
+        try:
+            conn = dbm._connection._conn
+            conn.execute(
+                """
+                INSERT INTO pending_candidates
+                (request_title, request_season, user_name, source, status,
+                 candidates_json, trace_json, business_key)
+                VALUES ('测试番剧', 1, 'user1', 'plex', 'deleted', '[]', '{}',
+                 'match|user1|测试番剧|1')
+                """
+            )
+            conn.commit()
+            assert (
+                dbm._pending.find_latest_by_business_key("match|user1|测试番剧|1")
+                is None
+            )
+        finally:
+            dbm._connection._conn.close()

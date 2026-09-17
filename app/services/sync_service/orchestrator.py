@@ -439,13 +439,16 @@ class SyncOrchestrator:
     def _enqueue_match_assist_run(
         self, run_id: str, item: CustomItem, sync_record_id: int, trace: MatchTrace
     ) -> None:
-        """去重后向 agent_runs 提交一条 match 任务（业务键版本）。
+        """向 agent_runs 提交一条 match 任务（业务键决策，失败每次新建 run）。
 
-        按 business_key（user_name + normalize(title) + season）决策：
-        - 同键在途 → 只刷新 sync_record_id（in_flight）
-        - 同键 failed 且未超限 → 复用（requeued）
-        - 同键 succeeded/no_suggestion 且 7 天内 → 只刷新 sync_record_id（reused）
-        - 否则新建（created）
+        决策由 :meth:`AgentRunsRepository.enqueue_match_run` 在单事务内完成：
+        - created：新建 pending（无历史 / failed 未超限 / 候选出窗或映射失效）
+        - in_flight：同键在途 → 复用该 run 并刷新主指针
+        - reuse_accepted / reuse_holding：业务子状态命中 → 复用已有 run 结果
+        - exhausted：累计失败达上限 → 不再新建
+
+        accepted_mapping_valid 由 mapping_service 现有查询接口校验（accepted
+        候选的映射是否仍有效），供 confirmed 候选的复用判定使用。
         任何落库异常仅日志，不阻塞主匹配流程。
         """
         try:
@@ -457,25 +460,46 @@ class SyncOrchestrator:
                 title=item.title,
                 season=item.season,
             )
-            result = database_manager.agent_runs.enqueue_run_dedup(
+            result = database_manager.agent_runs.enqueue_match_run(
                 run_id=run_id,
-                task_type="match",
-                sync_record_id=sync_record_id,
                 business_key=business_key,
+                sync_record_id=sync_record_id,
+                accepted_mapping_valid=self._accepted_mapping_valid(item),
             )
+            decision = result.get("decision", "")
+            actual_run_id = result.get("run_id", run_id)
             logger.info(
-                f"匹配增强任务落库: decision={result}, business_key={business_key}, "
-                f"sync_record_id={sync_record_id}"
+                f"匹配增强任务落库: decision={decision}, run_id={actual_run_id}, "
+                f"business_key={business_key}, sync_record_id={sync_record_id}"
             )
-            if result == "in_flight":
+            if actual_run_id != run_id:
                 # trace step 里记录的 run_id 与最终复用的 run_id 可能不一致
                 # （trace 已持久化无法回写，属已知展示层小瑕疵）
                 logger.debug(
-                    f"trace step 记录的 run_id={run_id} 与复用的 run_id 不一致"
-                    "（trace 已持久化无法回写，属已知展示层小瑕疵）"
+                    f"trace step 记录的 run_id={run_id} 与最终复用的 run_id="
+                    f"{actual_run_id} 不一致（trace 已持久化无法回写）"
                 )
         except Exception as e:
             logger.warning(f"匹配增强任务落库失败（不影响主流程）: {e}")
+
+    def _accepted_mapping_valid(self, item: CustomItem) -> bool:
+        """校验 accepted（候选已确认）的映射是否仍有效（能查到 subject_id）。
+
+        accepted 候选复用判定用：映射有效 → 复用历史成功结果（不限时间）；
+        已被删除 → 重新评估。查询异常返回 False（重新评估更安全）并记录告警。
+        """
+        try:
+            from ..mapping_service import mapping_service
+
+            subject_id, _, _ = mapping_service.find_mapping(
+                item.title, item.ori_title or "", int(item.season)
+            )
+            return bool(subject_id)
+        except Exception as e:
+            logger.warning(
+                f"校验 accepted 映射有效性失败（按无效处理，将重新评估）: {e}"
+            )
+            return False
 
     # ------------------------------------------------------------------
     # 执行阶段管线（episode_resolve → cross_season → sync_action → result）

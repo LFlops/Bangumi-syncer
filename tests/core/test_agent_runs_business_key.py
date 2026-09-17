@@ -166,3 +166,56 @@ class TestAgentRunsBusinessKeySchema:
             assert cur.fetchone()[0] == 2
         finally:
             dbm._connection._conn.close()
+
+
+class TestTerminalStatusMigration:
+    """启动迁移：业务特化终态 applied/rejected 收敛为 succeeded（幂等）"""
+
+    def _seed_legacy_statuses(self, db_path: str) -> None:
+        dbm = DatabaseManager(db_path)
+        conn = dbm._connection._conn
+        for run_id, status in (
+            ("a1", "applied"),
+            ("r1", "rejected"),
+            ("s1", "succeeded"),
+            ("f1", "failed"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO agent_runs
+                (run_id, task_type, sync_record_id, status, business_key,
+                 attempts, total_attempts, created_at, last_attempt_at, ended_at)
+                VALUES (?, 'match', 1, ?, 'bk', 0, 0, 1000, 1000, 1000)
+                """,
+                (run_id, status),
+            )
+        conn.commit()
+        dbm._connection.close()
+
+    def test_applied_rejected_migrate_to_succeeded(self, tmp_path):
+        """旧库 applied/rejected 启动后收敛为 succeeded，其余状态不动"""
+        db_path = str(tmp_path / "migrate.db")
+        self._seed_legacy_statuses(db_path)
+
+        dbm = DatabaseManager(db_path)
+        try:
+            assert dbm.agent_runs.get_run("a1")["status"] == "succeeded"
+            assert dbm.agent_runs.get_run("r1")["status"] == "succeeded"
+            assert dbm.agent_runs.get_run("s1")["status"] == "succeeded"
+            assert dbm.agent_runs.get_run("f1")["status"] == "failed"
+        finally:
+            dbm._connection.close()
+
+    def test_migration_idempotent_on_second_start(self, tmp_path):
+        """迁移幂等：第二次启动不报错且状态保持 succeeded"""
+        db_path = str(tmp_path / "migrate2.db")
+        self._seed_legacy_statuses(db_path)
+
+        first = DatabaseManager(db_path)
+        first._connection.close()
+
+        second = DatabaseManager(db_path)
+        try:
+            assert second.agent_runs.get_run("a1")["status"] == "succeeded"
+        finally:
+            second._connection.close()

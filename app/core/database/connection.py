@@ -385,6 +385,46 @@ class DatabaseConnection:
             message="agent_runs 已迁移：增加 business_key 列",
         )
 
+    def _ensure_agent_run_sync_records(self, cursor) -> None:
+        """agent_run ↔ sync_record 关联表：多对一（N 条集级 record 关联 1 个剧集级 run）。
+
+        与 agent_steps 的 FK 风格一致（run 删除时级联清理关联行）。
+        sync_records 表不加字段，关联关系独立承载，避免污染通用同步记录表。
+        SQL 幂等（IF NOT EXISTS），重复执行安全。
+        """
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_run_sync_records (
+                run_id         TEXT NOT NULL REFERENCES agent_runs(run_id)
+                    ON DELETE CASCADE,
+                sync_record_id INTEGER NOT NULL,
+                decision       TEXT DEFAULT '',
+                created_at     INTEGER NOT NULL,
+                PRIMARY KEY (run_id, sync_record_id)
+            )
+            """
+        )
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_run_sync_records_record "
+            "ON agent_run_sync_records(sync_record_id)"
+        )
+
+    def _migrate_agent_run_terminal_statuses(self, cursor) -> None:
+        """旧库迁移：业务特化终态 applied/rejected 收敛为 succeeded。
+
+        用户处理结果改由 pending_candidates（status + resolved_at）承载，
+        agent_runs 回归通用框架、不再持有业务状态。幂等：首次迁移后
+        重复执行影响 0 行。
+        """
+        cursor.execute(
+            "UPDATE agent_runs SET status='succeeded' "
+            "WHERE status IN ('applied', 'rejected')"
+        )
+        if cursor.rowcount > 0:
+            logger.info(
+                f"agent_runs 已迁移：{cursor.rowcount} 条 applied/rejected 收敛为 succeeded"
+            )
+
     def _ensure_agent_memory(self, cursor) -> None:
         """Agent 工作记忆 schema：主表 + 归档表 + 索引 + FTS5 + 同步触发器。
 
@@ -627,10 +667,11 @@ class DatabaseConnection:
         self._ensure_pending_sync_queue_sync_record_id(cursor)
 
         # Agent 通用会话表：agent_runs（一次会话状态机）+ agent_steps（span 可重放日志）
-        # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled/
-        #              applied/rejected（exhausted 仅作 stop_reason，不作 status）
+        # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled
+        # （applied/rejected 已移除，用户处理结果由 pending_candidates 承载；
+        #   exhausted 仅作 stop_reason，不作 status）
         # 时间列统一 epoch 秒整数（写入方显式写入，DEFAULT 0 占位）。
-        # agent_runs 必须先于 agent_steps 创建（steps 有 FK 引用 runs）。
+        # agent_runs 必须先于 agent_steps / agent_run_sync_records 创建（FK 引用 runs）。
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS agent_runs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -693,6 +734,8 @@ class DatabaseConnection:
         cursor.execute(
             "CREATE INDEX IF NOT EXISTS idx_agent_steps_run_id ON agent_steps(run_id)"
         )
+        # run ↔ sync_record 关联表（多对一），须在 agent_runs 之后创建（FK 引用）
+        self._ensure_agent_run_sync_records(cursor)
 
         # Bangumi 账号（含 OAuth 令牌）：以「账号列表」为唯一真相源，
         # 取代散落在 INI 各 [bangumi-*] 段的配置。
@@ -809,6 +852,9 @@ class DatabaseConnection:
 
         # Agent 工作记忆（热表 + 归档冷表 + FTS5 + 同步触发器）
         self._ensure_agent_memory(cursor)
+
+        # 旧库迁移：applied/rejected 业务特化终态收敛为 succeeded（幂等）
+        self._migrate_agent_run_terminal_statuses(cursor)
 
         # 一次性数据迁移：加密历史明文 token（仓储层已改为写入即加密）
         self._ensure_tokens_encrypted(cursor)

@@ -1,13 +1,12 @@
-"""匹配增强接入 + confirm/reject 联动集成测试
+"""匹配增强接入 + confirm/reject 不触碰 agent_runs 集成测试
 
 覆盖：
 - 开关开 + LLM 可用 → 失败落 agent_runs(pending) + trace 补 llm_assist step（persist 前）
 - 无候选也落任务
 - 开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）
 - LLM 配置缺失 → 不落任务 + 日志含 "LLM 配置缺失"
-- 去重：同 key 活跃 → 跳过；failed 且 total_attempts<=10 → 重新入队；>10 → 不重入
-- confirm（从候选列表外确认建议）→ 写映射 + 补发 + mark_applied
-- 无关联 agent_runs（开关关流程）→ confirm/reject no-op 不报错
+- 入队决策：enqueue_match_run 返回 dict（decision/run_id），orchestrator 记录 decision
+- S12：confirm/reject 候选不再改写 run 状态（用户结果由 pending_candidates 承载）
 - 不带 llm_subject_id 的既有 confirm → 原逻辑闭环
 - API：confirm 端点接收可选 llm_subject_id 并优先使用
 """
@@ -74,15 +73,17 @@ def _make_orchestrator() -> SyncOrchestrator:
 def test_handle_match_failure_enqueues_when_enabled(
     mock_db, mock_cfg, mock_notify, with_candidates
 ):
-    """开关开 + LLM 可用 → 落 agent_runs(pending) + trace 含 llm_assist step
+    """开关开 + LLM 可用 → 调 enqueue_match_run（业务键 + accepted_mapping_valid）
 
     无候选也落任务；trace step 必须在 _persist_sync_record 之前（persist 被
     mock，其序列化结果即被视为 persist 时刻的 trace 状态）。
-    新实现使用 enqueue_run_dedup（业务键去重）。
     """
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.enqueue_run_dedup.return_value = "created"
+    agent_runs.enqueue_match_run.return_value = {
+        "decision": "created",
+        "run_id": "generated-run",
+    }
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {
         "api_key": "sk-test",
@@ -98,15 +99,19 @@ def test_handle_match_failure_enqueues_when_enabled(
         captured["steps"] = t.to_dict()["steps"]
         return 123
 
-    with patch.object(orch, "_persist_sync_record", side_effect=fake_persist):
+    with (
+        patch.object(orch, "_persist_sync_record", side_effect=fake_persist),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.enqueue_run_dedup.assert_called_once()
-    kwargs = agent_runs.enqueue_run_dedup.call_args.kwargs
-    assert kwargs["task_type"] == "match"
+    agent_runs.enqueue_match_run.assert_called_once()
+    kwargs = agent_runs.enqueue_match_run.call_args.kwargs
     assert kwargs["sync_record_id"] == 123
     assert kwargs["run_id"]
     assert kwargs["business_key"]  # 业务键非空
+    assert kwargs["accepted_mapping_valid"] is False  # 映射未命中 → 无效
     # trace step 在 persist 前已存在
     assert any(
         s["stage"] == "llm_assist" and s["status"] == "pending"
@@ -131,7 +136,7 @@ def test_handle_match_failure_switch_off_no_enqueue(mock_db, mock_cfg, mock_noti
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.enqueue_run_dedup.assert_not_called()
+    agent_runs.enqueue_match_run.assert_not_called()
     assert not any(s["stage"] == "llm_assist" for s in trace.to_dict()["steps"])
 
 
@@ -154,18 +159,21 @@ def test_handle_match_failure_llm_missing_no_enqueue(
     with patch.object(orch, "_persist_sync_record", return_value=123):
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.enqueue_run_dedup.assert_not_called()
+    agent_runs.enqueue_match_run.assert_not_called()
     assert "LLM 配置缺失" in capsys.readouterr().out
 
 
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
-def test_dedup_in_flight_returns_in_flight(mock_db, mock_cfg, mock_notify):
-    """去重：同键已有在途 → enqueue_run_dedup 返回 in_flight，不新建"""
+def test_enqueue_decision_in_flight_logged(mock_db, mock_cfg, mock_notify, capsys):
+    """入队返回 in_flight → 记录 decision 与复用的 run_id，不报错"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.enqueue_run_dedup.return_value = "in_flight"
+    agent_runs.enqueue_match_run.return_value = {
+        "decision": "in_flight",
+        "run_id": "existing-run",
+    }
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
     mock_db.agent_runs = agent_runs
@@ -173,23 +181,30 @@ def test_dedup_in_flight_returns_in_flight(mock_db, mock_cfg, mock_notify):
     item = _make_item()
     trace = _make_trace()
 
-    with patch.object(orch, "_persist_sync_record", return_value=123):
+    with (
+        patch.object(orch, "_persist_sync_record", return_value=123),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.enqueue_run_dedup.assert_called_once()
-    # 业务键由 item 计算
-    kwargs = agent_runs.enqueue_run_dedup.call_args.kwargs
-    assert "business_key" in kwargs
+    agent_runs.enqueue_match_run.assert_called_once()
+    out = capsys.readouterr().out
+    assert "decision=in_flight" in out
+    assert "existing-run" in out
 
 
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
-def test_dedup_requeued_returns_requeued(mock_db, mock_cfg, mock_notify):
-    """去重：同键 failed 且未超限 → enqueue_run_dedup 返回 requeued"""
+def test_enqueue_decision_reuse_holding_logged(mock_db, mock_cfg, mock_notify, capsys):
+    """入队返回 reuse_holding（候选等待用户处理）→ 记录 decision，不新建 run"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
-    agent_runs.enqueue_run_dedup.return_value = "requeued"
+    agent_runs.enqueue_match_run.return_value = {
+        "decision": "reuse_holding",
+        "run_id": "holding-run",
+    }
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
     mock_db.agent_runs = agent_runs
@@ -197,56 +212,19 @@ def test_dedup_requeued_returns_requeued(mock_db, mock_cfg, mock_notify):
     item = _make_item()
     trace = _make_trace()
 
-    with patch.object(orch, "_persist_sync_record", return_value=123):
+    with (
+        patch.object(orch, "_persist_sync_record", return_value=123),
+        patch("app.services.mapping_service.mapping_service") as mock_mapping,
+    ):
+        mock_mapping.find_mapping.return_value = ("", "", "")
         orch._handle_match_failure(item, "plex", trace, "err", [""])
 
-    agent_runs.enqueue_run_dedup.assert_called_once()
-
-
-@patch("app.services.sync_service.notification_service")
-@patch("app.services.sync_service.config_manager")
-@patch("app.services.sync_service.database_manager")
-def test_dedup_exhausted_returns_exhausted(mock_db, mock_cfg, mock_notify):
-    """去重：同键 failed 且超限 → enqueue_run_dedup 返回 exhausted"""
-    orch = _make_orchestrator()
-    agent_runs = MagicMock()
-    agent_runs.enqueue_run_dedup.return_value = "exhausted"
-    mock_cfg.get.return_value = "true"
-    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
-    mock_db.agent_runs = agent_runs
-
-    item = _make_item()
-    trace = _make_trace()
-
-    with patch.object(orch, "_persist_sync_record", return_value=123):
-        orch._handle_match_failure(item, "plex", trace, "err", [""])
-
-    agent_runs.enqueue_run_dedup.assert_called_once()
-
-
-@patch("app.services.sync_service.notification_service")
-@patch("app.services.sync_service.config_manager")
-@patch("app.services.sync_service.database_manager")
-def test_dedup_reused_returns_reused(mock_db, mock_cfg, mock_notify):
-    """去重：同键 succeeded 且 7 天内 → enqueue_run_dedup 返回 reused"""
-    orch = _make_orchestrator()
-    agent_runs = MagicMock()
-    agent_runs.enqueue_run_dedup.return_value = "reused"
-    mock_cfg.get.return_value = "true"
-    mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
-    mock_db.agent_runs = agent_runs
-
-    item = _make_item()
-    trace = _make_trace()
-
-    with patch.object(orch, "_persist_sync_record", return_value=123):
-        orch._handle_match_failure(item, "plex", trace, "err", [""])
-
-    agent_runs.enqueue_run_dedup.assert_called_once()
+    agent_runs.enqueue_match_run.assert_called_once()
+    assert "reuse_holding" in capsys.readouterr().out
 
 
 # ----------------------------------------------------------------------
-# confirm / reject 联动
+# confirm / reject 不再触碰 agent_runs（S12）
 # ----------------------------------------------------------------------
 
 
@@ -259,8 +237,14 @@ def _patch_db_for_confirm(record: dict, agent_runs: MagicMock) -> MagicMock:
     return db
 
 
-def test_confirm_llm_subject_from_outside_marks_applied():
-    """从候选列表外确认建议 → 写映射 + 补发 + agent_runs→applied"""
+def test_linkage_methods_removed():
+    """S12 业务联动方法已删除（用户处理结果由 pending_candidates 承载）"""
+    assert not hasattr(SyncService, "_linkage_mark_applied")
+    assert not hasattr(SyncService, "_linkage_mark_rejected")
+
+
+def test_confirm_does_not_touch_agent_runs():
+    """S12 候选确认 → 写映射 + 更新候选状态，不再改写 agent_runs"""
     svc = SyncService()
     record = {
         "id": 5,
@@ -272,11 +256,6 @@ def test_confirm_llm_subject_from_outside_marks_applied():
         "sync_record_id": 7,
     }
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = {
-        "run_id": "run-x",
-        "status": "succeeded",
-    }
-    agent_runs.mark_applied.return_value = True
     db = _patch_db_for_confirm(record, agent_runs)
 
     with (
@@ -288,82 +267,21 @@ def test_confirm_llm_subject_from_outside_marks_applied():
         ) as mock_upsert,
         patch.object(svc, "_auto_replay_after_confirm", return_value=""),
     ):
-        ok, msg = svc.confirm_pending_candidate(5, "999")  # 999 不在任何候选列表内
+        ok, msg = svc.confirm_pending_candidate(5, "999")
 
     assert ok is True
     # 映射以确认的主体写入（允许列表外 subject_id）
     mock_upsert.assert_called_once_with("测试番", "999", 1)
-    # 联动：succeeded → applied
-    agent_runs.mark_applied.assert_called_once_with("run-x")
-
-
-def test_confirm_no_linked_run_is_noop():
-    """无关联 agent_runs（开关关流程）→ confirm 成功但联动 no-op 不报错"""
-    svc = SyncService()
-    record = {
-        "id": 6,
-        "status": "pending",
-        "request_title": "测试番",
-        "request_season": 1,
-        "user_name": "u1",
-        "source": "plex",
-        "sync_record_id": 8,
-    }
-    agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None  # 无关联 run
-    db = _patch_db_for_confirm(record, agent_runs)
-
-    with (
-        patch("app.services.sync_service.database_manager", db),
-        patch.object(svc, "_validate_subject_id", return_value=(True, "")),
-        patch(
-            "app.services.sync_service.mapping_service.upsert_single_mapping",
-            return_value=True,
-        ),
-        patch.object(svc, "_auto_replay_after_confirm", return_value=""),
-    ):
-        ok, msg = svc.confirm_pending_candidate(6, "123")
-
-    assert ok is True
+    # 用户处理结果由 pending_candidates 承载
+    db.update_pending_candidate_status.assert_called_once()
+    # run 状态不再被联动改写
+    agent_runs.find_active_by_sync_record.assert_not_called()
     agent_runs.mark_applied.assert_not_called()
+    agent_runs.update_run_status.assert_not_called()
 
 
-def test_confirm_linked_run_not_succeeded_no_applied():
-    """联动守卫：关联 run 非 succeeded（如 processing）→ 不 applied"""
-    svc = SyncService()
-    record = {
-        "id": 7,
-        "status": "pending",
-        "request_title": "测试番",
-        "request_season": 1,
-        "user_name": "u1",
-        "source": "plex",
-        "sync_record_id": 9,
-    }
-    agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = {
-        "run_id": "run-y",
-        "status": "processing",
-    }
-    db = _patch_db_for_confirm(record, agent_runs)
-
-    with (
-        patch("app.services.sync_service.database_manager", db),
-        patch.object(svc, "_validate_subject_id", return_value=(True, "")),
-        patch(
-            "app.services.sync_service.mapping_service.upsert_single_mapping",
-            return_value=True,
-        ),
-        patch.object(svc, "_auto_replay_after_confirm", return_value=""),
-    ):
-        ok, msg = svc.confirm_pending_candidate(7, "123")
-
-    assert ok is True
-    agent_runs.mark_applied.assert_not_called()
-
-
-def test_reject_no_linked_run_is_noop():
-    """无关联 agent_runs → reject 成功但联动 no-op 不报错"""
+def test_reject_does_not_touch_agent_runs():
+    """S12 候选忽略 → 更新候选状态，不触碰 agent_runs"""
     svc = SyncService()
     record = {
         "id": 8,
@@ -375,7 +293,6 @@ def test_reject_no_linked_run_is_noop():
         "sync_record_id": 10,
     }
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None
     db = MagicMock()
     db.agent_runs = agent_runs
     db.get_pending_candidate_by_id.return_value = record
@@ -385,36 +302,9 @@ def test_reject_no_linked_run_is_noop():
         ok, msg = svc.reject_pending_candidate(8)
 
     assert ok is True
+    db.update_pending_candidate_status.assert_called_once_with(8, "rejected")
+    agent_runs.find_active_by_sync_record.assert_not_called()
     agent_runs.mark_rejected.assert_not_called()
-
-
-def test_reject_linked_succeeded_marks_rejected():
-    """联动：关联 run 为 succeeded → reject 联动 mark_rejected"""
-    svc = SyncService()
-    record = {
-        "id": 9,
-        "status": "pending",
-        "request_title": "测试番",
-        "request_season": 1,
-        "user_name": "u1",
-        "source": "plex",
-        "sync_record_id": 11,
-    }
-    agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = {
-        "run_id": "run-z",
-        "status": "succeeded",
-    }
-    db = MagicMock()
-    db.agent_runs = agent_runs
-    db.get_pending_candidate_by_id.return_value = record
-    db.update_pending_candidate_status.return_value = True
-
-    with patch("app.services.sync_service.database_manager", db):
-        ok, msg = svc.reject_pending_candidate(9)
-
-    assert ok is True
-    agent_runs.mark_rejected.assert_called_once_with("run-z")
 
 
 def test_confirm_legacy_without_llm_subject_still_closes():
@@ -430,7 +320,6 @@ def test_confirm_legacy_without_llm_subject_still_closes():
         # 无 sync_record_id：纯手动流
     }
     agent_runs = MagicMock()
-    agent_runs.find_active_by_sync_record.return_value = None
     db = _patch_db_for_confirm(record, agent_runs)
 
     with (
