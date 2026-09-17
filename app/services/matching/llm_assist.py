@@ -34,7 +34,7 @@ from app.services.agent.trace import (
     record_budget_message as trace_record_budget_message,
     start_span as trace_start_span,
 )
-from app.services.llm.client import LLMCallError
+from app.services.llm.client import LLMCallError, get_llm_client
 from app.services.llm.models import (
     Message,
     ToolResultBlock,
@@ -42,6 +42,7 @@ from app.services.llm.models import (
 )
 from app.services.llm.output_parser import parse_suggestion
 from app.services.llm.tools import ToolDefinition, ToolRegistry, get_tool_registry
+from app.services.sync_service import SyncService
 
 # ---------------------------------------------------------------------------
 # Prompt 常量（注入防护）
@@ -90,11 +91,13 @@ _sync_service_instance = None
 
 
 def _get_sync_service():
-    """惰性获取 SyncService 单例（仅成功路径调用一次）。"""
+    """惰性获取 SyncService 单例（仅成功路径调用一次）。
+
+    ``SyncService`` 类已在模块头部导入（无导入环，见 P2-2 AST 守卫测试），
+    此处仅延迟**实例化**：构造较重且仅校验成功路径需要。
+    """
     global _sync_service_instance
     if _sync_service_instance is None:
-        from app.services.sync_service import SyncService
-
         _sync_service_instance = SyncService()
     return _sync_service_instance
 
@@ -743,9 +746,10 @@ def _build_default_chat_fn(thinking_level: str):
 
     ``thinking_level`` 由调用方（run）传入，透传到 provider 层，使 match 的 LLM
     请求按自身思考强度工作（而非使用全局 [llm] thinking_level 默认值）。
-    """
-    from app.services.llm import get_llm_client
 
+    ``get_llm_client`` 在模块头部导入（无导入环）：每次调用现取单例，
+    使测试可 ``patch("app.services.matching.llm_assist.get_llm_client")``。
+    """
     client = get_llm_client()
 
     async def chat_fn(messages, *, tools=None, tool_choice=None):
@@ -960,9 +964,9 @@ async def continue_run(
                 sync_record_id=sync_record_id,
                 bgm=bgm,
                 notification_service=notification_service,
-                # 恢复路径无实时 recorder：已发生轮次的 tokens 未随 replay 携带，
-                # 与旧实现（last_response=None → 0）行为一致。
-                total_tokens=0,
+                # 恢复路径无实时 recorder：已发生轮次的 tokens 由 replay 从
+                # agent_steps 的 llm_chat span 累计回传（口径见 ReplayResult.total_tokens）。
+                total_tokens=replay_result.total_tokens,
             )
             return
 
@@ -999,8 +1003,30 @@ async def continue_run(
             logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
             repo.increment_attempts(run_id, last_error=str(e)[:500])
     except Exception as e:
-        logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
+        # P2-3：附带当前 run 状态，便于区分「处理中异常」与「已终态后的异常」
+        logger.error(
+            f"🤖 恢复续跑 {run_id} 异常（当前 run 状态="
+            f"{_current_run_status(repo, run_id)}）: {e}"
+        )
         repo.increment_attempts(run_id, last_error=str(e)[:500])
+
+
+def _current_run_status(repo, run_id: str) -> str:
+    """best-effort 读取 run 当前 status，供最外层异常日志定位。
+
+    读取失败/无记录时返回可读占位（``unknown`` / ``missing``），并记 warning，
+    绝不因此抛错掩盖原始异常。
+    """
+    try:
+        row = repo.get_run(run_id)
+    except Exception as e:  # best-effort：状态读取失败不遮蔽原始异常
+        logger.warning(f"🤖 恢复续跑读取 run {run_id} 状态失败（日志降级）: {e}")
+        return "unknown"
+    if not row:
+        return "missing"
+    if isinstance(row, dict):
+        return str(row.get("status") or "unknown")
+    return str(getattr(row, "status", "unknown"))
 
 
 async def _execute_continuation(

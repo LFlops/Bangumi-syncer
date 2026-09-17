@@ -218,12 +218,17 @@ class ReplayResult:
       tool_execute 的缺失项（供调用方补执行；readonly 校验由调用方做）。
     - ``last_response``：最后一条完整 llm_chat 的响应（当其未产生工具/已终止时，
       调用方直接消费分派 end_turn / tool_use / submit；为 None 表示应直接进入下一轮 chat）。
+    - ``total_tokens``：本次重放中**所有已出现 llm_chat span** 的 ``tokens`` 列之和。
+      口径为「已发生的 LLM 调用都消耗了 token」——无论该轮是否完整执行、是否计入
+      ``executed_iterations``、是否被消费（含未完成轮与终局响应所在轮），只要落了
+      llm_chat span 就累计。供恢复路径写回 ``total_tokens``（历史轮次已消耗的用量）。
     """
 
     messages: list = field(default_factory=list)
     executed_iterations: int = 0
     missing_tool_calls: list = field(default_factory=list)
     last_response: dict | None = None
+    total_tokens: int = 0
 
 
 def _parse_json(raw: str, default: Any = None) -> Any:
@@ -301,6 +306,13 @@ def replay(run_id: str) -> ReplayResult:
     """
     dbm = get_database_manager()
     steps = dbm.agent_runs.get_steps(run_id)
+
+    # 累计所有已出现 llm_chat span 的 tokens（口径见 ReplayResult.total_tokens）；
+    # 与重建循环的 break 解耦：已发生的 LLM 调用即使所在轮未完整重放也已消耗 token。
+    total_tokens = 0
+    for s in steps:
+        if s["name"] == "llm_chat":
+            total_tokens += int(s.get("tokens") or 0)
 
     steps_by_iter: dict[int, list] = {}
     seed_messages: list[Message] = []
@@ -409,4 +421,5 @@ def replay(run_id: str) -> ReplayResult:
         executed_iterations=executed_iterations,
         missing_tool_calls=missing_tool_calls,
         last_response=last_response,
+        total_tokens=total_tokens,
     )

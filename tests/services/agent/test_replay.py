@@ -97,12 +97,14 @@ def _now_epoch():
 
 
 def _write_llm_chat(
-    dbm, run_id, iteration, tool_calls, stop_reason="tool_use", content=""
+    dbm, run_id, iteration, tool_calls, stop_reason="tool_use", content="", tokens=0
 ):
-    """写入一轮 llm_chat span。"""
+    """写入一轮 llm_chat span（``tokens`` 写专用列）。"""
     _ensure_run(dbm, run_id)
     span_id = trace.start_span(run_id, "llm_chat", iteration, 0)
-    trace.end_span(span_id, replay_delta=_chat_rd(stop_reason, content, tool_calls))
+    trace.end_span(
+        span_id, tokens=tokens, replay_delta=_chat_rd(stop_reason, content, tool_calls)
+    )
     return span_id
 
 
@@ -201,6 +203,46 @@ class TestReplayReconstructsFullRun:
         assert isinstance(result, trace.ReplayResult)
         # 无 unrecoverable_iteration 字段
         assert not hasattr(result, "unrecoverable_iteration")
+
+
+class TestReplayTotalTokens:
+    """P2-1：replay 累计已发生 llm_chat span 的 tokens，供恢复路径写回 total_tokens。"""
+
+    def test_replay_accumulates_total_tokens(self, dbm):
+        """2 轮 llm_chat（tokens=100/50）→ ReplayResult.total_tokens == 150。"""
+        _write_seed(dbm, "run-toks", [])
+        _write_llm_chat(
+            dbm,
+            "run-toks",
+            0,
+            [{"id": "t1", "name": "search_bangumi", "input": {}}],
+            tokens=100,
+        )
+        _write_tool_exec(dbm, "run-toks", 0, 1, "t1", "res1")
+        _write_llm_chat(
+            dbm,
+            "run-toks",
+            1,
+            [],
+            stop_reason="end_turn",
+            content="done",
+            tokens=50,
+        )
+
+        result = trace.replay("run-toks")
+        assert result.total_tokens == 150, (
+            f"应累计 2 轮 tokens=150，实际 {result.total_tokens}"
+        )
+
+    def test_replay_total_tokens_zero_when_no_chat_tokens(self, dbm):
+        """无 tokens 数据时累计为 0（不报错、不误记）。"""
+        _write_seed(dbm, "run-toks-zero", [])
+        _write_llm_chat(
+            dbm, "run-toks-zero", 0, [], stop_reason="end_turn", content="done"
+        )
+
+        result = trace.replay("run-toks-zero")
+        assert result.total_tokens == 0
 
 
 class TestReplayCheckpointResume:

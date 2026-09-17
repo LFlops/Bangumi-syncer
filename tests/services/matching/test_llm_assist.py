@@ -959,9 +959,11 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
 
-    # get_llm_client 在 _build_default_chat_fn 内部局部导入，需 patch 源模块
+    # get_llm_client 由 llm_assist 模块头部导入，patch 其模块命名空间
     # 不 mock loop_run：让真实循环执行，验证默认 chat_fn 确实调用 client.chat
-    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+    with patch(
+        "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
+    ):
         run_id = "run-think-medium"
         sr_id = 80
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1001,7 +1003,9 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
 
     monkeypatch.setattr(llm_assist, "loop_run", _fake_loop_run)
 
-    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+    with patch(
+        "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
+    ):
         run_id = "run-think-high"
         sr_id = 81
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1028,7 +1032,9 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
 
-    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+    with patch(
+        "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
+    ):
         run_id = "run-think-off"
         sr_id = 82
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1061,7 +1067,9 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
         custom_called["tool_choice"] = tool_choice
         return ChatResponse(content="", stop_reason="end_turn")
 
-    with patch("app.services.llm.get_llm_client", return_value=mock_client):
+    with patch(
+        "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
+    ):
         run_id = "run-custom-chatfn"
         sr_id = 83
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1835,12 +1843,14 @@ def _make_replay_result(
     missing: list | None = None,
     last_response: dict | None = None,
     messages: list | None = None,
+    total_tokens: int = 0,
 ) -> ReplayResult:
     return ReplayResult(
         messages=messages or [Message(role="system", content="s")],
         executed_iterations=executed,
         missing_tool_calls=missing or [],
         last_response=last_response,
+        total_tokens=total_tokens,
     )
 
 
@@ -1924,6 +1934,51 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
     assert result_arg.suggestion == {"subject_id": "123", "reason": "跨季匹配"}
     # 接线断言：notification_service 必须透传（生产链路真正发送站内信）
     assert handle.call_args[1].get("notification_service") is fake_svc
+    loop.assert_not_awaited()
+
+
+def test_continue_run_submit_uses_replayed_total_tokens():
+    """P2-1：submit_suggestion 直接分派分支把 replay 累计 tokens 传给 _handle_result。
+
+    恢复路径无实时 recorder，历史轮次 tokens 由 ``ReplayResult.total_tokens`` 携带；
+    不得再硬编码 0。
+    """
+    repo = _make_continuation_repo()
+    handle = MagicMock()
+    rr = _make_replay_result(
+        executed=1,
+        last_response={
+            "stop_reason": "submit_suggestion",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "s1",
+                    "name": "submit_suggestion",
+                    "input": {"subject_id": "123", "reason": "跨季匹配"},
+                }
+            ],
+        },
+        total_tokens=150,
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.matching.llm_assist._handle_result", handle),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-tok", {"id": 1}, MagicMock()))
+
+    handle.assert_called_once()
+    assert handle.call_args[1].get("total_tokens") == 150, (
+        f"恢复 submit 分支应传 replay 累计 tokens=150，"
+        f"实际 {handle.call_args[1].get('total_tokens')}"
+    )
     loop.assert_not_awaited()
 
 
@@ -2242,6 +2297,41 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
     repo.mark_failed.assert_not_called()
 
 
+def test_continue_run_outer_exception_logs_current_run_status():
+    """P2-3：最外层 except 日志须带当前 run 状态，便于定位「已终态后的异常」。"""
+    repo = _make_continuation_repo()
+    repo.get_run.return_value = {"status": "processing"}
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+    log = MagicMock()
+
+    async def _chat_fn(messages, *, tools=None, tool_choice=None):
+        return ChatResponse(content="done", stop_reason="end_turn")
+
+    boom_loop = AsyncMock(side_effect=RuntimeError("kaboom"))
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_chat_fn",
+            return_value=_chat_fn,
+        ),
+        patch("app.services.matching.llm_assist.loop_run", boom_loop),
+        patch("app.services.matching.llm_assist.logger", log),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-outer-err", {"id": 1}, MagicMock()))
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("processing" in m for m in errors), (
+        f"最外层异常日志应包含当前 run 状态(processing)，实际 {errors}"
+    )
+    repo.increment_attempts.assert_called_once()
+
+
 # F4 / G5：缺失工具补执行（readonly 执行 / 非 read 占位闭合协议） -------------
 
 
@@ -2432,7 +2522,9 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
-    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+    monkeypatch.setattr(
+        "app.services.matching.llm_assist.get_llm_client", lambda: client
+    )
 
     class _Bgm:
         def search(self, **kwargs):
@@ -2510,7 +2602,9 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     chat = AsyncMock(side_effect=_chat)
     client = MagicMock()
     client.chat = chat
-    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+    monkeypatch.setattr(
+        "app.services.matching.llm_assist.get_llm_client", lambda: client
+    )
 
     class _Bgm:
         def search(self, **kwargs):
@@ -2565,7 +2659,9 @@ def test_continue_run_writes_chat_span(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
-    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+    monkeypatch.setattr(
+        "app.services.matching.llm_assist.get_llm_client", lambda: client
+    )
 
     rr = _make_replay_result(
         executed=0,
@@ -2699,7 +2795,9 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
-    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+    monkeypatch.setattr(
+        "app.services.matching.llm_assist.get_llm_client", lambda: client
+    )
 
     rr = _make_replay_result(
         executed=2,
@@ -2756,7 +2854,9 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
-    monkeypatch.setattr("app.services.llm.get_llm_client", lambda: client)
+    monkeypatch.setattr(
+        "app.services.matching.llm_assist.get_llm_client", lambda: client
+    )
 
     class _Bgm:
         def search(self, **kwargs):
@@ -2984,4 +3084,36 @@ async def test_total_tokens_zero_when_no_usage():
     run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["total_tokens"] == 0, (
         f"无 usage 应记 0，实际 {run_row['total_tokens']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# P2-2：函数内 import 守卫（白名单为空 = 全部禁止，import 统一在模块头部）
+# ---------------------------------------------------------------------------
+
+
+def test_llm_assist_module_no_unlisted_function_level_imports():
+    """llm_assist 模块函数体内不得残留 import（白名单为空，全部已提升到模块头部）。
+
+    白名单形如 ``{(函数名, ast.unparse(import 语句)), ...}``；当前为空表示全禁。
+    如确需豁免（如避免模块级导入环），在此登记并同时在源码处注明豁免原因。
+    """
+    import ast
+    import inspect
+
+    allowed: set[tuple[str, str]] = set()
+
+    tree = ast.parse(inspect.getsource(llm_assist))
+    offenders: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            stmt = ast.unparse(node)
+            if (fn.name, stmt) not in allowed:
+                offenders.append(f"{fn.name}: {stmt}")
+    assert offenders == [], (
+        f"函数内不应残留未豁免 import（应提升到模块头部），实际：{offenders}"
     )
