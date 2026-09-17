@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import socket
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,10 +15,55 @@ import httpx
 from ...core.logging import logger
 from ..http_base import SyncHttpClient
 from ..retry import RETRY_EXCEPTIONS, RETRY_STATUS_CODES
+from .rate_limit import get_bgm_rate_limiter
+
+
+def _parse_retry_after(res: httpx.Response) -> float | None:
+    """解析响应头 ``Retry-After`` 为秒数
+
+    支持纯秒数与 HTTP-date；缺失或无法解析时返回 None（由令牌桶走默认冷却）。
+    """
+    headers = getattr(res, "headers", None) or {}
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    # 纯秒数
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        pass
+
+    # HTTP-date
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(text)
+        if dt is None:
+            logger.warning(f"⚠️  Retry-After 无法解析: {text!r}，使用默认冷却")
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.warning(f"⚠️  Retry-After 无法解析: {text!r} ({e})，使用默认冷却")
+        return None
 
 
 class HttpLayerMixin:
     """HTTP 请求层相关方法（供 BangumiApi 组合）"""
+
+    def _apply_rate_limit_notification(self, res: httpx.Response) -> None:
+        """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）"""
+        limiter = get_bgm_rate_limiter()
+        if res.status_code == 429:
+            limiter.notify_rate_limited(_parse_retry_after(res))
+        else:
+            limiter.notify_success()
 
     def _try_direct_connection(
         self, method: str, url: str, **kwargs: Any
@@ -59,9 +105,11 @@ class HttpLayerMixin:
             kwargs_copy["timeout"] = 15
 
         try:
+            get_bgm_rate_limiter().acquire()
             res = temp_session.request(method, url, **kwargs_copy)
 
             # 检查响应状态
+            self._apply_rate_limit_notification(res)
             if res.status_code < 400:
                 return res
             else:
@@ -145,6 +193,7 @@ class HttpLayerMixin:
             return self._try_direct_connection(method, url, **kwargs)
 
         try:
+            get_bgm_rate_limiter().acquire()
             res = session.request(method, url, **kwargs)
         except RETRY_EXCEPTIONS as e:
             # SyncHttpClient 重试耗尽后仍抛出异常
@@ -176,6 +225,9 @@ class HttpLayerMixin:
             self.mark_api_unreachable()
 
             raise e
+
+        # 429 冻结令牌桶 / 成功重置升级计数（须在重试状态码分支前处理）
+        self._apply_rate_limit_notification(res)
 
         # 重试耗尽后仍返回重试状态码（429/500/502/503/504）
         if res.status_code in RETRY_STATUS_CODES:
