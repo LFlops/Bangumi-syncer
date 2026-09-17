@@ -1090,7 +1090,9 @@ async def _execute_continuation(
         sync_record_id=sync_record_id,
         bgm=bgm,
         notification_service=notification_service,
-        total_tokens=span_recorder.total_tokens,
+        # 全口径累计：replay 历史轮次（agent_steps 的 llm_chat span 累计）+
+        # 本次新产生轮次（实时 recorder 累计），避免恢复续跑只记新轮、丢历史。
+        total_tokens=replay_result.total_tokens + span_recorder.total_tokens,
     )
 
 

@@ -2053,6 +2053,43 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
     assert handle.call_args[0][2].stop_reason == "end_turn"
 
 
+def test_continue_run_continuation_sums_replay_and_new_round_tokens():
+    """S4/P2-3：通用续跑分支 total_tokens = replay 历史累计 + 本次新轮累计。
+
+    replay 历史 150 + 本次新产生 50 → ``_handle_result`` 必须收到 200，
+    避免恢复续跑路径只记本次新轮、丢失历史 tokens。
+    """
+    repo = _make_continuation_repo()
+    handle = MagicMock()
+    rr = _make_replay_result(
+        executed=1, missing=[], last_response=None, total_tokens=150
+    )
+    recorder = MagicMock()
+    recorder.total_tokens = 50
+    trace_recorder_cls = MagicMock(return_value=recorder)
+    loop = AsyncMock(return_value=RunResult(stop_reason="end_turn"))
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.matching.llm_assist.TraceRecorder", trace_recorder_cls),
+        patch("app.services.matching.llm_assist._handle_result", handle),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    loop.assert_awaited_once()
+    handle.assert_called_once()
+    assert handle.call_args[1].get("total_tokens") == 200, (
+        "续跑分支应叠加 replay 历史 tokens(150) 与本次新轮 tokens(50)，"
+        f"实际 {handle.call_args[1].get('total_tokens')}"
+    )
+
+
 # G3：config_override 非正数回退 None ---------------------------------------
 
 

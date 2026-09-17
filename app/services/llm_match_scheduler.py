@@ -231,7 +231,8 @@ class LlmMatchScheduler(BaseScheduler):
 
         0. sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮，不占用执行权
         1. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
-        2. 以**统一时间戳**刷新 started_at（防下一轮重复恢复）
+        2. 以**统一时间戳**对 started_at 做 CAS 刷新（expected=扫描到的值），
+           防跨进程重复恢复：未抢到（值已被他人刷新/状态已变）则释放执行权返回
         3. sync_record 缺失 → mark_failed(error)
         4. 否则构造 bgm → 调用场景层单一公开入口 ``llm_assist.continue_run``
            （replay / 补执行 / 续跑 / 落库与失败分流均在场景层内部完成）
@@ -251,9 +252,15 @@ class LlmMatchScheduler(BaseScheduler):
         try:
             repo = get_database_manager().agent_runs
 
-            # 恢复开始即刷新 started_at；统一时间戳由调用方注入（单一时钟基准）
+            # 恢复开始即以 CAS 抢占并刷新 started_at：expected 取扫描到的
+            # started_at，仅当无其他执行者刷新过（值未变）才成功，避免两个
+            # 调度进程在同一轮扫描后都续跑同一 run。
             ts = int(time.time())
-            repo.refresh_started_at(run_id, ts)
+            if not repo.refresh_started_at(
+                run_id, ts, expected_started_at=run.started_at
+            ):
+                logger.debug(f"🤖 恢复 run {run_id} 跳过：已被其他执行者抢占或状态已变")
+                return
 
             sync_record = self._get_sync_record(run.sync_record_id)
             if sync_record is None:
@@ -347,8 +354,8 @@ class LlmMatchScheduler(BaseScheduler):
 
     def _build_bgm(self, sync_record: dict):
         """从用户配置构造 BangumiApi 实例（失败返回 None，交由场景层降级）。"""
+        user_name = (sync_record or {}).get("user_name")
         try:
-            user_name = sync_record.get("user_name")
             cfg = get_active_bangumi_config(user_name)
             if not cfg or not cfg.get("username") or not cfg.get("access_token"):
                 logger.debug("🤖 无可用 Bangumi 账号配置，bgm 为 None")
@@ -366,7 +373,10 @@ class LlmMatchScheduler(BaseScheduler):
                 ech_mode=dev["ech_mode"],
             )
         except Exception as e:
-            logger.warning(f"🤖 构造 BangumiApi 失败: {e}")
+            # 脱敏：异常文本可能包含构造参数（access_token），仅记录类型 + 用户维度
+            logger.warning(
+                f"🤖 构造 BangumiApi 失败（user={user_name}）: {type(e).__name__}"
+            )
             return None
 
 

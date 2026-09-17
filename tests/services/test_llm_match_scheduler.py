@@ -562,7 +562,10 @@ def test_recover_run_passes_caller_timestamp_to_refresh():
     ):
         asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=42)))
 
-    repo.refresh_started_at.assert_called_once_with("A", 1700000000)
+    # CAS：expected_started_at 取扫描到的 run.started_at（默认 0）
+    repo.refresh_started_at.assert_called_once_with(
+        "A", 1700000000, expected_started_at=0
+    )
 
 
 def test_concurrent_recover_same_run_only_one_acquires():
@@ -609,8 +612,45 @@ def test_concurrent_recover_same_run_only_one_acquires():
         asyncio.run(_go())
 
     assert cont_calls["n"] == 1, "并发恢复同一 run 只应有一次续跑"
-    repo.refresh_started_at.assert_called_once_with("A", 1700000001)
+    repo.refresh_started_at.assert_called_once_with(
+        "A", 1700000001, expected_started_at=0
+    )
     assert "A" not in sched_module._active_run_ids
+
+
+def test_recover_run_cas_loser_skips_continuation_and_releases_active():
+    """S2：CAS 刷新失败（已被其他执行者抢占/状态已变）→ 跳过续跑并释放执行权。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.refresh_started_at.return_value = False
+    cont = AsyncMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.time.time", return_value=1700000009),
+        patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            new=cont,
+        ),
+    ):
+        asyncio.run(
+            sched._recover_run(
+                _run_model(run_id="A", sync_record_id=42, started_at=111)
+            )
+        )
+
+    # CAS 必须带扫描行携带的 expected_started_at，供仓储做原子比对
+    repo.refresh_started_at.assert_called_once_with(
+        "A", 1700000009, expected_started_at=111
+    )
+    cont.assert_not_awaited()
+    assert "A" not in sched_module._active_run_ids, "CAS 失败后必须释放执行权"
 
 
 def test_recover_run_releases_after_unexpected_exception():
@@ -1104,3 +1144,39 @@ def test_scheduler_module_has_no_function_level_imports():
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 offenders.append(f"{fn.name}: {ast.unparse(node)}")
     assert offenders == [], f"函数内不应残留 import，实际：{offenders}"
+
+
+def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
+    """S3：构造 BangumiApi 异常 → warning 不含原始异常文本（防 access_token 泄漏），
+    但保留可诊断的用户维度与异常类型。"""
+    sched = LlmMatchScheduler()
+    log = MagicMock()
+    secret = "SECRET-ACCESS-TOKEN-abc123"
+    cm = MagicMock()
+    cm.get_dev_http_snapshot.return_value = {
+        "script_proxy": "",
+        "ssl_verify": True,
+        "bgm_api_proxy": "",
+        "bgm_next_proxy": "",
+        "ech_mode": False,
+    }
+    with (
+        patch(
+            "app.services.llm_match_scheduler.get_active_bangumi_config",
+            return_value={"username": "u1", "access_token": secret},
+        ),
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.BangumiApi",
+            side_effect=ValueError(f"invalid access_token={secret}"),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        result = sched._build_bgm({"user_name": "alice"})
+
+    assert result is None
+    log.warning.assert_called_once()
+    msg = log.warning.call_args[0][0]
+    assert secret not in msg, "日志不得包含原始异常文本（可能含 access_token）"
+    assert "ValueError" in msg, "应保留异常类型便于诊断"
+    assert "alice" in msg, "应保留用户维度便于定位"

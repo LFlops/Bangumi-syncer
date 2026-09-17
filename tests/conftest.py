@@ -535,6 +535,21 @@ def _speed_up_bangumi_rate_limit():
 
 
 @pytest.fixture(autouse=True)
+def _clear_llm_match_active_runs():
+    """测试隔离：清空 LLM 匹配调度器的进程级 active run 集合。
+
+    ``llm_match_scheduler._active_run_ids`` 是模块级进程状态，测试中预置或
+    残留会跨用例、跨测试模块污染（导致恢复扫描被误跳过）。此处统一在每条
+    测试前后清空，与 ``_speed_up_bangumi_rate_limit`` 等全局 fixture 风格一致。
+    """
+    from app.services.llm_match_scheduler import _clear_active_runs
+
+    _clear_active_runs()
+    yield
+    _clear_active_runs()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_archive_shortcut(monkeypatch):
     """每个测试默认禁用全局 archive_shortcut，避免用户 config.ini 中
     bangumi-archive.enabled=True 通过 conftest 复制污染测试。

@@ -402,6 +402,60 @@ class TestRefreshStartedAt:
         finally:
             dbm._connection._conn.close()
 
+    def test_refresh_started_at_cas_matching_expected_updates_and_returns_true(
+        self, tmp_path
+    ):
+        """S1：expected_started_at 与当前值一致 → CAS 成功，started_at 被刷新。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("cas-ok", "match", 1)
+            dbm.agent_runs.atomic_claim("cas-ok")  # → processing
+            current = dbm.agent_runs.get_run("cas-ok")["started_at"]
+            assert current > 0
+
+            assert (
+                dbm.agent_runs.refresh_started_at(
+                    "cas-ok", 2000, expected_started_at=current
+                )
+                is True
+            )
+            assert dbm.agent_runs.get_run("cas-ok")["started_at"] == 2000
+        finally:
+            dbm._connection._conn.close()
+
+    def test_refresh_started_at_cas_mismatch_returns_false_and_keeps_value(
+        self, tmp_path
+    ):
+        """S2：expected_started_at 不匹配（已被其他执行者刷新）→ False，原值不变。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("cas-bad", "match", 1)
+            dbm.agent_runs.atomic_claim("cas-bad")
+            current = dbm.agent_runs.get_run("cas-bad")["started_at"]
+
+            assert (
+                dbm.agent_runs.refresh_started_at(
+                    "cas-bad", 2000, expected_started_at=current + 1
+                )
+                is False
+            )
+            assert dbm.agent_runs.get_run("cas-bad")["started_at"] == current
+        finally:
+            dbm._connection._conn.close()
+
+    def test_refresh_started_at_cas_non_processing_returns_false(self, tmp_path):
+        """S2：CAS 同时要求 status='processing'，非活性态不生效。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("cas-p", "match", 1)  # 仍为 pending
+            assert (
+                dbm.agent_runs.refresh_started_at("cas-p", 2000, expected_started_at=0)
+                is False
+            )
+            assert dbm.agent_runs.get_run("cas-p")["started_at"] == 0
+        finally:
+            dbm._connection._conn.close()
+
 
 class TestRunSyncRecordLinks:
     """run ↔ sync_record 关联表（多对一）与 find_latest_by_sync_record"""
@@ -1181,3 +1235,28 @@ class TestEnqueueMatchRun:
             assert dbm.agent_runs.get_run("new-run") is None
         finally:
             dbm._connection._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-4：进程级 active 集合由 tests/conftest.py 的 autouse fixture 统一隔离
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _seed_scheduler_active_runs():
+    """S5：模块首条测试前预先污染进程级 active 集合。
+
+    conftest 的 autouse fixture 在每条测试 setup 阶段清理；模块级 fixture 的
+    setup 早于函数级 fixture，因此首条用例即可观测到 conftest 清理已生效。
+    """
+    import app.services.llm_match_scheduler as sched_module
+
+    sched_module._active_run_ids.add("s5-leftover")
+    yield
+
+
+def test_scheduler_active_runs_cleared_by_conftest_fixture():
+    """S5：预置的 active run 元素被 conftest 的 autouse fixture 清空。"""
+    import app.services.llm_match_scheduler as sched_module
+
+    assert sched_module._active_run_ids == set()

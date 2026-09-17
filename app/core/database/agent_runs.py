@@ -487,7 +487,12 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="累加 agent_run attempts 失败", default=0
         )
 
-    def refresh_started_at(self, run_id: str, ts: Optional[int] = None) -> bool:
+    def refresh_started_at(
+        self,
+        run_id: str,
+        ts: Optional[int] = None,
+        expected_started_at: Optional[int] = None,
+    ) -> bool:
         """恢复扫描时刷新 started_at（仅 processing 态有效）。
 
         ``ts`` 由调用方注入统一时间戳（重入防护抢占时保持同一时钟基准）；
@@ -495,15 +500,27 @@ class AgentRunsRepository(BaseRepository):
         ``started_at > 0`` 为恢复扫描前提，写入非正值会使该 run 永不入选。
 
         防止下一轮重复恢复同一崩溃遗留 run；行数=0（非 processing）返回 False。
+
+        **CAS 语义（跨进程恢复抢占）**：``expected_started_at`` 非 None 时追加
+        ``AND started_at=?`` 条件，仅当当前值与扫描到的值一致（即无其他执行者
+        已刷新过）才成功，返回 rowcount>0。用于避免两个调度进程在同一轮
+        ``list_stale_processing`` 后都恢复同一 run。默认 None 保持向后兼容。
         """
 
         def _write(conn):
             ts_value = _now() if ts is None or ts <= 0 else ts
-            cursor = conn.execute(
-                "UPDATE agent_runs SET started_at=? "
-                "WHERE run_id=? AND status='processing'",
-                (ts_value, run_id),
-            )
+            if expected_started_at is None:
+                cursor = conn.execute(
+                    "UPDATE agent_runs SET started_at=? "
+                    "WHERE run_id=? AND status='processing'",
+                    (ts_value, run_id),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE agent_runs SET started_at=? "
+                    "WHERE run_id=? AND status='processing' AND started_at=?",
+                    (ts_value, run_id, expected_started_at),
+                )
             return cursor.rowcount > 0
 
         return self._run_write(
