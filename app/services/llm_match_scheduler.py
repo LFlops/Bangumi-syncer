@@ -364,10 +364,10 @@ class LlmMatchScheduler(BaseScheduler):
                 )
             else:
                 logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
-                repo.increment_attempts(run_id)
+                repo.increment_attempts(run_id, last_error=str(e)[:500])
         except Exception as e:
             logger.error(f"🤖 恢复续跑 {run_id} 异常: {e}")
-            repo.increment_attempts(run_id)
+            repo.increment_attempts(run_id, last_error=str(e)[:500])
 
     async def _replay_missing_tool(
         self,
@@ -493,9 +493,8 @@ class LlmMatchScheduler(BaseScheduler):
             )
         except Exception as e:
             logger.error(f"🤖 处理 run {run_id} 异常: {e}")
-            attempts = repo.increment_attempts(run_id)
-            if attempts >= 3:
-                repo.mark_failed(run_id, stop_reason="failed", last_error=str(e)[:500])
+            # 计数与达上限置终态在 repo 内单点事务完成，携带 last_error 供排查
+            repo.increment_attempts(run_id, last_error=str(e)[:500])
 
     # ------------------------------------------------------------------
     # 辅助

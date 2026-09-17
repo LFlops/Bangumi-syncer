@@ -7,7 +7,7 @@
 关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - mark_applied / mark_rejected：仅当 status='succeeded' 可流转（WHERE 守卫）
-- increment_attempts：调度轮次失败计数，>=3 转 failed
+- increment_attempts：调度轮次失败计数，>=3 单点置 failed（同事务携带 last_error）
  - cleanup_expired：滑动窗口轮转，单条 DELETE（FK 级联删 steps）
 """
 
@@ -28,7 +28,7 @@ _TERMINAL_STATUSES = (
     "rejected",
 )
 
-# 活性态：pending / processing（cleanup_expired 的活性腿用）
+# 活性态：pending / processing（cleanup_expired 的活性分支判断用）
 _ACTIVE_STATUSES = ("pending", "processing")
 
 
@@ -235,6 +235,8 @@ class AgentRunsRepository(BaseRepository):
         """原子抢占：仅当 status='pending' 时置 processing。
 
         受影响行数=0（已被其它调度器抢占）返回 False；否则 True。
+
+        单 worker 部署下语义等价 mark_processing；保留原子抢占语义以支持多实例/并发场景。
         """
 
         def _write(conn):
@@ -355,10 +357,14 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="标记 agent_run rejected 失败", default=False
         )
 
-    def increment_attempts(self, run_id: str) -> int:
+    def increment_attempts(self, run_id: str, last_error: str = "") -> int:
         """累加调度轮次失败次数（仅 processing 态有效），返回最新 attempts。
 
-        attempts>=3 时置 failed（stop_reason='failed'）并记终态时间。
+        达上限（attempts>=3）时在**同一次调用事务内**单点置终态：
+        status='failed'、stop_reason='failed'、last_error、ended_at。
+        调用方无需再自行 mark_failed（避免"失败置终态"双写）。
+
+        非 processing 态 / run 不存在 → 不计数，返回 0。
         """
 
         def _write(conn):
@@ -376,8 +382,8 @@ class AgentRunsRepository(BaseRepository):
             if attempts >= 3:
                 conn.execute(
                     "UPDATE agent_runs SET status='failed', stop_reason='failed', "
-                    "ended_at=? WHERE run_id=?",
-                    (_now(), run_id),
+                    "last_error=?, ended_at=? WHERE run_id=?",
+                    (last_error, _now(), run_id),
                 )
             return attempts
 
@@ -385,8 +391,11 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="累加 agent_run attempts 失败", default=0
         )
 
-    def refresh_started_at(self, run_id: str) -> bool:
-        """恢复扫描时刷新 started_at=now()（仅 processing 态有效）。
+    def refresh_started_at(self, run_id: str, ts: Optional[int] = None) -> bool:
+        """恢复扫描时刷新 started_at（仅 processing 态有效）。
+
+        ``ts`` 由调用方注入统一时间戳（重入防护抢占时保持同一时钟基准）；
+        缺省（None）取当前时间。
 
         防止下一轮重复恢复同一崩溃遗留 run；行数=0（非 processing）返回 False。
         """
@@ -395,7 +404,7 @@ class AgentRunsRepository(BaseRepository):
             cursor = conn.execute(
                 "UPDATE agent_runs SET started_at=? "
                 "WHERE run_id=? AND status='processing'",
-                (_now(), run_id),
+                (_now() if ts is None else ts, run_id),
             )
             return cursor.rowcount > 0
 
@@ -423,9 +432,9 @@ class AgentRunsRepository(BaseRepository):
     def cleanup_expired(self, retention_days: int) -> int:
         """按滑动窗口轮转清理过期 runs（单条 DELETE，FK 级联删 steps）。
 
-        两腿 OR：
-        - 终态腿：status IN (terminal) AND ended_at > 0 AND ended_at < cutoff
-        - 活性腿：status IN (pending, processing) AND created_at < cutoff（过期死行一并删）
+        两个分支 OR：
+        - 终态分支：status IN (terminal) AND ended_at > 0 AND ended_at < cutoff
+        - 活性分支：status IN (pending, processing) AND created_at < cutoff（过期死行一并删）
 
         retention_days <= 0 → 直接 return 0（永不清理语义，参照 sync_records.cleanup_old_records）。
         时间比较统一为 epoch 秒整数。

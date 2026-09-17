@@ -294,10 +294,11 @@ def test_run_exception_increments_attempts():
 
         asyncio.run(sched._run_sync_job())
 
-    repo.increment_attempts.assert_called_once_with("a")
+    repo.increment_attempts.assert_called_once_with("a", last_error="boom")
 
 
-def test_run_exception_attempts_reach_three_marks_failed():
+def test_run_exception_attempts_reach_three_single_point_no_double_mark_failed():
+    """达上限由 repo.increment_attempts 单点置终态，调度器不再二次 mark_failed。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -318,8 +319,9 @@ def test_run_exception_attempts_reach_three_marks_failed():
 
         asyncio.run(sched._run_sync_job())
 
-    repo.increment_attempts.assert_called_once_with("a")
-    repo.mark_failed.assert_called_once()
+    repo.increment_attempts.assert_called_once_with("a", last_error="boom")
+    # 终态写入收敛到 increment_attempts 单点事务，外层不得二次 mark_failed
+    repo.mark_failed.assert_not_called()
 
 
 def test_exception_in_one_run_does_not_stop_others():
@@ -349,7 +351,7 @@ def test_exception_in_one_run_does_not_stop_others():
 
     # 两条都尝试处理（第一条异常被捕获后仍继续）
     assert run_mock.await_count == 2
-    repo.increment_attempts.assert_called_once_with("a")
+    repo.increment_attempts.assert_called_once_with("a", last_error="boom")
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +941,7 @@ def test_continue_replay_llm_call_error_retryable_false_marks_failed():
 
 
 def test_continue_replay_llm_call_error_retryable_true_increments_attempts():
-    """恢复续跑遇 LLMCallError(retryable=True) → increment_attempts。"""
+    """恢复续跑遇 LLMCallError(retryable=True) → increment_attempts 并携带 last_error。"""
     from unittest.mock import patch
 
     from app.services.agent.trace import ReplayResult
@@ -983,7 +985,9 @@ def test_continue_replay_llm_call_error_retryable_true_increments_attempts():
             )
         )
 
-    repo.increment_attempts.assert_called_once_with("r-err-retry")
+    repo.increment_attempts.assert_called_once_with(
+        "r-err-retry", last_error="500 Internal Server Error"
+    )
     repo.mark_failed.assert_not_called()
 
 

@@ -4,7 +4,7 @@
 1. 建表：agent_runs / agent_steps 表与索引存在；status 枚举不含 exhausted
 2. create_pending / atomic_claim（双调度器竞争）
 3. mark_succeeded / mark_applied / mark_rejected 守卫（仅 succeeded 可 applied/rejected）
-4. increment_attempts 到 3 置 failed
+4. increment_attempts 计数与达 3 单点置 failed（携带 last_error）；refresh_started_at 支持时间戳注入
 5. 去重查询 find_active_by_sync_record（pending/processing/succeeded/no_suggestion 命中；超保留期 no_suggestion 不命中）
 6. cleanup_terminal（先删 steps 再删 runs，无孤儿 steps）
 7. get_steps 按 (iteration, sequence) 排序
@@ -180,25 +180,119 @@ class TestStatusTransitions:
 
 
 class TestIncrementAttempts:
-    """increment_attempts 到 3 置 failed"""
+    """increment_attempts：计数与达上限置终态单点完成"""
 
-    def test_increment_to_three_sets_failed(self, tmp_path):
+    def test_increment_attempts_reaches_limit_sets_terminal_with_last_error(
+        self, tmp_path
+    ):
+        """达上限（3）时同一次调用落 failed/stop_reason/last_error/ended_at。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("r3", "match", 1)
             dbm.agent_runs.atomic_claim("r3")  # → processing
-            a1 = dbm.agent_runs.increment_attempts("r3")
-            assert a1 == 1
+            assert dbm.agent_runs.increment_attempts("r3") == 1
+            assert dbm.agent_runs.increment_attempts("r3") == 2
             assert dbm.agent_runs.get_run("r3")["status"] == "processing"
-            a2 = dbm.agent_runs.increment_attempts("r3")
-            assert a2 == 2
-            assert dbm.agent_runs.get_run("r3")["status"] == "processing"
-            a3 = dbm.agent_runs.increment_attempts("r3")
+
+            # 第二次已达上限，单点调用直接置终态并携带 last_error
+            a3 = dbm.agent_runs.increment_attempts("r3", last_error="boom")
             assert a3 == 3
             run = dbm.agent_runs.get_run("r3")
+            assert run["attempts"] == 3
             assert run["status"] == "failed"
             assert run["stop_reason"] == "failed"
-            assert run["ended_at"]
+            assert run["last_error"] == "boom"
+            assert run["ended_at"] > 0
+        finally:
+            dbm._connection._conn.close()
+
+    def test_increment_attempts_below_limit_only_counts(self, tmp_path):
+        """未达上限仅计数：attempts=1 → 返回 2，状态仍 processing 且不覆盖 last_error。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("r2", "match", 1)
+            dbm.agent_runs.atomic_claim("r2")  # → processing
+            assert dbm.agent_runs.increment_attempts("r2") == 1
+            # 预置一个哨兵值，验证未达上限时不写 last_error
+            conn = dbm._connection._conn
+            conn.execute(
+                "UPDATE agent_runs SET last_error='prev' WHERE run_id=?", ("r2",)
+            )
+            conn.commit()
+
+            assert dbm.agent_runs.increment_attempts("r2", last_error="temp") == 2
+            run = dbm.agent_runs.get_run("r2")
+            assert run["attempts"] == 2
+            assert run["status"] == "processing"
+            # 未达上限不落终态、不覆盖 last_error
+            assert run["ended_at"] == 0
+            assert run["last_error"] == "prev"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_increment_attempts_non_processing_returns_zero_and_unchanged(
+        self, tmp_path
+    ):
+        """非 processing 态不计数：返回 0，状态 / attempts / last_error 均不变。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rs", "match", 1)
+            dbm.agent_runs.atomic_claim("rs")
+            dbm.agent_runs.mark_succeeded("rs")  # → succeeded
+            conn = dbm._connection._conn
+            conn.execute(
+                "UPDATE agent_runs SET last_error='prev' WHERE run_id=?", ("rs",)
+            )
+            conn.commit()
+
+            assert dbm.agent_runs.increment_attempts("rs", last_error="boom") == 0
+            run = dbm.agent_runs.get_run("rs")
+            assert run["status"] == "succeeded"
+            assert run["attempts"] == 0
+            assert run["last_error"] == "prev"
+        finally:
+            dbm._connection._conn.close()
+
+
+class TestRefreshStartedAt:
+    """refresh_started_at：支持调用方注入时间戳（重入防护统一时间戳）"""
+
+    def test_refresh_started_at_uses_caller_timestamp(self, tmp_path):
+        """调用方传入 ts=1000 → started_at=1000（不得取当前时间）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rf-ts", "match", 1)
+            dbm.agent_runs.atomic_claim("rf-ts")  # → processing
+
+            assert dbm.agent_runs.refresh_started_at("rf-ts", 1000) is True
+            assert dbm.agent_runs.get_run("rf-ts")["started_at"] == 1000
+        finally:
+            dbm._connection._conn.close()
+
+    def test_refresh_started_at_none_falls_back_to_now(self, tmp_path):
+        """ts=None → 取当前 epoch 秒。"""
+        import time
+
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rf-now", "match", 1)
+            dbm.agent_runs.atomic_claim("rf-now")
+
+            before = int(time.time())
+            assert dbm.agent_runs.refresh_started_at("rf-now") is True
+            after = int(time.time())
+            started_at = dbm.agent_runs.get_run("rf-now")["started_at"]
+            assert before <= started_at <= after
+        finally:
+            dbm._connection._conn.close()
+
+    def test_refresh_started_at_non_processing_returns_false(self, tmp_path):
+        """非 processing 态不刷新：返回 False，started_at 不变。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rf-term", "match", 1)
+            assert dbm.agent_runs.refresh_started_at("rf-term", 1000) is False
+            assert dbm.agent_runs.get_run("rf-term")["started_at"] == 0
         finally:
             dbm._connection._conn.close()
 
