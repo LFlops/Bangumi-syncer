@@ -7,6 +7,14 @@
 - **replay_delta**：重放所需全部增量（seed / response / tool_result / budget_message），
   完整、Fernet 加密（BGS1: 前缀）、永不截断、无大小上限、无 error 标记机制。
 
+存储边界（与 ``llm_usage_logs`` 的分工，避免重复/误删）：
+- ``llm_usage_logs``：**用量/成本聚合**，跨任务（job）维度，由 LLM client 层在每次
+  API 调用后写入，服务于成本统计、配额与供应商观测；**不参与会话重放**。
+- ``agent_steps``：**会话观测 + replay 自包含**，run 维度，由本模块记录 span 全生命周期，
+  是断点续跑的唯一数据源。
+- 两者在 ``model`` / ``tokens`` / ``latency_ms`` 等字段上重叠属**有意设计**：用途不同
+  （成本聚合 vs 会话重建），重叠字段**不删除**，以免任一职责失去自包含性。
+
 提供：
 - ``start_span`` / ``end_span``：写入 ``agent_steps``（独立 best-effort 事务，失败仅日志），
   承载可重放会话日志。时间列统一 epoch 秒整数。
@@ -246,6 +254,30 @@ def _extract_budget_message(step: dict) -> str | None:
     return bm if isinstance(bm, str) else None
 
 
+def _restore_seed_messages(seed_step: dict, out: list[Message]) -> None:
+    """从 seed 行的 ``replay_delta`` 还原种子消息。
+
+    任何异常数据条目都**跳过并记 warning**（不静默）：replay_delta 结构非 dict、
+    条目非 dict、条目无法模型化（缺字段/非法结构）。合法条目正常追加。
+    """
+    obj = _parse_json(seed_step.get("replay_delta"), {})
+    if not isinstance(obj, dict):
+        logger.warning(
+            "[trace] replay seed 行 replay_delta 结构非 dict，已跳过该 seed 行"
+        )
+        return
+    for m in obj.get("seed_messages") or []:
+        if not isinstance(m, dict):
+            logger.warning(
+                f"[trace] replay seed 条目非 dict（type={type(m).__name__}），已跳过"
+            )
+            continue
+        try:
+            out.append(Message.model_validate(m))
+        except Exception as e:  # 异常数据：跳过该条目，不影响其余 seed 重建
+            logger.warning(f"[trace] replay seed 消息反序列化失败，已跳过该条目: {e}")
+
+
 def replay(run_id: str) -> ReplayResult:
     """按 (iteration, sequence, id) 重放会话增量，重建可续跑 ``list[Message]``。
 
@@ -274,15 +306,8 @@ def replay(run_id: str) -> ReplayResult:
     seed_messages: list[Message] = []
     for s in steps:
         if s["name"] == "seed":
-            # 提取种子消息
-            obj = _parse_json(s.get("replay_delta"), {})
-            if isinstance(obj, dict):
-                for m in obj.get("seed_messages") or []:
-                    if isinstance(m, dict):
-                        try:
-                            seed_messages.append(Message.model_validate(m))
-                        except Exception:
-                            pass
+            # 提取种子消息（异常条目跳过并记 warning，不静默）
+            _restore_seed_messages(s, seed_messages)
             continue
         steps_by_iter.setdefault(s["iteration"], []).append(s)
 
@@ -296,9 +321,20 @@ def replay(run_id: str) -> ReplayResult:
         chat = next((s for s in isteps if s["name"] == "llm_chat"), None)
         if chat is None:
             # 该轮无 llm_chat（异常数据）：在该轮 break，交回调用方从该轮重新 chat
+            logger.warning(
+                f"[trace] replay iteration={it} 无 llm_chat 行，从该轮 break"
+            )
             break
 
         response = _parse_response(chat)
+        if not response:
+            # 空 delta（异常数据）：在该轮 break，交回调用方从该轮重新 chat
+            logger.info(
+                f"[trace] replay iteration={it} llm_chat replay_delta 为空"
+                "（无 response），从该轮 break"
+            )
+            break
+
         tool_calls = response.get("tool_calls") or []
         # 重建 assistant 消息：content 为 list[ToolUseBlock]（与原执行对齐）
         assistant_msg = Message(
@@ -313,19 +349,24 @@ def replay(run_id: str) -> ReplayResult:
             ],
         )
 
-        if not response:
-            # 空 delta（异常数据）：在该轮 break，交回调用方从该轮重新 chat
-            break
-
         if tool_calls:
             messages.append(assistant_msg)
             recorded_ids: set = set()
             budget_message: str | None = None
             for t in sorted(isteps, key=lambda x: (x["sequence"], x["id"])):
                 if t["name"] != "tool_execute":
+                    logger.debug(
+                        f"[trace] replay iteration={it} 跳过非 tool_execute 行:"
+                        f" name={t['name']}"
+                    )
                     continue
                 tr = _parse_tool_result(t)
                 if tr is None:
+                    # 异常数据：无有效 tool_result，跳过该行（该工具由 missing 兜底）
+                    logger.warning(
+                        f"[trace] replay iteration={it} tool_execute 行无有效"
+                        f" tool_result，已跳过: span_id={t.get('span_id', '')}"
+                    )
                     continue
                 # 逐条 tool_result 独立成 Message（不合并），与原执行一致
                 messages.append(

@@ -37,6 +37,25 @@ def crypto_on():
         yield
 
 
+@pytest.fixture
+def log_records():
+    """捕获自定义 Logger（非 stdlib logging，caplog 无法捕获）的日志行。
+
+    应用使用 ``app.core.logging.logger``（print 实现），其监听器不受级别阈值
+    限制，故此方式可捕获 DEBUG/INFO/WARNING 全部级别。产出 ``[(level, line)]``。
+    """
+    from app.core.logging import logger as app_logger
+
+    records: list[tuple[str, str]] = []
+
+    def _listener(line: str, level: str) -> None:
+        records.append((level, line))
+
+    app_logger.add_listener(_listener)
+    yield records
+    app_logger.remove_listener(_listener)
+
+
 def _chat_rd(stop_reason, content, tool_calls):
     return {
         "response": {
@@ -348,3 +367,94 @@ class TestReplayEncryptionTransparent:
             if m.role == "user" and isinstance(m.content, list)
         ]
         assert tr[0].content[0].content == "secret-result"
+
+
+class TestReplayAbnormalBranchLogging:
+    """异常数据分支不得静默：每条跳过/中断路径都须留日志。"""
+
+    def test_replay_seed_parse_failure_logs_warning(self, dbm, log_records):
+        """seed 条目反序列化失败：跳过该条并记 warning，其余 seed 正常重建。"""
+        _ensure_run(dbm, "run-seed-bad")
+        span_id = trace.start_span("run-seed-bad", "seed", 0, 0)
+        dbm.agent_runs.update_step(
+            span_id,
+            replay_delta={
+                "seed_messages": [
+                    {"role": "system", "content": "sys"},
+                    {"content": "缺 role 字段，无法 model_validate"},
+                ]
+            },
+            ended_at=_now_epoch(),
+        )
+        _write_llm_chat(
+            dbm, "run-seed-bad", 0, [], stop_reason="end_turn", content="hi"
+        )
+
+        result = trace.replay("run-seed-bad")
+
+        # 合法 seed 正常重建，非法条目被跳过（不影响其余）
+        assert result.messages[0].role == "system"
+        assert result.messages[0].content == "sys"
+        # 记录 warning，且含 seed 关键信息与异常内容
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("seed" in line for line in warns)
+
+    def test_replay_missing_llm_chat_logs_warning(self, dbm, log_records):
+        """某轮无 llm_chat 行：在该轮 break 并记 warning。"""
+        _write_seed(dbm, "run-nochat-log", [])
+        _write_tool_exec(dbm, "run-nochat-log", 0, 1, "t1", "r1")
+
+        result = trace.replay("run-nochat-log")
+
+        assert result.executed_iterations == 0
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("llm_chat" in line for line in warns)
+
+    def test_replay_empty_chat_delta_logs_info(self, dbm, log_records):
+        """llm_chat 的 replay_delta 为空（无 response）：在该轮 break 并记 info。"""
+        _write_seed(dbm, "run-empty-info", [])
+        # 只 start_span 不 end_span → replay_delta 为空字符串
+        trace.start_span("run-empty-info", "llm_chat", 0, 0)
+
+        result = trace.replay("run-empty-info")
+
+        assert result.executed_iterations == 0
+        infos = [line for level, line in log_records if level == "INFO"]
+        assert any("replay_delta" in line for line in infos)
+
+    def test_replay_skips_non_tool_execute_rows_logs_debug(self, dbm, log_records):
+        """重建轮内非 tool_execute 行：跳过并记 debug。"""
+        _write_seed(dbm, "run-skip-row", [])
+        _write_llm_chat(
+            dbm, "run-skip-row", 0, [{"id": "t1", "name": "x", "input": {}}]
+        )
+        _write_tool_exec(dbm, "run-skip-row", 0, 1, "t1", "r1")
+
+        result = trace.replay("run-skip-row")
+
+        assert result.executed_iterations == 1
+        debugs = [line for level, line in log_records if level == "DEBUG"]
+        # 同轮 llm_chat 行在重建循环中被跳过，应留 debug
+        assert any("llm_chat" in line for line in debugs)
+
+    def test_replay_tool_result_parse_failure_logs_warning(self, dbm, log_records):
+        """tool_execute 无有效 tool_result：跳过并记 warning，工具计入缺失。"""
+        _write_seed(dbm, "run-tr-bad", [])
+        _write_llm_chat(dbm, "run-tr-bad", 0, [{"id": "t1", "name": "x", "input": {}}])
+        # tool_execute 行存在，但 replay_delta 无 tool_result 字段
+        span_id = trace.start_span("run-tr-bad", "tool_execute", 0, 1)
+        trace.end_span(span_id, replay_delta={"foo": "bar"})
+
+        result = trace.replay("run-tr-bad")
+
+        # 该工具未记录 → 计入 missing_tool_calls
+        assert [tc["id"] for tc in result.missing_tool_calls] == ["t1"]
+        # 不追加任何 tool_result 消息
+        tr_msgs = [
+            m
+            for m in result.messages
+            if m.role == "user" and isinstance(m.content, list)
+        ]
+        assert tr_msgs == []
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("tool_result" in line for line in warns)

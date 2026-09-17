@@ -223,6 +223,14 @@ class TestEndSpanDoesNotOverwriteStartedAt:
         assert steps[0]["ended_at"] == t_new + 50
 
 
+class TestAgentStepsVsLlmUsageSplit:
+    def test_docstring_documents_agent_steps_vs_llm_usage_split(self):
+        """模块 docstring 明确 agent_steps 与 llm_usage_logs 的职责分工。"""
+        doc = trace.__doc__ or ""
+        assert "llm_usage_logs" in doc
+        assert "agent_steps" in doc
+
+
 class TestRecordBudgetMessage:
     def test_record_budget_message_encrypted_at_rest(self, dbm, crypto_on):
         """record_budget_message 读改写后落库仍为密文。"""
