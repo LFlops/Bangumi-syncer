@@ -446,6 +446,7 @@ class TestSyncLlmMatchConfig:
             "llm_match_retention_days": 30,
             "llm_match_max_iterations": "",
             "llm_match_recovery_timeout_s": 120,
+            "llm_match_concurrency": 3,
             "llm_match_thinking_level": "medium",
         }
 
@@ -458,6 +459,7 @@ llm_match_cron = 0 */2 * * *
 llm_match_retention_days = 30
 llm_match_max_iterations = 5
 llm_match_recovery_timeout_s = 300
+llm_match_concurrency = 5
 llm_match_thinking_level = high
 """
         cm = _config_manager_from_ini(tmp_path, ini)
@@ -468,6 +470,7 @@ llm_match_thinking_level = high
         # 数字字符串经 get() 协程为 int（与 get_max_iterations 的 config_override 类型一致）
         assert cfg["llm_match_max_iterations"] == 5
         assert cfg["llm_match_recovery_timeout_s"] == 300
+        assert cfg["llm_match_concurrency"] == 5
         assert cfg["llm_match_thinking_level"] == "high"
 
     @pytest.mark.parametrize(
@@ -492,15 +495,17 @@ llm_match_thinking_level = high
         assert cfg["llm_match_thinking_level"] == expected
 
     def test_get_sync_llm_match_config_invalid_int_falls_back(self, tmp_path):
-        """非法整数值回退默认值（与调度器 _cfg_int 行为对齐）。"""
+        """非法整数值回退默认值（集中 getter 为唯一解析来源）。"""
         ini = """[sync]
 llm_match_retention_days = notint
 llm_match_recovery_timeout_s = bad
+llm_match_concurrency = notint
 """
         cm = _config_manager_from_ini(tmp_path, ini)
         cfg = cm.get_sync_llm_match_config()
         assert cfg["llm_match_retention_days"] == 30
         assert cfg["llm_match_recovery_timeout_s"] == 120
+        assert cfg["llm_match_concurrency"] == 3
 
     def test_get_sync_llm_match_config_empty_max_iterations_default(self, tmp_path):
         """llm_match_max_iterations 显式空字符串仍返回空（优先级覆盖语义）。"""

@@ -73,25 +73,6 @@ def _clear_active_runs() -> None:
     _active_run_ids.clear()
 
 
-def _cfg_bool(value: Any) -> bool:
-    """宽松布尔解析：实际 bool 或字符串 true/1/yes/on（任意大小写）。"""
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return False
-    return str(value).strip().lower() in ("true", "1", "yes", "on")
-
-
-def _cfg_int(value: Any, fallback: int) -> int:
-    """宽松整数解析，失败回退 fallback。"""
-    if value is None:
-        return fallback
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return fallback
-
-
 def _parse_run_rows(raw_rows: list, *, source: str) -> list[AgentRunRecord]:
     """把 repo 返回的 dict 行转换为 ``AgentRunRecord``。
 
@@ -129,9 +110,7 @@ class LlmMatchScheduler(BaseScheduler):
         - 开关关 → False（不启动）
         - 开关开但 LLM 配置缺失 → False + 日志"LLM 配置缺失，匹配增强已禁用"
         """
-        enabled = _cfg_bool(
-            config_manager.get("sync", "llm_match_assist", fallback=False)
-        )
+        enabled = config_manager.get_sync_llm_match_config()["llm_match_assist"]
         if not enabled:
             return False
         llm_cfg = config_manager.get_llm_config()
@@ -141,11 +120,11 @@ class LlmMatchScheduler(BaseScheduler):
         return True
 
     def _get_driver_config(self) -> dict:
-        """返回含 sync_interval（cron）的配置。"""
+        """返回含 sync_interval（cron）的配置（默认值由集中 getter 提供）。"""
         return {
-            "sync_interval": config_manager.get(
-                "sync", "llm_match_cron", fallback=self.DEFAULT_CRON
-            )
+            "sync_interval": config_manager.get_sync_llm_match_config()[
+                "llm_match_cron"
+            ]
         }
 
     async def _run_sync_job(self) -> None:
@@ -160,10 +139,12 @@ class LlmMatchScheduler(BaseScheduler):
         dbm = get_database_manager()
         repo = dbm.agent_runs
 
+        # llm_match_* 配置统一走集中 getter，本轮只读取一次后复用；每次调度周期
+        # 重新读取，保证 Web 保存配置后的热更新语义不变。
+        match_cfg = config_manager.get_sync_llm_match_config()
+
         # 1. 滑动窗口轮转清理（终态超窗 + 活性过期死行，单条 DELETE）
-        retention_days = _cfg_int(
-            config_manager.get("sync", "llm_match_retention_days", fallback=30), 30
-        )
+        retention_days = match_cfg["llm_match_retention_days"]
         try:
             deleted = repo.cleanup_expired(retention_days=retention_days)
         except Exception as e:
@@ -173,10 +154,7 @@ class LlmMatchScheduler(BaseScheduler):
             logger.info(f"🤖 清理过期 agent_run {deleted} 条")
 
         # 2. 恢复扫描（本进程已在处理（活着但慢）的 run 不得被重复捞起）
-        recovery_timeout = _cfg_int(
-            config_manager.get("sync", "llm_match_recovery_timeout_s", fallback=120),
-            120,
-        )
+        recovery_timeout = match_cfg["llm_match_recovery_timeout_s"]
         try:
             stale_raw = repo.list_stale_processing(timeout_seconds=recovery_timeout)
         except Exception as e:
@@ -197,12 +175,8 @@ class LlmMatchScheduler(BaseScheduler):
         pending = _parse_run_rows(pending_raw, source="pending")
 
         # 4. 并发消费：recover 先入列，与 pending 共享并发限额（信号量结构化并发）
-        limit = max(
-            1,
-            _cfg_int(
-                config_manager.get("sync", "llm_match_concurrency", fallback=3), 3
-            ),
-        )
+        # getter 已做非法值回退，此处仅兜底非正数下限。
+        limit = max(1, match_cfg["llm_match_concurrency"])
         sem = asyncio.Semaphore(limit)
         failures = 0
 

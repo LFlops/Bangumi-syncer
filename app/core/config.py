@@ -646,6 +646,7 @@ class ConfigManager:
         - llm_match_retention_days (int, 默认 30)
         - llm_match_max_iterations (str, 默认空=按 thinking_level 映射)
         - llm_match_recovery_timeout_s (int, 默认 120)
+        - llm_match_concurrency (int, 默认 3)
         - llm_match_thinking_level (str, 默认 "medium")
         """
 
@@ -678,6 +679,9 @@ class ConfigManager:
             or "",
             "llm_match_recovery_timeout_s": _to_int(
                 self.get("sync", "llm_match_recovery_timeout_s", fallback=120), 120
+            ),
+            "llm_match_concurrency": _to_int(
+                self.get("sync", "llm_match_concurrency", fallback=3), 3
             ),
             "llm_match_thinking_level": self._normalize_thinking_level(
                 self.get("sync", "llm_match_thinking_level", fallback="medium"),

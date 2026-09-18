@@ -1054,6 +1054,7 @@ async def test_get_sync_config_llm_available_false_when_llm_not_configured(
         "llm_match_retention_days": 7,
         "llm_match_max_iterations": "",
         "llm_match_recovery_timeout_s": 120,
+        "llm_match_concurrency": 3,
         "llm_match_thinking_level": "medium",
     }
     mock_sync_cm.get_llm_config.return_value = {"api_key": ""}
@@ -1067,12 +1068,13 @@ async def test_get_sync_config_llm_available_false_when_llm_not_configured(
     data = response.json()["data"]
     assert data["llm_available"] is False
     assert data["llm_api_key_masked"] == ""
-    # 六键默认值透出
+    # 七键默认值透出（集中 getter 输出原样展开）
     assert data["llm_match_assist"] is False
     assert data["llm_match_cron"] == "*/1 * * * *"
     assert data["llm_match_retention_days"] == 7
     assert data["llm_match_max_iterations"] == ""
     assert data["llm_match_recovery_timeout_s"] == 120
+    assert data["llm_match_concurrency"] == 3
     assert data["llm_match_thinking_level"] == "medium"
 
 
@@ -1087,6 +1089,7 @@ async def test_get_sync_config_llm_available_true_when_llm_configured(
         "llm_match_retention_days": 7,
         "llm_match_max_iterations": "",
         "llm_match_recovery_timeout_s": 120,
+        "llm_match_concurrency": 3,
         "llm_match_thinking_level": "medium",
     }
     mock_sync_cm.get_llm_config.return_value = {"api_key": "sk-liveabcd1234"}

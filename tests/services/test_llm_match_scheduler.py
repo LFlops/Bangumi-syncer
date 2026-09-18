@@ -34,19 +34,25 @@ def _run_model(**overrides) -> AgentRunRecord:
     return AgentRunRecord.model_validate(data)
 
 
-def _make_config(enabled: bool = True, api_key: str = "k", cron: str = "*/2 * * * *"):
-    """构造 config_manager mock：get 按 key 返回，get_llm_config 返回 api_key。"""
+def _make_config(
+    enabled: bool = True,
+    api_key: str = "k",
+    cron: str = "*/2 * * * *",
+    concurrency: int = 3,
+    retention_days: int = 30,
+    recovery_timeout_s: int = 120,
+):
+    """构造 config_manager mock：llm_match_* 一律走集中 getter，get_llm_config 返回 api_key。"""
     cm = MagicMock()
-
-    def _get(section, key, fallback=None):
-        if key == "llm_match_assist":
-            return "true" if enabled else "false"
-        if key == "llm_match_cron":
-            return cron
-        # retention_days / recovery_timeout_s 等：返回 fallback 以保证解析安全
-        return fallback
-
-    cm.get.side_effect = _get
+    cm.get_sync_llm_match_config.return_value = {
+        "llm_match_assist": enabled,
+        "llm_match_cron": cron,
+        "llm_match_retention_days": retention_days,
+        "llm_match_max_iterations": "",
+        "llm_match_recovery_timeout_s": recovery_timeout_s,
+        "llm_match_concurrency": concurrency,
+        "llm_match_thinking_level": "medium",
+    }
     cm.get_llm_config.return_value = {"api_key": api_key}
     return cm
 
@@ -148,7 +154,8 @@ def test_cleanup_deletes_expired_terminal_and_logs():
         import asyncio
 
         asyncio.run(sched._run_sync_job())
-    repo.cleanup_expired.assert_called_once()
+    # retention 值由集中 getter 提供，调度器不再自行解析
+    repo.cleanup_expired.assert_called_once_with(retention_days=30)
     log.info.assert_any_call("🤖 清理过期 agent_run 3 条")
 
 
@@ -207,6 +214,8 @@ def test_recovery_missing_sync_record_marks_failed():
     ts_call_args = repo.refresh_started_at.call_args[0]
     assert ts_call_args[0] == "r1"
     assert isinstance(ts_call_args[1], int)
+    # recovery 超时值由集中 getter 提供，调度器不再自行解析
+    repo.list_stale_processing.assert_called_once_with(timeout_seconds=120)
     repo.mark_failed.assert_called_once_with(
         "r1", stop_reason="error", last_error="sync_record missing"
     )
@@ -713,23 +722,10 @@ def test_process_run_skips_active_run():
 # ---------------------------------------------------------------------------
 
 
-def _patch_concurrency(cm: MagicMock, value):
-    """在 config mock 上叠加 llm_match_concurrency 返回值。"""
-    base_get = cm.get.side_effect
-
-    def _get(section, key, fallback=None):
-        if key == "llm_match_concurrency":
-            return value
-        return base_get(section, key, fallback)
-
-    cm.get.side_effect = _get
-
-
 def test_stale_and_pending_share_concurrency_limit():
     """S1：1 stale + 3 pending，limit=2 → 并发峰值恰好 2，且 4 条都被处理。"""
     sched = LlmMatchScheduler()
-    cm = _make_config()
-    _patch_concurrency(cm, "2")
+    cm = _make_config(concurrency=2)
     repo = _make_repo()
     repo.list_stale_processing.return_value = [
         {"run_id": "s1", "task_type": "match", "sync_record_id": 10}
@@ -856,10 +852,9 @@ def test_consume_exception_isolated_and_logged_error():
 # ---------------------------------------------------------------------------
 
 
-def _measure_peak_concurrency(concurrency_value, n_pending: int = 3) -> int:
+def _measure_peak_concurrency(concurrency_value: int, n_pending: int = 3) -> int:
     sched = LlmMatchScheduler()
-    cm = _make_config()
-    _patch_concurrency(cm, concurrency_value)
+    cm = _make_config(concurrency=concurrency_value)
     repo = _make_repo()
     repo.list_pending.return_value = [
         {"run_id": f"p{i}", "task_type": "match", "sync_record_id": i + 1}
@@ -888,17 +883,18 @@ def _measure_peak_concurrency(concurrency_value, n_pending: int = 3) -> int:
 @pytest.mark.parametrize(
     "value,expected_peak",
     [
-        (None, 3),  # 缺失 → 回退 3
-        ("", 3),  # 空串非法 → 回退 3
-        ("abc", 3),  # 非法 → 回退 3
-        ("0", 1),  # 0 → 下限 1
-        ("-4", 1),  # 负数 → 下限 1
-        ("2", 2),  # 合法值生效
-        ("9", 3),  # 大于任务数 → 峰值受任务数限制
+        (3, 3),  # 集中 getter 默认 3 → 峰值 3
+        (0, 1),  # 0 → 下限 1
+        (-4, 1),  # 负数 → 下限 1
+        (2, 2),  # 合法值生效
+        (9, 3),  # 大于任务数 → 峰值受任务数限制
     ],
 )
 def test_concurrency_config_parsing(value, expected_peak):
-    """S7：llm_match_concurrency 非法/缺失回退 3，非正数下限 1。"""
+    """S7：调度器消费集中 getter 的 llm_match_concurrency，非正数下限 1。
+
+    非法/缺失值回退 3 属 getter 职责，见 tests/core/test_config.py。
+    """
     assert _measure_peak_concurrency(value, n_pending=3) == expected_peak
 
 
