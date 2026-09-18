@@ -7,6 +7,7 @@
 4. resolve_similar_pending_candidates 的 exclude_id 排除自身
 """
 
+import json
 from pathlib import Path
 
 from app.core.database import DatabaseManager
@@ -304,5 +305,167 @@ class TestPendingCandidatesSyncRecordId:
 
             record = dbm.get_pending_candidate_by_id(id1)
             assert record["sync_record_id"] == 200
+        finally:
+            dbm._connection._conn.close()
+
+
+class TestLlmFieldProjection:
+    """llm_subject_id / llm_reason 由 candidates_json 投影（旧数据回退列值）。
+
+    唯一真相源为 candidates_json；DB 两列为兼容保留，读取时仅作回退。
+    """
+
+    def _insert(
+        self,
+        dbm,
+        candidates_json,
+        llm_subject_id="",
+        llm_reason="",
+        sync_record_id=None,
+        business_key="",
+    ):
+        conn = dbm._connection._conn
+        cur = conn.execute(
+            """
+            INSERT INTO pending_candidates
+            (created_at, request_title, request_season, user_name, source, status,
+             candidates_json, trace_json, llm_subject_id, llm_reason,
+             sync_record_id, business_key)
+            VALUES (datetime('now'), '投影标题', 1, 'u', 'plex', 'pending',
+                    ?, '{}', ?, ?, ?, ?)
+            """,
+            (
+                candidates_json,
+                llm_subject_id,
+                llm_reason,
+                sync_record_id,
+                business_key,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+    def test_projects_last_llm_entry(self, tmp_path):
+        """多条 llm 条目 → 取最后一条的 subject_id / reason。"""
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm,
+                json.dumps(
+                    [
+                        {"subject_id": "111", "name": "规则", "score": 0.9},
+                        {
+                            "subject_id": "222",
+                            "source": "llm_assist",
+                            "reason": "旧理由",
+                        },
+                        {
+                            "subject_id": "333",
+                            "source": "llm_assist",
+                            "reason": "新理由",
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "333"
+            assert rec["llm_reason"] == "新理由"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_falls_back_to_column_without_llm_entry(self, tmp_path):
+        """candidates_json 无 llm 条目 → 保留列值（旧数据兼容）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm,
+                json.dumps(
+                    [{"subject_id": "111", "name": "规则", "score": 0.9}],
+                    ensure_ascii=False,
+                ),
+                llm_subject_id="999",
+                llm_reason="列内旧理由",
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "999"
+            assert rec["llm_reason"] == "列内旧理由"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_falls_back_to_column_when_llm_entry_missing_reason(self, tmp_path):
+        """llm 条目缺 reason → reason 回退列值，subject_id 仍取 JSON。"""
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm,
+                json.dumps([{"subject_id": "444", "source": "llm_assist"}]),
+                llm_subject_id="999",
+                llm_reason="列内旧理由",
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "444"
+            assert rec["llm_reason"] == "列内旧理由"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_invalid_candidates_json_keeps_columns(self, tmp_path):
+        """非法 JSON → 原样保留列值（不抛错）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm, "not-json", llm_subject_id="888", llm_reason="列内旧理由"
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "888"
+            assert rec["llm_reason"] == "列内旧理由"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_projects_in_list_path(self, tmp_path):
+        """列表读取路径同样投影。"""
+        dbm = _make_db(tmp_path)
+        try:
+            self._insert(
+                dbm,
+                json.dumps(
+                    [
+                        {
+                            "subject_id": "555",
+                            "source": "llm_assist",
+                            "reason": "列表理由",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+            result = dbm.get_pending_candidates(status="pending")
+            assert result["records"][0]["llm_subject_id"] == "555"
+            assert result["records"][0]["llm_reason"] == "列表理由"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_projects_in_find_latest_by_business_key(self, tmp_path):
+        """find_latest_by_business_key（SELECT * 路径）同样投影。"""
+        dbm = _make_db(tmp_path)
+        try:
+            self._insert(
+                dbm,
+                json.dumps(
+                    [
+                        {
+                            "subject_id": "666",
+                            "source": "llm_assist",
+                            "reason": "bk理由",
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                business_key="match|u|投影标题|1",
+            )
+            row = dbm._pending.find_latest_by_business_key("match|u|投影标题|1")
+            assert row is not None
+            assert row["llm_subject_id"] == "666"
+            assert row["llm_reason"] == "bk理由"
         finally:
             dbm._connection._conn.close()

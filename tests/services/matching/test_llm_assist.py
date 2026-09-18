@@ -107,23 +107,23 @@ def _submit_response(subject_id="123", reason="跨季匹配"):
 
 
 def _read_candidate(sync_record_id):
-    """直接读取 pending_candidates 行（含 llm 两列），因为 repo 查询未 SELECT 这两列。"""
-    conn = database_manager._connection._conn
-    cur = conn.execute(
-        "SELECT id, llm_subject_id, llm_reason, candidates_json, status "
-        "FROM pending_candidates WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
-        (sync_record_id,),
+    """经仓储读取 pending_candidates 行（llm 两列为 candidates_json 投影值）。"""
+    return database_manager._pending.get_pending_candidate_by_sync_record_id(
+        sync_record_id
     )
-    row = cur.fetchone()
+
+
+def _read_raw_llm_columns(sync_record_id):
+    """直读 DB 的 llm 两列（验证写入侧不再写列，仅写 candidates_json）。"""
+    conn = database_manager._connection._conn
+    row = conn.execute(
+        "SELECT llm_subject_id, llm_reason FROM pending_candidates "
+        "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
+        (sync_record_id,),
+    ).fetchone()
     if not row:
         return None
-    return {
-        "id": row[0],
-        "llm_subject_id": row[1],
-        "llm_reason": row[2],
-        "candidates_json": row[3],
-        "status": row[4],
-    }
+    return {"llm_subject_id": row[0], "llm_reason": row[1]}
 
 
 def _read_full_candidate(candidate_id):
@@ -150,11 +150,15 @@ def _read_full_candidate(candidate_id):
 def _assert_candidate_written(sync_record_id, subject_id="123", reason="跨季匹配"):
     row = _read_candidate(sync_record_id)
     assert row is not None, "pending_candidates 行应已写入"
-    assert row["llm_subject_id"] == subject_id, "llm_subject_id 应写入"
-    assert row["llm_reason"] == reason, "llm_reason 应写入"
+    assert row["llm_subject_id"] == subject_id, "llm_subject_id 应为 JSON 投影值"
+    assert row["llm_reason"] == reason, "llm_reason 应为 JSON 投影值"
     assert row["status"] == "pending"
     candidates = json.loads(row["candidates_json"]) if row["candidates_json"] else []
     assert any(str(c.get("subject_id")) == subject_id for c in candidates)
+    llm_entries = [c for c in candidates if c.get("source") == "llm_assist"]
+    assert llm_entries and llm_entries[-1].get("reason") == reason, (
+        "candidates_json 应承载 llm 建议的 reason"
+    )
     return row
 
 
@@ -260,6 +264,92 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
     candidates = json.loads(row["candidates_json"])
     assert len(candidates) == 1
     assert str(candidates[0]["subject_id"]) == "456"
+
+
+# ---------------------------------------------------------------------------
+# 评论#12：candidates_json 为唯一写入源——仓储读取投影，DB 两列不再写入
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_submit_suggestion_projects_llm_fields_and_leaves_columns_empty(
+    monkeypatch,
+):
+    """写入 LLM 建议后：仓储读取得到投影值，DB llm 两列保持空（不双写）。"""
+    run_id = "run-proj-write"
+    sr_id = 21
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect([_submit_response("777", "投影理由")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+    # 仓储读取：两列由 candidates_json 投影
+    rec = _read_candidate(sr_id)
+    assert rec["llm_subject_id"] == "777"
+    assert rec["llm_reason"] == "投影理由"
+    # 写入侧不再写 DB 两列
+    raw = _read_raw_llm_columns(sr_id)
+    assert raw is not None
+    assert raw["llm_subject_id"] == "", "llm_subject_id 列不应再被写入"
+    assert raw["llm_reason"] == "", "llm_reason 列不应再被写入"
+    # reason 随 llm 候选条目落 candidates_json
+    cands = json.loads(rec["candidates_json"])
+    llm_entries = [c for c in cands if c.get("source") == "llm_assist"]
+    assert len(llm_entries) == 1
+    assert llm_entries[-1].get("reason") == "投影理由"
+
+
+@pytest.mark.asyncio
+async def test_run_submit_suggestion_marks_existing_candidate_on_duplicate_subject(
+    monkeypatch,
+):
+    """LLM 推荐与既有候选同 subject_id → 不重复追加，但 JSON 条目标注 llm 标记，
+    保证投影仍能读到本次建议（candidates_json 为唯一真相源）。"""
+    run_id = "run-dup-subject"
+    sr_id = 22
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    database_manager.log_pending_candidate(
+        request_title=f"dup-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "123", "name": "Rule A", "score": 0.9}],
+        sync_record_id=sr_id,
+    )
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect([_submit_response("123", "同候选加强")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+    rec = _read_candidate(sr_id)
+    assert rec["llm_subject_id"] == "123"
+    assert rec["llm_reason"] == "同候选加强"
+    cands = json.loads(rec["candidates_json"])
+    same = [c for c in cands if str(c.get("subject_id")) == "123"]
+    assert len(same) == 1, "同 subject_id 不应重复追加候选"
+    assert same[0]["source"] == "llm_assist"
+    assert same[0]["reason"] == "同候选加强"
 
 
 # ---------------------------------------------------------------------------

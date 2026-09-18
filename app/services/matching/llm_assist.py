@@ -8,10 +8,12 @@
 - ``continue_run``：崩溃恢复续跑单一公开入口（replay → 补执行 → 续跑 → 落库），
   调度器只调用本入口，不触碰本模块 ``_`` 前缀私有符号
 
-事务：候选写入（pending_candidates 两列）与 agent_runs 状态更新在
+事务：候选写入（pending_candidates.candidates_json）与 agent_runs 状态更新在
 **单一数据库事务**内完成（``database_manager._execute_with_lock`` 包裹两条
-语句，异常即整体回滚）。注：llm_subject_id / llm_reason 两列由
-``connection.py`` 建库期迁移保证存在，本服务层不再自行补列。
+语句，异常即整体回滚）。``candidates_json`` 是 LLM 建议的唯一写入源（条目含
+``source='llm_assist'`` 与 ``reason``）；``llm_subject_id`` / ``llm_reason``
+两列仅为旧数据兼容保留，本服务层不再写入，读取时由 pending_candidates 仓储
+层从 JSON 投影（见 ``_project_llm_fields``）。
 """
 
 from __future__ import annotations
@@ -578,6 +580,22 @@ def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
     return ""
 
 
+def _merge_llm_candidate(existing: list, new_cand: dict) -> None:
+    """将 llm 建议并入候选列表（原地修改）。
+
+    保持「同 subject_id 不重复追加」去重语义；但 candidates_json 是唯一真相源，
+    命中去重时仍需把 ``source='llm_assist'`` 与最新 ``reason`` 写回既有条目，
+    否则读取投影（``_project_llm_fields``）会丢失本次 LLM 建议。
+    """
+    sid = str(new_cand.get("subject_id"))
+    for cand in reversed(existing):
+        if isinstance(cand, dict) and str(cand.get("subject_id")) == sid:
+            cand["source"] = "llm_assist"
+            cand["reason"] = new_cand.get("reason", "")
+            return
+    existing.append(new_cand)
+
+
 def _persist_llm_candidate(
     dbm,
     *,
@@ -591,7 +609,10 @@ def _persist_llm_candidate(
     bgm: Any = None,
     bgm_title: str = "",
 ) -> int | None:
-    """在单一事务内：写 pending_candidates（llm 两列，有则更新/无则新建）+ 置 succeeded。
+    """在单一事务内：写 pending_candidates（candidates_json 唯一写入源）+ 置 succeeded。
+
+    ``candidates_json`` 追加/复用含 ``source='llm_assist'`` 与 ``reason`` 的条目；
+    ``llm_subject_id`` / ``llm_reason`` 两列不再写入（读取时由仓储层投影）。
 
     ``bgm_title`` 必须在事务外预取（见 ``_prefetch_bgm_name`` / ``_persist_and_notify``），
     事务内只做纯 DB 操作（F8：将外部 HTTP 调用移出事务，保持原子性语义不变）。
@@ -637,6 +658,7 @@ def _persist_llm_candidate(
             "name_cn": name,
             "score": 1.0,
             "source": "llm_assist",
+            "reason": reason,
         }
 
         if row:
@@ -647,18 +669,11 @@ def _persist_llm_candidate(
                 existing = []
             if not isinstance(existing, list):
                 existing = []
-            if not any(str(c.get("subject_id")) == str(subject_id) for c in existing):
-                existing.append(new_cand)
+            _merge_llm_candidate(existing, new_cand)
             cursor = conn.execute(
-                "UPDATE pending_candidates SET candidates_json=?, "
-                "llm_subject_id=?, llm_reason=?, status='pending' "
+                "UPDATE pending_candidates SET candidates_json=?, status='pending' "
                 "WHERE id=? AND status='pending'",
-                (
-                    json.dumps(existing, ensure_ascii=False),
-                    subject_id,
-                    reason,
-                    existing_id,
-                ),
+                (json.dumps(existing, ensure_ascii=False), existing_id),
             )
             if cursor.rowcount == 0:
                 # SELECT 后被并发处理：带守卫 UPDATE 未命中，同样不复活。
@@ -681,9 +696,8 @@ def _persist_llm_candidate(
                 INSERT INTO pending_candidates
                 (created_at, request_title, request_ori_title, request_season,
                  request_episode, user_name, source, candidates_json, trace_json,
-                 status, confirmed_subject_id, resolved_at, sync_record_id,
-                 llm_subject_id, llm_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?, ?)
+                 status, confirmed_subject_id, resolved_at, sync_record_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?)
                 """,
                 (
                     now,
@@ -696,8 +710,6 @@ def _persist_llm_candidate(
                     json.dumps([new_cand], ensure_ascii=False),
                     "{}",
                     sync_record_id,
-                    subject_id,
-                    reason,
                 ),
             )
             candidate_id = cur.lastrowid
