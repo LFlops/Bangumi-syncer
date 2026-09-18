@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import time
@@ -923,7 +924,7 @@ async def run(
         attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e)[:500])
         return "failed" if attempts >= 3 else "processing"
 
-    return _handle_result(
+    return await _handle_result_async(
         dbm,
         run_id,
         result,
@@ -1030,7 +1031,7 @@ async def continue_run(
                 suggestion=sug,
                 last_response=None,
             )
-            _handle_result(
+            await _handle_result_async(
                 dbm,
                 run_id,
                 result,
@@ -1157,7 +1158,7 @@ async def _execute_continuation(
         seed_messages=replay_result.messages,
         recorder=span_recorder,
     )
-    _handle_result(
+    await _handle_result_async(
         dbm,
         run_id,
         result,
@@ -1255,6 +1256,49 @@ def _append_tool_result(
             ],
         )
     )
+
+
+async def _handle_result_async(
+    dbm,
+    run_id: str,
+    result: RunResult,
+    *,
+    sync_record: dict,
+    sync_record_id: int | None,
+    bgm: Any,
+    notification_service: Any | None,
+    total_tokens: int,
+) -> str:
+    """在**线程池**执行同步收尾链 ``_handle_result``，避免阻塞事件循环。
+
+    ``_handle_result`` 内部含阻塞调用——``_validate_subject_id``（SyncService
+    → ``api.get_subject``）与 ``_prefetch_bgm_name``（``bgm.get_subject``）都是
+    同步 HTTP，且链路可能触发限速器同步 sleep；而三个调用方
+    （``run`` / ``continue_run`` / ``_execute_continuation``）均在事件循环上运行，
+    直接调用会阻塞心跳协程与同一循环内的其他任务。
+
+    线程安全前提（已核查，故整链在线程池执行 = 方案 A）：
+    - SQLite 连接以 ``check_same_thread=False`` 创建，所有读写经
+      ``DatabaseConnection._lock`` 串行化（``_execute_with_lock`` / ``_run_write``），
+      跨线程执行安全；
+    - ``notification_service.notify`` 内部 DB 写入复用同一仓储与锁，外部渠道
+      发送无跨调用共享可变状态。
+
+    用 ``functools.partial`` 绑定全部参数后再交给 ``asyncio.to_thread``：兼容
+    Python 3.9 早期版本 ``to_thread`` 不支持 kwargs 的限制，行为等价。
+    """
+    call = functools.partial(
+        _handle_result,
+        dbm,
+        run_id,
+        result,
+        sync_record=sync_record,
+        sync_record_id=sync_record_id,
+        bgm=bgm,
+        notification_service=notification_service,
+        total_tokens=total_tokens,
+    )
+    return await asyncio.to_thread(call)
 
 
 def _handle_result(

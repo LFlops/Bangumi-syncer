@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
+from contextlib import suppress
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -3570,3 +3573,160 @@ def test_system_suffix_describes_interactive_rounds_not_tool_call_count():
 
     assert "表示剩余可交互轮次（每轮可执行多个工具）" in suffix
     assert "表示剩余可调用工具的次数" not in suffix, "旧文案应被替换"
+
+
+# ---------------------------------------------------------------------------
+# PR#8 评论#21：收尾路径异步化 —— 消除事件循环上的同步阻塞
+#
+# 收尾链 ``_handle_result``（同步）含阻塞 HTTP（``_validate_subject_id`` /
+# ``_prefetch_bgm_name``）与限速器同步 sleep，必须移入线程池执行，否则
+# 阻塞事件循环。（线程安全前提核查见源码 ``_handle_result_async`` docstring）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_tail_does_not_block_event_loop(monkeypatch):
+    """run 收尾期间（bgm.get_subject 同步睡 0.2s）事件循环仍被调度。
+
+    证据：心跳协程在慢函数执行窗口内持续递增（每 0.01s 一次），且落库/通知
+    行为保持正常。若收尾链在事件循环线程同步执行，心跳在该窗口内为 0。
+    """
+    run_id = "run-async-tail"
+    sr_id = 91
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+
+    tail_active = threading.Event()
+
+    class _SlowBgm:
+        """get_subject 为同步阻塞函数：模拟收尾期阻塞 HTTP。"""
+
+        def search(self, **kwargs):
+            return [{"id": 1}]
+
+        def get_subject(self, sid):
+            tail_active.set()
+            time.sleep(0.2)
+            tail_active.clear()
+            return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    beats_during_tail = 0
+
+    async def _heartbeat():
+        nonlocal beats_during_tail
+        while True:
+            await asyncio.sleep(0.01)
+            if tail_active.is_set():
+                beats_during_tail += 1
+
+    ns = _make_notify()
+    hb = asyncio.create_task(_heartbeat())
+    await asyncio.sleep(0)  # 让心跳先进入等待，再执行收尾
+    try:
+        status = await llm_assist.run(
+            run_id,
+            sync_record=sr,
+            bgm=_SlowBgm(),
+            thinking_level="medium",
+            chat_fn=_chat_side_effect([_search_response(), _submit_response()]),
+            notification_service=ns,
+            span_recorder=None,
+        )
+    finally:
+        hb.cancel()
+        with suppress(asyncio.CancelledError):
+            await hb
+
+    assert status == "succeeded"
+    # 0.2s / 0.01s ≈ 20 次机会；阈值 5 留足 CI 余量
+    assert beats_during_tail >= 5, (
+        f"收尾期间事件循环应持续调度心跳（实际仅 {beats_during_tail} 次）"
+    )
+    _assert_candidate_written(sr_id)
+    ns.notify.assert_called_once()
+
+
+def test_continue_run_submit_tail_runs_off_event_loop_thread():
+    """continue_run 的 submit 收尾分派不得在事件循环线程执行（线程归属证据）。"""
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(
+        executed=1,
+        last_response={
+            "stop_reason": "submit_suggestion",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "s1",
+                    "name": "submit_suggestion",
+                    "input": {"subject_id": "123", "reason": "跨季匹配"},
+                }
+            ],
+        },
+    )
+    loop = AsyncMock()
+    main_ident = threading.get_ident()
+    seen: dict = {}
+
+    def _capture(*args, **kwargs):
+        seen["ident"] = threading.get_ident()
+        return "succeeded"
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch(
+            "app.services.matching.llm_assist._handle_result",
+            side_effect=_capture,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-tail", {"id": 1}, MagicMock()))
+
+    assert seen.get("ident") is not None, "_handle_result 应被调用"
+    assert seen["ident"] != main_ident, "收尾链应在工作线程执行，不得占用事件循环线程"
+
+
+def test_continue_run_continuation_tail_runs_off_event_loop_thread():
+    """_execute_continuation 续跑后的收尾分派同样不在事件循环线程执行。"""
+    repo = _make_continuation_repo()
+    seed = [Message(role="system", content="s"), Message(role="user", content="u")]
+    rr = _make_replay_result(executed=2, missing=[], last_response=None, messages=seed)
+    loop = AsyncMock(return_value=RunResult(stop_reason="end_turn"))
+    main_ident = threading.get_ident()
+    seen: dict = {}
+
+    def _capture(*args, **kwargs):
+        seen["ident"] = threading.get_ident()
+        return "no_suggestion"
+
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch(
+            "app.services.matching.llm_assist._handle_result",
+            side_effect=_capture,
+        ),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r-cont", {"id": 1}, MagicMock()))
+
+    loop.assert_awaited_once()
+    assert seen.get("ident") is not None, "_handle_result 应被调用"
+    assert seen["ident"] != main_ident, (
+        "续跑收尾链应在工作线程执行，不得占用事件循环线程"
+    )
