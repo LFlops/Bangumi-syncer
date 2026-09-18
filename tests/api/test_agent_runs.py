@@ -267,9 +267,8 @@ async def test_get_agent_run_steps_sorted_and_no_replay_delta(app, mock_db):
         assert "replay_delta" not in s, f"replay_delta 不应出现在响应: {s}"
         assert "payload_json" not in s, f"payload_json 不应出现在响应: {s}"
         assert "display_json" in s, f"display_json 应出现在响应: {s}"
-        # display_json 必须是合法 JSON 字符串
-        parsed = json.loads(s["display_json"])
-        assert isinstance(parsed, dict)
+        # display_json 应是嵌套对象（非「JSON 字符串再塞进 JSON 字段」的双重编码）
+        assert isinstance(s["display_json"], dict)
 
 
 # ---------------------------------------------------------------------------
@@ -321,30 +320,30 @@ async def test_display_json_llm_chat_small_content_not_truncated(app, mock_db):
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
-    display = json.loads(steps[0]["display_json"])
+    display = steps[0]["display_json"]
     assert display["stop_reason"] == "end_turn"
     assert display["content"] == big
-    assert SHRINKED_MARKER not in steps[0]["display_json"]
+    assert SHRINKED_MARKER not in json.dumps(display, ensure_ascii=False)
 
 
 async def test_display_json_llm_chat_oversized_content_truncated_with_marker(
     app, mock_db
 ):
-    """llm_chat 超长 content → display_json 截断且含 shrinked 标记，仍是合法 JSON"""
+    """llm_chat 超长 content → display_json 截断且含 shrinked 标记，仍是嵌套对象"""
     huge = "A" * 5000  # 远超 2KB
     delta = json.dumps(
         {"response": {"stop_reason": "end_turn", "content": huge, "tool_calls": []}}
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
-    raw = steps[0]["display_json"]
-    # 截断后仍合法 JSON
-    parsed = json.loads(raw)
-    assert isinstance(parsed, dict)
+    display = steps[0]["display_json"]
+    # 截断后仍是嵌套对象
+    assert isinstance(display, dict)
+    serialized = json.dumps(display, ensure_ascii=False)
     # 含 shrinked 标记
-    assert SHRINKED_MARKER in raw
-    # 截断后大小 ≤ 2KB
-    assert len(raw.encode("utf-8")) <= 2 * 1024
+    assert SHRINKED_MARKER in serialized
+    # 截断后大小 ≤ 2KB（对序列化结果度量）
+    assert len(serialized.encode("utf-8")) <= 2 * 1024
 
 
 async def test_display_json_tool_execute_preview_fields(app, mock_db):
@@ -354,7 +353,7 @@ async def test_display_json_tool_execute_preview_fields(app, mock_db):
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "tool_execute", delta)])
 
-    display = json.loads(steps[0]["display_json"])
+    display = steps[0]["display_json"]
     assert display["tool_use_id"] == "tu-1"
     assert display["content"] == "ok结果"
     assert display["is_error"] is False
@@ -369,25 +368,26 @@ async def test_display_json_seed_only_count(app, mock_db):
     delta = json.dumps({"seed_messages": messages})
     steps = await _get_steps(app, mock_db, [_make_step("s1", "seed", delta)])
 
-    display = json.loads(steps[0]["display_json"])
+    display = steps[0]["display_json"]
     assert display == {"seed_messages_count": 2}
     # 原始消息内容不应泄露
-    assert "msg1" not in steps[0]["display_json"]
-    assert "msg2" not in steps[0]["display_json"]
+    serialized = json.dumps(display, ensure_ascii=False)
+    assert "msg1" not in serialized
+    assert "msg2" not in serialized
 
 
-async def test_display_json_empty_delta_returns_empty_string(app, mock_db):
-    """空 replay_delta → display_json 为空字符串，不抛异常"""
+async def test_display_json_empty_delta_returns_empty_object(app, mock_db):
+    """空 replay_delta → display_json 为空对象，不抛异常"""
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", "")])
-    assert steps[0]["display_json"] == ""
+    assert steps[0]["display_json"] == {}
 
 
-async def test_display_json_malformed_delta_returns_empty_string(app, mock_db):
-    """非法 JSON replay_delta → display_json 为空字符串，不抛异常"""
+async def test_display_json_malformed_delta_returns_empty_object(app, mock_db):
+    """非法 JSON replay_delta → display_json 为空对象，不抛异常"""
     steps = await _get_steps(
         app, mock_db, [_make_step("s1", "llm_chat", "{not valid json")]
     )
-    assert steps[0]["display_json"] == ""
+    assert steps[0]["display_json"] == {}
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +423,10 @@ async def test_run_timestamps_epoch_to_iso(app, mock_db):
     # ISO 格式断言：含 T、含时区偏移
     assert "T" in data["started_at"]
     assert "+" in data["started_at"] or "Z" in data["started_at"]
+    # 机器可读 API 统一 UTC 表示（+00:00 结尾）
+    assert data["started_at"].endswith("+00:00")
+    assert data["ended_at"].endswith("+00:00")
+    assert data["created_at"].endswith("+00:00")
     # 固定 epoch → 固定时刻（与运行时区无关）
     assert datetime.fromisoformat(data["started_at"]) == datetime.fromtimestamp(
         1704067200, tz=timezone.utc
@@ -470,6 +474,9 @@ async def test_steps_timestamps_epoch_to_iso(app, mock_db):
     )
     s = steps[0]
     assert "T" in s["started_at"]
+    # 机器可读 API 统一 UTC 表示（+00:00 结尾）
+    assert s["started_at"].endswith("+00:00")
+    assert s["ended_at"].endswith("+00:00")
     # 固定 epoch → 固定时刻（与运行时区无关）
     assert datetime.fromisoformat(s["started_at"]) == datetime.fromtimestamp(
         1704067200, tz=timezone.utc

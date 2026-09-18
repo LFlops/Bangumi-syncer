@@ -86,6 +86,35 @@ def truncate_json(payload: Any, max_bytes: int = MAX_PAYLOAD_JSON_BYTES) -> str:
     return _build_truncation_shell(text, max_bytes)
 
 
+def truncate_text_with_marker(text: str, max_bytes: int) -> str:
+    """将字符串按 UTF-8 字节数截断至 ≤ max_bytes，并保证以 SHRINKED_MARKER 结尾。
+
+    供展示层需要「嵌套对象而非序列化字符串」时使用：
+
+    - 文本已在预算内：原样返回（不追加标记）。
+    - 超预算：二分查找安全截断点，避免切断多字节字符，结果以
+      ``...[shrinked]`` 结尾。
+    - 预算连标记本身都容纳不下：退化为标记前缀片段并记 warning（防御分支，
+      正常预算（2KB）下不会触发）。
+    """
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+    marker_bytes = SHRINKED_MARKER.encode("utf-8")
+    if max_bytes <= len(marker_bytes):
+        logger.warning(
+            f"⚠️ 截断预算过小 (max_bytes={max_bytes})，无法容纳完整 shrinked 标记"
+        )
+        return marker_bytes[:max_bytes].decode("utf-8", "ignore")
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if len((text[:mid] + SHRINKED_MARKER).encode("utf-8")) <= max_bytes:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo] + SHRINKED_MARKER
+
+
 def _build_truncation_shell(text: str, max_bytes: int) -> str:
     """构建降级包壳 ``{"truncated": true, "preview": "<前缀>...[shrinked]"}``。
 

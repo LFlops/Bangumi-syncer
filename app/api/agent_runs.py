@@ -13,12 +13,13 @@ Agent 追踪查询 API
 展示契约：
 - 响应永不包含 ``replay_delta`` 原文（仅用于内部重放）。
 - ``payload_json`` 列已删除，不再出现在响应中。
-- steps 端点新增 ``display_json``：读取时解密 replay_delta → 现场截断生成展示摘要。
-- 时间字段由 epoch 秒整数转为 ISO 8601 字符串（含时区）；0/None → None。
+- steps 端点新增 ``display_json``：读取时解密 replay_delta → 现场生成展示摘要
+  （直接返回嵌套对象，超限时截断字符串字段并追加 ``...[shrinked]`` 标记）。
+- 时间字段由 epoch 秒整数转为 ISO 8601 字符串（统一 UTC，形如 ``...+00:00``）；0/None → None。
 """
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -27,7 +28,7 @@ from ..api.deps import get_current_user_flexible
 from ..core.database import database_manager
 from ..core.logging import logger
 from ..core.security import security_manager
-from ..utils.truncate import truncate_json
+from ..utils.truncate import MAX_PAYLOAD_JSON_BYTES, truncate_text_with_marker
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
@@ -115,13 +116,13 @@ def _authorize(run: dict, current_user: dict) -> None:
 
 
 def _iso_from_epoch(ts) -> Optional[str]:
-    """epoch 秒整数 → ISO 8601 字符串（含时区）；0/None/非数字 → None。"""
+    """epoch 秒整数 → ISO 8601 字符串（统一 UTC，形如 ``...+00:00``）；0/None/非数字 → None。"""
     if not ts:
         return None
     if not isinstance(ts, (int, float)):
         return None
     try:
-        return datetime.fromtimestamp(ts).astimezone().isoformat()
+        return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -134,24 +135,55 @@ def _apply_time_fields(record: dict) -> dict:
     return record
 
 
-def _build_display_json(name: str, replay_delta: str) -> str:
-    """从 replay_delta 现场生成展示摘要（截断至合法 JSON）。
+def _json_byte_size(obj) -> int:
+    """对象序列化后的 UTF-8 字节数（展示预算度量）。"""
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+
+def _fit_preview_within_limit(preview: dict) -> dict:
+    """保证展示预览序列化后 ≤ MAX_PAYLOAD_JSON_BYTES。
+
+    超限时逐轮截断当前最长的字符串字段并追加 ``...[shrinked]`` 标记；若已无
+    可截断字符串字段、或收敛失败，则返回空对象（记 warning，不静默）。
+    """
+    if _json_byte_size(preview) <= MAX_PAYLOAD_JSON_BYTES:
+        return preview
+    result = dict(preview)
+    for _ in range(8):
+        text_fields = [(k, v) for k, v in result.items() if isinstance(v, str)]
+        if not text_fields:
+            logger.warning("⚠️ display_json 预览无可截断字符串字段，返回空对象")
+            return {}
+        key, value = max(text_fields, key=lambda kv: len(kv[1].encode("utf-8")))
+        # 该字段可用预算 = 总上限 - 其余字段（含本字段空串占位）序列化开销
+        overhead = _json_byte_size({**result, key: ""})
+        result[key] = truncate_text_with_marker(
+            value, max(0, MAX_PAYLOAD_JSON_BYTES - overhead)
+        )
+        if _json_byte_size(result) <= MAX_PAYLOAD_JSON_BYTES:
+            return result
+    logger.warning("⚠️ display_json 预览截断多轮后仍超限，返回空对象")
+    return {}
+
+
+def _build_display_json(name: str, replay_delta: str) -> dict:
+    """从 replay_delta 现场生成展示摘要（直接返回嵌套对象，超限截断）。
 
     - llm_chat → {"stop_reason", "content"}
     - tool_execute → {"tool_use_id", "content", "is_error"}
     - seed → {"seed_messages_count": N}
-    - 解析失败/空 delta/未知 name → ""
+    - 解析失败/空 delta/未知 name → {}
     """
     if not replay_delta:
-        return ""
+        return {}
     try:
         data = (
             json.loads(replay_delta) if isinstance(replay_delta, str) else replay_delta
         )
     except (ValueError, TypeError):
-        return ""
+        return {}
     if not isinstance(data, dict):
-        return ""
+        return {}
 
     if name == "llm_chat":
         response = data.get("response") or {}
@@ -170,9 +202,9 @@ def _build_display_json(name: str, replay_delta: str) -> str:
         seed_messages = data.get("seed_messages") or []
         preview = {"seed_messages_count": len(seed_messages)}
     else:
-        return ""
+        return {}
 
-    return truncate_json(preview)
+    return _fit_preview_within_limit(preview)
 
 
 def _project_run(run: dict) -> dict:
