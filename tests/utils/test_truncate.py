@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 from app.utils.truncate import (
     MAX_PAYLOAD_JSON_BYTES,
     SHRINKED_MARKER,
+    _build_truncation_shell,
+    _safe_json_dumps,
     truncate_json,
 )
 
@@ -105,3 +108,42 @@ class TestTruncateJsonDeepNesting:
             deep = [deep]
         out = truncate_json(deep)
         json.loads(out)
+
+
+def _make_recursion_error_object() -> dict:
+    """构造足以让 json.dumps 触发 RecursionError 的病态深嵌套对象。"""
+    deep: object = "x"
+    for _ in range(20000):
+        deep = {"n": deep}
+    return deep  # type: ignore[return-value]
+
+
+class TestTruncateFailureLogging:
+    def test_safe_json_dumps_recursion_error_logs_error_and_returns_none(self):
+        """序列化触发 RecursionError 时记录 error 级别日志并返回 None。"""
+        deep = _make_recursion_error_object()
+
+        with patch("app.utils.truncate.logger") as mock_logger:
+            result = _safe_json_dumps(deep, MAX_PAYLOAD_JSON_BYTES)
+
+        assert result is None
+        mock_logger.error.assert_called_once()
+        msg = str(mock_logger.error.call_args.args[0])
+        assert "RecursionError" in msg
+        mock_logger.warning.assert_not_called()
+
+    def test_build_truncation_shell_invalid_json_logs_error(self):
+        """包壳拼接结果非法 JSON 时记录 error 级别日志并继续缩减预算。"""
+        # 前若干个切片字符含未转义控制字符，使拼接串不是合法 JSON
+        text = "\x00" * 5000
+
+        with patch("app.utils.truncate.logger") as mock_logger:
+            result = _build_truncation_shell(text, 256)
+
+        # 最终仍返回合法包壳（预算耗尽后仅剩标记）
+        json.loads(result)
+        assert result.endswith(SHRINKED_MARKER + '"}')
+        mock_logger.error.assert_called()
+        msgs = [str(c.args[0]) for c in mock_logger.error.call_args_list if c.args]
+        assert any("JSON" in m for m in msgs), msgs
+        mock_logger.warning.assert_not_called()

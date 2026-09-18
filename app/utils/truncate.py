@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..core.logging import logger
+
 # 观测摘要上限（截断 ≤2KB）
 MAX_PAYLOAD_JSON_BYTES = 2 * 1024
 SHRINKED_MARKER = "...[shrinked]"
@@ -46,6 +48,9 @@ def _safe_json_dumps(obj: Any, max_bytes: int) -> str | None:
     try:
         return json.dumps(obj, ensure_ascii=False)
     except RecursionError:
+        logger.error(
+            "❌ JSON 序列化触发 RecursionError（payload 嵌套过深），降级为截断包壳"
+        )
         return None
 
 
@@ -101,8 +106,10 @@ def _build_truncation_shell(text: str, max_bytes: int) -> str:
             try:
                 json.loads(result)
                 return result
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as e:
+                logger.error(
+                    f"❌ 截断包壳 JSON 校验失败，继续缩减预算 (budget={budget}): {e}"
+                )
         budget -= 1
     # 预算耗尽：仅返回标记包壳
     return prefix + SHRINKED_MARKER + suffix

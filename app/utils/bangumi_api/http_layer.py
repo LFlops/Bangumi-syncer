@@ -34,8 +34,11 @@ def _parse_retry_after(res: httpx.Response) -> float | None:
     # 纯秒数
     try:
         return max(0.0, float(text))
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as e:
+        # 正常降级路径：Retry-After 也可能是 HTTP-date，继续按 date 解析
+        logger.warning(
+            f"⚠️  Retry-After 非纯秒数，尝试按 HTTP-date 解析: {text!r} ({e})"
+        )
 
     # HTTP-date
     try:

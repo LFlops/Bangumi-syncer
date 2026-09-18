@@ -517,6 +517,22 @@ def test_parse_retry_after_http_date():
     assert 80.0 <= parsed <= 91.0
 
 
+def test_parse_retry_after_http_date_logs_seconds_fallback_warning():
+    """Retry-After 为 HTTP-date 时，纯秒数解析失败分支须记录 warning 并继续解析 date。"""
+    raw = "Wed, 21 Oct 2015 07:28:00 GMT"
+    res = _mock_response(429, {"Retry-After": raw})
+
+    with patch("app.utils.bangumi_api.http_layer.logger") as mock_logger:
+        parsed = _parse_retry_after(res)
+
+    # date 分支解析成功（过去时间 → 0.0），证明降级后继续解析
+    assert parsed == 0.0
+    mock_logger.warning.assert_called_once()
+    msg = str(mock_logger.warning.call_args.args[0])
+    assert raw in msg
+    mock_logger.error.assert_not_called()
+
+
 def test_parse_retry_after_invalid_returns_none():
     res = _mock_response(429, {"Retry-After": "not-a-valid-value"})
 
