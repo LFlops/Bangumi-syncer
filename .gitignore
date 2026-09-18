@@ -192,3 +192,9 @@ rrr/
 
 # Pi Agent
 .pi
+
+# 本地待办与内部任务稿（不随仓库提交）
+/remain/
+/specs/
+/scripts/memory_selfcheck.py
+/log.txt.*
