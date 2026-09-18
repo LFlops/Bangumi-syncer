@@ -10,6 +10,7 @@
 """
 
 import asyncio
+import json
 import logging
 import re
 from collections import UserDict
@@ -35,6 +36,25 @@ _TYPE_MAP: dict[str, tuple[type, ...]] = {
 
 class ToolError(Exception):
     """工具执行 / 校验失败。"""
+
+
+def serialize_tool_result(result: Any) -> str:
+    """工具结果统一序列化：可 JSON 序列化用 ``json.dumps(ensure_ascii=False)``，
+    否则 fallback ``str``。
+
+    这是工具结果回填给 LLM 的**协议契约**：所有工具结果（含字符串、dict、list）
+    统一走 JSON 编码，保证消费方（含 replay 补执行路径）有一致的解析口径。
+    不可 JSON 序列化的对象（自定义类型等）降级为 ``str(result)``，不抛异常。
+    """
+    try:
+        return json.dumps(result, ensure_ascii=False)
+    except (TypeError, ValueError):
+        # 非 JSON 可序列化对象：降级 str，记录 debug 以便定位降级来源（非静默）
+        logger.debug(
+            "serialize_tool_result 无法 JSON 编码 %s，降级为 str",
+            type(result).__name__,
+        )
+        return str(result)
 
 
 @dataclass
@@ -152,7 +172,7 @@ class ToolRegistry:
         """
         if defn.name in self._tools:
             if quiet:
-                logger.debug("工具 %r 重新注册（覆盖旧定义）", defn.name)
+                logger.info("工具 %r 重新注册（覆盖旧定义）", defn.name)
             else:
                 logger.warning("工具 %r 重复注册，已覆盖旧定义", defn.name)
         self._tools[defn.name] = defn
@@ -361,7 +381,9 @@ class ToolRegistry:
             if isinstance(result, TerminalCapture):
                 return result
             result_for_recorder = ToolResultBlock(
-                tool_use_id=tc.id, content=str(result), is_error=False
+                tool_use_id=tc.id,
+                content=serialize_tool_result(result),
+                is_error=False,
             )
             return result_for_recorder
         except Exception as exc:  # ToolError / handler 异常 / 超时 统一转为错误块

@@ -8,6 +8,7 @@
 """
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -21,6 +22,7 @@ from app.services.llm.tools import (
     ToolRegistry,
     get_tool_registry,
     reset_tool_registry,
+    serialize_tool_result,
 )
 
 
@@ -137,6 +139,27 @@ def test_register_duplicate_warns_and_overwrites(caplog):
 def test_get_unregistered_returns_none():
     reg = ToolRegistry()
     assert reg.get("nope") is None
+
+
+def test_register_quiet_overwrite_logs_info_not_warning(caplog):
+    """quiet 覆盖注册是正常的重绑定路径，记 info（非 warning），仍完成覆盖。"""
+    reg = ToolRegistry()
+    old = ToolDefinition(
+        name="q", description="old", parameters={}, handler=_noop_handler, access="read"
+    )
+    new = ToolDefinition(
+        name="q", description="new", parameters={}, handler=_noop_handler, access="read"
+    )
+    reg.register(old)
+    with caplog.at_level(logging.INFO, logger="app.services.llm.tools"):
+        reg.register(new, quiet=True)
+    # 覆盖路径记 info
+    infos = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert any("q" in r.getMessage() and "覆盖" in r.getMessage() for r in infos)
+    # 不再刷 warning
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+    # 覆盖仍然生效
+    assert reg.get("q").description == "new"
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +372,39 @@ async def test_read_handler_timeout_raises_tool_error():
 
 
 # ---------------------------------------------------------------------------
+# serialize_tool_result：工具结果统一序列化
+# ---------------------------------------------------------------------------
+
+
+def test_serialize_tool_result_dict_keeps_unicode_unescaped():
+    """dict 结果 JSON 编码；中文 ensure_ascii=False 不转义。"""
+    result = {"标题": "进击的巨人", "score": 9}
+    encoded = serialize_tool_result(result)
+    assert json.loads(encoded) == result
+    assert "进击的巨人" in encoded
+    assert "\\u" not in encoded
+
+
+def test_serialize_tool_result_list_uses_json():
+    """list 结果 JSON 编码（非 Python repr）。"""
+    result = ["a", 1, {"b": True}]
+    assert serialize_tool_result(result) == json.dumps(result, ensure_ascii=False)
+
+
+def test_serialize_tool_result_string_is_json_quoted():
+    """字符串结果同样 JSON 编码（带引号），保证契约统一。"""
+    assert serialize_tool_result("ran") == '"ran"'
+
+
+def test_serialize_tool_result_unserializable_falls_back_to_str():
+    """不可 JSON 序列化对象 fallback str(result)，不抛异常。"""
+    obj = {1, 2}  # set 无法 JSON 序列化
+    with pytest.raises(TypeError):
+        json.dumps(obj, ensure_ascii=False)
+    assert serialize_tool_result(obj) == str(obj)
+
+
+# ---------------------------------------------------------------------------
 # execute_batch：分段并行（连续 readonly 段 gather 并行）
 # ---------------------------------------------------------------------------
 
@@ -395,7 +451,8 @@ async def test_execute_batch_readonly_segment_runs_in_parallel():
         assert isinstance(blk, ToolResultBlock)
         assert blk.tool_use_id == k
         assert blk.is_error is False
-        assert blk.content == k
+        # 新契约：字符串结果也走 JSON 编码（带引号）
+        assert blk.content == json.dumps(k, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +578,7 @@ async def test_execute_batch_duplicate_tool_use_id_executes_only_first():
     # 首个槽位保留真实执行结果（不被 dup 错误块覆盖）
     assert isinstance(first, ToolResultBlock)
     assert first.is_error is False
-    assert first.content == "ran"
+    assert first.content == '"ran"'
     # 第二个槽位为 duplicate 错误块
     assert isinstance(second, ToolResultBlock)
     assert second.is_error is True
@@ -558,10 +615,10 @@ async def test_execute_batch_duplicate_write_tool_keeps_first_result():
     assert called == ["first"]
     assert [i for i, _ in results.ordered] == ["w1", "w1"]
     assert results.ordered[0][1].is_error is False
-    assert results.ordered[0][1].content == "written"
+    assert results.ordered[0][1].content == '"written"'
     assert results.ordered[1][1].is_error is True
     assert results.ordered[1][1].content == "duplicate tool_use_id"
-    assert results["w1"].content == "written"
+    assert results["w1"].content == '"written"'
 
 
 @pytest.mark.asyncio
@@ -593,14 +650,14 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     assert called == ["a", "dup", "b"]
     # 唯一 id 结果不受影响
     assert results["a"].is_error is False
-    assert results["a"].content == "ran"
+    assert results["a"].content == '"ran"'
     assert results["b"].is_error is False
-    assert results["b"].content == "ran"
+    assert results["b"].content == '"ran"'
     # G2：重复 id 的首个槽位保留真实结果，第二个槽位为错误块
     slots = results.ordered
     assert [i for i, _ in slots] == ["a", "dup", "dup", "b"]
     assert slots[1][1].is_error is False
-    assert slots[1][1].content == "ran"
+    assert slots[1][1].content == '"ran"'
     assert isinstance(slots[2][1], ToolResultBlock)
     assert slots[2][1].is_error is True
     assert slots[2][1].content == "duplicate tool_use_id"
@@ -1006,4 +1063,4 @@ async def test_recorder_重复id_占位错误块同样有span且is_error():
 
     # 首个保留真实结果
     assert results["same"].is_error is False
-    assert results["same"].content == "ran"
+    assert results["same"].content == '"ran"'
