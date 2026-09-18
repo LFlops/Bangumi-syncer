@@ -6,10 +6,14 @@
 3. 直连回退路径同样限速
 4. 429 自适应冷却（Retry-After / 默认 / 指数延长 / 成功重置）
 5. 配置解析（生效值与非法/缺失回退）
+6. 预扣（reserve）公平模式：FIFO 单调等待、冻结解除后按 1/rate 间隔放行
+7. 获取超时：超过 timeout 放弃预约（回滚）并抛 RateLimitTimeoutError
+8. async 兼容层 acquire_async：不阻塞事件循环、与同步共享令牌桶
 """
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -22,12 +26,19 @@ from app.core.config import config_manager
 from app.utils.bangumi_api import BangumiApi, rate_limit
 from app.utils.bangumi_api.http_layer import _parse_retry_after
 from app.utils.bangumi_api.rate_limit import (
+    DEFAULT_ACQUIRE_TIMEOUT,
     DEFAULT_BURST,
     DEFAULT_RATE,
     RateLimiter,
+    RateLimitTimeoutError,
     get_bgm_rate_limiter,
     reset_bgm_rate_limiter,
 )
+from app.utils.retry import RETRY_EXCEPTIONS
+
+# 冻结类用例会预约 60~3600s 的等待，显式给出足够大的 timeout，
+# 与「超时」场景（小 timeout）区分开。
+_FREEZE_TIMEOUT = 4000.0
 
 
 class FakeClock:
@@ -53,6 +64,25 @@ class FakeSleeper:
     def __call__(self, seconds: float) -> None:
         self.calls.append(seconds)
         self._clock.advance(seconds)
+
+
+class _AbortReservation(Exception):
+    """测试用：在 sleep 时中断，仅采集预约的放行等待，不真正推进时钟"""
+
+
+class AbortOnSleep:
+    """记录每次预约所需的等待并立刻中断，便于单线程观察排队时序
+
+    预约（reserve）在进入 ``sleep`` 前已提交令牌扣减，因此中断后令牌债务
+    保留，后续 ``acquire`` 会看到连续排队的效果（等价于并发到达）。
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+        raise _AbortReservation
 
 
 class RecordingLimiter:
@@ -233,6 +263,194 @@ def test_freeze_update_visible_during_wait():
 
 
 # ---------------------------------------------------------------------------
+# 场景 6：预扣（reserve）公平模式 —— FIFO 排队 + 冻结后间隔放行
+# ---------------------------------------------------------------------------
+
+
+def test_default_acquire_timeout_is_30_seconds():
+    """默认 timeout 常量为 30s"""
+    assert DEFAULT_ACQUIRE_TIMEOUT == pytest.approx(30.0)
+
+
+def test_acquire_reservations_are_fifo_with_monotonic_wait():
+    """连续预约的放行时刻按到达顺序单调递增，相邻间隔 1/rate（先到先得）"""
+    clock = FakeClock()
+    aborter = AbortOnSleep()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=aborter)
+
+    # 第一个请求消耗唯一令牌，立即放行
+    assert limiter.acquire(timeout=_FREEZE_TIMEOUT) == pytest.approx(0.0)
+
+    # 随后三个请求依次排队：1s、2s、3s，严格单调不减
+    for _ in range(3):
+        with pytest.raises(_AbortReservation):
+            limiter.acquire(timeout=_FREEZE_TIMEOUT)
+
+    assert aborter.calls == [
+        pytest.approx(1.0),
+        pytest.approx(2.0),
+        pytest.approx(3.0),
+    ]
+    intervals = [b - a for a, b in zip(aborter.calls, aborter.calls[1:])]
+    assert intervals == [pytest.approx(1.0), pytest.approx(1.0)]
+
+
+def test_freeze_thaw_preserves_release_spacing():
+    """冻结期间排队的请求，解除后按 1/rate 间隔依次放行（不超发）"""
+    clock = FakeClock()
+    aborter = AbortOnSleep()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=aborter)
+
+    limiter.notify_rate_limited(60.0)  # t=1000 冻结至 1060
+
+    for _ in range(3):
+        with pytest.raises(_AbortReservation):
+            limiter.acquire(timeout=_FREEZE_TIMEOUT)
+
+    # 放行时刻为 1060、1061、1062：等待 60、61、62，间隔恢复为 1/rate
+    assert aborter.calls == [
+        pytest.approx(60.0),
+        pytest.approx(61.0),
+        pytest.approx(62.0),
+    ]
+
+
+def test_acquire_default_timeout_gives_up_when_frozen_longer_than_timeout():
+    """冻结时长超过默认 timeout 时，acquire 放弃预约并抛错（不静默阻塞）"""
+    limiter, sleeper = _make_limiter()  # rate=1/s、burst=3
+    limiter.notify_rate_limited(60.0)  # 冻结 60s > 默认 30s
+
+    with pytest.raises(RateLimitTimeoutError):
+        limiter.acquire()
+
+    assert sleeper.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 场景 7：获取超时 —— 放弃预约并回滚
+# ---------------------------------------------------------------------------
+
+
+def test_acquire_timeout_raises_and_rolls_back_reservation():
+    """预约等待超过 timeout 时抛 RateLimitTimeoutError，且归还透支令牌"""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
+
+    limiter.acquire()  # 耗尽唯一令牌
+
+    with pytest.raises(RateLimitTimeoutError):
+        limiter.acquire(timeout=0.5)  # 需排队 1.0s > 0.5s
+
+    # 未产生真实等待，且未扣减令牌
+    assert sleeper.calls == []
+
+    # 若预约未回滚，这里会因透支再等 1s；回滚后补满令牌即可立即获取
+    clock.advance(1.0)
+    assert limiter.acquire() == pytest.approx(0.0)
+    assert sleeper.calls == []
+
+
+def test_acquire_timeout_rollback_does_not_disturb_earlier_waiter():
+    """超时回滚不改变已排队等待者的放行时刻（不影响他人预约）"""
+    clock = FakeClock()
+    aborter = AbortOnSleep()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=aborter)
+
+    limiter.acquire()  # 耗尽唯一令牌
+
+    # 先到者预约 1s 后放行
+    with pytest.raises(_AbortReservation):
+        limiter.acquire(timeout=_FREEZE_TIMEOUT)
+    assert aborter.calls == [pytest.approx(1.0)]
+
+    # 后到者 timeout 过小，放弃预约
+    with pytest.raises(RateLimitTimeoutError):
+        limiter.acquire(timeout=0.5)
+
+    # 先到者的令牌债务保留：下一个请求仍在 1s 之后（而非被超时者挤回）
+    with pytest.raises(_AbortReservation):
+        limiter.acquire(timeout=_FREEZE_TIMEOUT)
+    assert aborter.calls == [pytest.approx(1.0), pytest.approx(2.0)]
+
+
+def test_rate_limit_timeout_error_is_not_retryable():
+    """RateLimitTimeoutError 不属于 RETRY_EXCEPTIONS，不会被当作可重试异常"""
+    assert not issubclass(RateLimitTimeoutError, RETRY_EXCEPTIONS)
+    assert not issubclass(RateLimitTimeoutError, httpx.HTTPError)
+
+
+# ---------------------------------------------------------------------------
+# 场景 8：async 兼容层 acquire_async
+# ---------------------------------------------------------------------------
+
+
+async def test_acquire_async_returns_immediately_when_tokens_available():
+    """令牌充足时 acquire_async 立即返回 0，不进入任何等待"""
+    clock = FakeClock()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock)
+
+    assert await limiter.acquire_async() == pytest.approx(0.0)
+
+
+async def test_acquire_async_does_not_block_event_loop():
+    """等待期间事件循环不被阻塞：并发心跳任务持续推进"""
+    limiter = RateLimiter(rate=20.0, burst=1)  # 真实时钟，第二次约等 0.05s
+    await limiter.acquire_async()
+
+    heartbeats = 0
+
+    async def heartbeat() -> None:
+        nonlocal heartbeats
+        while True:
+            heartbeats += 1
+            await asyncio.sleep(0.001)
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        await limiter.acquire_async()
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert heartbeats >= 2
+
+
+async def test_acquire_async_timeout_raises_and_rolls_back():
+    """acquire_async 超时抛 RateLimitTimeoutError，并回滚令牌预约"""
+    clock = FakeClock()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock)
+
+    limiter.acquire()  # 同步耗尽唯一令牌
+
+    with pytest.raises(RateLimitTimeoutError):
+        await limiter.acquire_async(timeout=0.5)
+
+    clock.advance(1.0)
+    assert await limiter.acquire_async() == pytest.approx(0.0)
+
+
+async def test_sync_and_async_share_same_bucket_state():
+    """同一实例上同步/异步混用共享令牌桶：互相看得到对方的占用与债务"""
+    # 同步占用 → 异步感知
+    clock = FakeClock()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock)
+    limiter.acquire()
+    with pytest.raises(RateLimitTimeoutError):
+        await limiter.acquire_async(timeout=0.5)
+
+    # 异步占用 → 同步感知
+    clock2 = FakeClock()
+    limiter2 = RateLimiter(rate=1.0, burst=1, clock=clock2)
+    assert await limiter2.acquire_async() == pytest.approx(0.0)
+    with pytest.raises(RateLimitTimeoutError):
+        limiter2.acquire(timeout=0.5)
+
+
+# ---------------------------------------------------------------------------
 # 场景 2：多实例共享同一令牌桶
 # ---------------------------------------------------------------------------
 
@@ -389,7 +607,7 @@ def test_notify_rate_limited_with_retry_after_freezes_bucket():
     limiter, sleeper = _make_limiter()
 
     limiter.notify_rate_limited(60.0)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(60.0)]
 
@@ -399,7 +617,7 @@ def test_notify_rate_limited_freezes_at_least_default_even_if_hint_smaller():
     limiter, sleeper = _make_limiter()
 
     limiter.notify_rate_limited(5.0)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(60.0)]
 
@@ -409,7 +627,7 @@ def test_notify_rate_limited_without_retry_after_defaults_to_60():
     limiter, sleeper = _make_limiter()
 
     limiter.notify_rate_limited(None)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(60.0)]
 
@@ -420,7 +638,7 @@ def test_consecutive_rate_limits_escalate_exponentially():
 
     for _ in range(3):
         limiter.notify_rate_limited(None)
-        limiter.acquire()
+        limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [
         pytest.approx(60.0),
@@ -435,7 +653,7 @@ def test_consecutive_rate_limits_capped_at_3600():
 
     for _ in range(8):
         limiter.notify_rate_limited(None)
-        limiter.acquire()
+        limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert max(sleeper.calls) == pytest.approx(3600.0)
     assert all(w <= 3600.0 for w in sleeper.calls)
@@ -446,11 +664,11 @@ def test_notify_success_resets_escalation():
     limiter, sleeper = _make_limiter()
 
     limiter.notify_rate_limited(None)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
     limiter.notify_success()
 
     limiter.notify_rate_limited(None)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(60.0), pytest.approx(60.0)]
 
@@ -460,7 +678,7 @@ def test_rate_limit_hint_capped_at_max_cooldown():
     limiter, sleeper = _make_limiter()
 
     limiter.notify_rate_limited(100000)
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(3600.0)]
 
@@ -472,12 +690,12 @@ def test_notify_success_not_called_for_5xx():
     api = BangumiApi(access_token="t")
 
     api._apply_rate_limit_notification(_mock_response(429, {}))
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     api._apply_rate_limit_notification(_mock_response(500, {}))
     api._apply_rate_limit_notification(_mock_response(429, {}))
 
-    limiter.acquire()
+    limiter.acquire(timeout=_FREEZE_TIMEOUT)
 
     assert sleeper.calls == [pytest.approx(60.0), pytest.approx(120.0)]
 
