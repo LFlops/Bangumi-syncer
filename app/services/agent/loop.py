@@ -10,8 +10,9 @@
   （``tool_registry.execute_batch`` 做分段并行 gather/串行），按**独立结果槽位**逐条回填
   tool_result（重复 tool_use_id 时首个保留真实结果、后续为 duplicate 错误块）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
-- **透明预算**：每轮追加 ``[剩余轮次：N]``；末轮（remaining==1 起手）强制 ``tool_choice=terminal``。
-- **预算钩子**：每轮预算消息生成后调用 ``recorder.record_budget(budget_message)``，
+- **透明预算**：每轮递减后仅当仍有后续轮次（remaining>0）才追加 ``[剩余轮次：N]``；
+  末轮（remaining==1 起手）强制 ``tool_choice=terminal``。末轮不再产生剩余 0 的幻影预算消息。
+- **预算钩子**：非末轮预算消息生成后调用 ``recorder.record_budget(budget_message)``，
   由 recorder 内部决定并入哪条 span（同轮最后 tool_execute 或回退 llm_chat）。
   ``recorder=None`` 时整体跳过（可空实现）。
 
@@ -173,12 +174,15 @@ async def run(
                 continue
             messages.append(Message(role="user", content=[result]))
 
-        # ⑦ 透明预算：递减并注入剩余轮次
+        # ⑦ 透明预算：递减后仅当仍有后续轮次（remaining>0）才注入剩余轮次。
+        #    末轮递减到 0 时循环随即结束，若仍构造预算消息会写入 trace 参与 replay，
+        #    但该消息从未发给 LLM —— 形成「幻影预算消息」，故不注入也不记录。
         remaining -= 1
-        budget_message = f"[剩余轮次：{remaining}]"
-        messages.append(Message(role="user", content=budget_message))
-        if recorder is not None:
-            recorder.record_budget(budget_message)
+        if remaining > 0:
+            budget_message = f"[剩余轮次：{remaining}]"
+            messages.append(Message(role="user", content=budget_message))
+            if recorder is not None:
+                recorder.record_budget(budget_message)
 
     # 预算刚性耗尽（兜底由场景层 output_parser 解析 last_response）
     return RunResult(stop_reason="exhausted", last_response=resp)

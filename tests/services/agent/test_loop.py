@@ -5,10 +5,11 @@
 - assistant 聚合消息先于 tool_result（协议顺序）
 - submit_suggestion 捕获即 break（stop_reason=submit_suggestion），同轮其他工具不执行（终止工具优先）
 - 分段并行：循环将整批 tool_calls 一次性交给注入的 tool_calls_fn（execute_batch 内部做 gather/串行）
-- 透明预算：每轮追加 ``[剩余轮次：N]``；remaining==0 的末轮 tool_choice=terminal
+- 透明预算：仅当递减后 remaining>0 才追加 ``[剩余轮次：N]``；remaining==1 起手的末轮 tool_choice=terminal
 - 畸形 tool_use（execute_batch 返回 is_error 的 ToolResultBlock）→ 循环继续不崩溃
 - max_iterations 耗尽 → stop_reason=exhausted + last_response
-- 预算钩子：recorder.record_budget 每轮恰好调用一次且参数为 "[剩余轮次：N]"；None 时跳过
+- 预算钩子：recorder.record_budget 每个非末轮恰好调用一次且参数为 "[剩余轮次：N]"；None 时跳过；
+  末轮（递减后 remaining==0）不注入、不记录（幻影消息修复）
 - 防御分支：result 非 ToolResultBlock 时记 warning
 - 不直接依赖 LLMClient：LLM 调用经注入的 chat_fn（可 mock）
 """
@@ -270,7 +271,7 @@ async def test_segmented_parallel_preserves_mixed_read_write_order():
 
 
 # ---------------------------------------------------------------------------
-# 6. 透明预算：每轮追加 [剩余轮次：N]；末轮强制 terminal
+# 6. 透明预算：每轮（递减后 remaining>0）追加 [剩余轮次：N]；末轮强制 terminal
 # ---------------------------------------------------------------------------
 
 
@@ -487,8 +488,8 @@ class _FakeBudgetRecorder:
         self.budget_calls.append(budget_message)
 
 
-async def test_budget_record_budget_called_per_round_with_remaining():
-    """每轮恰好调用一次 record_budget，参数为 "[剩余轮次：N]"。"""
+async def test_budget_record_budget_called_per_non_final_round_with_remaining():
+    """仅非末轮调用 record_budget，参数为 "[剩余轮次：N]"（末轮不产生幻影消息）。"""
     recorder = _FakeBudgetRecorder()
 
     chat_fn = AsyncMock(
@@ -508,11 +509,10 @@ async def test_budget_record_budget_called_per_round_with_remaining():
         recorder=recorder,
     )
 
-    # 3 轮，每轮一次 record_budget
-    assert len(recorder.budget_calls) == 3
-    assert recorder.budget_calls[0] == "[剩余轮次：2]"
-    assert recorder.budget_calls[1] == "[剩余轮次：1]"
-    assert recorder.budget_calls[2] == "[剩余轮次：0]"
+    # 3 轮中前 2 轮递减后 remaining>0（2、1）→ 各记录一次；末轮递减后 remaining==0
+    # 的预算消息从未发给 LLM，不得记录
+    assert recorder.budget_calls == ["[剩余轮次：2]", "[剩余轮次：1]"]
+    assert "[剩余轮次：0]" not in recorder.budget_calls
 
 
 async def test_budget_recorder_none_is_noop():
@@ -558,6 +558,46 @@ async def test_budget_appended_to_messages_even_without_recorder():
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
     assert last_msg.content == "[剩余轮次：1]"
+
+
+async def test_budget_no_phantom_message_on_final_round():
+    """起手 remaining==1 的末轮模型返回非终止工具 → 不注入/记录 [剩余轮次：0]。
+
+    末轮执行完毕后循环随即结束，该预算消息从未发给 LLM，不应进入 messages 或 trace。
+    """
+    recorder = _FakeBudgetRecorder()
+    observed: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        # 传引用（不 copy）：循环后续 append 会反映到同一列表，便于检查终态
+        observed.append(args[0])
+        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=1,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        recorder=recorder,
+    )
+
+    assert result.stop_reason == "exhausted"
+    assert recorder.budget_calls == [], "末轮递减后 remaining==0，不应记录预算消息"
+    phantom = [
+        m.content
+        for m in observed[0]
+        if m.role == "user"
+        and isinstance(m.content, str)
+        and m.content.startswith("[剩余轮次")
+    ]
+    assert phantom == [], f"末轮不应生成幻影预算消息，实际 {phantom}"
 
 
 # ---------------------------------------------------------------------------
