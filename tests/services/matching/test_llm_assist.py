@@ -3154,3 +3154,141 @@ def test_llm_assist_module_no_unlisted_function_level_imports():
     assert offenders == [], (
         f"函数内不应残留未豁免 import（应提升到模块头部），实际：{offenders}"
     )
+
+
+# ---------------------------------------------------------------------------
+# PR#8 评审修复：静默分支补日志 / _prefetch_bgm_name 失败记 error /
+# TraceRecorder docstring 与 _SYSTEM_SUFFIX 文案清理
+#
+# 说明：本模块使用 ``app.core.logging.logger``（自定义 print 实现），
+# stdlib ``caplog`` 无法捕获；此处沿用 ``tests/services/agent/test_replay.py``
+# 的监听器捕获方式（监听器不受级别阈值限制，可断言级别 + 关键字）。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def log_records():
+    """捕获自定义 Logger 产出的 ``(level, line)`` 记录，供级别 + 关键字断言。"""
+    from app.core.logging import logger as app_logger
+
+    records: list[tuple[str, str]] = []
+
+    def _listener(line: str, level: str) -> None:
+        records.append((level, line))
+
+    app_logger.add_listener(_listener)
+    yield records
+    app_logger.remove_listener(_listener)
+
+
+def test_extract_candidates_invalid_json_logs_warning(log_records):
+    """match_trace 为非法 JSON 字符串 → warning（含异常信息）且返回 []。"""
+    sr = {"match_trace": "{ this is not json"}
+
+    result = llm_assist._extract_candidates(sr)
+
+    assert result == []
+    warnings = [line for level, line in log_records if level == "WARNING"]
+    assert warnings, "非法 JSON 不应静默吞掉，必须记 warning"
+    assert any("match_trace" in line and "解析失败" in line for line in warnings), (
+        f"warning 应指明 match_trace JSON 解析失败，实际 {warnings}"
+    )
+    # 含异常信息（JSONDecodeError 文本），证明未只记一句无信息的占位
+    assert any("Expecting" in line for line in warnings), (
+        f"warning 应包含异常信息，实际 {warnings}"
+    )
+
+
+def test_extract_candidates_non_dict_step_logs_info(log_records):
+    """steps 中非 dict 元素 → info（不再静默 continue），返回 []。"""
+    sr = {"match_trace": {"steps": ["not-a-dict"]}}
+
+    result = llm_assist._extract_candidates(sr)
+
+    assert result == []
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("非 dict step" in line for line in infos), (
+        f"跳过非 dict step 应记 info，实际 {infos}"
+    )
+
+
+def test_extract_candidates_non_dict_candidate_logs_info(log_records):
+    """候选列表含非 dict 元素 → info（不再静默 continue），返回 []。"""
+    sr = {"match_trace": {"steps": [{"candidates": ["bad-cand"]}]}}
+
+    result = llm_assist._extract_candidates(sr)
+
+    assert result == []
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("非 dict 候选" in line for line in infos), (
+        f"跳过非 dict 候选应记 info，实际 {infos}"
+    )
+
+
+def test_extract_candidates_empty_or_duplicate_subject_id_logs_info(log_records):
+    """subject_id 为空 / 重复 → info（两种原因均须可见），只保留唯一有效候选。"""
+    sr = {
+        "match_trace": {
+            "steps": [
+                {
+                    "candidates": [
+                        {"subject_id": ""},
+                        {"subject_id": "111", "score": 0.5},
+                        {"subject_id": "111", "score": 0.9},
+                    ]
+                }
+            ]
+        }
+    }
+
+    result = llm_assist._extract_candidates(sr)
+
+    assert [str(c["subject_id"]) for c in result] == ["111"]
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("subject_id 为空" in line for line in infos), (
+        f"subject_id 为空应记 info，实际 {infos}"
+    )
+    assert any("重复 subject_id" in line for line in infos), (
+        f"subject_id 重复应记 info，实际 {infos}"
+    )
+
+
+def test_prefetch_bgm_name_failure_logs_error_with_subject_id(log_records):
+    """bgm.get_subject 抛异常 → error（含 subject_id + 异常信息），仍返回空串。"""
+
+    class _BoomBgm:
+        def get_subject(self, sid):
+            raise RuntimeError("boom-network")
+
+    result = llm_assist._prefetch_bgm_name(_BoomBgm(), "123")
+
+    assert result == "", "失败时行为不变：仍返回空串"
+    errors = [line for level, line in log_records if level == "ERROR"]
+    assert errors, "预取失败不应静默 pass，必须记 error"
+    assert any("123" in line and "boom-network" in line for line in errors), (
+        f"error 应包含 subject_id 与异常信息，实际 {errors}"
+    )
+
+
+def test_prefetch_bgm_name_none_bgm_returns_empty_without_error(log_records):
+    """bgm 为 None（无 HTTP 机会）→ 返回空串且不记 error（非异常路径）。"""
+    assert llm_assist._prefetch_bgm_name(None, "1") == ""
+    assert not [line for level, line in log_records if level == "ERROR"], (
+        "bgm=None 属正常短路，不应记 error"
+    )
+
+
+def test_trace_recorder_docstring_has_no_legacy_span_recorder_reference():
+    """TraceRecorder docstring 不应再引用已删除的旧 _SpanRecorder 实现。"""
+    doc = llm_assist.TraceRecorder.__doc__ or ""
+
+    assert "_SpanRecorder" not in doc, "docstring 不应残留旧 _SpanRecorder 表述"
+    assert "统一 trace 记录器" in doc, "应保留中性职责描述"
+
+
+def test_system_suffix_describes_interactive_rounds_not_tool_call_count():
+    """[剩余轮次] 文案应表述为可交互轮次（每轮可执行多个工具）。"""
+    suffix = llm_assist._SYSTEM_SUFFIX
+
+    assert "表示剩余可交互轮次（每轮可执行多个工具）" in suffix
+    assert "表示剩余可调用工具的次数" not in suffix, "旧文案应被替换"

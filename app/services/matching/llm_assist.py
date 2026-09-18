@@ -62,7 +62,8 @@ _SYSTEM_SUFFIX = (
     "get_related_subjects 进行检索，最终必须通过 submit_suggestion(subject_id, reason) "
     "给出你的推荐（且只能调用一次）。\n\n"
     "[剩余轮次]\n"
-    "每轮工具执行结束后你会收到「[剩余轮次：N]」提示，表示剩余可调用工具的次数；"
+    "每轮工具执行结束后你会收到「[剩余轮次：N]」提示，"
+    "表示剩余可交互轮次（每轮可执行多个工具）；"
     "请在预算内尽快完成检索与决策。\n\n"
     "[收尾要求]\n"
     "若已确定推荐条目，调用 submit_suggestion；若确实无法确定，"
@@ -251,12 +252,18 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
 
 
 def _extract_candidates(sync_record: dict) -> list[dict]:
-    """从 sync_records 的 match_trace 提取候选 top-5（去重、按 score 降序）。"""
+    """从 sync_records 的 match_trace 提取候选 top-5（去重、按 score 降序）。
+
+    非法/异常结构不抛出，逐层跳过并记日志（warning/info），保证调用方总能拿到
+    可用的候选列表。
+    """
     raw = sync_record.get("match_trace")
     if isinstance(raw, str):
         try:
             raw = json.loads(raw)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            # 脏数据（历史行/外部写入）不应中断匹配，但必须可观测
+            logger.warning(f"[llm_assist] match_trace JSON 解析失败（已忽略）: {e}")
             raw = None
     if not isinstance(raw, dict):
         return []
@@ -265,12 +272,20 @@ def _extract_candidates(sync_record: dict) -> list[dict]:
     merged: list[dict] = []
     for step in steps:
         if not isinstance(step, dict):
+            logger.info(f"[llm_assist] 跳过非 dict step（类型={type(step).__name__}）")
             continue
         for cand in step.get("candidates") or []:
             if not isinstance(cand, dict):
+                logger.info(
+                    f"[llm_assist] 跳过非 dict 候选（类型={type(cand).__name__}）"
+                )
                 continue
             sid = str(cand.get("subject_id") or "")
-            if not sid or sid in seen:
+            if not sid:
+                logger.info("[llm_assist] 跳过 subject_id 为空的候选")
+                continue
+            if sid in seen:
+                logger.info(f"[llm_assist] 跳过重复 subject_id 的候选: {sid}")
                 continue
             seen.add(sid)
             merged.append(cand)
@@ -333,7 +348,7 @@ def build_seed_messages(
 
 
 class TraceRecorder:
-    """统一 trace 记录器，替代旧 ``_SpanRecorder``。
+    """统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）。
 
     职责：
     - **chat span 包装**：``wrap_chat_fn`` 返回包装后的 chat_fn，每轮 start_span
@@ -548,8 +563,11 @@ def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
         data = bgm.get_subject(int(subject_id))
         if isinstance(data, dict):
             return data.get("name") or data.get("name_cn") or ""
-    except Exception:
-        pass
+    except Exception as e:
+        # best-effort：失败仅存 id，但必须可观测（网络/类型异常）
+        logger.error(
+            f"[llm_assist] 预取 Bangumi 条目名称失败（subject_id={subject_id}）: {e}"
+        )
     return ""
 
 
