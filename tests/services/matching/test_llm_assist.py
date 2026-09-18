@@ -126,6 +126,27 @@ def _read_candidate(sync_record_id):
     }
 
 
+def _read_full_candidate(candidate_id):
+    """读取候选行全部关注列（用于断言是否被复活改写）。"""
+    conn = database_manager._connection._conn
+    row = conn.execute(
+        "SELECT id, status, confirmed_subject_id, resolved_at, candidates_json, "
+        "llm_subject_id, llm_reason FROM pending_candidates WHERE id=?",
+        (candidate_id,),
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "status": row[1],
+        "confirmed_subject_id": row[2],
+        "resolved_at": row[3],
+        "candidates_json": row[4],
+        "llm_subject_id": row[5],
+        "llm_reason": row[6],
+    }
+
+
 def _assert_candidate_written(sync_record_id, subject_id="123", reason="跨季匹配"):
     row = _read_candidate(sync_record_id)
     assert row is not None, "pending_candidates 行应已写入"
@@ -239,6 +260,119 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
     candidates = json.loads(row["candidates_json"])
     assert len(candidates) == 1
     assert str(candidates[0]["subject_id"]) == "456"
+
+
+# ---------------------------------------------------------------------------
+# 评论#3：恢复续跑/迟到提交与用户确认的竞态——候选不得「复活」
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resolved_status", ["confirmed", "rejected"])
+async def test_run_submit_skips_reviving_resolved_candidate(
+    monkeypatch, resolved_status
+):
+    """既有候选已被用户处理（confirmed/rejected）→ 不复活为 pending：
+    run 标 cancelled(user_resolved)、通知不发送、候选行完全不变。"""
+    run_id = f"run-race-{resolved_status}"
+    sr_id = 30 if resolved_status == "confirmed" else 31
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    cid = database_manager.log_pending_candidate(
+        request_title=f"race-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert cid
+    assert database_manager.update_pending_candidate_status(cid, resolved_status, "111")
+    before = _read_full_candidate(cid)
+    assert before is not None and before["status"] == resolved_status
+
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    bgm = _make_bgm()
+    ns = _make_notify()
+    chat = _chat_side_effect([_submit_response("123", "r")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=bgm,
+        thinking_level="medium",
+        chat_fn=chat,
+        notification_service=ns,
+        span_recorder=None,
+    )
+
+    # 跳过信号：非 succeeded
+    assert status == ""
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "cancelled"
+    assert run_row["stop_reason"] == "user_resolved"
+    assert run_row["ended_at"] > 0
+    # 候选行完全不变（status / 确认字段 / candidates_json / llm 列）
+    assert _read_full_candidate(cid) == before, "已处理候选行不得被复活改写"
+    ns.notify.assert_not_called()
+
+
+def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch):
+    """SELECT 后候选被并发处理（UPDATE rowcount=0）→ 不复活，run cancelled，返回 None。"""
+    run_id = "run-concurrent-resolve"
+    sr_id = 32
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    cid = database_manager.log_pending_candidate(
+        request_title=f"rule-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert cid
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    real_conn = database_manager._connection._conn
+
+    class _ZeroCursor:
+        rowcount = 0
+
+    class _Conn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, sql, params=()):
+            # 模拟 SELECT 与 UPDATE 之间候选被用户处理：带守卫 UPDATE 影响 0 行
+            if "UPDATE pending_candidates" in sql:
+                return _ZeroCursor()
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    returned = llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+
+    assert returned is None, "并发处理时不应返回候选 id（跳过信号）"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "cancelled"
+    assert run_row["stop_reason"] == "user_resolved"
+    # 候选行未被改写（原 pending 行保持原状）
+    unchanged = _read_full_candidate(cid)
+    assert unchanged["status"] == "pending"
+    assert unchanged["llm_subject_id"] == ""
+    assert unchanged["llm_reason"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -667,7 +801,7 @@ def test_register_match_tools_rebinds_handlers_to_latest_bgm():
 
 @pytest.mark.asyncio
 async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
-    """两次 run（共享模块单例 registry）→ 第二次的 search handler 调用第二个 bgm。"""
+    """两次 run（各自 per-run registry）→ 第二次的 search handler 调用第二个 bgm。"""
     used: list[str] = []
 
     def _bgm(tag: str):
@@ -710,6 +844,32 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
     )
     assert used == ["bgm1", "bgm2"], (
         f"第二个 run 必须使用第二个 bgm（实际 {used}）——handler 闭包不得钉死首次注册"
+    )
+
+
+def test_run_does_not_pollute_module_singleton_registry():
+    """per-run ToolRegistry：run 注册的工具不得写入模块单例（隔离，防串账号）。"""
+    from app.services.llm.tools import get_tool_registry
+
+    run_id = "run-per-run-registry"
+    sr_id = 81
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    reset_tool_registry()
+    assert get_tool_registry().get("search_bangumi") is None
+
+    asyncio.run(
+        llm_assist.run(
+            run_id,
+            sync_record=_make_sync_record(sync_record_id=sr_id),
+            bgm=_make_bgm(),
+            thinking_level="medium",
+            chat_fn=_chat_side_effect([_search_response()]),
+            span_recorder=None,
+        )
+    )
+
+    assert get_tool_registry().get("search_bangumi") is None, (
+        "run 不得把捕获本次 bgm 的 handler 写入模块单例（并发下会串账号）"
     )
 
 
@@ -2433,8 +2593,8 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
         and isinstance(m.content, list)
         and any(isinstance(b, ToolResultBlock) for b in m.content)
     ]
-    assert any(t.tool_use_id == "t2" and t.content == "SEARCH-RESULT" for t in trs), (
-        "补执行的 tool_result 应对应缺失的 tool_use t2"
+    assert any(t.tool_use_id == "t2" and t.content == '"SEARCH-RESULT"' for t in trs), (
+        "补执行的 tool_result 应对应缺失的 tool_use t2，且按 JSON 序列化（字符串带引号）"
     )
 
 
@@ -2528,13 +2688,45 @@ def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
     assert blk.content == _SKIP_PLACEHOLDER
 
 
+def test_replay_missing_tool_serializes_dict_result_as_json():
+    """dict 工具结果经补执行后按 JSON 字符串回填（与 execute_batch 契约一致）。"""
+
+    def _handler(args):
+        return {"id": 2, "name": "花咲くいろは"}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="get_subject_detail",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=_handler,
+            access="read",
+        )
+    )
+    messages: list = []
+
+    asyncio.run(
+        llm_assist._replay_missing_tool(
+            {"id": "t9", "name": "get_subject_detail", "input": {}},
+            registry,
+            messages,
+        )
+    )
+
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.tool_use_id == "t9"
+    # 新契约：JSON 字符串（ensure_ascii=False），而非 Python repr/str
+    assert json.loads(blk.content) == {"id": 2, "name": "花咲くいろは"}
+
+
 # P1-c：补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
 
 
 def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):
     """补执行缺失工具后写 tool_execute span，二次 replay 不再判缺失。"""
     from app.services.agent.trace import replay as real_replay
-    from app.services.llm.tools import get_tool_registry
 
     run_id = "run-continue-replay-span"
     sr_id = 401
@@ -2574,10 +2766,9 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
             return []
 
     bgm = _Bgm()
-    reg = get_tool_registry()
     eb_calls = {"n": 0}
 
-    async def _eb(tool_calls, *, recorder=None):
+    async def _eb(self, tool_calls, *, recorder=None):
         eb_calls["n"] += 1
         if eb_calls["n"] == 1:
             raise RuntimeError("crash mid-exec")
@@ -2586,7 +2777,8 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
             for tc in tool_calls
         }
 
-    monkeypatch.setattr(reg, "execute_batch", _eb)
+    # per-run registry：不再取模块单例，patch 类方法以覆盖任意实例
+    monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     async def _go():
         # 初始正常运行至崩溃（记录 1 条 llm_chat span，但 tool_execute 缺失）
@@ -2613,8 +2805,6 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
 
 def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     """崩溃前 1 次 + 恢复后 1 次 → 累计 LLM 调用 2，run 落 no_suggestion。"""
-    from app.services.llm.tools import get_tool_registry
-
     run_id = "run-continue-m22"
     sr_id = 992
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -2654,10 +2844,9 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
             return []
 
     bgm = _Bgm()
-    reg = get_tool_registry()
     eb_calls = {"n": 0}
 
-    async def _eb(tool_calls, *, recorder=None):
+    async def _eb(self, tool_calls, *, recorder=None):
         eb_calls["n"] += 1
         if eb_calls["n"] == 1:
             raise RuntimeError("crash mid-exec")
@@ -2666,7 +2855,8 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
             for tc in tool_calls
         }
 
-    monkeypatch.setattr(reg, "execute_batch", _eb)
+    # per-run registry：不再取模块单例，patch 类方法以覆盖任意实例
+    monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     async def _go():
         await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
@@ -2866,7 +3056,6 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
 async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     """崩溃 → 恢复完成 → 再次重置 processing → 第二次恢复不再额外调 LLM。"""
     from app.services.agent.trace import replay as real_replay
-    from app.services.llm.tools import get_tool_registry
 
     run_id = "run-continue-double"
     sr_id = 995
@@ -2906,11 +3095,10 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
             return []
 
     bgm = _Bgm()
-    reg = get_tool_registry()
 
     eb_calls = {"n": 0}
 
-    async def _eb(tool_calls, *, recorder=None):
+    async def _eb(self, tool_calls, *, recorder=None):
         """模拟 execute_batch：写 tool_execute span（同真实实现），首次调用抛错。"""
         eb_calls["n"] += 1
         if eb_calls["n"] == 1:
@@ -2928,7 +3116,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
                 recorder.end_tool(sid, result=blk)
         return results
 
-    monkeypatch.setattr(reg, "execute_batch", _eb)
+    monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     # 第一次 run → 崩溃
     await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")

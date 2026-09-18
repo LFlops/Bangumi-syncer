@@ -457,6 +457,31 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="标记 agent_run failed 失败", default=False
         )
 
+    def mark_cancelled(self, run_id: str, *, stop_reason: str = "") -> bool:
+        """标记取消（用户已处理同 record 的候选，本次 LLM 建议作废，不再通知）。
+
+        **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 cancelled；
+        对 ``succeeded`` / ``no_suggestion`` / ``failed`` / 已 ``cancelled``
+        等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
+
+        写 ``ended_at``（epoch 秒，与其它终态方法口径一致）。
+        """
+
+        def _write(conn):
+            cursor = conn.execute(
+                """
+                UPDATE agent_runs
+                SET status='cancelled', stop_reason=?, ended_at=?
+                WHERE run_id=? AND status IN ('pending','processing')
+                """,
+                (stop_reason, _now(), run_id),
+            )
+            return cursor.rowcount > 0
+
+        return self._run_write(
+            _write, error_msg="标记 agent_run cancelled 失败", default=False
+        )
+
     def increment_attempts(self, run_id: str, last_error: str = "") -> int:
         """累加调度轮次失败次数（仅 processing 态有效），返回最新 attempts。
 

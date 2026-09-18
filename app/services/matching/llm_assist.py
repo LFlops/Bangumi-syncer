@@ -41,7 +41,11 @@ from app.services.llm.models import (
     ToolUseBlock,
 )
 from app.services.llm.output_parser import parse_suggestion
-from app.services.llm.tools import ToolDefinition, ToolRegistry, get_tool_registry
+from app.services.llm.tools import (
+    ToolDefinition,
+    ToolRegistry,
+    serialize_tool_result,
+)
 from app.services.sync_service import SyncService
 
 # ---------------------------------------------------------------------------
@@ -82,6 +86,9 @@ DEFAULT_SYSTEM_TEMPLATE = (
 # 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
 _SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
+
+# 候选已被用户处理（恢复续跑/迟到提交竞态）时 run 的取消原因
+_STOP_REASON_USER_RESOLVED = "user_resolved"
 
 
 # ---------------------------------------------------------------------------
@@ -583,22 +590,44 @@ def _persist_llm_candidate(
     total_tokens: int = 0,
     bgm: Any = None,
     bgm_title: str = "",
-) -> int:
+) -> int | None:
     """在单一事务内：写 pending_candidates（llm 两列，有则更新/无则新建）+ 置 succeeded。
 
     ``bgm_title`` 必须在事务外预取（见 ``_prefetch_bgm_name`` / ``_persist_and_notify``），
     事务内只做纯 DB 操作（F8：将外部 HTTP 调用移出事务，保持原子性语义不变）。
 
-    返回 pending_candidates 行 id。异常时整体回滚（F6）。
+    **竞态守卫（评论#3）**：若同 sync_record 的既有候选已被用户处理
+    （status != 'pending'），或带守卫 UPDATE 时被并发处理（rowcount=0），
+    则不复活该行，改为把本 run 标 ``cancelled``（``stop_reason='user_resolved'``）
+    并返回 ``None``（跳过信号，调用方不得发送通知）。
+
+    返回 pending_candidates 行 id（正常路径）；跳过时返回 ``None``。
+    异常时整体回滚（F6）。
     """
 
     def _write(conn):
-        # 找既有行（优先 pending，其次任意状态，按 id 倒序）
+        # 取既有行：按 id 倒序取最新一条（不区分状态；历史注释曾称「优先 pending」
+        # 但实现从未按状态过滤，此处一并修正）
         row = conn.execute(
-            "SELECT id, candidates_json FROM pending_candidates "
+            "SELECT id, candidates_json, status FROM pending_candidates "
             "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
             (sync_record_id,),
         ).fetchone()
+
+        if row is not None and row[2] != "pending":
+            # 用户已处理（confirmed/rejected）→ 不复活候选，run 标 cancelled 并跳过。
+            # 注意：必须在 _write 事务内直写 SQL（复用 mark_cancelled 会因
+            # _run_write 再次取锁造成嵌套写锁），SQL 语义与 mark_cancelled 守卫一致。
+            conn.execute(
+                "UPDATE agent_runs SET status='cancelled', stop_reason=?, ended_at=? "
+                "WHERE run_id=? AND status IN ('pending','processing')",
+                (_STOP_REASON_USER_RESOLVED, int(time.time()), run_id),
+            )
+            logger.info(
+                f"[llm_assist] run {run_id} 候选(pending_candidates.id={row[0]}) "
+                f"状态={row[2]} 已被用户处理，跳过落库并标 run cancelled"
+            )
+            return None
 
         name = bgm_title
 
@@ -620,9 +649,10 @@ def _persist_llm_candidate(
                 existing = []
             if not any(str(c.get("subject_id")) == str(subject_id) for c in existing):
                 existing.append(new_cand)
-            conn.execute(
+            cursor = conn.execute(
                 "UPDATE pending_candidates SET candidates_json=?, "
-                "llm_subject_id=?, llm_reason=?, status='pending' WHERE id=?",
+                "llm_subject_id=?, llm_reason=?, status='pending' "
+                "WHERE id=? AND status='pending'",
                 (
                     json.dumps(existing, ensure_ascii=False),
                     subject_id,
@@ -630,6 +660,18 @@ def _persist_llm_candidate(
                     existing_id,
                 ),
             )
+            if cursor.rowcount == 0:
+                # SELECT 后被并发处理：带守卫 UPDATE 未命中，同样不复活。
+                conn.execute(
+                    "UPDATE agent_runs SET status='cancelled', stop_reason=?, "
+                    "ended_at=? WHERE run_id=? AND status IN ('pending','processing')",
+                    (_STOP_REASON_USER_RESOLVED, int(time.time()), run_id),
+                )
+                logger.info(
+                    f"[llm_assist] run {run_id} 候选(pending_candidates.id="
+                    f"{existing_id}) 在落库瞬间被并发处理，跳过落库并标 run cancelled"
+                )
+                return None
             candidate_id = existing_id
         else:
             # 无候选场景：新建行，candidates_json 仅含 LLM 推荐
@@ -803,7 +845,9 @@ async def run(
     if not dbm.agent_runs.atomic_claim(run_id):
         return "skipped"
 
-    registry = get_tool_registry()
+    # per-run ToolRegistry（评论#7）：每个 run 独立实例，handler 闭包只绑定本次
+    # bgm（含 access_token），避免并发入口下共享单例互相覆盖导致串账号。
+    registry = ToolRegistry()
     defns = register_match_tools(registry, bgm)
     tools_schemas = [d.to_schema() for d in defns]
 
@@ -1066,7 +1110,8 @@ async def _execute_continuation(
     recorder 需锚定到已发生的轮次（补执行 tool span 与既有 chat span 同轮），
     并让续跑 chat 从 ``executed_iterations + 1`` 开始。
     """
-    registry = get_tool_registry()
+    # per-run ToolRegistry（评论#7）：续跑同样使用独立实例，不写模块单例
+    registry = ToolRegistry()
     defns = register_match_tools(registry, bgm)
     tools_schemas = [d.to_schema() for d in defns]
 
@@ -1167,7 +1212,8 @@ async def _replay_missing_tool(
 
     try:
         result = await registry.execute(name, args)
-        content = str(result)
+        # 与 execute_batch 统一协议契约：工具结果 JSON 序列化（评论#6b）
+        content = serialize_tool_result(result)
         is_error = False
     except Exception as e:
         logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
@@ -1231,7 +1277,7 @@ def _handle_result(
         reason = str(suggestion.get("reason", "") or "")
         ok, err = _validate_subject_id(sid)
         if ok:
-            _persist_and_notify(
+            persisted = _persist_and_notify(
                 dbm,
                 run_id,
                 sync_record=sync_record,
@@ -1243,7 +1289,8 @@ def _handle_result(
                 total_tokens=total_tokens,
                 notification_service=notification_service,
             )
-            return "succeeded"
+            # 竞态跳过（候选已被用户处理）时返回空串，与正常 succeeded 区分
+            return "succeeded" if persisted else ""
         # 校验失败：不落库，标记 no_suggestion + last_error
         dbm.agent_runs.mark_no_suggestion(
             run_id, stop_reason="submit_suggestion", last_error=err
@@ -1257,7 +1304,7 @@ def _handle_result(
         if suggestion is not None:
             ok, verr = _validate_subject_id(suggestion.subject_id)
             if ok:
-                _persist_and_notify(
+                persisted = _persist_and_notify(
                     dbm,
                     run_id,
                     sync_record=sync_record,
@@ -1269,7 +1316,7 @@ def _handle_result(
                     total_tokens=total_tokens,
                     notification_service=notification_service,
                 )
-                return "succeeded"
+                return "succeeded" if persisted else ""
             perr = verr
         dbm.agent_runs.mark_no_suggestion(
             run_id, stop_reason="exhausted", last_error=perr or "无建议"
@@ -1303,14 +1350,16 @@ def _persist_and_notify(
     stop_reason: str,
     total_tokens: int,
     notification_service: Any | None,
-) -> None:
+) -> bool:
     """单一事务落库 + 事务提交后 best-effort 通知。
 
     Bangumi 标题在事务外预取一次，事务内不再发起 HTTP 调用，
     同时通知复用同一名称避免重复请求。
+
+    返回是否落库成功（``False`` = 候选已被用户处理而跳过，调用方不得通知）。
     """
     bgm_title = _prefetch_bgm_name(bgm, subject_id)
-    _persist_llm_candidate(
+    candidate_id = _persist_llm_candidate(
         dbm,
         run_id=run_id,
         sync_record_id=sync_record_id,
@@ -1322,6 +1371,9 @@ def _persist_and_notify(
         bgm=bgm,
         bgm_title=bgm_title,
     )
+    if candidate_id is None:
+        # 竞态跳过：候选已被用户处理，run 已标 cancelled，不得再发通知
+        return False
     if notification_service is not None:
         _send_notification(
             notification_service,
@@ -1330,3 +1382,4 @@ def _persist_and_notify(
             reason=reason,
             name=bgm_title,
         )
+    return True

@@ -240,6 +240,41 @@ class TestStatusTransitions:
         finally:
             dbm._connection._conn.close()
 
+    def test_mark_cancelled_from_processing_sets_terminal_and_ended_at(self, tmp_path):
+        """processing → cancelled 成功，写 stop_reason 与 ended_at（epoch 秒）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rc", "match", 1)
+            assert dbm.agent_runs.atomic_claim("rc") is True  # → processing
+
+            assert (
+                dbm.agent_runs.mark_cancelled("rc", stop_reason="user_resolved") is True
+            )
+            run = dbm.agent_runs.get_run("rc")
+            assert run["status"] == "cancelled"
+            assert run["stop_reason"] == "user_resolved"
+            assert run["ended_at"] > 0
+        finally:
+            dbm._connection._conn.close()
+
+    def test_mark_cancelled_guard_rejects_terminal_states(self, tmp_path):
+        """状态守卫：succeeded 等非活性态不被 mark_cancelled 改写（返回 False）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rc2", "match", 1)
+            assert dbm.agent_runs.atomic_claim("rc2") is True
+            assert dbm.agent_runs.mark_succeeded("rc2") is True
+
+            assert (
+                dbm.agent_runs.mark_cancelled("rc2", stop_reason="user_resolved")
+                is False
+            )
+            run = dbm.agent_runs.get_run("rc2")
+            assert run["status"] == "succeeded"
+            assert run["stop_reason"] == ""
+        finally:
+            dbm._connection._conn.close()
+
     def test_same_key_two_failed_runs_sum_is_two(self, tmp_path):
         """同键两条 failed run → SUM(total_attempts)=2（累计失败次数）"""
         dbm = _make_db(tmp_path)
