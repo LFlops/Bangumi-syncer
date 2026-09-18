@@ -112,6 +112,9 @@ SECTIONS: dict[str, SectionMeta] = {
         name="sync",
         display_name="同步设置",
         order=20,
+        # llm_match_cron 是内部调度机制，不在配置页暴露；仅提供环境变量
+        # 高级调优入口（LLM_MATCH_CRON 覆盖 [sync] llm_match_cron）。
+        env_overrides={"llm_match_cron": "LLM_MATCH_CRON"},
         fields=(
             FieldMeta(name="movie_playback_start_mark_watching", default_true=True),
             FieldMeta(name="movie_mark_subject_completed", default_true=True),

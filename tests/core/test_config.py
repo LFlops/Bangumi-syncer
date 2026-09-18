@@ -507,6 +507,22 @@ llm_match_recovery_timeout_s = bad
         cm = _config_manager_from_ini(tmp_path, "[sync]\nllm_match_max_iterations = \n")
         assert cm.get_sync_llm_match_config()["llm_match_max_iterations"] == ""
 
+    def test_get_sync_llm_match_config_cron_env_override(self, tmp_path, monkeypatch):
+        """LLM_MATCH_CRON 环境变量覆盖 llm_match_cron（高级调优入口）。"""
+        monkeypatch.setenv("LLM_MATCH_CRON", "*/5 * * * *")
+        cm = _config_manager_from_ini(tmp_path, "[sync]\nmode = single\n")
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_cron"] == "*/5 * * * *"
+
+    def test_get_sync_llm_match_config_cron_falls_back_to_default(
+        self, tmp_path, monkeypatch
+    ):
+        """未设置 LLM_MATCH_CRON 时 llm_match_cron 回落默认 */1 * * * *。"""
+        monkeypatch.delenv("LLM_MATCH_CRON", raising=False)
+        cm = _config_manager_from_ini(tmp_path, "[sync]\nmode = single\n")
+        cfg = cm.get_sync_llm_match_config()
+        assert cfg["llm_match_cron"] == "*/1 * * * *"
+
 
 class TestMediaServerUsernameParseAndMigration:
     def test_parse_media_server_username_value(self):

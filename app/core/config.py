@@ -666,8 +666,9 @@ class ConfigManager:
             "llm_match_assist": _to_bool(
                 self.get("sync", "llm_match_assist", fallback=False), False
             ),
-            "llm_match_cron": self.get("sync", "llm_match_cron", fallback="*/1 * * * *")
-            or "*/1 * * * *",
+            "llm_match_cron": self.get(
+                "sync", "llm_match_cron", fallback="*/1 * * * *"
+            ),
             "llm_match_retention_days": _to_int(
                 self.get("sync", "llm_match_retention_days", fallback=30), 30
             ),

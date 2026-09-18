@@ -61,10 +61,16 @@ class TestEnvOverrides:
         assert overrides[("dev", "log_level")] == "LOG_LEVEL"
         assert overrides[("web", "base_path")] == "APPLICATION_ROOT"
 
-    def test_count_matches_original(self):
-        """原硬编码共 14 条映射，新增 bangumi-oauth 的 client_id/client_secret 共 2 条、log_level 共 1 条"""
+    def test_includes_sync_llm_match_cron(self):
+        """llm_match_cron 降级为环境变量高级配置入口。"""
         overrides = config_schema.all_env_overrides()
-        assert len(overrides) == 17
+        assert overrides[("sync", "llm_match_cron")] == "LLM_MATCH_CRON"
+
+    def test_count_matches_original(self):
+        """原硬编码共 14 条映射，新增 bangumi-oauth 的 client_id/client_secret 共 2 条、
+        log_level 共 1 条、sync 的 llm_match_cron 共 1 条"""
+        overrides = config_schema.all_env_overrides()
+        assert len(overrides) == 18
 
 
 class TestIsSensitiveField:
