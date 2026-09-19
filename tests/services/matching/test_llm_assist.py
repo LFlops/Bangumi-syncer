@@ -594,6 +594,139 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
     assert unchanged["llm_reason"] == ""
 
 
+def test_persist_content_cas_skips_when_json_concurrently_modified(monkeypatch):
+    """B3：SELECT 后候选 JSON 被并发修改（内容型 CAS 失配）→ 不覆盖并发值。
+
+    status 保持 pending（隔离「状态守卫」语义），仅由另一连接改写 candidates_json：
+    - 无内容 CAS 时：UPDATE 命中 1 行 → 覆盖并发写入 → 双写 + 双通知（缺陷）
+    - 有内容 CAS 时：COALESCE 比对旧值失配 → rowcount=0 → run cancelled、
+      返回 False、不通知、并发写入的 JSON 保持原样
+    """
+    import sqlite3
+
+    run_id = "run-content-cas"
+    sr_id = 35
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    cid = database_manager.log_pending_candidate(
+        request_title=f"cas-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert cid
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    # 并发方改写后的内容（含新增条目，必然与 SELECT 时读到的 JSON 不同）
+    concurrent_json = json.dumps(
+        [
+            {"subject_id": "111", "name": "A", "score": 0.8},
+            {"subject_id": "555", "name": "并发新增", "score": 0.6},
+        ],
+        ensure_ascii=False,
+    )
+    db_path = str(database_manager._connection.db_path)
+    real_conn = database_manager._connection._conn
+
+    class _Conn:
+        """包装真实连接：在首次 pending_candidates UPDATE 前用独立连接并发改写该行。"""
+
+        def __init__(self, real):
+            self._real = real
+            self._injected = False
+
+        def execute(self, sql, params=()):
+            if not self._injected and "UPDATE pending_candidates" in sql:
+                self._injected = True
+                # 独立 sqlite3 连接 = 模拟另一进程；此时主连接尚未开启写事务（仅 SELECT）
+                other = sqlite3.connect(db_path)
+                try:
+                    other.execute(
+                        "UPDATE pending_candidates SET candidates_json=? WHERE id=?",
+                        (concurrent_json, cid),
+                    )
+                    other.commit()
+                finally:
+                    other.close()
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    ns = _make_notify()
+    result = llm_assist._persist_and_notify(
+        database_manager,
+        run_id,
+        sync_record=sr,
+        sync_record_id=sr_id,
+        bgm=None,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        total_tokens=0,
+        notification_service=ns,
+    )
+
+    assert result is False, "内容 CAS 失配应返回 False（跳过通知）"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "cancelled"
+    assert run_row["stop_reason"] == "user_resolved"
+    # 并发写入的 candidates_json 未被本 run 覆盖
+    assert _read_full_candidate(cid)["candidates_json"] == concurrent_json, (
+        "内容型 CAS 失配时不得覆盖并发方写入的 candidates_json"
+    )
+    ns.notify.assert_not_called()
+
+
+@pytest.mark.parametrize("raw_value", [None, ""], ids=["null", "empty"])
+def test_persist_content_cas_matches_null_or_empty_json(raw_value):
+    """B3：COALESCE 语义——candidates_json 为 NULL/空串时 CAS 仍能命中并正常落库。"""
+    sr_id = 36 if raw_value is None else 37
+    run_id = f"run-cas-raw-{sr_id}"
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    cid = database_manager.log_pending_candidate(
+        request_title=f"cas-raw-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert cid
+    # 预置为 NULL / 空串（历史脏数据 / 手工沉淀）
+    conn = database_manager._connection._conn
+    conn.execute(
+        "UPDATE pending_candidates SET candidates_json=? WHERE id=?", (raw_value, cid)
+    )
+    conn.commit()
+
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+    returned = llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        business_key=build_match_business_key(
+            sr["user_name"], sr["title"], sr["season"]
+        ),
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+
+    assert returned == cid, "COALESCE 应把 NULL/空串归一并命中内容 CAS"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "succeeded"
+    cands = json.loads(_read_full_candidate(cid)["candidates_json"])
+    assert any(str(c.get("subject_id")) == "123" for c in cands), (
+        "NULL/空串行应能追加 LLM 候选"
+    )
+
+
 def test_persist_llm_candidate_succeeded_guard_skips_when_run_terminal(log_records):
     """succeeded UPDATE 带源状态守卫：run 已被并发终态化 → 不翻回 succeeded。
 
@@ -3875,6 +4008,108 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
     assert beats_during_tail >= 5, (
         f"收尾期间事件循环应持续调度心跳（实际仅 {beats_during_tail} 次）"
     )
+    _assert_candidate_written(sr_id)
+    ns.notify.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
+    monkeypatch,
+):
+    """A2：收尾线程池执行期间，事件循环/其他线程并发 DB 操作必须安全。
+
+    窗口构造：``_prefetch_bgm_name`` 调用 ``bgm.get_subject`` 时置位 ``entered``
+    并阻塞在 ``release`` 上，把收尾线程钉在慢预取窗口内；测试侧在窗口内用
+    ``asyncio.to_thread`` 并发发起一次读（``agent_runs.get_run``）与一次写
+    （``log_pending_candidate``）。若收尾链错误占有共享锁或未走线程池，这些
+    并发操作会抛 ``database is locked`` / 争用异常。
+
+    断言：并发操作全部成功且无异常、目标 run 终态 succeeded、通知恰好一次。
+    """
+    run_id = "run-tail-concurrent"
+    sr_id = 92
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _BlockingBgm:
+        """get_subject 阻塞在慢预取窗口，直到测试侧放行。"""
+
+        def search(self, **kwargs):
+            return [{"id": 1}]
+
+        def get_subject(self, sid):
+            entered.set()
+            # 超时兜底：避免测试侧异常时永久卡死
+            assert release.wait(timeout=10), "收尾慢预取窗口未被测试释放"
+            return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+        def get_related_subjects(self, sid):
+            return []
+
+    ns = _make_notify()
+    task = asyncio.create_task(
+        llm_assist.run(
+            run_id,
+            sync_record=sr,
+            bgm=_BlockingBgm(),
+            thinking_level="medium",
+            chat_fn=_chat_side_effect([_search_response(), _submit_response()]),
+            notification_service=ns,
+            span_recorder=None,
+        )
+    )
+
+    # 等待收尾线程进入慢预取窗口
+    for _ in range(1000):
+        if entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert entered.is_set(), "收尾线程未进入慢预取窗口"
+
+    errors: list[Exception] = []
+
+    def _concurrent_read():
+        try:
+            return database_manager.agent_runs.get_run(run_id)
+        except Exception as e:  # noqa: BLE001 - 收集并发异常用于断言
+            errors.append(e)
+            return None
+
+    def _concurrent_write():
+        try:
+            return database_manager.log_pending_candidate(
+                request_title="并发写入",
+                request_season=1,
+                user_name="bob",
+                source="plex",
+                candidates=[{"subject_id": "999", "name": "并发", "score": 0.5}],
+                sync_record_id=993,
+            )
+        except Exception as e:  # noqa: BLE001 - 收集并发异常用于断言
+            errors.append(e)
+            return None
+
+    read_row, new_cid = await asyncio.gather(
+        asyncio.to_thread(_concurrent_read),
+        asyncio.to_thread(_concurrent_write),
+    )
+
+    release.set()
+    status = await asyncio.wait_for(task, timeout=10)
+
+    assert not errors, f"收尾窗口内并发 DB 操作不应抛异常: {errors}"
+    assert not any("locked" in str(e).lower() for e in errors), (
+        f"不应出现 database is locked 类错误: {errors}"
+    )
+    assert read_row is not None and read_row["run_id"] == run_id
+    assert new_cid, "并发写入应成功返回候选 id"
+    assert status == "succeeded"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "succeeded"
     _assert_candidate_written(sr_id)
     ns.notify.assert_called_once()
 

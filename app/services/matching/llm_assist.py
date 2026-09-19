@@ -676,32 +676,49 @@ def _persist_llm_candidate(
             if not isinstance(existing, list):
                 existing = []
             _merge_llm_candidate(existing, new_cand)
+            # CAS 乐观锁：除状态守卫外，追加**内容型**比对（SELECT 时的原始
+            # candidates_json），把幂等的 ``SET status='pending' WHERE
+            # status='pending'`` 升级为变更型 CAS。多进程下两个进程各自 SELECT
+            # 到同一旧值、各自 UPDATE 时，只有先提交者内容匹配，后提交者因
+            # candidates_json 已变而 rowcount=0 → 不双写、不双通知。
+            # COALESCE 兼容 NULL（历史行）/空串：SELECT 侧原始值统一由
+            # ``row[1] or ""`` 归一为空串，两侧口径一致。
+            original_json = row[1] or ""
             # 历史行（无业务键）在同一事务内回填：否则后续 enqueue 复用判定
             # 按 business_key 查询永远 miss，导致重复重跑 LLM。已在展示的候选行
             # 不覆盖既有非空键（保持原身份，避免改写已被引用的业务身份）。
             if not existing_business_key and business_key:
                 cursor = conn.execute(
                     "UPDATE pending_candidates SET candidates_json=?, status='pending', "
-                    "business_key=? WHERE id=? AND status='pending'",
+                    "business_key=? WHERE id=? AND status='pending' "
+                    "AND COALESCE(candidates_json, '') = ?",
                     (
                         json.dumps(existing, ensure_ascii=False),
                         business_key,
                         existing_id,
+                        original_json,
                     ),
                 )
             else:
                 cursor = conn.execute(
                     "UPDATE pending_candidates SET candidates_json=?, status='pending' "
-                    "WHERE id=? AND status='pending'",
-                    (json.dumps(existing, ensure_ascii=False), existing_id),
+                    "WHERE id=? AND status='pending' "
+                    "AND COALESCE(candidates_json, '') = ?",
+                    (
+                        json.dumps(existing, ensure_ascii=False),
+                        existing_id,
+                        original_json,
+                    ),
                 )
             if cursor.rowcount == 0:
-                # SELECT 后被并发处理：带守卫 UPDATE 未命中，同样不复活。
-                # 事务内直调 apply_cancelled（单一 SQL 入口，不二次取锁）。
+                # SELECT 后行被并发处理或内容被并发修改：带守卫 + 内容 CAS 的
+                # UPDATE 未命中，同样不复活。事务内直调 apply_cancelled
+                # （单一 SQL 入口，不二次取锁）。
                 apply_cancelled(conn, run_id, stop_reason=_STOP_REASON_USER_RESOLVED)
                 logger.info(
                     f"[llm_assist] run {run_id} 候选(pending_candidates.id="
-                    f"{existing_id}) 在落库瞬间被并发处理，跳过落库并标 run cancelled"
+                    f"{existing_id}) 在落库瞬间状态变更/内容被并发修改，"
+                    f"跳过落库并标 run cancelled"
                 )
                 return None
             candidate_id = existing_id
