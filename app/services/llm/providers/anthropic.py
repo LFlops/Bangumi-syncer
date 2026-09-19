@@ -140,9 +140,9 @@ class AnthropicProvider(BaseProvider):
             "model": kwargs.get("model", self.model),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "temperature": kwargs.get("temperature", self.temperature),
-            "messages": [
-                self._to_wire_message(m) for m in messages if m.role != "system"
-            ],
+            "messages": self._merge_tool_result_messages(
+                [self._to_wire_message(m) for m in messages if m.role != "system"]
+            ),
         }
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
@@ -228,6 +228,35 @@ class AnthropicProvider(BaseProvider):
         if isinstance(content, str):
             return content
         return "\n\n".join(b.text for b in content if isinstance(b, TextBlock))
+
+    @staticmethod
+    def _merge_tool_result_messages(wire_messages: list[dict]) -> list[dict]:
+        """合并连续的 tool_result user 消息为单条。
+
+        Anthropic 协议要求 assistant 的全部 ``tool_use`` 由**紧随其后同一条
+        消息**中的 ``tool_result`` 一一响应。agent 循环按 provider 无关契约
+        逐条追加（assistant tool_use × N → user(tr1) → user(tr2) → ...），
+        此处归一化收敛，避免第 2..N 个 tool_use 悬空（真实端点 400：
+        "``tool_use`` ids were found without ``tool_result`` blocks
+        immediately after"）。纯文本 user 消息（如预算提示）不合并，
+        保持原有交替语义。
+        """
+
+        def _is_tool_result(msg: dict) -> bool:
+            return msg.get("role") == "user" and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in (msg.get("content") or [])
+            )
+
+        merged: list[dict] = []
+        for msg in wire_messages:
+            if _is_tool_result(msg) and merged and _is_tool_result(merged[-1]):
+                merged[-1]["content"] = list(merged[-1].get("content") or []) + list(
+                    msg.get("content") or []
+                )
+                continue
+            merged.append(msg)
+        return merged
 
     def _to_wire_message(self, m: Message) -> dict:
         """内部消息 → Anthropic wire 消息（content 统一为 blocks 数组）。"""

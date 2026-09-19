@@ -438,3 +438,109 @@ class TestAnthropicProviderChatTools:
         assert isinstance(resp, ChatResponse)
         assert resp.stop_reason == "tool_use"
         assert isinstance(resp.blocks[0], ToolUseBlock)
+
+
+# ===================================================================
+# Feature：连续 tool_result 消息合并（Anthropic 协议：tool_use 必须被
+# 紧随其后同一条消息中的 tool_result 一一响应）
+# ===================================================================
+
+
+class TestMergeToolResultMessages:
+    """agent 循环逐条追加的 tool_result user 消息 → 归一化为单条。"""
+
+    def test_multiple_tool_results_merged_into_single_user_message(self):
+        """assistant 两个 tool_use + 两条独立 user(tool_result) + budget → 合并。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(id="tu_1", name="search_bangumi", input={}),
+                        ToolUseBlock(id="tu_2", name="search_bangumi", input={}),
+                    ],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ToolResultBlock(
+                            tool_use_id="tu_1", content="r1", is_error=False
+                        )
+                    ],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ToolResultBlock(tool_use_id="tu_2", content="r2", is_error=True)
+                    ],
+                ),
+                Message(role="user", content="[剩余轮次：2]"),
+            ]
+        )
+        msgs = body["messages"]
+        assert [m["role"] for m in msgs] == ["assistant", "user", "user"]
+        merged = msgs[1]["content"]
+        assert [b["tool_use_id"] for b in merged] == ["tu_1", "tu_2"]
+        assert merged[0]["is_error"] is False
+        assert merged[1]["is_error"] is True
+        assert msgs[2]["content"][0]["text"] == "[剩余轮次：2]"
+
+    def test_single_tool_result_followed_by_text_kept_separate(self):
+        """单条 tool_result 后的纯文本 user（budget）不被并入。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(
+                    role="assistant",
+                    content=[ToolUseBlock(id="tu_1", name="t", input={})],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ToolResultBlock(tool_use_id="tu_1", content="r", is_error=False)
+                    ],
+                ),
+                Message(role="user", content="[剩余轮次：1]"),
+            ]
+        )
+        msgs = body["messages"]
+        assert [m["role"] for m in msgs] == ["assistant", "user", "user"]
+        assert msgs[1]["content"][0]["type"] == "tool_result"
+        assert msgs[2]["content"][0]["type"] == "text"
+
+    def test_already_merged_form_unchanged(self):
+        """单条 user 里已含多个 tool_result → 保持原样。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(
+                    role="assistant",
+                    content=[
+                        ToolUseBlock(id="tu_1", name="t", input={}),
+                        ToolUseBlock(id="tu_2", name="t", input={}),
+                    ],
+                ),
+                Message(
+                    role="user",
+                    content=[
+                        ToolResultBlock(tool_use_id="tu_1", content="r1"),
+                        ToolResultBlock(tool_use_id="tu_2", content="r2"),
+                    ],
+                ),
+            ]
+        )
+        msgs = body["messages"]
+        assert [m["role"] for m in msgs] == ["assistant", "user"]
+        assert [b["tool_use_id"] for b in msgs[1]["content"]] == ["tu_1", "tu_2"]
+
+    def test_consecutive_plain_text_users_unchanged(self):
+        """连续纯文本 user（无 tool_result）不合并。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(role="user", content="a"),
+                Message(role="user", content="b"),
+            ]
+        )
+        assert [m["role"] for m in body["messages"]] == ["user", "user"]
