@@ -7,8 +7,8 @@ Agent 追踪查询 API
 
 鉴权语义：
 - 未认证 → 401（复用 ``get_current_user_flexible`` 既有行为）
-- 非本人且非管理员 → 403（经 ``sync_record_id`` 关联 ``sync_records.user_name`` 校验）
-- run 不存在 → 404
+- run 不存在或无权访问 → 404（统一文案「追踪记录不存在」，不暴露 run_id 存在性；
+  经 ``sync_record_id`` 关联 ``sync_records.user_name`` 校验归属，拒绝场景记审计 warning）
 
 展示契约：
 - 响应永不包含 ``replay_delta`` 原文（仅用于内部重放）。
@@ -102,17 +102,40 @@ def _resolve_owner_user_name(run: dict) -> Optional[str]:
     return record.get("user_name")
 
 
-def _authorize(run: dict, current_user: dict) -> None:
-    """校验当前用户是否可访问该 run；否则 403。"""
+def _log_access_denied(
+    endpoint: str, run_id: str, current_user: dict, reason: str, owner: Optional[str]
+) -> None:
+    """拒绝访问追踪记录时记录审计日志（不静默）。"""
+    logger.warning(
+        f"⚠️ 追踪记录访问拒绝 endpoint={endpoint} run_id={run_id} "
+        f"username={current_user.get('username')} reason={reason} owner={owner}"
+    )
+
+
+def _trace_not_found() -> HTTPException:
+    """统一的 404：不存在与无权访问共用，避免泄露 run_id 存在性。"""
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="追踪记录不存在")
+
+
+def _load_authorized_run(run_id: str, current_user: dict, endpoint: str) -> dict:
+    """查询 run 并鉴权，返回可访问的 run 数据。
+
+    不存在与无权访问统一抛 404（不暴露存在性）；拒绝场景先记审计日志再抛同一 404。
+    鉴权顺序：先取 run 数据（owner 解析所需），再做权限判定。
+    """
+    run = database_manager.agent_runs.get_run(run_id)
+    if not run:
+        _log_access_denied(
+            endpoint, run_id, current_user, reason="not_found", owner=None
+        )
+        raise _trace_not_found()
     if _is_admin_user(current_user):
-        return
+        return run
     owner = _resolve_owner_user_name(run)
     if owner is not None and current_user.get("username") == owner:
-        return
-    raise HTTPException(
-        status_code=status.HTTP_403_FORBIDDEN,
-        detail="无权访问该追踪记录",
-    )
+        return run
+    _log_access_denied(endpoint, run_id, current_user, reason="forbidden", owner=owner)
+    raise _trace_not_found()
 
 
 def _iso_from_epoch(ts) -> Optional[str]:
@@ -235,12 +258,7 @@ async def get_agent_run(
     current_user: dict = Depends(get_current_user_flexible),
 ) -> dict:
     """获取单次 Agent 会话的元数据（观测用途）。"""
-    run = database_manager.agent_runs.get_run(run_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="追踪记录不存在"
-        )
-    _authorize(run, current_user)
+    run = _load_authorized_run(run_id, current_user, endpoint="get_agent_run")
     return _project_run(run)
 
 
@@ -251,11 +269,6 @@ async def get_agent_run_steps(
     current_user: dict = Depends(get_current_user_flexible),
 ) -> list:
     """获取单次 Agent 会话的 span 列表（按 (iteration, sequence) 排序）。"""
-    run = database_manager.agent_runs.get_run(run_id)
-    if not run:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="追踪记录不存在"
-        )
-    _authorize(run, current_user)
+    _load_authorized_run(run_id, current_user, endpoint="get_agent_run_steps")
     steps = database_manager.agent_runs.get_steps(run_id)
     return _project_steps(steps)

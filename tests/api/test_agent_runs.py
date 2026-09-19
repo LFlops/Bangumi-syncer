@@ -3,10 +3,10 @@ Agent 追踪 API 测试
 
 覆盖：
 - 未认证请求 → 401
-- 非本人/非管理员访问他人 run → 403
+- 非本人/非管理员访问他人 run → 404（与不存在统一，不暴露存在性）+ 审计日志
 - 本人访问 → 200 + 字段完整
 - 管理员可访问他人 run → 200
-- 不存在 run → 404
+- 不存在 run → 404 + 审计日志
 - /steps 按 (iteration, sequence) 排序，且不含 replay_delta / payload_json
 - display_json：llm_chat 截断、tool 预览、seed 条数、空 delta 容错
 - 时间字段 epoch → ISO 8601；0/None → None
@@ -68,9 +68,9 @@ async def test_get_agent_run_unauthenticated_returns_401(app, mock_db):
     assert resp.status_code == 401
 
 
-async def test_get_agent_run_other_user_forbidden_403(app, mock_db):
-    """非本人/非管理员访问他人 run → 403"""
-    run = {
+def _other_owner_run():
+    """run-1 归属 bob 的最小元数据（当前用户 alice 无权访问）"""
+    return {
         "run_id": "run-1",
         "task_type": "match",
         "sync_record_id": 42,
@@ -84,16 +84,51 @@ async def test_get_agent_run_other_user_forbidden_403(app, mock_db):
         "created_at": "2026-01-01 00:00:00",
         "last_error": "",
     }
-    mock_db.agent_runs.get_run.return_value = run
+
+
+async def test_get_agent_run_other_user_returns_404_and_logs(app, mock_db):
+    """非本人/非管理员访问他人 run → 404（与不存在同响应）+ 审计日志"""
+    mock_db.agent_runs.get_run.return_value = _other_owner_run()
     # sync_record 42 归属 bob，当前用户是 alice（非管理员）
     mock_db.sync_records.get_sync_record_by_id.return_value = {"user_name": "bob"}
 
     await _override_user(app, {"username": "alice"})
 
-    async with _client(app) as client:
-        resp = await client.get("/api/agent/runs/run-1")
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        async with _client(app) as client:
+            resp = await client.get("/api/agent/runs/run-1")
 
-    assert resp.status_code == 403
+    assert resp.status_code == 404
+    # 与「不存在」同文案，外部无法区分
+    assert resp.json()["detail"] == "追踪记录不存在"
+    mock_logger.warning.assert_called_once()
+    msg = str(mock_logger.warning.call_args.args[0])
+    assert "run-1" in msg
+    assert "alice" in msg
+    assert "forbidden" in msg
+    assert "bob" in msg
+
+
+async def test_get_agent_run_steps_other_user_returns_404_and_logs(app, mock_db):
+    """非本人/非管理员访问他人 run 的 steps → 404（与不存在同响应）+ 审计日志"""
+    mock_db.agent_runs.get_run.return_value = _other_owner_run()
+    mock_db.sync_records.get_sync_record_by_id.return_value = {"user_name": "bob"}
+
+    await _override_user(app, {"username": "alice"})
+
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        async with _client(app) as client:
+            resp = await client.get("/api/agent/runs/run-1/steps")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "追踪记录不存在"
+    mock_logger.warning.assert_called_once()
+    msg = str(mock_logger.warning.call_args.args[0])
+    assert "run-1" in msg
+    assert "alice" in msg
+    assert "forbidden" in msg
+    # 无权时不查询 steps
+    mock_db.agent_runs.get_steps.assert_not_called()
 
 
 async def test_get_agent_run_owner_allowed_200(app, mock_db):
@@ -150,7 +185,7 @@ async def test_get_agent_run_owner_allowed_200(app, mock_db):
 
 
 async def test_get_agent_run_admin_can_access_other_200(app, mock_db):
-    """管理员可访问他人 run → 200（覆盖“非管理员才 403”）"""
+    """管理员可访问他人 run → 200（覆盖“非管理员才被拒”）"""
     run = {
         "run_id": "run-1",
         "task_type": "match",
@@ -178,15 +213,42 @@ async def test_get_agent_run_admin_can_access_other_200(app, mock_db):
 
 
 async def test_get_agent_run_not_found_404(app, mock_db):
-    """不存在 run → 404"""
+    """不存在 run → 404 + 审计日志（not_found）"""
     mock_db.agent_runs.get_run.return_value = None
 
     await _override_user(app, {"username": "alice"})
 
-    async with _client(app) as client:
-        resp = await client.get("/api/agent/runs/run-missing")
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        async with _client(app) as client:
+            resp = await client.get("/api/agent/runs/run-missing")
 
     assert resp.status_code == 404
+    assert resp.json()["detail"] == "追踪记录不存在"
+    mock_logger.warning.assert_called_once()
+    msg = str(mock_logger.warning.call_args.args[0])
+    assert "run-missing" in msg
+    assert "alice" in msg
+    assert "not_found" in msg
+
+
+async def test_get_agent_run_steps_not_found_404(app, mock_db):
+    """不存在 run 的 steps → 404 + 审计日志（not_found）"""
+    mock_db.agent_runs.get_run.return_value = None
+
+    await _override_user(app, {"username": "alice"})
+
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        async with _client(app) as client:
+            resp = await client.get("/api/agent/runs/run-missing/steps")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "追踪记录不存在"
+    mock_logger.warning.assert_called_once()
+    msg = str(mock_logger.warning.call_args.args[0])
+    assert "run-missing" in msg
+    assert "alice" in msg
+    assert "not_found" in msg
+    mock_db.agent_runs.get_steps.assert_not_called()
 
 
 async def test_get_agent_run_steps_sorted_and_no_replay_delta(app, mock_db):
