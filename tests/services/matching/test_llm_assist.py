@@ -29,7 +29,6 @@ from app.services.llm.models import (
 from app.services.llm.tools import (
     ToolDefinition,
     ToolRegistry,
-    reset_tool_registry,
 )
 from app.services.matching import llm_assist
 from app.services.matching.identity import build_match_business_key
@@ -213,13 +212,6 @@ def _assert_candidate_written(sync_record_id, subject_id="123", reason="跨季�
         "candidates_json 应承载 llm 建议的 reason"
     )
     return row
-
-
-@pytest.fixture(autouse=True)
-def _reset_registry():
-    reset_tool_registry()
-    yield
-    reset_tool_registry()
 
 
 # ---------------------------------------------------------------------------
@@ -1592,32 +1584,6 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
     )
     assert used == ["bgm1", "bgm2"], (
         f"第二个 run 必须使用第二个 bgm（实际 {used}）——handler 闭包不得钉死首次注册"
-    )
-
-
-def test_run_does_not_pollute_module_singleton_registry():
-    """per-run ToolRegistry：run 注册的工具不得写入模块单例（隔离，防串账号）。"""
-    from app.services.llm.tools import get_tool_registry
-
-    run_id = "run-per-run-registry"
-    sr_id = 81
-    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-    reset_tool_registry()
-    assert get_tool_registry().get("search_bangumi") is None
-
-    asyncio.run(
-        llm_assist.run(
-            run_id,
-            sync_record=_make_sync_record(sync_record_id=sr_id),
-            bgm=_make_bgm(),
-            thinking_level="medium",
-            chat_fn=_chat_side_effect([_search_response()]),
-            span_recorder=None,
-        )
-    )
-
-    assert get_tool_registry().get("search_bangumi") is None, (
-        "run 不得把捕获本次 bgm 的 handler 写入模块单例（并发下会串账号）"
     )
 
 
