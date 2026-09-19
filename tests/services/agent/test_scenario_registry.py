@@ -1,16 +1,20 @@
 """场景装配（Composition Root）与注册表纯机制化测试。
 
-BDD 场景：
+BDD 场景（编号与规划源清单对齐；本文件覆盖 1/2/5/6/7/8）：
 
 1. ``wire_scenarios()`` 后 ``get_scenario("match")`` 返回绑定匹配场景 hooks 的
    ``ScenarioRuntime``
-2. 重复 ``wire_scenarios()`` 幂等（不抛异常、不打 warning，仍可获取）
-4. 装配层必须**静态 import** 场景工厂（禁止 importlib / 字符串路径），注册表
-   不得残留字符串表 ``_SCENARIO_PROVIDERS``
+2. 重复 ``wire_scenarios()`` 幂等（覆盖注册，不抛异常、不打 warning，仍可获取）
 5. 未注册 task_type → ``KeyError``（消息含未知 task_type 与已注册列表）
 6. 未装配（表为空）→ ``KeyError``（消息明确提示需先装配）
 7. 装配层 / 注册表 / 场景模块在**干净子进程**中以任意顺序导入均不触发
    循环依赖（``subprocess`` 隔离验证 import 顺序无关）
+8. 装配层必须**静态 import** 场景工厂（禁止 importlib / 字符串路径），注册表
+   不得残留字符串表 ``_SCENARIO_PROVIDERS``
+
+未在本文件直接编号的场景：场景 3（生产引导装配）见
+``tests/services/test_scheduler_bootstrap.py``；场景 4（测试会话装配一致）由
+conftest 装配路径回归覆盖；场景 9（行为等价回归）由全量套件覆盖。
 
 说明：注册表 ``_scenarios`` 为进程级共享状态。测试中通过 ``monkeypatch`` 隔离，
 不新增任何「仅测试用」的重置 API（monkeypatch 自动还原）。
@@ -46,7 +50,17 @@ class TestWireScenarios:
         assert runtime.hooks is llm_assist._MATCH_HOOKS
 
     def test_wire_scenarios_called_twice_is_idempotent_and_logs_no_warning(self):
-        """重复 wire_scenarios() 幂等：不抛异常、不打 warning、仍可获取。"""
+        """重复 wire_scenarios() 幂等：覆盖注册 + 打 debug（非 warning）+ 仍可获取。
+
+        正向证据（两路互补，均不依赖日志级别阈值）：
+        - 行为面：``get_scenario_runtime()`` 每次调用新建 ``ScenarioRuntime``，
+          故第二次装配后 ``get_scenario("match")`` 必为新实例（``is not`` 首次），
+          直接证明「覆盖确实发生」，而非「第二次装配未执行」。
+        - 日志面：覆盖分支走 ``logger.debug``（消息含「覆盖」）；项目 Logger 的
+          监听器**不受级别阈值限制**（见 ``app/core/logging.py`` 中
+          ``log_level_enabled``/``log`` 的注释），DEBUG 行可达监听器，故断言
+          收到覆盖 DEBUG 行，证明走的是覆盖分支。
+        """
         from app.core.logging import logger
 
         seen: list[tuple[str, str]] = []
@@ -55,6 +69,8 @@ class TestWireScenarios:
             seen.append((line, level))
 
         scenarios_module.wire_scenarios()
+        first = get_scenario("match")
+
         logger.add_listener(_listener)
         try:
             scenarios_module.wire_scenarios()
@@ -64,6 +80,14 @@ class TestWireScenarios:
         runtime = get_scenario("match")
         assert runtime.task_type == "match"
         assert runtime.hooks is llm_assist._MATCH_HOOKS
+        # 正向证据 1：覆盖注册真的发生（第二次装配产生新的 ScenarioRuntime 实例）
+        assert runtime is not first, (
+            "第二次 wire_scenarios() 应覆盖为新的 ScenarioRuntime 实例"
+        )
+        # 正向证据 2：覆盖分支的 DEBUG 日志被监听器捕获
+        assert any(level == "DEBUG" and "覆盖" in line for line, level in seen), (
+            f"应捕获覆盖分支 DEBUG 日志，实际 {seen}"
+        )
 
         warnings = [(line, level) for line, level in seen if level == "WARNING"]
         assert warnings == [], f"重复装配属预期，不应打 warning，实际 {warnings}"
@@ -97,7 +121,7 @@ class TestGetScenarioErrors:
 
 
 class TestStaticWiringGuard:
-    """场景 4：静态装配 / 纯机制化的 AST 守卫（防回归）。"""
+    """场景 8：静态装配 / 纯机制化的 AST 守卫（防回归）。"""
 
     _REPO_ROOT = Path(__file__).resolve().parents[3]
 
