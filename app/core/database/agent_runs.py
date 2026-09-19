@@ -30,6 +30,7 @@ import time
 from datetime import datetime
 from typing import Any, Optional
 
+from ...utils.secret_redact import redact_secrets
 from ..logging import logger
 from .base_repository import BaseRepository
 
@@ -410,6 +411,8 @@ class AgentRunsRepository(BaseRepository):
     ) -> bool:
         """标记无建议（预算耗尽 / 校验失败 / 无候选），终态"""
 
+        last_error = redact_secrets(last_error)
+
         def _write(conn):
             cursor = conn.execute(
                 """
@@ -439,6 +442,8 @@ class AgentRunsRepository(BaseRepository):
         活性态首次调用时 +1（「一个 run 只计 1 次失败」），避免
         increment_attempts 达上限置终态后调用方再 mark_failed 造成双计。
         """
+
+        last_error = redact_secrets(last_error)
 
         def _write(conn):
             cursor = conn.execute(
@@ -492,6 +497,8 @@ class AgentRunsRepository(BaseRepository):
 
         非 processing 态 / run 不存在 → 不计数，返回 0。
         """
+
+        last_error = redact_secrets(last_error)
 
         def _write(conn):
             cursor = conn.execute(

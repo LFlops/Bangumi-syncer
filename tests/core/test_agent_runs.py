@@ -374,6 +374,104 @@ class TestIncrementAttempts:
             dbm._connection._conn.close()
 
 
+class TestLastErrorRedaction:
+    """last_error 落库前统一脱敏（经 /api/agent/runs 暴露，防密钥外泄）。
+
+    覆盖三个写入点：mark_failed / mark_no_suggestion / increment_attempts。
+    断言「敏感值已遮蔽 + 正常字段（状态/stop_reason/tokens/attempts）不变」。
+    """
+
+    def test_mark_failed_redacts_secret_and_preserves_fields(self, tmp_path):
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rd1", "match", 1)
+            assert (
+                dbm.agent_runs.mark_failed(
+                    "rd1",
+                    "llm_error",
+                    "LLM 调用失败: Bearer sk-secret-123 鉴权被拒",
+                    7,
+                )
+                is True
+            )
+            run = dbm.agent_runs.get_run("rd1")
+            assert "sk-secret-123" not in run["last_error"]
+            assert "Bearer ***" in run["last_error"]
+            assert "鉴权被拒" in run["last_error"]  # 正常信息保留
+            # 状态机字段不受脱敏影响
+            assert run["status"] == "failed"
+            assert run["stop_reason"] == "llm_error"
+            assert run["total_tokens"] == 7
+            assert run["total_attempts"] == 1
+        finally:
+            dbm._connection._conn.close()
+
+    @pytest.mark.parametrize(
+        ("last_error", "leaked"),
+        [
+            ("token=abc123 已失效", "abc123"),
+            ('响应体 {"api_key": "sk-live-1"} 解析失败', "sk-live-1"),
+            ("password=hunter2 认证失败", "hunter2"),
+            ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+        ],
+    )
+    def test_mark_failed_redacts_various_patterns(self, tmp_path, last_error, leaked):
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rd2", "match", 1)
+            assert dbm.agent_runs.mark_failed("rd2", "error", last_error) is True
+            stored = dbm.agent_runs.get_run("rd2")["last_error"]
+            assert leaked not in stored
+            assert stored != last_error  # 确实发生遮蔽
+        finally:
+            dbm._connection._conn.close()
+
+    def test_mark_no_suggestion_redacts_secret(self, tmp_path):
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rn1", "match", 1)
+            assert (
+                dbm.agent_runs.mark_no_suggestion(
+                    "rn1", "budget_exhausted", "调用超限: access_token=tok-999"
+                )
+                is True
+            )
+            run = dbm.agent_runs.get_run("rn1")
+            assert "tok-999" not in run["last_error"]
+            assert "access_token=***" in run["last_error"]
+            assert run["status"] == "no_suggestion"
+            assert run["stop_reason"] == "budget_exhausted"
+        finally:
+            dbm._connection._conn.close()
+
+    @pytest.mark.parametrize(
+        ("last_error", "leaked"),
+        [
+            ("Bearer sk-secret-123 重试耗尽", "sk-secret-123"),
+            ("api_key=sk-abcd 调用失败", "sk-abcd"),
+        ],
+    )
+    def test_increment_attempts_redacts_last_error_on_terminal(
+        self, tmp_path, last_error, leaked
+    ):
+        """达上限单点置 failed 时写入的 last_error 同样脱敏。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("ri1", "match", 1)
+            dbm.agent_runs.atomic_claim("ri1")  # → processing
+            assert dbm.agent_runs.increment_attempts("ri1") == 1
+            assert dbm.agent_runs.increment_attempts("ri1") == 2
+            assert dbm.agent_runs.increment_attempts("ri1", last_error=last_error) == 3
+
+            run = dbm.agent_runs.get_run("ri1")
+            assert run["status"] == "failed"
+            assert run["stop_reason"] == "failed"
+            assert leaked not in run["last_error"]
+            assert run["total_attempts"] == 1
+        finally:
+            dbm._connection._conn.close()
+
+
 class TestRefreshStartedAt:
     """refresh_started_at：支持调用方注入时间戳（重入防护统一时间戳）"""
 
