@@ -637,8 +637,7 @@ class ConfigManager:
         """获取 [sync] 段 LLM 匹配增强（llm_match_*）配置，集中填充默认值。
 
         上游调度器/编排曾各自直接 ``get("sync", "llm_match_*", fallback=...)``；
-        本方法将其正式化为单一读取入口，保证默认值一致，并供
-        ``GET /api/sync/config`` 复用默认值。
+        本方法将其正式化为单一读取入口，保证默认值一致。
 
         返回字段：
         - llm_match_assist (bool, 默认 false)

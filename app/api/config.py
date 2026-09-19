@@ -159,32 +159,6 @@ async def get_config(_=Depends(get_current_user_flexible)) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"获取配置失败: {str(e)}")
 
 
-@router.get("/sync/config")
-async def get_sync_config(_=Depends(get_current_user_flexible)) -> dict[str, Any]:
-    """获取 [sync] 段 LLM 匹配增强配置 + llm_available 标志。
-
-    - llm_available：LLM api_key 是否非空（true=已配置）。
-    - llm_api_key_masked：按 app/api/llm.py 的脱敏方式返回掩码值（不泄露明文）。
-    """
-    llm_match_cfg = config_manager.get_sync_llm_match_config()
-    llm_cfg = config_manager.get_llm_config()
-    api_key = llm_cfg.get("api_key", "") or ""
-    llm_available = bool(api_key.strip())
-    # 脱敏（参照 app/api/llm.py 的 get_llm_config 掩码逻辑）
-    if api_key:
-        masked_key = "***" + api_key[-4:] if len(api_key) > 4 else "***"
-    else:
-        masked_key = ""
-    return {
-        "status": "success",
-        "data": {
-            **llm_match_cfg,
-            "llm_available": llm_available,
-            "llm_api_key_masked": masked_key,
-        },
-    }
-
-
 @router.get("/config/schema")
 async def get_config_schema(_=Depends(get_current_user_flexible)) -> dict[str, Any]:
     """获取配置段元数据 schema

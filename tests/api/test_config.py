@@ -1024,12 +1024,12 @@ async def test_refresh_webhook_key_exception(app_with_auth, mock_config_manager)
             assert response.status_code == 500
 
 
-# ========== [sync] llm_match_* 配置读取 + 保存校验 + llm_available ==========
+# ========== [sync] llm_match_* 保存校验 + /api/config 暴露字段 ==========
 
 
 @pytest.fixture
 def mock_sync_cm():
-    """可控 config_manager：用于 /api/sync/config 与配置保存校验测试。"""
+    """可控 config_manager：用于配置保存校验与 /api/config 字段暴露测试。"""
     with patch("app.api.config.config_manager") as mock_cm:
         mock_cm.active_config_path = "/tmp/test_config.ini"
         mock_cm.get_config_parser.return_value = MagicMock()
@@ -1044,66 +1044,39 @@ def mock_sync_cm():
 
 
 @pytest.mark.asyncio
-async def test_get_sync_config_llm_available_false_when_llm_not_configured(
-    app_with_auth, mock_sync_cm
-):
-    """LLM 未配置时 GET /api/sync/config 返回 llm_available=false。"""
-    mock_sync_cm.get_sync_llm_match_config.return_value = {
-        "llm_match_assist": False,
-        "llm_match_cron": "*/1 * * * *",
-        "llm_match_retention_days": 7,
-        "llm_match_max_iterations": "",
-        "llm_match_recovery_timeout_s": 120,
-        "llm_match_concurrency": 3,
-        "llm_match_thinking_level": "medium",
-    }
-    mock_sync_cm.get_llm_config.return_value = {"api_key": ""}
-
+async def test_sync_config_endpoint_removed(app_with_auth, mock_config_manager):
+    """GET /api/sync/config 已删除，前端改为复用 /api/config 数据（评论#5）。"""
     async with AsyncClient(
         transport=ASGITransport(app=app_with_auth), base_url="http://test"
     ) as client:
         response = await client.get("/api/sync/config")
 
-    assert response.status_code == 200
-    data = response.json()["data"]
-    assert data["llm_available"] is False
-    assert data["llm_api_key_masked"] == ""
-    # 七键默认值透出（集中 getter 输出原样展开）
-    assert data["llm_match_assist"] is False
-    assert data["llm_match_cron"] == "*/1 * * * *"
-    assert data["llm_match_retention_days"] == 7
-    assert data["llm_match_max_iterations"] == ""
-    assert data["llm_match_recovery_timeout_s"] == 120
-    assert data["llm_match_concurrency"] == 3
-    assert data["llm_match_thinking_level"] == "medium"
+    assert response.status_code == 404
 
 
 @pytest.mark.asyncio
-async def test_get_sync_config_llm_available_true_when_llm_configured(
-    app_with_auth, mock_sync_cm
+async def test_get_config_exposes_llm_key_and_match_assist(
+    app_with_auth, mock_config_manager
 ):
-    """LLM 已配置时 GET /api/sync/config 返回 llm_available=true + 掩码 key。"""
-    mock_sync_cm.get_sync_llm_match_config.return_value = {
-        "llm_match_assist": True,
-        "llm_match_cron": "*/1 * * * *",
-        "llm_match_retention_days": 7,
-        "llm_match_max_iterations": "",
-        "llm_match_recovery_timeout_s": 120,
-        "llm_match_concurrency": 3,
-        "llm_match_thinking_level": "medium",
+    """GET /api/config 暴露 llm.api_key 与 sync.llm_match_assist 供前端复用。
+
+    前端 loadLLMMatchAssist 以 llm.api_key 非空判定开关可用性、以
+    sync.llm_match_assist 回填勾选，故这两个字段必须在 /api/config 响应中可见。
+    """
+    mock_config_manager.get_all_config.return_value = {
+        "llm": {"api_key": "sk-liveabcd1234"},
+        "sync": {"llm_match_assist": True},
     }
-    mock_sync_cm.get_llm_config.return_value = {"api_key": "sk-liveabcd1234"}
 
     async with AsyncClient(
         transport=ASGITransport(app=app_with_auth), base_url="http://test"
     ) as client:
-        response = await client.get("/api/sync/config")
+        response = await client.get("/api/config")
 
     assert response.status_code == 200
     data = response.json()["data"]
-    assert data["llm_available"] is True
-    assert data["llm_api_key_masked"] == "***1234"
-    assert data["llm_match_assist"] is True
+    assert data["llm"]["api_key"] == "sk-liveabcd1234"
+    assert data["sync"]["llm_match_assist"] is True
 
 
 @pytest.mark.asyncio

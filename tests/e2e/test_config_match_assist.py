@@ -4,8 +4,11 @@
 的渲染测试 + 手测清单覆盖。
 
 场景：
-- LLM 未配置（llm_available=false）：开关不显示 + 展示「需先配置 LLM」提示
-- LLM 已配置（llm_available=true）：开关显示；读取当前值；保存走 /api/config
+- LLM 未配置（/api/config 的 llm.api_key 为空）：开关不显示 + 展示「需先配置 LLM」提示
+- LLM 已配置（llm.api_key 非空）：开关显示；读取当前值；保存走 /api/config
+
+开关显隐由 loadConfig() 内的 loadLLMMatchAssist(config) 依据已加载的
+/api/config 数据控制，不再有独立的 /api/sync/config 请求。
 """
 
 from __future__ import annotations
@@ -27,14 +30,11 @@ def test_match_assist_switch_hidden_when_llm_not_configured(authed_page, base_ur
     page = authed_page
     _open_config_page(page, base_url)
 
-    # 等待条件渲染完成（/api/sync/config 返回后 JS 控制显隐）
-    page.wait_for_function(
-        "document.getElementById('llm-match-assist-tip') !== null",
-        timeout=10000,
-    )
-
     switch = page.locator("#llm-match-assist-switch")
     tip = page.locator("#llm-match-assist-tip")
+
+    # 等待条件渲染完成（/api/config 数据就绪后 JS 控制显隐）
+    tip.wait_for(state="visible", timeout=10000)
 
     # 未配置时：提示可见、开关不可见
     assert tip.is_visible()
@@ -46,7 +46,7 @@ def test_match_assist_switch_visible_when_llm_configured(authed_page, base_url: 
     """LLM 已配置 → 开关显示；保存生效（sync.llm_match_assist 写入）。"""
     page = authed_page
 
-    # 自行配置 LLM（写入 api_key），使 llm_available=true
+    # 自行配置 LLM（写入 api_key），使 /api/config 的 llm.api_key 非空
     put = page.request.put(
         f"{base_url}/api/llm/conf",
         headers={"Content-Type": "application/json"},
@@ -68,6 +68,9 @@ def test_match_assist_switch_visible_when_llm_configured(authed_page, base_url: 
 
     switch = page.locator("#llm-match-assist-switch")
     tip = page.locator("#llm-match-assist-tip")
+
+    # 等待条件渲染完成（/api/config 数据就绪后 JS 控制显隐）
+    switch.wait_for(state="visible", timeout=10000)
 
     # 已配置时：开关可见、提示不可见
     assert switch.is_visible()
