@@ -3,7 +3,6 @@
 提供：
 - ``ToolDefinition``：工具元信息（含 access 枚举与 readonly 推导）
 - ``ToolRegistry``：注册 / 执行 / JSON Schema 轻量校验 / 分段并行批量执行
-- 模块级单例 ``get_tool_registry()`` / ``reset_tool_registry()``
 
 零新增依赖：JSON Schema 校验使用手写轻量实现（必填字段、类型、pattern、maxLength），
 不引入 ``jsonschema``。
@@ -400,21 +399,3 @@ class ToolRegistry:
                     result=result_for_recorder,
                     error=error_for_recorder,
                 )
-
-
-# ---------------------------------------------------------------------------
-# 模块级单例（参照 mapping_service 的 Injectable 模式简化版）
-# ---------------------------------------------------------------------------
-
-_tool_registry: ToolRegistry = ToolRegistry()
-
-
-def get_tool_registry() -> ToolRegistry:
-    """返回模块级工具注册表单例。"""
-    return _tool_registry
-
-
-def reset_tool_registry() -> None:
-    """重置模块级单例（测试隔离）。"""
-    global _tool_registry
-    _tool_registry = ToolRegistry()
