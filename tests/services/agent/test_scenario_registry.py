@@ -9,6 +9,8 @@ BDD 场景：
    不得残留字符串表 ``_SCENARIO_PROVIDERS``
 5. 未注册 task_type → ``KeyError``（消息含未知 task_type 与已注册列表）
 6. 未装配（表为空）→ ``KeyError``（消息明确提示需先装配）
+7. 装配层 / 注册表 / 场景模块在**干净子进程**中以任意顺序导入均不触发
+   循环依赖（``subprocess`` 隔离验证 import 顺序无关）
 
 说明：注册表 ``_scenarios`` 为进程级共享状态。测试中通过 ``monkeypatch`` 隔离，
 不新增任何「仅测试用」的重置 API（monkeypatch 自动还原）。
@@ -17,6 +19,9 @@ BDD 场景：
 from __future__ import annotations
 
 import ast
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -146,4 +151,57 @@ class TestStaticWiringGuard:
         assert importlib_hits == [], f"注册表不应依赖 importlib，实际：{importlib_hits}"
         assert provider_names == [], (
             f"注册表不应保留字符串提供者表，实际：{provider_names}"
+        )
+
+
+class TestImportOrderGuard:
+    """场景 7：装配层 / 注册表 / 场景模块的导入顺序无关（无循环依赖）。
+
+    在**干净子进程**中分别按不同顺序导入三模块：若存在循环导入或装配层被
+    场景模块反向依赖，子进程会 ImportError 退出（returncode != 0）。
+    ``cwd`` 设为仓库根，使 ``python -c`` 的 ``sys.path[0]`` 指向仓库；
+    ``env`` 继承当前测试进程——conftest 已设 ``CONFIG_FILE`` 指向测试临时配置，
+    子进程因此不会读写本地 ``config.ini``。
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[3]
+
+    _IMPORT_ORDERS: dict[str, tuple[str, ...]] = {
+        # A: 装配层优先（触发其静态 import 链）
+        "composition_root_first": (
+            "import app.services.scenarios",
+            "import app.services.agent.registry",
+            "import app.services.matching.llm_assist",
+        ),
+        # B: 注册表优先
+        "registry_first": (
+            "import app.services.agent.registry",
+            "import app.services.matching.llm_assist",
+            "import app.services.scenarios",
+        ),
+        # C: 场景模块优先
+        "scenario_first": (
+            "import app.services.matching.llm_assist",
+            "import app.services.agent.registry",
+        ),
+    }
+
+    @pytest.mark.parametrize("order_name", sorted(_IMPORT_ORDERS))
+    def test_import_orders_no_cycle(self, order_name):
+        """任一导入顺序均成功（无循环依赖），失败时输出子进程 stderr。"""
+        code = "\n".join(self._IMPORT_ORDERS[order_name])
+
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=self._REPO_ROOT,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+        )
+
+        assert completed.returncode == 0, (
+            f"导入顺序 {order_name!r} 失败（returncode={completed.returncode}），"
+            f"存在循环导入或反向依赖。\n"
+            f"code:\n{code}\n"
+            f"stderr:\n{completed.stderr}"
         )

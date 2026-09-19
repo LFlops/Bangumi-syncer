@@ -19,7 +19,8 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | 预算 | `agent/budget.py` | 轮次预算策略（`task_type` + `thinking_level` → `max_iterations`） |
 | 运行时 | `agent/runtime.py` | `run` 编排与 `continue_run` 恢复状态机（原子抢占 / 异常分流 / replay 分派 / 补执行 / 终局分派） |
 | 场景协议 | `agent/scenario.py` | `ScenarioHooks`：场景差异点契约 |
-| 注册表 | `agent/registry.py` | `get_scenario(task_type)`：调度器等通用组件按 task_type 取得场景运行入口 |
+| 注册表 | `agent/registry.py` | `get_scenario(task_type)`：调度器等通用组件按 task_type 取得场景运行入口（纯机制，由装配层登记） |
+| 装配层 | `services/scenarios.py` | Composition Root：静态 import 场景工厂并 `wire_scenarios()` 登记进注册表 |
 | 场景实现 | `matching/llm_assist.py` | 匹配场景：工具注册 / seed 构建 / 条目校验 / 候选落库 / 通知 / 业务键 |
 
 ## ScenarioHooks 协议（`agent/scenario.py`）
@@ -86,12 +87,22 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 
 ## 新增一个 Agent 场景
 
-1. 实现 `ScenarioHooks` 的 8 个钩子（工具 / seed / chat / 预算 / 终局 等）；
-2. 提供工厂 `get_scenario_runtime() -> ScenarioRuntime`（`agent/registry.py` 中的类型）；
-3. 在 `agent/registry.py::_SCENARIO_PROVIDERS` 登记
-   `task_type -> (场景模块路径, 工厂函数名)`（惰性导入，通用层不反向依赖场景）；
+1. 实现 `ScenarioHooks` 的 8 个钩子（工具 / seed / chat / 预算 / 终局 等）与
+   `make_ctx`；
+2. 提供工厂 `get_scenario_runtime() -> ScenarioRuntime`（`agent/registry.py`
+   中的类型）；
+3. 在**应用装配层** `app/services/scenarios.py::wire_scenarios()` 中**静态
+   import** 该工厂并 `register_scenario(task_type, factory())`；
 4. 调度/触发入口按 `get_scenario(task_type).run / .continue_run` 调用，
    不 import 场景模块内部。
+
+装配触发点：生产由 `scheduler_bootstrap.register_all()` 调用一次；测试由
+`tests/conftest.py` 调用一次（保证测试中 `get_scenario("match")` 可用）。
+
+> 采用**静态装配（Composition Root）**而非注册表内字符串路径表惰性导入，动机：
+> 场景工厂调用对静态分析 / LSP 可见；注册表保持纯机制、不感知具体场景；装配层
+> 位于应用层，通用层（`agent/`）不反向依赖场景层。有 AST 守卫测试防回归
+> （禁止 `importlib` / 字符串提供者表），并有子进程导入顺序测试保证无循环导入。
 
 ## 约束与约定
 
