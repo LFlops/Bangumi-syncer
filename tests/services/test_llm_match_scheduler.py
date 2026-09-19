@@ -113,6 +113,140 @@ def test_get_driver_config_returns_cron():
     assert cfg["sync_interval"] == "*/5 * * * *"
 
 
+# ---------------------------------------------------------------------------
+# C1：cron 空串/非法值 fail-loud（不注册 job + error 日志含原值）
+#
+# 集中 getter 已移除默认值兜底（符合「配置类参数禁默认值兜底」沉淀），空串会直达
+# 调度器；基类 _schedule_or_refresh_job 的 `or DEFAULT_CRON` 与 _parse_cron 的
+# 静默降级会把配置错误掩盖为「以默认频率运行」。故在子类 _get_driver_config 前置
+# 校验：空串/非法表达式 → 记 error（含原值）+ 抛 ValueError，绝不回落默认值。
+# ---------------------------------------------------------------------------
+
+
+def test_get_driver_config_empty_cron_fails_loud():
+    """空串 cron → 抛 ValueError 且 error 日志可见（不回落 DEFAULT_CRON）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._get_driver_config()
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("llm_match_cron" in m for m in errors), (
+        f"空串 cron 应记 error 且指明配置项，实际 {errors}"
+    )
+
+
+def test_get_driver_config_blank_cron_fails_loud():
+    """仅空白字符的 cron 视同空值，同样 fail-loud。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="   ")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._get_driver_config()
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("llm_match_cron" in m for m in errors), (
+        f"空白 cron 应记 error 且指明配置项，实际 {errors}"
+    )
+
+
+def test_get_driver_config_invalid_cron_fails_loud_and_logs_raw_value():
+    """段数非法的 cron（如 'not a cron'）→ 抛 ValueError，error 日志含原值。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="not a cron")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._get_driver_config()
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("not a cron" in m for m in errors), (
+        f"非法 cron 的 error 日志应含原值，实际 {errors}"
+    )
+
+
+def test_get_driver_config_out_of_range_field_fails_loud():
+    """5 段但字段越界（minute=99）→ 同样 fail-loud，不静默降级默认。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="99 99 99 99 99")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._get_driver_config()
+
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("99 99 99 99 99" in m for m in errors), (
+        f"越界 cron 的 error 日志应含原值，实际 {errors}"
+    )
+
+
+def test_schedule_or_refresh_job_invalid_cron_does_not_register():
+    """非法 cron → 注册流程抛错且绝不调用 add_job（不注册 job）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="not a cron")
+    sched.scheduler = MagicMock()
+    sched.scheduler.running = True
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._schedule_or_refresh_job()
+
+    sched.scheduler.add_job.assert_not_called()
+
+
+def test_schedule_or_refresh_job_empty_cron_does_not_register():
+    """空串 cron → 注册流程抛错且绝不调用 add_job（不注册 job）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="")
+    sched.scheduler = MagicMock()
+    sched.scheduler.running = True
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        with pytest.raises(ValueError):
+            sched._schedule_or_refresh_job()
+
+    sched.scheduler.add_job.assert_not_called()
+
+
+def test_schedule_or_refresh_job_valid_cron_registers_job():
+    """正常 cron → 注册行为与现状一致（add_job 用本任务 JOB_ID）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config(cron="*/1 * * * *")
+    sched.scheduler = MagicMock()
+    sched.scheduler.running = True
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        sched._schedule_or_refresh_job()
+
+    sched.scheduler.add_job.assert_called_once()
+    _, kwargs = sched.scheduler.add_job.call_args
+    assert kwargs["id"] == LlmMatchScheduler.JOB_ID
+
+
 def test_disabled_run_sync_job_returns_early():
     sched = LlmMatchScheduler()
     cm = _make_config(enabled=False)

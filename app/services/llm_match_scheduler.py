@@ -27,6 +27,7 @@ import asyncio
 import time
 from typing import Any
 
+from apscheduler.triggers.cron import CronTrigger
 from pydantic import ValidationError
 
 from app.core.accounts import get_active_bangumi_config
@@ -120,12 +121,49 @@ class LlmMatchScheduler(BaseScheduler):
         return True
 
     def _get_driver_config(self) -> dict:
-        """返回含 sync_interval（cron）的配置（默认值由集中 getter 提供）。"""
-        return {
-            "sync_interval": config_manager.get_sync_llm_match_config()[
-                "llm_match_cron"
-            ]
-        }
+        """返回含 sync_interval（cron）的配置。
+
+        cron 空串/非法时 **fail-loud**（见 ``_resolve_cron_or_fail``）：集中 getter
+        已移除默认值兜底，若此处不拦截，基类 ``_schedule_or_refresh_job`` 的
+        ``or DEFAULT_CRON`` / ``_parse_cron`` 会静默回落默认值，掩盖用户的配置错误。
+        """
+        return {"sync_interval": self._resolve_cron_or_fail()}
+
+    def _resolve_cron_or_fail(self) -> str:
+        """读取并校验 cron；空串/非法表达式 → 记 error（含原值）+ 抛 ValueError。
+
+        校验失败即不注册/刷新 job（异常在基类 add_job 之前抛出），由上层
+        ``start`` 的 except 记录「调度器启动失败」；不回落 DEFAULT_CRON。
+        """
+        cron = config_manager.get_sync_llm_match_config()["llm_match_cron"]
+        expr = str(cron).strip()
+        if not expr:
+            msg = f"🤖 llm_match_cron 为空，拒绝注册定时任务（原值={cron!r}）"
+            logger.error(msg)
+            raise ValueError(msg)
+        if not self._is_valid_cron(expr):
+            msg = f"🤖 llm_match_cron 非法，拒绝注册定时任务（原值={cron!r}）"
+            logger.error(msg)
+            raise ValueError(msg)
+        return expr
+
+    @staticmethod
+    def _is_valid_cron(expr: str) -> bool:
+        """校验 5 段式 cron 表达式是否可被 APScheduler 接受（不回落默认值）。"""
+        parts = expr.split()
+        if len(parts) != 5:
+            return False
+        try:
+            CronTrigger(
+                minute=parts[0],
+                hour=parts[1],
+                day=parts[2],
+                month=parts[3],
+                day_of_week=parts[4],
+            )
+        except ValueError:
+            return False
+        return True
 
     async def _run_sync_job(self) -> None:
         """单轮调度：清理 → 恢复扫描 → pending 共享信号量并发消费。
