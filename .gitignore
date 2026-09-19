@@ -198,3 +198,6 @@ rrr/
 /specs/
 /scripts/memory_selfcheck.py
 /log.txt.*
+
+# eval 运行产物（本地生成，不入库）
+/eval-out/

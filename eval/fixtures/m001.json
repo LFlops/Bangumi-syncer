@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "case_id": "m001",
+  "meta": {
+    "model": "deepseek-chat",
+    "provider": "anthropic_compat",
+    "thinking_level": "medium",
+    "golden_note": "无职转生 S3 曾被规则层误配到 S2（325585）；期望 501963"
+  },
+  "rounds": [
+    {
+      "request_fingerprint": "sha256:1213a5b109569e3c491fc72326edf3c315c184bedd46fbe9a0c214e22a059256",
+      "response": {
+        "stop_reason": "tool_use",
+        "content": "I'll search for this title on Bangumi.",
+        "tool_calls": [
+          {
+            "type": "tool_use",
+            "id": "call_00_zI9UEZS8CPDRjNeSZ6dC1172",
+            "name": "search_bangumi",
+            "input": {
+              "title": "无职转生 到了异世界就拿出真本事"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "call_01_b5V1AUwj8DvmaB85O2Sa0300",
+            "name": "search_bangumi",
+            "input": {
+              "title": "無職転生"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 184,
+          "completion_tokens": 92,
+          "total_tokens": 276
+        }
+      },
+      "tool_results": [
+        {
+          "tool_use_id": "call_00_zI9UEZS8CPDRjNeSZ6dC1172",
+          "tool_name": "search_bangumi",
+          "input": {
+            "title": "无职转生 到了异世界就拿出真本事"
+          },
+          "content": "[{\"id\": 277554, \"name\": \"無職転生 ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/8b/00/277554_z999u.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/8b/00/277554_z999u.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/8b/00/277554_z999u.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/8b/00/277554_z999u.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/8b/00/277554_z999u.jpg\"}, \"summary\": \"\"}, {\"id\": 325585, \"name\": \"無職転生 ～異世界行ったら本気だす～ 第2クール\", \"name_cn\": \"无职转生～到了异世界就拿出真本事～ 第2部分\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/60/4d/325585_tfU01.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/60/4d/325585_tfU01.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/60/4d/325585_tfU01.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/60/4d/325585_tfU01.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/60/4d/325585_tfU01.jpg\"}, \"summary\": \"\"}, {\"id\": 373247, \"name\": \"無職転生Ⅱ ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生 第二季 ～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/cf/55/373247_aBFR1.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/cf/55/373247_aBFR1.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/cf/55/373247_aBFR1.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/cf/55/373247_aBFR1.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/cf/55/373247_aBFR1.jpg\"}, \"summary\": \"\"}, {\"id\": 501963, \"name\": \"無職転生Ⅲ ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生 第三季 ～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/1f/9e/501963_bXlEP.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/1f/9e/501963_bXlEP.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/1f/9e/501963_bXlEP.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/1f/9e/501963_bXlEP.jpg\"}, \"summary\": \"\"}, {\"id\": 444557, \"name\": \"無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール\", \"name_cn\": \"无职转生 第二季 ～到了异世界就拿出真本事～ 第2部分\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/ad/25/444557_e4hPO.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/ad/25/444557_e4hPO.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/ad/25/444557_e4hPO.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/ad/25/444557_e4hPO.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/ad/25/444557_e4hPO.jpg\"}, \"summary\": \"\"}]",
+          "is_error": false
+        },
+        {
+          "tool_use_id": "call_01_b5V1AUwj8DvmaB85O2Sa0300",
+          "tool_name": "search_bangumi",
+          "input": {
+            "title": "無職転生"
+          },
+          "content": "[{\"id\": 325585, \"name\": \"無職転生 ～異世界行ったら本気だす～ 第2クール\", \"name_cn\": \"无职转生～到了异世界就拿出真本事～ 第2部分\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/60/4d/325585_tfU01.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/60/4d/325585_tfU01.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/60/4d/325585_tfU01.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/60/4d/325585_tfU01.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/60/4d/325585_tfU01.jpg\"}, \"summary\": \"\"}, {\"id\": 373247, \"name\": \"無職転生Ⅱ ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生 第二季 ～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/cf/55/373247_aBFR1.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/cf/55/373247_aBFR1.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/cf/55/373247_aBFR1.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/cf/55/373247_aBFR1.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/cf/55/373247_aBFR1.jpg\"}, \"summary\": \"\"}, {\"id\": 501963, \"name\": \"無職転生Ⅲ ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生 第三季 ～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/1f/9e/501963_bXlEP.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/1f/9e/501963_bXlEP.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/1f/9e/501963_bXlEP.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/1f/9e/501963_bXlEP.jpg\"}, \"summary\": \"\"}, {\"id\": 277554, \"name\": \"無職転生 ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生～到了异世界就拿出真本事～\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/8b/00/277554_z999u.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/8b/00/277554_z999u.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/8b/00/277554_z999u.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/8b/00/277554_z999u.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/8b/00/277554_z999u.jpg\"}, \"summary\": \"\"}, {\"id\": 444557, \"name\": \"無職転生Ⅱ ～異世界行ったら本気だす～ 第2クール\", \"name_cn\": \"无职转生 第二季 ～到了异世界就拿出真本事～ 第2部分\", \"date\": \"\", \"type\": 2, \"images\": {\"large\": \"http://lain.bgm.tv/pic/cover/l/ad/25/444557_e4hPO.jpg\", \"common\": \"http://lain.bgm.tv/pic/cover/c/ad/25/444557_e4hPO.jpg\", \"medium\": \"http://lain.bgm.tv/pic/cover/m/ad/25/444557_e4hPO.jpg\", \"small\": \"http://lain.bgm.tv/pic/cover/s/ad/25/444557_e4hPO.jpg\", \"grid\": \"http://lain.bgm.tv/pic/cover/g/ad/25/444557_e4hPO.jpg\"}, \"summary\": \"\"}]",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "request_fingerprint": "sha256:e27834fb1ce69e7783131bf2d445aa24033d3f3c5cce6b4196fadb1b82953096",
+      "response": {
+        "stop_reason": "tool_use",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "tool_use",
+            "id": "call_00_0iuiTirEKA0fk5Yt6S502575",
+            "name": "get_subject_detail",
+            "input": {
+              "subject_id": "501963"
+            }
+          },
+          {
+            "type": "tool_use",
+            "id": "call_01_upZIO2S6HtIPHxIkOLJH9384",
+            "name": "check_subject",
+            "input": {
+              "subject_id": "501963"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 2312,
+          "completion_tokens": 72,
+          "total_tokens": 2384
+        }
+      },
+      "tool_results": [
+        {
+          "tool_use_id": "call_00_0iuiTirEKA0fk5Yt6S502575",
+          "tool_name": "get_subject_detail",
+          "input": {
+            "subject_id": "501963"
+          },
+          "content": "{\"date\": \"2026-07-04\", \"platform\": \"TV\", \"images\": {\"small\": \"https://lain.bgm.tv/r/200/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"grid\": \"https://lain.bgm.tv/r/100/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"large\": \"https://lain.bgm.tv/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"medium\": \"https://lain.bgm.tv/r/800/pic/cover/l/1f/9e/501963_bXlEP.jpg\", \"common\": \"https://lain.bgm.tv/r/400/pic/cover/l/1f/9e/501963_bXlEP.jpg\"}, \"summary\": \"「俺は、この異世界で本気だす！」\\r\\n34歳・童貞・無職の引きこもりニート男。\\r\\n両親の葬儀の日に家を追い出された瞬間、トラックに轢かれ命を落としてしまう。\\r\\n目覚めると、なんと剣と魔法の異世界で赤ん坊に生まれ変わっていた！\\r\\nゴミクズのように生きてきた男は、少年・ルーデウスとして異世界で本気をだして生きていく事を誓うー！\\r\\nルーデウスを待ち受けるのは、ロリっ子魔術師、エルフ耳のボクっ子幼馴染、凶暴ツンデレお嬢様、\\r\\nそのほかの様々な人間との出会い。そして過酷な冒険と戦い。\\r\\n新しい人生が動き出す！\\r\\n「人生やり直し」ファンタジー、開幕！\", \"name\": \"無職転生Ⅲ ～異世界行ったら本気だす～\", \"name_cn\": \"无职转生 第三季 ～到了异世界就拿出真本事～\", \"tags\": [{\"name\": \"异世界\", \"count\": 1778, \"total_count\": 265299}, {\"name\": \"轻小说改\", \"count\": 1321, \"total_count\": 499613}, {\"name\": \"2026年7月\", \"count\": 1259, \"total_count\": 24496}, {\"name\": \"奇幻\", \"count\": 1168, \"total_count\": 477347}, {\"name\": \"StudioBind\", \"count\": 1102, \"total_count\": 15822}, {\"name\": \"TV\", \"count\": 1008, \"total_count\": 1415930}, {\"name\": \"无职转生\", \"count\": 955, \"total_count\": 5175}, {\"name\": \"冒险\", \"count\": 915, \"total_count\": 54784}, {\"name\": \"后宫\", \"count\": 831, \"total_count\": 305860}, {\"name\": \"小说改\", \"count\": 612, \"total_count\": 161822}, {\"name\": \"日本\", \"count\": 486, \"total_count\": 302377}, {\"name\": \"2026\", \"count\": 469, \"total_count\": 45569}, {\"name\": \"战斗\", \"count\": 444, \"total_count\": 476620}, {\"name\": \"轻改\", \"count\": 395, \"total_count\": 153412}, {\"name\": \"续作\", \"count\": 145, \"total_count\": 47036}, {\"name\": \"未定档\", \"count\": 33, \"total_count\": 4175}, {\"name\": \"涩谷亮介\", \"count\": 32, \"total_count\": 81}, {\"name\": \"2026年4月\", \"count\": 31, \"total_count\": 25865}, {\"name\": \"穿越\", \"count\": 31, \"total_count\": 63664}, {\"name\": \"恋爱\", \"count\": 28, \"total_count\": 569711}, {\"name\": \"2025\", \"count\": 24, \"total_count\": 73462}, {\"name\": \"奇幻异世\", \"count\": 14, \"total_count\": 193}, {\"name\": \"转生\", \"count\": 13, \"total_count\": 5496}, {\"name\": \"渋谷亮介\", \"count\": 12, \"total_count\": 76}, {\"name\": \"日常\", \"count\": 12, \"total_count\": 404450}, {\"name\": \"动画\", \"count\": 11, \"total_count\": 35816}, {\"name\": \"魔法\", \"count\": 10, \"total_count\": 20187}, {\"name\": \"2026年\", \"count\": 9, \"total_count\": 1959}, {\"name\": \"涉谷亮介\", \"count\": 8, \"total_count\": 15}, {\"name\": \"藤泽庆昌\", \"count\": 5, \"total_count\": 148}], \"infobox\": [{\"key\": \"中文名\", \"value\": \"无职转生 第三季 ～到了异世界就拿出真本事～\"}, {\"key\": \"别名\", \"value\": [{\"v\": \"Mushoku Tensei: Jobless Reincarnation Season 3\"}, {\"v\": \"Mushoku Tensei III: Isekai Ittara Honki Dasu\"}, {\"v\": \"无职转生 第三季 ～在异世界认真地活下去～\"}]}, {\"key\": \"话数\", \"value\": \"14\"}, {\"key\": \"放送开始\", \"value\": \"2026年7月4日\"}, {\"key\": \"放送星期\", \"value\": \"星期日\"}, {\"key\": \"官方网站\", \"value\": \"https://mushokutensei.jp/\"}, {\"key\": \"播放电视台\", \"value\": \"TOKYO MX / BS11\"}, {\"key\": \"其他电视台\", \"value\": \"サンテレビ / KBS京都\"}, {\"key\": \"导演\", \"value\": \"渋谷亮介\"}, {\"key\": \"音乐\", \"value\": \"藤澤慶昌\"}, {\"key\": \"链接\", \"value\": [{\"k\": \"X\", \"v\": \"https://x.com/mushokutensei_A\"}]}, {\"key\": \"Copyright\", \"value\": \"©理不尽な孫の手/MFブックス/「無職転生Ⅲ」製作委員会\"}, {\"key\": \"原作\", \"value\": \"理不尽な孫の手（MFブックス／KADOKAWA刊）\"}, {\"key\": \"人物设定\", \"value\": \"嶋田真恵・古川良太\"}, {\"key\": \"副人物设定\", \"value\": \"西野佳祐[西野佳佑]\"}, {\"key\": \"道具设计\", \"value\": \"反田誠二、勝谷遥\"}, {\"key\": \"主题歌演出\", \"value\": \"大原ゆい子 / 中島美嘉\"}, {\"key\": \"製作\", \"value\": \"「無職転生Ⅲ」製作委員会（博報堂DYミュージック&ピクチャーズ、東宝、KADOKAWA、フロンティアワークス、日本BS放送、グリーエンターテインメント、EGG FIRM）\"}, {\"key\": \"企画\", \"value\": \"神部宗之、大田圭二、工藤大丈、辻政英、羽川寛、宿輪浩介、大澤信博\"}, {\"key\": \"制片人\", \"value\": \"山中隆弘、菱山光輝、滝澤圭一、今井遼介、大和田智之、大須賀翔、畠山拓郎\"}, {\"key\": \"副制片人\", \"value\": \"岩田誉生、東真央\"}, {\"key\": \"助理制片人\", \"value\": \"荻原玲奈、鈴木滉人、外垣萌生\"}, {\"key\": \"宣传制片人\", \"value\": \"下山亮\"}, {\"key\": \"动画制片人\", \"value\": \"大友寿也\"}, {\"key\": \"制作管理\", \"value\": \"制作デスク：中元英史\"}, {\"key\": \"设定制作\", \"value\": \"森敦子\"}, {\"key\": \"制作进行\", \"value\": \"津村航輝\"}, {\"key\": \"协力\", \"value\": \"平野栄一、奥山真司、長谷川嘉範（KADOKAWA）、村仲しえな（KADOKAWA）、有賀彩乃（KADOKAWA）、上野亮、根岸淳、森永沙絵子、吉岡美羽、藤原滉士、加藤えみ、佐藤茂薫（クオラス）、小島英徳（クオラス）、福岡弘起（クオラス）\"}, {\"key\": \"设定协力\", \"value\": \"杉山和隆、高橋瑞紀、今村亮、日崖タケ、福本夏央\"}, {\"key\": \"音乐制作\", \"value\": \"東宝ミュージック\"}, {\"key\": \"音乐制作人\", \"value\": \"小林健樹\"}, {\"key\": \"音乐助理\", \"value\": \"早瀬晶望\"}, {\"key\": \"主题歌作词\", \"value\": \"大原ゆい子 / シノダ\"}, {\"key\": \"主题歌作曲\", \"value\": \"大原ゆい子 / シノダ\"}, {\"key\": \"主题歌编曲\", \"value\": \"MANYO / ヒトリエ\"}, {\"key\": \"录音\", \"value\": \"根岸信洋\"}, {\"key\": \"录音助理\", \"value\": \"久保田未萌\"}, {\"key\": \"音响\", \"value\": \"マジックカプセル\"}, {\"key\": \"音响制作担当\", \"value\": \"見留滉平\"}, {\"key\": \"特效\", \"value\": \"福田直征\"}, {\"key\": \"美术设计\", \"value\": \"新妻雅行（千住工房）\"}, {\"key\": \"背景美术\", \"value\": \"三宅早織、小坂由佳子、本多敬、長岡慎治、キム・ミンジ、佐藤瞳\"}, {\"key\": \"美术板\", \"value\": \"三宅昌和\"}, {\"key\": \"美术监督助理\", \"value\": \"宮本実生（スタジオ・ルーファス）\"}, {\"key\": \"摄影\", \"value\": \"金原友哉、魚山真志、浅黄康裕、井手はるか、山部七海、松井凛、田中慈雨、山本聖、頓所信二\"}, {\"key\": \"在线剪辑\", \"value\": \"大西邦侑、桑原礼門；在线剪辑工作室：Imagica EMS\"}, {\"key\": \"3D 设计\", \"value\": \"中村倫子\"}, {\"key\": \"2D 设计\", \"value\": \"鎌田誠（ガロアプロダクション）\"}, {\"key\": \"总作画监督\", \"value\": \"中野圭哉、嶋田聡史[島田賢史]\"}, {\"key\": \"作画监督\", \"value\": \"中野圭哉、勝谷遥、李嘉、嶋田聡史[島田賢史]、藤部生馬、杉薗真希、大原大、山村俊了\"}, {\"key\": \"作画监督助理\", \"value\": \"佐々木菜美子、高田愛華、和久田晃弘\"}], \"rating\": {\"rank\": 337, \"total\": 3952, \"count\": {\"1\": 56, \"2\": 22, \"3\": 20, \"4\": 24, \"5\": 66, \"6\": 192, \"7\": 762, \"8\": 1724, \"9\": 602, \"10\": 484}, \"score\": 7.9}, \"total_episodes\": 14, \"collection\": {\"on_hold\": 205, \"dropped\": 140, \"wish\": 5058, \"collect\": 1489, \"doing\": 14882}, \"id\": 501963, \"eps\": 14, \"meta_tags\": [\"后宫\", \"TV\", \"日本\", \"奇幻\", \"冒险\", \"小说改\"], \"volumes\": 0, \"series\": false, \"locked\": false, \"nsfw\": false, \"type\": 2}",
+          "is_error": false
+        },
+        {
+          "tool_use_id": "call_01_upZIO2S6HtIPHxIkOLJH9384",
+          "tool_name": "check_subject",
+          "input": {
+            "subject_id": "501963"
+          },
+          "content": "{\"valid\": true, \"reason\": \"\"}",
+          "is_error": false
+        }
+      ]
+    },
+    {
+      "request_fingerprint": "sha256:7de21bdd7d737056ad0f4e1a249259dbd669e4cb6790a026701dc5ab945ea272",
+      "response": {
+        "stop_reason": "tool_use",
+        "content": "",
+        "tool_calls": [
+          {
+            "type": "tool_use",
+            "id": "call_00_q6XvycdU0F9gQ8Rj4VMl0115",
+            "name": "submit_suggestion",
+            "input": {
+              "subject_id": "501963",
+              "reason": "标题「无职转生：到了异世界就拿出真本事」第3季，与条目501963「无职转生 第三季 ～到了异世界就拿出真本事～」完全对应，放送开始日期2026-07-04与请求开播日期一致，类型为TV动画（episode所属）。"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 5200,
+          "completion_tokens": 121,
+          "total_tokens": 5321
+        }
+      },
+      "tool_results": []
+    }
+  ],
+  "expected_outcome": {
+    "run_status": "succeeded",
+    "stop_reason": "submit_suggestion",
+    "candidate_subject_id": "501963",
+    "notifications": 1
+  }
+}
