@@ -519,6 +519,93 @@ class TestAnthropicProviderChat:
         assert resp.usage.total_tokens == 150
 
     @pytest.mark.asyncio
+    async def test_thinking_degrades_forced_tool_choice_to_auto(self):
+        """thinking 开启时强制 tool_choice 降级为 auto（Anthropic/DeepSeek 约束）。"""
+        mock_client = _make_mock_client(
+            json_body={
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "deepseek-v4-pro",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }
+        )
+        tools = [
+            {
+                "name": "submit_suggestion",
+                "description": "提交建议",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = _make_provider(thinking_level="medium")
+            await provider.chat(
+                [Message(role="user", content="Q")],
+                tools=tools,
+                tool_choice="submit_suggestion",
+            )
+        body = mock_client.post.call_args[1]["json"]
+        assert body["thinking"]["type"] == "enabled"
+        assert body["tool_choice"] == {"type": "auto"}
+
+    @pytest.mark.asyncio
+    async def test_forced_tool_choice_kept_when_thinking_off(self):
+        """thinking off 时强制 tool_choice 保持 tool 形态（不降级）。"""
+        mock_client = _make_mock_client(
+            json_body={
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "deepseek-chat",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }
+        )
+        tools = [
+            {
+                "name": "submit_suggestion",
+                "description": "提交建议",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = _make_provider(thinking_level="off")
+            await provider.chat(
+                [Message(role="user", content="Q")],
+                tools=tools,
+                tool_choice="submit_suggestion",
+            )
+        body = mock_client.post.call_args[1]["json"]
+        assert "thinking" not in body
+        assert body["tool_choice"] == {"type": "tool", "name": "submit_suggestion"}
+
+    @pytest.mark.asyncio
+    async def test_force_tool_choice_degraded_flag_degrades_to_auto(self):
+        """端点级降级标志置位后，强制 tool_choice 归一化为 auto。"""
+        mock_client = _make_mock_client(
+            json_body={
+                "content": [{"type": "text", "text": "ok"}],
+                "model": "deepseek-v4-pro",
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            }
+        )
+        tools = [
+            {
+                "name": "submit_suggestion",
+                "description": "提交建议",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ]
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = _make_provider()
+            provider._force_tool_choice_degraded = True
+            await provider.chat(
+                [Message(role="user", content="Q")],
+                tools=tools,
+                tool_choice="submit_suggestion",
+            )
+        body = mock_client.post.call_args[1]["json"]
+        assert body["tool_choice"] == {"type": "auto"}
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("status_code", [401, 429, 500])
     async def test_http_error_handling(self, status_code):
         """HTTP 错误抛出 httpx.HTTPStatusError。"""

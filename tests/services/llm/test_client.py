@@ -586,6 +586,45 @@ class TestParamRejectionDegradation:
         assert provider._extras_disabled is True
 
     @pytest.mark.asyncio
+    async def test_tool_choice_rejection_degrades_and_retries(
+        self, reset_llm_singleton, mock_config, mock_log_usage
+    ):
+        """首次 400（thinking 模式拒绝强制 tool_choice）→ 专用降级标记置位 → 重试成功。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.anthropic import AnthropicProvider
+
+        calls: list[dict] = []
+
+        def _flaky_chat(messages, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise TestParamRejectionDegradation._httpx_400(
+                    '{"error": {"message": '
+                    '"Thinking mode does not support this tool_choice"}}'
+                )
+            return ChatResponse(content="ok", model="deepseek-v4-pro", usage=None)
+
+        provider = AnthropicProvider(
+            api_base="https://api.deepseek.com/anthropic/v1",
+            api_key="sk-test",
+            model="deepseek-v4-pro",
+        )
+        provider.chat = AsyncMock(side_effect=_flaky_chat)
+
+        client = LLMClient()
+        client._provider = provider
+        resp = await client.chat(
+            [Message(role="user", content="Q")],
+            tools=[{"name": "t", "description": "d", "parameters": {"type": "object"}}],
+            tool_choice="t",
+        )
+
+        assert resp.content == "ok"
+        assert len(calls) == 2  # 降级后立即重试，无退避
+        assert provider._force_tool_choice_degraded is True
+        assert provider._extras_disabled is True
+
+    @pytest.mark.asyncio
     async def test_param_rejection_latency_excludes_failed_attempt(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):

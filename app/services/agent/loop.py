@@ -136,16 +136,15 @@ async def run(
                 stop_reason="end_turn", text=resp.content, last_response=resp
             )
 
-        # ③ 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加（F1 修正）
-        messages.append(
-            Message(
-                role="assistant",
-                content=[
-                    ToolUseBlock(id=tc.id, name=tc.name, input=tc.input)
-                    for tc in tool_calls
-                ],
-            )
-        )
+        # ③ 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加（F1 修正）。
+        # 同时保留响应中的非工具块（Text/Thinking）：思考模型的 thinking 块必须随
+        # tool_use 一并回传（Anthropic/DeepSeek 约束，否则真实端点 400：
+        # "content[].thinking ... must be passed back"）；OpenAI 兼容层在 provider
+        # 侧按各自协议处理（thinking 块跳过）。
+        assistant_blocks: list = list(resp.blocks) or [
+            ToolUseBlock(id=tc.id, name=tc.name, input=tc.input) for tc in tool_calls
+        ]
+        messages.append(Message(role="assistant", content=assistant_blocks))
 
         # ④ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
         terminal_tc = next(

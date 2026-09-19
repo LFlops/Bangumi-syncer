@@ -19,9 +19,14 @@ class BaseProvider(ABC):
         _extras_disabled: 端点拒绝扩展参数（thinking/reasoning 等）后由
             LLMClient 置位的降级标记——置位后 _build_request 不再构造
             扩展字段（双重保险第二道，见 client._is_param_rejection）。
+        _force_tool_choice_degraded: 端点拒绝强制工具选择（如 thinking 模式
+            下的服务端约束："Thinking mode does not support this
+            tool_choice"）后由 LLMClient 置位的降级标记——置位后
+            _build_request 将强制 tool_choice 降级为 auto。
     """
 
     _extras_disabled: bool = False
+    _force_tool_choice_degraded: bool = False
 
     @abstractmethod
     async def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:

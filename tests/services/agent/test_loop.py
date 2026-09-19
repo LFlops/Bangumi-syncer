@@ -22,6 +22,8 @@ from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -744,3 +746,51 @@ def test_loop_no_trace_imports():
                 raise AssertionError(
                     f"loop.py 不应 from ... import trace: {node.module}"
                 )
+
+
+# ---------------------------------------------------------------------------
+# N. 思考模型兼容：assistant 聚合消息保留 Text/Thinking 块（随 tool_use 回传）
+# ---------------------------------------------------------------------------
+
+
+async def test_assistant_message_preserves_text_and_thinking_blocks():
+    """响应含 text+thinking+tool_use 时，assistant 消息保留全部块（顺序不变）。
+
+    思考模型（Anthropic thinking 模式 / DeepSeek pro）要求 thinking 块随
+    tool_use 在后续请求回传，否则真实端点 400。
+    """
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        if len(calls) == 1:
+            return ChatResponse(
+                content="先搜索",
+                blocks=[
+                    TextBlock(text="先搜索"),
+                    ThinkingBlock(thinking="我需要先搜索", signature="sig-1"),
+                    _tool_use("t1", "search_bangumi"),
+                ],
+                stop_reason="tool_use",
+            )
+        return _resp("end_turn", None)
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(
+        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
+    )
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assistant_msg = next(m for m in calls[1] if m.role == "assistant")
+    types = [b.type for b in assistant_msg.content]
+    assert types == ["text", "thinking", "tool_use"]
+    thinking_block = next(b for b in assistant_msg.content if b.type == "thinking")
+    assert thinking_block.signature == "sig-1"

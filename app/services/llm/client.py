@@ -195,6 +195,19 @@ class LLMClient:
                 # 置位降级标记后立即重试（该 provider 实例生命周期内不再发送）
                 if not extras_degraded and _is_param_rejection(e):
                     extras_degraded = True
+                    resp_text = (
+                        getattr(getattr(e, "response", None), "text", "") or ""
+                    ).lower()
+                    if "tool_choice" in resp_text and hasattr(
+                        self._provider, "_force_tool_choice_degraded"
+                    ):
+                        # 专用降级：部分端点（thinking 模式）拒绝强制工具选择，
+                        # 仅降级 tool_choice，保留 thinking 等其它参数
+                        self._provider._force_tool_choice_degraded = True
+                        logger.warning(
+                            "LLM endpoint rejected forced tool_choice, "
+                            f"degraded to auto: {_format_error_detail(e)}"
+                        )
                     if hasattr(self._provider, "_extras_disabled"):
                         self._provider._extras_disabled = True
                     logger.warning(

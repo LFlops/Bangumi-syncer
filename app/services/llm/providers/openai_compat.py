@@ -169,7 +169,20 @@ class OpenAICompatProvider(BaseProvider):
         if "tool_choice" in kwargs:
             tc = kwargs["tool_choice"]
             if tc is not None:
-                body["tool_choice"] = self._normalize_openai_tool_choice(tc)
+                normalized_tc = self._normalize_openai_tool_choice(tc)
+                if (
+                    self._force_tool_choice_degraded
+                    and isinstance(normalized_tc, dict)
+                    and normalized_tc.get("type") == "function"
+                ):
+                    # 端点级降级（client 依据服务端拒绝置位）：该端点不支持
+                    # 强制工具选择（如 thinking 模式约束），改为 auto。
+                    logger.warning(
+                        "已按端点约束将强制 tool_choice 降级为 auto"
+                        "（该端点不支持强制工具选择）"
+                    )
+                    normalized_tc = "auto"
+                body["tool_choice"] = normalized_tc
         # cache_control 是 Anthropic 专属参数，OpenAI 无此字段——忽略不发送，
         # 即便调用方误传也不得进入请求体（否则部分端点报错）
         body.pop("cache_control", None)

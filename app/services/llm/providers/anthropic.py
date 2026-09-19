@@ -159,7 +159,20 @@ class AnthropicProvider(BaseProvider):
             body["tools"] = [self._normalize_anthropic_tool(t) for t in tools]
         tool_choice = kwargs.get("tool_choice")
         if tool_choice is not None:
-            body["tool_choice"] = self._normalize_anthropic_tool_choice(tool_choice)
+            normalized_tc = self._normalize_anthropic_tool_choice(tool_choice)
+            if (
+                self._force_tool_choice_degraded
+                and isinstance(normalized_tc, dict)
+                and normalized_tc.get("type") in ("tool", "any")
+            ):
+                # 端点级降级（client 依据服务端拒绝置位）：该端点不支持强制
+                # 工具选择（如 thinking 模式约束），改为 auto。
+                logger.warning(
+                    "已按端点约束将强制 tool_choice 降级为 auto"
+                    "（该端点不支持强制工具选择）"
+                )
+                normalized_tc = {"type": "auto"}
+            body["tool_choice"] = normalized_tc
 
         # thinking_level：每任务 kwargs 覆盖 > 全局默认；模型不支持时降级；
         # 端点拒绝过扩展参数时（_extras_disabled）不再发送
@@ -181,6 +194,16 @@ class AnthropicProvider(BaseProvider):
             body["temperature"] = (
                 1  # Anthropic 要求 thinking 开启时 temperature 必须为 1
             )
+            # thinking 模式不支持强制工具选择（Anthropic/DeepSeek 约束：
+            # tool_choice 仅 auto/none 可用）→ 降级 auto 并告警；收尾依赖模型
+            # 自行提交（场景侧 output_parser 兜底解析文本建议）。
+            forced = body.get("tool_choice")
+            if isinstance(forced, dict) and forced.get("type") in ("tool", "any"):
+                logger.warning(
+                    "thinking 模式不支持强制 tool_choice，已降级为 auto"
+                    "（收尾依赖模型自行调用终止工具）"
+                )
+                body["tool_choice"] = {"type": "auto"}
         return body
 
     @staticmethod
