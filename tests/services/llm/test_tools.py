@@ -20,8 +20,6 @@ from app.services.llm.tools import (
     ToolDefinition,
     ToolError,
     ToolRegistry,
-    get_tool_registry,
-    reset_tool_registry,
     serialize_tool_result,
 )
 
@@ -738,22 +736,6 @@ async def test_execute_batch_terminal_returns_capture_without_handler():
     assert cap.name == "submit"
     assert cap.args == {"subject_id": "9"}
     assert called == []
-
-
-# ---------------------------------------------------------------------------
-# 模块级单例
-# ---------------------------------------------------------------------------
-
-
-def test_module_singleton_get_and_reset():
-    reset_tool_registry()
-    reg = get_tool_registry()
-    assert isinstance(reg, ToolRegistry)
-    # 二次获取同一实例
-    assert get_tool_registry() is reg
-    # reset 后获得新实例
-    reset_tool_registry()
-    assert get_tool_registry() is not reg
 
 
 # ---------------------------------------------------------------------------
