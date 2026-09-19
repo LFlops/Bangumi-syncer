@@ -468,7 +468,7 @@ async def run_case(
         _maybe_patch_legacy_search(bgm)
 
     with tools_cm:
-        status = await llm_assist.run(
+        status = await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=sync_record,
             bgm=bgm,

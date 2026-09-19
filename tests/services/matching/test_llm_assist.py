@@ -245,7 +245,7 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
 
     chat = _chat_side_effect([_search_response(), _submit_response()])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -293,7 +293,7 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
         [_search_response(), _submit_response("456", "无候选补充")]
     )
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -327,7 +327,7 @@ async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
     chat = _chat_side_effect([_submit_response("456", "无候选补充")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -356,7 +356,7 @@ async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch)
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
     chat = _chat_side_effect([_submit_response("456", "闭环")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -404,7 +404,7 @@ async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
     chat = _chat_side_effect([_submit_response("123", "补写业务键")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -436,7 +436,7 @@ async def test_run_submit_suggestion_projects_llm_fields_and_leaves_columns_empt
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
     chat = _chat_side_effect([_submit_response("777", "投影理由")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -484,7 +484,7 @@ async def test_run_submit_suggestion_marks_existing_candidate_on_duplicate_subje
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
     chat = _chat_side_effect([_submit_response("123", "同候选加强")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -538,7 +538,7 @@ async def test_run_submit_skips_reviving_resolved_candidate(
     ns = _make_notify()
     chat = _chat_side_effect([_submit_response("123", "r")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -606,7 +606,6 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
-        bgm=None,
     )
 
     assert returned is None, "并发处理时不应返回候选 id（跳过信号）"
@@ -741,7 +740,6 @@ def test_persist_content_cas_matches_null_or_empty_json(raw_value):
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
-        bgm=None,
     )
 
     assert returned == cid, "COALESCE 应把 NULL/空串归一并命中内容 CAS"
@@ -780,7 +778,6 @@ def test_persist_llm_candidate_succeeded_guard_skips_when_run_terminal(log_recor
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
-        bgm=None,
     )
 
     assert returned is None, "run 已被并发终态化时应返回 None（跳过通知）"
@@ -965,7 +962,7 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
 
     chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -1010,7 +1007,7 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
 
     chat = _chat_side_effect([_submit_response("999999", "非法")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -1070,7 +1067,7 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
     # 每轮都调 search（失败），共 max_iterations(medium=5) 轮 → exhausted
     chat = _chat_side_effect([_search_response() for _ in range(5)])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_Boom(),
@@ -1123,7 +1120,7 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
         ]
     )
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -1163,7 +1160,7 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
         ]
     )
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -1255,7 +1252,6 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
             subject_id="123",
             reason="r",
             stop_reason="submit_suggestion",
-            bgm=None,
         )
 
     # 回滚验证：agent_runs 未 succeeded，pending_candidates 未被改写
@@ -1283,7 +1279,7 @@ async def test_run_candidate_committed_and_visible_to_independent_connection(
 
     monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -1342,7 +1338,6 @@ def test_persist_llm_candidate_race_skip_commits_cancelled_state(monkeypatch):
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
-        bgm=None,
     )
 
     assert returned is None, "守卫命中 0 行应返回 None（跳过通知）"
@@ -1378,7 +1373,7 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
     ns = _make_notify()
 
     results = await asyncio.gather(
-        llm_assist.run(
+        llm_assist.get_scenario_runtime().run(
             run_a,
             sync_record=_make_sync_record(sync_record_id=sr_a),
             bgm=_make_bgm(),
@@ -1387,7 +1382,7 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
             notification_service=ns,
             span_recorder=None,
         ),
-        llm_assist.run(
+        llm_assist.get_scenario_runtime().run(
             run_b,
             sync_record=_make_sync_record(sync_record_id=sr_b),
             bgm=_make_bgm(),
@@ -1448,7 +1443,7 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
 
     bgm = _make_bgm()
     chat = _chat_side_effect([_submit_response()])
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=_make_sync_record(sync_record_id=sr_id),
         bgm=bgm,
@@ -1574,7 +1569,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
 
     run_a, sr_a = "run-g1-a", 60
     database_manager.agent_runs.create_pending(run_a, "match", sr_a)
-    await llm_assist.run(
+    await llm_assist.get_scenario_runtime().run(
         run_a,
         sync_record=_make_sync_record(sync_record_id=sr_a),
         bgm=bgm1,
@@ -1586,7 +1581,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
 
     run_b, sr_b = "run-g1-b", 61
     database_manager.agent_runs.create_pending(run_b, "match", sr_b)
-    await llm_assist.run(
+    await llm_assist.get_scenario_runtime().run(
         run_b,
         sync_record=_make_sync_record(sync_record_id=sr_b),
         bgm=bgm2,
@@ -1600,7 +1595,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
 
 
 # ---------------------------------------------------------------------------
-# F5：llm_assist.run 将 config_override（llm_match_max_iterations）透传给
+# F5：场景运行入口将 config_override（llm_match_max_iterations）透传给
 # get_max_iterations（优先级：配置覆盖 > 策略 > 默认）；空值传 None
 # ---------------------------------------------------------------------------
 
@@ -1637,7 +1632,9 @@ async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
     sr_id = 50
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     sr = _make_sync_record(sync_record_id=sr_id)
-    await llm_assist.run(run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="high")
+    await llm_assist.get_scenario_runtime().run(
+        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="high"
+    )
 
     assert captured["task_type"] == "match"
     assert captured["thinking_level"] == "high"
@@ -1675,7 +1672,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     sr_id = 51
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     sr = _make_sync_record(sync_record_id=sr_id)
-    await llm_assist.run(
+    await llm_assist.get_scenario_runtime().run(
         run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
     )
 
@@ -1729,7 +1726,7 @@ async def test_run_non_positive_config_override_falls_back_to_none(
         "前置：agent_run 应创建成功（否则 run 会因抢占失败提前返回 skipped）"
     )
     sr = _make_sync_record(sync_record_id=sr_id)
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
     )
     assert status != "skipped"
@@ -1772,7 +1769,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     run_id = "run-g3-invalid"
     sr_id = 71
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-    await llm_assist.run(
+    await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=_make_sync_record(sync_record_id=sr_id),
         bgm=_make_bgm(),
@@ -1856,7 +1853,7 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
         run_id = "run-think-medium"
         sr_id = 80
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-        await llm_assist.run(
+        await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=_make_sync_record(sync_record_id=sr_id),
             bgm=_make_bgm(),
@@ -1898,7 +1895,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
         run_id = "run-think-high"
         sr_id = 81
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-        await llm_assist.run(
+        await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=_make_sync_record(sync_record_id=sr_id),
             bgm=_make_bgm(),
@@ -1927,7 +1924,7 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
         run_id = "run-think-off"
         sr_id = 82
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-        await llm_assist.run(
+        await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=_make_sync_record(sync_record_id=sr_id),
             bgm=_make_bgm(),
@@ -1962,7 +1959,7 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
         run_id = "run-custom-chatfn"
         sr_id = 83
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-        await llm_assist.run(
+        await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=_make_sync_record(sync_record_id=sr_id),
             bgm=_make_bgm(),
@@ -2036,7 +2033,7 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
 
     chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -2092,7 +2089,7 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
 
     chat = _chat_side_effect([_submit_response("111", "直接建议")])
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=bgm,
@@ -2460,7 +2457,7 @@ async def test_run_llm_call_error_retryable_true_increments_attempts(
     async def _boom(messages, *, tools=None, tool_choice=None):
         raise LLMCallError("429 rate limited", retryable=True)
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -2487,7 +2484,7 @@ async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch
     async def _boom(messages, *, tools=None, tool_choice=None):
         raise LLMCallError("401 Unauthorized", retryable=False)
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -2520,7 +2517,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
         raise LLMCallError("500 Internal Server Error", retryable=True)
 
     # 第 1 次 → processing (attempts=1)
-    status1 = await llm_assist.run(
+    status1 = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -2532,7 +2529,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
 
     # 重新 claim 并跑第 2 次 → processing (attempts=2)
     database_manager.agent_runs.update_run_status(run_id, "pending")
-    status2 = await llm_assist.run(
+    status2 = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -2544,7 +2541,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
 
     # 第 3 次 → failed (attempts=3)
     database_manager.agent_runs.update_run_status(run_id, "pending")
-    status3 = await llm_assist.run(
+    status3 = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -2751,7 +2748,6 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
-        bgm=None,
     )
     after = int(time.time())
 
@@ -2844,7 +2840,11 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
         patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.mark_no_suggestion.assert_called_once_with(
         "r", stop_reason="end_turn", total_tokens=222
@@ -2887,8 +2887,11 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
-            llm_assist.continue_run(
-                "r", {"id": 1}, MagicMock(), notification_service=fake_svc
+            llm_assist.get_scenario_runtime().continue_run(
+                "r",
+                sync_record={"id": 1},
+                bgm=MagicMock(),
+                notification_service=fake_svc,
             )
         )
 
@@ -2936,7 +2939,11 @@ def test_continue_run_submit_uses_replayed_total_tokens():
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-tok", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-tok", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     handle.assert_called_once()
     assert handle.call_args[1].get("total_tokens") == 150, (
@@ -2975,7 +2982,11 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
         patch("app.services.agent.runtime._replay_missing_tool", backfill),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     # 缺失工具补执行一次，并锚定同轮 span（sequence=0）
     backfill.assert_awaited_once()
@@ -3007,7 +3018,11 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     loop.assert_awaited_once()
     assert loop.await_args.kwargs["seed_messages"] is seed
@@ -3044,7 +3059,11 @@ def test_continue_run_continuation_sums_replay_and_new_round_tokens():
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     loop.assert_awaited_once()
     handle.assert_called_once()
@@ -3082,7 +3101,11 @@ def _run_continue_run_with_config(raw_max: str):
         patch("app.services.matching.llm_assist.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg(raw_max)
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
     return captured.get("config_override"), log
 
 
@@ -3133,7 +3156,11 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
         patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     # 不再续跑 loop，但必须落终态（否则 run 永久 processing）
     loop.assert_not_awaited()
@@ -3163,7 +3190,11 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     loop.assert_not_awaited()
     repo.mark_no_suggestion.assert_called_once_with(
@@ -3188,7 +3219,11 @@ def test_continue_run_replay_exhausted_logs_warning():
         patch("app.services.agent.runtime.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.mark_no_suggestion.assert_called_once_with(
         "r", stop_reason="exhausted", total_tokens=444
@@ -3237,7 +3272,11 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     handle.assert_called_once()
     result_arg = handle.call_args[0][2]
@@ -3267,7 +3306,11 @@ def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn(
         patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.mark_no_suggestion.assert_called_once_with(
         "r", stop_reason="end_turn", total_tokens=55
@@ -3302,7 +3345,11 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
         patch("app.services.agent.runtime.loop_run", new=AsyncMock()),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r2", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r2", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.mark_no_suggestion.assert_called_once_with(
         "r2", stop_reason="exhausted", total_tokens=66
@@ -3343,7 +3390,11 @@ def test_continue_run_llm_call_error_retryable_false_marks_failed():
         ),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-err-terminal", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-err-terminal", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.mark_failed.assert_called_once()
     call_kwargs = repo.mark_failed.call_args[1]
@@ -3375,7 +3426,11 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
         ),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-err-retry", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-err-retry", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     repo.increment_attempts.assert_called_once_with(
         "r-err-retry", last_error="500 Internal Server Error"
@@ -3409,7 +3464,11 @@ def test_continue_run_outer_exception_logs_current_run_status():
         patch("app.services.agent.runtime.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-outer-err", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-outer-err", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     errors = [str(c.args[0]) for c in log.error.call_args_list]
     assert any("processing" in m for m in errors), (
@@ -3671,9 +3730,13 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
 
     async def _go():
         # 初始正常运行至崩溃（记录 1 条 llm_chat span，但 tool_execute 缺失）
-        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+        await llm_assist.get_scenario_runtime().run(
+            run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+        )
         # 恢复续跑：真实 trace.replay + 真实 loop_run
-        await llm_assist.continue_run(run_id, sr, bgm)
+        await llm_assist.get_scenario_runtime().continue_run(
+            run_id, sync_record=sr, bgm=bgm
+        )
 
     asyncio.run(_go())
 
@@ -3748,8 +3811,12 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     async def _go():
-        await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
-        await llm_assist.continue_run(run_id, sr, bgm)
+        await llm_assist.get_scenario_runtime().run(
+            run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+        )
+        await llm_assist.get_scenario_runtime().continue_run(
+            run_id, sync_record=sr, bgm=bgm
+        )
 
     asyncio.run(_go())
 
@@ -3790,7 +3857,11 @@ def test_continue_run_writes_chat_span(monkeypatch):
     )
     monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
 
-    asyncio.run(llm_assist.continue_run(run_id, sr, MagicMock()))
+    asyncio.run(
+        llm_assist.get_scenario_runtime().continue_run(
+            run_id, sync_record=sr, bgm=MagicMock()
+        )
+    )
 
     steps = database_manager.agent_runs.get_steps(run_id)
     chat_steps = [s for s in steps if s["name"] == "llm_chat"]
@@ -3830,7 +3901,11 @@ def test_continue_run_respects_thinking_level(monkeypatch):
             "llm_match_thinking_level": "high",
             "llm_match_max_iterations": "",
         }
-        asyncio.run(llm_assist.continue_run("r-think", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-think", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     assert captured.get("thinking_level") == "high", (
         f"恢复路径应透传 thinking_level='high'，实际 {captured}"
@@ -3886,7 +3961,9 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
         ),
     ):
         asyncio.run(
-            llm_assist.continue_run("r-think-normalize", {"id": 1}, MagicMock())
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-think-normalize", sync_record={"id": 1}, bgm=MagicMock()
+            )
         )
 
     assert captured.get("thinking_level") == "high", (
@@ -3926,7 +4003,11 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
     )
     monkeypatch.setattr("app.services.agent.trace.replay", lambda rid: rr)
 
-    asyncio.run(llm_assist.continue_run(run_id, sr, MagicMock()))
+    asyncio.run(
+        llm_assist.get_scenario_runtime().continue_run(
+            run_id, sync_record=sr, bgm=MagicMock()
+        )
+    )
 
     steps = database_manager.agent_runs.get_steps(run_id)
     chat_steps = [s for s in steps if s["name"] == "llm_chat"]
@@ -4008,9 +4089,13 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     # 第一次 run → 崩溃
-    await llm_assist.run(run_id, sync_record=sr, bgm=bgm, thinking_level="medium")
+    await llm_assist.get_scenario_runtime().run(
+        run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+    )
     # 第一次恢复（完成对话）
-    await llm_assist.continue_run(run_id, sr, bgm)
+    await llm_assist.get_scenario_runtime().continue_run(
+        run_id, sync_record=sr, bgm=bgm
+    )
 
     steps_after_first = database_manager.agent_runs.get_steps(run_id)
     chat_iters_after_first = [
@@ -4024,7 +4109,9 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     database_manager.agent_runs.update_run_status(run_id, "processing")
 
     # 第二次恢复（应直接 mark_no_suggestion，无额外 LLM 调用）
-    await llm_assist.continue_run(run_id, sr, bgm)
+    await llm_assist.get_scenario_runtime().continue_run(
+        run_id, sync_record=sr, bgm=bgm
+    )
 
     assert chat_calls["n"] == 2, (
         f"期望累计 2 次 LLM 调用（第二次恢复不应额外调 LLM），实际 {chat_calls['n']}"
@@ -4064,7 +4151,7 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         status = asyncio.run(
-            llm_assist.run(
+            llm_assist.get_scenario_runtime().run(
                 "run-double-write",
                 sync_record=_make_sync_record(sync_record_id=520),
                 bgm=MagicMock(),
@@ -4155,7 +4242,7 @@ async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
         ]
     )
 
-    status = await llm_assist.run(
+    status = await llm_assist.get_scenario_runtime().run(
         run_id,
         sync_record=sr,
         bgm=_make_bgm(),
@@ -4183,7 +4270,7 @@ async def test_total_tokens_zero_when_no_usage():
         chat = _chat_side_effect(
             [_search_response(), _submit_response("123", "跨季匹配")]
         )
-        status = await llm_assist.run(
+        status = await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=sr,
             bgm=_make_bgm(),
@@ -4422,7 +4509,7 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
     hb = asyncio.create_task(_heartbeat())
     await asyncio.sleep(0)  # 让心跳先进入等待，再执行收尾
     try:
-        status = await llm_assist.run(
+        status = await llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=sr,
             bgm=_SlowBgm(),
@@ -4485,7 +4572,7 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
 
     ns = _make_notify()
     task = asyncio.create_task(
-        llm_assist.run(
+        llm_assist.get_scenario_runtime().run(
             run_id,
             sync_record=sr,
             bgm=_BlockingBgm(),
@@ -4586,7 +4673,11 @@ def test_continue_run_submit_tail_runs_off_event_loop_thread():
         ),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-tail", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-tail", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     assert seen.get("ident") is not None, "_handle_result 应被调用"
     assert seen["ident"] != main_ident, "收尾链应在工作线程执行，不得占用事件循环线程"
@@ -4619,7 +4710,11 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
         ),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
-        asyncio.run(llm_assist.continue_run("r-cont", {"id": 1}, MagicMock()))
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-cont", sync_record={"id": 1}, bgm=MagicMock()
+            )
+        )
 
     loop.assert_awaited_once()
     assert seen.get("ident") is not None, "_handle_result 应被调用"
