@@ -31,7 +31,12 @@ from app.services.llm.tools import (
     reset_tool_registry,
 )
 from app.services.matching import llm_assist
+from app.services.matching.identity import build_match_business_key
 from app.services.matching.llm_assist import build_seed_messages
+from app.services.sync_service.orchestrator import (
+    MATCH_ASSIST_MAX_TOTAL_ATTEMPTS,
+    MATCH_ASSIST_REUSE_WINDOW_DAYS,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -127,6 +132,17 @@ def _read_raw_llm_columns(sync_record_id):
     if not row:
         return None
     return {"llm_subject_id": row[0], "llm_reason": row[1]}
+
+
+def _read_candidate_business_key(sync_record_id):
+    """直读 pending_candidates.business_key（验证写入侧业务键口径）。"""
+    conn = database_manager._connection._conn
+    row = conn.execute(
+        "SELECT business_key FROM pending_candidates "
+        "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
+        (sync_record_id,),
+    ).fetchone()
+    return row[0] if row else None
 
 
 def _read_full_candidate(candidate_id):
@@ -267,6 +283,113 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
     candidates = json.loads(row["candidates_json"])
     assert len(candidates) == 1
     assert str(candidates[0]["subject_id"]) == "456"
+
+
+# ---------------------------------------------------------------------------
+# B1：LLM 新建候选必须写入 business_key，闭合「写→查→复用」去重契约
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
+    """B1：无候选新建行时 business_key 必须与 enqueue 同口径（user/title/season）。"""
+    run_id = "run-bk-new"
+    sr_id = 901
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect([_submit_response("456", "无候选补充")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+    expected_bk = build_match_business_key(sr["user_name"], sr["title"], sr["season"])
+    assert _read_candidate_business_key(sr_id) == expected_bk, (
+        "LLM 新建候选行的 business_key 必须与 enqueue_match_run 同口径"
+    )
+
+
+@pytest.mark.asyncio
+async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch):
+    """B1 端到端：run 落库候选后，同一 business_key 经入队决策命中 reuse_holding。"""
+    run_id = "run-bk-loop"
+    sr_id = 902
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+    bk = build_match_business_key(sr["user_name"], sr["title"], sr["season"])
+    # 与生产同口径：agent_run 入队时即携带 business_key
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id, business_key=bk)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect([_submit_response("456", "闭环")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+    assert status == "succeeded"
+
+    # 再以同一业务键入队：最新 run=succeeded + 候选 pending → reuse_holding（复用原 run）
+    decision = database_manager.agent_runs.enqueue_match_run(
+        run_id="run-bk-loop-retry",
+        business_key=bk,
+        sync_record_id=None,
+        reuse_window_days=MATCH_ASSIST_REUSE_WINDOW_DAYS,
+        max_total_attempts=MATCH_ASSIST_MAX_TOTAL_ATTEMPTS,
+        accepted_mapping_valid=True,
+    )
+    assert decision["decision"] == "reuse_holding", (
+        "同一 business_key 的 LLM 候选应可被复用判定命中"
+    )
+    assert decision["run_id"] == run_id
+
+
+@pytest.mark.asyncio
+async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
+    monkeypatch,
+):
+    """B1：更新既有（历史无 business_key）行时补写业务键，供后续复用命中。"""
+    run_id = "run-bk-backfill"
+    sr_id = 903
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    # 历史行：log_pending_candidate 未传 business_key（默认空串）
+    database_manager.log_pending_candidate(
+        request_title=f"legacy-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert _read_candidate_business_key(sr_id) == ""
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    chat = _chat_side_effect([_submit_response("123", "补写业务键")])
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+    expected_bk = build_match_business_key(sr["user_name"], sr["title"], sr["season"])
+    assert _read_candidate_business_key(sr_id) == expected_bk
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +574,9 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
         run_id=run_id,
         sync_record_id=sr_id,
         sync_record=sr,
+        business_key=build_match_business_key(
+            sr["user_name"], sr["title"], sr["season"]
+        ),
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",
@@ -758,6 +884,9 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
             run_id=run_id,
             sync_record_id=sr_id,
             sync_record=sr,
+            business_key=build_match_business_key(
+                sr["user_name"], sr["title"], sr["season"]
+            ),
             subject_id="123",
             reason="r",
             stop_reason="submit_suggestion",
@@ -2040,6 +2169,9 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
         run_id=run_id,
         sync_record_id=sr_id,
         sync_record=sr,
+        business_key=build_match_business_key(
+            sr["user_name"], sr["title"], sr["season"]
+        ),
         subject_id="123",
         reason="r",
         stop_reason="submit_suggestion",

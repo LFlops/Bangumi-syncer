@@ -49,6 +49,7 @@ from app.services.llm.tools import (
     ToolRegistry,
     serialize_tool_result,
 )
+from app.services.matching.identity import build_match_business_key
 from app.services.sync_service import SyncService
 
 # ---------------------------------------------------------------------------
@@ -603,6 +604,7 @@ def _persist_llm_candidate(
     run_id: str,
     sync_record_id: int | None,
     sync_record: dict,
+    business_key: str,
     subject_id: str,
     reason: str,
     stop_reason: str,
@@ -614,6 +616,11 @@ def _persist_llm_candidate(
 
     ``candidates_json`` 追加/复用含 ``source='llm_assist'`` 与 ``reason`` 的条目；
     ``llm_subject_id`` / ``llm_reason`` 两列不再写入（读取时由仓储层投影）。
+
+    ``business_key`` 为**必填**业务身份键（``build_match_business_key`` 口径），
+    与 ``enqueue_match_run`` / ``log_pending_candidate`` 一致：新建行必须写入该列，
+    否则 ``_decide_reuse_from_candidate`` 按 business_key 查询永远 miss，导致同一剧集
+    反复重跑 LLM + 重复通知。既有行若为历史空键则在同一事务内回填。
 
     ``bgm_title`` 必须在事务外预取（见 ``_prefetch_bgm_name`` / ``_persist_and_notify``），
     事务内只做纯 DB 操作（F8：将外部 HTTP 调用移出事务，保持原子性语义不变）。
@@ -631,7 +638,7 @@ def _persist_llm_candidate(
         # 取既有行：按 id 倒序取最新一条（不区分状态；历史注释曾称「优先 pending」
         # 但实现从未按状态过滤，此处一并修正）
         row = conn.execute(
-            "SELECT id, candidates_json, status FROM pending_candidates "
+            "SELECT id, candidates_json, status, business_key FROM pending_candidates "
             "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
             (sync_record_id,),
         ).fetchone()
@@ -664,6 +671,7 @@ def _persist_llm_candidate(
 
         if row:
             existing_id = row[0]
+            existing_business_key = row[3] or ""
             try:
                 existing = json.loads(row[1]) if row[1] else []
             except (ValueError, TypeError):
@@ -671,11 +679,25 @@ def _persist_llm_candidate(
             if not isinstance(existing, list):
                 existing = []
             _merge_llm_candidate(existing, new_cand)
-            cursor = conn.execute(
-                "UPDATE pending_candidates SET candidates_json=?, status='pending' "
-                "WHERE id=? AND status='pending'",
-                (json.dumps(existing, ensure_ascii=False), existing_id),
-            )
+            # 历史行（无业务键）在同一事务内回填：否则后续 enqueue 复用判定
+            # 按 business_key 查询永远 miss，导致重复重跑 LLM。已在展示的候选行
+            # 不覆盖既有非空键（保持原身份，避免改写已被引用的业务身份）。
+            if not existing_business_key and business_key:
+                cursor = conn.execute(
+                    "UPDATE pending_candidates SET candidates_json=?, status='pending', "
+                    "business_key=? WHERE id=? AND status='pending'",
+                    (
+                        json.dumps(existing, ensure_ascii=False),
+                        business_key,
+                        existing_id,
+                    ),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE pending_candidates SET candidates_json=?, status='pending' "
+                    "WHERE id=? AND status='pending'",
+                    (json.dumps(existing, ensure_ascii=False), existing_id),
+                )
             if cursor.rowcount == 0:
                 # SELECT 后被并发处理：带守卫 UPDATE 未命中，同样不复活。
                 conn.execute(
@@ -697,8 +719,9 @@ def _persist_llm_candidate(
                 INSERT INTO pending_candidates
                 (created_at, request_title, request_ori_title, request_season,
                  request_episode, user_name, source, candidates_json, trace_json,
-                 status, confirmed_subject_id, resolved_at, sync_record_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?)
+                 status, confirmed_subject_id, resolved_at, sync_record_id,
+                 business_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?)
                 """,
                 (
                     now,
@@ -711,6 +734,7 @@ def _persist_llm_candidate(
                     json.dumps([new_cand], ensure_ascii=False),
                     "{}",
                     sync_record_id,
+                    business_key,
                 ),
             )
             candidate_id = cur.lastrowid
@@ -1415,11 +1439,19 @@ def _persist_and_notify(
     返回是否落库成功（``False`` = 候选已被用户处理而跳过，调用方不得通知）。
     """
     bgm_title = _prefetch_bgm_name(bgm, subject_id)
+    # 业务键与 enqueue_match_run / log_pending_candidate 同口径（去 source、归一化标题）：
+    # 候选落库即携带该键，「写→查→复用」闭环才能命中，避免同剧集重复重跑与重复通知。
+    business_key = build_match_business_key(
+        sync_record.get("user_name", ""),
+        sync_record.get("title", ""),
+        sync_record.get("season", 1),
+    )
     candidate_id = _persist_llm_candidate(
         dbm,
         run_id=run_id,
         sync_record_id=sync_record_id,
         sync_record=sync_record,
+        business_key=business_key,
         subject_id=subject_id,
         reason=reason,
         stop_reason=stop_reason,
