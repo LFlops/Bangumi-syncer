@@ -19,6 +19,7 @@ order: 100
 | [🔐 OAuth 集成](./oauth)                | `OAuthProvider` 注册表、`OAuthService` 通用流程、如何接入新提供方 |
 | [🔔 通知系统](./notifications)          | `NotificationChannel` 抽象、如何新增通知渠道                  |
 | [🧪 测试与 CI](./testing)               | pytest 组织、HTTP mock、CI 工作流                             |
+| [🧪 LLM 匹配 Eval 方案](./eval)         | 两层评测（离线回放进 CI + 真实模型 eval）、cassette 与 judge |
 | [📦 开发环境](./environment)            | uv 安装、代码风格、依赖管理、文档协作                         |
 | [🧩 新驱动接入指南](./new-driver-guide) | 从零开始接入新媒体服务器的完整流程                            |
 | [📝 贡献指南](./contributing)           | 开发环境搭建、提交前自检、pre-commit 钩子                     |
