@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 from app.core.scheduler_registry import scheduler_registry
+from app.services.agent import registry as registry_module
+from app.services.agent.registry import get_scenario
 from app.services.llm_match_scheduler import llm_match_scheduler
 from app.services.scheduler_bootstrap import register_all
 
@@ -55,3 +57,21 @@ class TestRegisterAllLlmMatch:
             for line, level in seen
         )
         assert overwrite_logged
+
+
+class TestRegisterAllWiresScenarios:
+    """register_all() 装配 Agent 场景（Composition Root 生产接入点）"""
+
+    def test_register_all_wires_scenarios(self, monkeypatch):
+        """清空场景表后调用 register_all()，match 场景被重新装配可用
+
+        生产启动时 register_all() 是唯一的装配触发点；conftest 已在测试进程
+        全局装配，故必须先清空 ``_scenarios`` 使断言具备鉴别力（否则不调用
+        wire_scenarios 也会通过）。
+        """
+        monkeypatch.setattr(registry_module, "_scenarios", {})
+
+        register_all()
+
+        runtime = get_scenario("match")
+        assert runtime.task_type == "match"
