@@ -594,6 +594,99 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
     assert unchanged["llm_reason"] == ""
 
 
+def test_persist_llm_candidate_succeeded_guard_skips_when_run_terminal(log_records):
+    """succeeded UPDATE 带源状态守卫：run 已被并发终态化 → 不翻回 succeeded。
+
+    竞态：候选写入前 run 已被别的路径标 cancelled。succeeded UPDATE 命中 0 行时，
+    必须记 warning、返回 None（跳过通知），且候选写入保留。
+    """
+    run_id = "run-guard-succeeded"
+    sr_id = 33
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    # 预置为终态 cancelled（模拟并发路径先把 run 收口）
+    assert (
+        database_manager.agent_runs.mark_cancelled(run_id, stop_reason="user_resolved")
+        is True
+    )
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    returned = llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        business_key=build_match_business_key(
+            sr["user_name"], sr["title"], sr["season"]
+        ),
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+
+    assert returned is None, "run 已被并发终态化时应返回 None（跳过通知）"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "cancelled", "终态不得被 succeeded 守卫漏过而翻回"
+    assert run_row["stop_reason"] == "user_resolved"
+    # 必须留痕：warning 含 run_id 与当前状态
+    warnings = [line for level, line in log_records if level == "WARNING"]
+    assert any(run_id in line and "守卫命中 0 行" in line for line in warnings), (
+        f"succeeded 守卫命中 0 行必须记 warning（含 run_id），实际 {warnings}"
+    )
+    assert any("当前状态=cancelled" in line for line in warnings), (
+        f"warning 应包含当前状态便于排查，实际 {warnings}"
+    )
+
+
+def test_persist_and_notify_persist_error_marks_failed_no_raise(monkeypatch):
+    """落库异常不再裸抛：run 终态 failed/persist_error，last_error 落库，返回 False 且不通知。"""
+    import sqlite3
+
+    run_id = "run-persist-error"
+    sr_id = 34
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    real_conn = database_manager._connection._conn
+
+    class _Conn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, *args, **kwargs):
+            # 落库事务内抛 I/O 错误（模拟磁盘故障）
+            if args and "INSERT INTO pending_candidates" in args[0]:
+                raise sqlite3.OperationalError("disk I/O error")
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    ns = _make_notify()
+    # 不得向上抛：落库异常由 _persist_and_notify 内部消化并终态化
+    result = llm_assist._persist_and_notify(
+        database_manager,
+        run_id,
+        sync_record=sr,
+        sync_record_id=sr_id,
+        bgm=None,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        total_tokens=0,
+        notification_service=ns,
+    )
+
+    assert result is False, "落库失败应返回 False（跳过通知）"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "failed"
+    assert run_row["stop_reason"] == "persist_error"
+    assert "disk I/O error" in (run_row["last_error"] or "")
+    ns.notify.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 无候选全链路（LLM 搜索补充 → 建议 → 落库）
 # ---------------------------------------------------------------------------

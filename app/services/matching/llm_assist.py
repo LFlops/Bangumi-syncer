@@ -734,10 +734,14 @@ def _persist_llm_candidate(
             candidate_id = cur.lastrowid
 
         # 同一事务内更新 agent_runs 为 succeeded（F6 原子）
-        # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致
-        conn.execute(
+        # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致。
+        # **源状态守卫**：仅 pending/processing 活性态可转 succeeded；
+        # run 已被并发路径终态化（cancelled/failed/no_suggestion/...）时命中 0 行，
+        # 不翻回 succeeded（否则通知与 DB 终态矛盾），跳过通知但保留候选写入。
+        cursor = conn.execute(
             "UPDATE agent_runs SET status='succeeded', stop_reason=?, "
-            "total_tokens=?, ended_at=? WHERE run_id=?",
+            "total_tokens=?, ended_at=? WHERE run_id=? "
+            "AND status IN ('pending','processing')",
             (
                 stop_reason,
                 total_tokens,
@@ -745,6 +749,24 @@ def _persist_llm_candidate(
                 run_id,
             ),
         )
+        if cursor.rowcount == 0:
+            # 并发终态化：读当前状态供日志定位（best-effort，读失败不遮蔽主流程）
+            try:
+                current = conn.execute(
+                    "SELECT status FROM agent_runs WHERE run_id=?", (run_id,)
+                ).fetchone()
+                current_status = current[0] if current else "missing"
+            except Exception as e:  # 读状态失败仅降级日志，不影响返回契约
+                current_status = "unknown"
+                logger.warning(
+                    f"[llm_assist] run {run_id} succeeded 守卫命中 0 行后"
+                    f"读当前状态失败: {e}"
+                )
+            logger.warning(
+                f"[llm_assist] run {run_id} succeeded 守卫命中 0 行"
+                f"（当前状态={current_status}），跳过通知"
+            )
+            return None
         return candidate_id
 
     return dbm._execute_with_lock(_write)
@@ -1440,21 +1462,31 @@ def _persist_and_notify(
         sync_record.get("title", ""),
         sync_record.get("season", 1),
     )
-    candidate_id = _persist_llm_candidate(
-        dbm,
-        run_id=run_id,
-        sync_record_id=sync_record_id,
-        sync_record=sync_record,
-        business_key=business_key,
-        subject_id=subject_id,
-        reason=reason,
-        stop_reason=stop_reason,
-        total_tokens=total_tokens,
-        bgm=bgm,
-        bgm_title=bgm_title,
-    )
+    try:
+        candidate_id = _persist_llm_candidate(
+            dbm,
+            run_id=run_id,
+            sync_record_id=sync_record_id,
+            sync_record=sync_record,
+            business_key=business_key,
+            subject_id=subject_id,
+            reason=reason,
+            stop_reason=stop_reason,
+            total_tokens=total_tokens,
+            bgm=bgm,
+            bgm_title=bgm_title,
+        )
+    except Exception as e:
+        # 落库异常不再裸抛（事务已回滚，run 仍为活性态）：终态化避免 run 悬空
+        # 被恢复扫描反复拾取、以及调度层双计数（increment_attempts 叠加）。
+        # 失败即记录并置 failed(stop_reason='persist_error')，返回 False 跳过通知。
+        logger.error(
+            f"[llm_assist] run {run_id} 候选落库失败（已终态化 persist_error）: {e}"
+        )
+        _mark_persist_failed(dbm, run_id, e)
+        return False
     if candidate_id is None:
-        # 竞态跳过：候选已被用户处理，run 已标 cancelled，不得再发通知
+        # 竞态跳过：候选已被用户处理 / run 已被并发终态化，run 已终态，不得再发通知
         return False
     if notification_service is not None:
         _send_notification(
@@ -1465,3 +1497,21 @@ def _persist_and_notify(
             name=bgm_title,
         )
     return True
+
+
+def _mark_persist_failed(dbm, run_id: str, error: Exception) -> None:
+    """best-effort 把落库失败的 run 终态化为 failed(stop_reason='persist_error')。
+
+    ``mark_failed`` 自身失败（如 DB 仍不可用）不得静默：记 error 日志后返回，
+    避免此处异常覆盖/顶替上层的落库异常语义。
+    """
+    try:
+        dbm.agent_runs.mark_failed(
+            run_id,
+            stop_reason="persist_error",
+            last_error=str(error)[:500],
+        )
+    except Exception as e:  # 终态化自身失败：必须留痕，绝不静默
+        logger.error(
+            f"[llm_assist] run {run_id} 落库失败后终态化 persist_error 亦失败: {e}"
+        )
