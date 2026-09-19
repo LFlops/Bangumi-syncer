@@ -23,8 +23,9 @@
   重建可续跑的 ``messages``（断点恢复重建规则）。
 
 replay_delta 写入语义：
-- ``llm_chat.end_span``: ``replay_delta = {response: {stop_reason, content, tool_calls}}``
-  （tool_calls 为本轮全部工具调用的聚合——重建一条 assistant 消息的唯一来源）。
+- ``llm_chat.end_span``: ``replay_delta = {response: {stop_reason, content, tool_calls,
+  blocks}}``（``blocks`` 为本轮完整内容块，含 thinking/text/tool_use，是重建 assistant
+  消息的首选来源；``tool_calls`` 为工具调用聚合，仅在 ``blocks`` 缺失/非法时回退使用）。
 - ``tool_execute.end_span``: ``replay_delta = {tool_result: {...}}``（仅 tool_result）。
 - 预算消息：由 ``record_budget_message`` 并入同轮最后一个 ``tool_execute`` 的
   ``replay_delta``（``budget_message`` 字段）。
@@ -41,10 +42,17 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import TypeAdapter
+
 from app.core.config_secret_crypto import decrypt, encrypt
 from app.core.database import get_database_manager
 from app.core.logging import logger
-from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
+from app.services.llm.models import (
+    ContentBlock,
+    Message,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 # input_summary 上限（≤500 字符，仅参数名与类型，不记录参数值）
 MAX_INPUT_SUMMARY_CHARS = 500
@@ -259,6 +267,36 @@ def _extract_budget_message(step: dict) -> str | None:
     return bm if isinstance(bm, str) else None
 
 
+_CONTENT_BLOCK_ADAPTER = TypeAdapter(ContentBlock)
+
+
+def _restore_response_blocks(response: dict) -> list | None:
+    """从 llm_chat ``response.blocks`` 还原内容块列表（保持原顺序）。
+
+    返回 ``None`` 表示应回退 ``tool_calls`` 重建逻辑：
+
+    - ``blocks`` 字段缺失 / 为 None / 空列表（旧数据或本轮无内容块）→ 静默回退（向后兼容）。
+    - ``blocks`` 非列表 / 元素结构非法（类型未知）→ 记 warning 后回退（不静默、不抛断）。
+    """
+    raw_blocks = response.get("blocks")
+    if raw_blocks is None or raw_blocks == []:
+        return None
+    if not isinstance(raw_blocks, list):
+        logger.warning(
+            f"[trace] replay response.blocks 非列表"
+            f"（type={type(raw_blocks).__name__}），回退 tool_calls 重建"
+        )
+        return None
+    try:
+        return [_CONTENT_BLOCK_ADAPTER.validate_python(b) for b in raw_blocks]
+    except Exception as e:  # 异常数据：整体回退，不部分重建
+        logger.warning(
+            f"[trace] replay response.blocks 反序列化失败"
+            f"（{type(e).__name__}: {e}），回退 tool_calls 重建"
+        )
+        return None
+
+
 def _restore_seed_messages(seed_step: dict, out: list[Message]) -> None:
     """从 seed 行的 ``replay_delta`` 还原种子消息。
 
@@ -348,18 +386,22 @@ def replay(run_id: str) -> ReplayResult:
             break
 
         tool_calls = response.get("tool_calls") or []
-        # 重建 assistant 消息：content 为 list[ToolUseBlock]（与原执行对齐）
-        assistant_msg = Message(
-            role="assistant",
-            content=[
+        # 重建 assistant 消息：优先消费全量 blocks（含 thinking，与 live
+        # ``list(resp.blocks)`` 逐条一致）；blocks 缺失/非法时回退 tool_calls
+        # （旧数据兼容）。thinking 块必须随 tool_use 回传，否则续跑请求会 400。
+        blocks = _restore_response_blocks(response)
+        if blocks is not None:
+            assistant_content: list = blocks
+        else:
+            assistant_content = [
                 ToolUseBlock(
                     id=tc.get("id", ""),
                     name=tc.get("name", ""),
                     input=tc.get("input", {}) or {},
                 )
                 for tc in tool_calls
-            ],
-        )
+            ]
+        assistant_msg = Message(role="assistant", content=assistant_content)
 
         if tool_calls:
             messages.append(assistant_msg)

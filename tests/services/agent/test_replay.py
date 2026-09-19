@@ -16,7 +16,14 @@ import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent import trace
-from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
+from app.services.llm.models import (
+    ChatResponse,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 
 @pytest.fixture
@@ -104,6 +111,34 @@ def _write_llm_chat(
     span_id = trace.start_span(run_id, "llm_chat", iteration, 0)
     trace.end_span(
         span_id, tokens=tokens, replay_delta=_chat_rd(stop_reason, content, tool_calls)
+    )
+    return span_id
+
+
+def _write_llm_chat_with_blocks(
+    dbm,
+    run_id,
+    iteration,
+    tool_calls,
+    blocks,
+    stop_reason="tool_use",
+    content="",
+    tokens=0,
+):
+    """写入一轮含全量 ``blocks`` 字段的 llm_chat span（修复后 recorder 的形态）。"""
+    _ensure_run(dbm, run_id)
+    span_id = trace.start_span(run_id, "llm_chat", iteration, 0)
+    trace.end_span(
+        span_id,
+        tokens=tokens,
+        replay_delta={
+            "response": {
+                "stop_reason": stop_reason,
+                "content": content,
+                "tool_calls": tool_calls,
+                "blocks": blocks,
+            }
+        },
     )
     return span_id
 
@@ -203,6 +238,235 @@ class TestReplayReconstructsFullRun:
         assert isinstance(result, trace.ReplayResult)
         # 无 unrecoverable_iteration 字段
         assert not hasattr(result, "unrecoverable_iteration")
+
+
+class TestReplayRebuildsFullBlocks:
+    """修复 round1 遗留 #1：replay 重建 assistant 消息消费全量 blocks（含 thinking）。
+
+    思考模型的 thinking 块必须随 tool_use 一并回传，否则断点续跑的下一轮请求会 400。
+    """
+
+    def test_rebuilds_mixed_blocks_in_order(self, dbm):
+        """含 thinking/text/tool_use 的响应 → content 顺序与类型逐条保留。"""
+        _write_seed(dbm, "run-blocks", [])
+        blocks = [
+            ThinkingBlock(thinking="let me think", signature="sig-1").model_dump(),
+            TextBlock(text="here is my plan").model_dump(),
+            ToolUseBlock(id="t1", name="x", input={"a": 1}).model_dump(),
+        ]
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-blocks",
+            0,
+            [{"id": "t1", "name": "x", "input": {"a": 1}}],
+            blocks,
+        )
+        _write_tool_exec(dbm, "run-blocks", 0, 1, "t1", "r1")
+
+        result = trace.replay("run-blocks")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [type(b) for b in assistant.content] == [
+            ThinkingBlock,
+            TextBlock,
+            ToolUseBlock,
+        ]
+        assert assistant.content[0].thinking == "let me think"
+        assert assistant.content[0].signature == "sig-1"
+        assert assistant.content[1].text == "here is my plan"
+        assert assistant.content[2].id == "t1"
+
+    def test_rebuilt_assistant_matches_live_blocks_expression(self, dbm):
+        """replay 重建与 live ``list(resp.blocks)`` 逐条一致（含 thinking）。"""
+        _write_seed(dbm, "run-live-eq", [])
+        resp = ChatResponse(
+            content="plan",
+            blocks=[
+                ThinkingBlock(thinking="hmm", signature="s1"),
+                TextBlock(text="plan"),
+                ToolUseBlock(id="t1", name="search_bangumi", input={"title": "foo"}),
+            ],
+            stop_reason="tool_use",
+            model="m",
+        )
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-live-eq",
+            0,
+            [b.model_dump() for b in resp.blocks if isinstance(b, ToolUseBlock)],
+            [b.model_dump() for b in resp.blocks],
+            stop_reason=resp.stop_reason,
+            content=resp.content,
+        )
+        _write_tool_exec(dbm, "run-live-eq", 0, 1, "t1", "res1")
+
+        result = trace.replay("run-live-eq")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        # live loop 的构造表达式：Message(role="assistant", content=list(resp.blocks))
+        assert assistant == Message(role="assistant", content=list(resp.blocks))
+
+    def test_replay_matches_live_loop_messages_with_thinking(self, dbm):
+        """端到端一致性：真实 loop.run 的逐轮上下文与 replay.messages 逐条相等。"""
+        import asyncio
+
+        from app.services.agent import loop as loop_module
+        from app.services.agent.recorder import TraceRecorder
+
+        _ensure_run(dbm, "run-loop-eq")
+        seed = [
+            Message(role="system", content="sys"),
+            Message(role="user", content="ctx"),
+        ]
+        round0 = ChatResponse(
+            content="plan",
+            blocks=[
+                ThinkingBlock(thinking="hmm", signature="s1"),
+                TextBlock(text="plan"),
+                ToolUseBlock(id="t1", name="search_bangumi", input={"title": "foo"}),
+            ],
+            stop_reason="tool_use",
+            model="m",
+        )
+        round1 = ChatResponse(
+            content="done",
+            blocks=[
+                ThinkingBlock(thinking="final", signature="s2"),
+                TextBlock(text="done"),
+            ],
+            stop_reason="end_turn",
+            model="m",
+        )
+        live_contexts: list[list] = []
+        counter = {"n": 0}
+
+        recorder = TraceRecorder("run-loop-eq", start_iteration=0)
+        recorder.write_seed_row(seed)
+
+        async def chat(messages, *, tools=None, tool_choice=None):
+            live_contexts.append(list(messages))
+            counter["n"] += 1
+            return round0 if counter["n"] == 1 else round1
+
+        async def tools_fn(tool_calls):
+            results = {}
+            for i, tc in enumerate(tool_calls):
+                span_id = recorder.start_tool(tc, sequence=i + 1)
+                result = ToolResultBlock(tool_use_id=tc.id, content=f"res-{tc.id}")
+                recorder.end_tool(span_id, result=result)
+                results[tc.id] = result
+            return results
+
+        asyncio.run(
+            loop_module.run(
+                chat_fn=recorder.wrap_chat_fn(chat),
+                tools_schemas=[],
+                tool_calls_fn=tools_fn,
+                max_iterations=2,
+                tool_choice_terminal="submit_suggestion",
+                seed_messages=seed,
+                recorder=recorder,
+            )
+        )
+
+        result = trace.replay("run-loop-eq")
+
+        # live 第二轮请求前的完整上下文 == replay 重建的 messages
+        assert live_contexts[1] == result.messages
+        # 且确实携带了 thinking 块（修复核心）
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert any(isinstance(b, ThinkingBlock) for b in assistant.content)
+
+    def test_falls_back_to_tool_calls_when_blocks_absent(self, dbm):
+        """旧数据无 ``blocks`` 字段 → 回退 tool_calls 重建（与修复前一致）。"""
+        _write_seed(dbm, "run-old", [])
+        _write_llm_chat(
+            dbm,
+            "run-old",
+            0,
+            [{"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}],
+        )
+        _write_tool_exec(dbm, "run-old", 0, 1, "t1", "res1")
+
+        result = trace.replay("run-old")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert assistant == Message(
+            role="assistant",
+            content=[
+                ToolUseBlock(id="t1", name="search_bangumi", input={"title": "foo"})
+            ],
+        )
+
+    def test_falls_back_to_tool_calls_when_blocks_empty(self, dbm):
+        """``blocks`` 为空列表 → 回退 tool_calls 重建（不产生空 assistant 内容）。"""
+        _write_seed(dbm, "run-empty-blocks", [])
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-empty-blocks",
+            0,
+            [{"id": "t1", "name": "x", "input": {}}],
+            [],
+        )
+        _write_tool_exec(dbm, "run-empty-blocks", 0, 1, "t1", "res1")
+
+        result = trace.replay("run-empty-blocks")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [type(b) for b in assistant.content] == [ToolUseBlock]
+
+    def test_blocks_parse_failure_logs_warning_and_falls_back(self, dbm, log_records):
+        """``blocks`` 结构非法 → 记 warning 且回退 tool_calls（不抛断）。"""
+        _write_seed(dbm, "run-bad-blocks", [])
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-bad-blocks",
+            0,
+            [{"id": "t1", "name": "x", "input": {}}],
+            [{"type": "unknown_block", "foo": "bar"}],
+        )
+        _write_tool_exec(dbm, "run-bad-blocks", 0, 1, "t1", "res1")
+
+        result = trace.replay("run-bad-blocks")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [type(b) for b in assistant.content] == [ToolUseBlock]
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("blocks" in line for line in warns)
+
+    def test_terminal_round_with_thinking_returned_as_last_response(self, dbm):
+        """终局轮：thinking + 终止工具调用（无 tool_execute）→ 作为 last_response 交回。"""
+        _write_seed(dbm, "run-term-th", [])
+        submit_input = {"subject_id": "2", "reason": "best match"}
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-term-th",
+            1,
+            [
+                {
+                    "id": "t9",
+                    "name": "submit_suggestion",
+                    "input": submit_input,
+                }
+            ],
+            [
+                ThinkingBlock(thinking="decide", signature="s9").model_dump(),
+                ToolUseBlock(
+                    id="t9", name="submit_suggestion", input=submit_input
+                ).model_dump(),
+            ],
+            stop_reason="tool_use",
+        )
+
+        result = trace.replay("run-term-th")
+
+        assert result.last_response is not None
+        assert result.last_response["stop_reason"] == "tool_use"
+        tcs = result.last_response["tool_calls"]
+        assert [tc["name"] for tc in tcs] == ["submit_suggestion"]
+        assert tcs[0]["input"] == submit_input
+        # 终止工具未执行 → 计入缺失供 runtime 分派（语义不变）
+        assert [tc["id"] for tc in result.missing_tool_calls] == ["t9"]
 
 
 class TestReplayTotalTokens:

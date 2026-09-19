@@ -21,6 +21,14 @@ import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent import trace
+from app.services.agent.recorder import TraceRecorder
+from app.services.llm.models import (
+    ChatResponse,
+    Message,
+    TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
+)
 
 
 @pytest.fixture
@@ -171,6 +179,111 @@ class TestReplayDeltaEncryptedAtRest:
         # 解密容错：明文原样返回
         obj = json.loads(steps[0]["replay_delta"])
         assert obj["response"]["stop_reason"] == "end_turn"
+
+
+class TestRecorderPersistsFullBlocks:
+    """修复 round1 遗留 #1：recorder 的 replay_delta.response 追加全量 ``blocks``。
+
+    仅追加字段、不升级 schema：既有 stop_reason/content/tool_calls 保持不变，
+    旧数据（无 blocks）读取方走回退逻辑。
+    """
+
+    def test_wrap_chat_fn_persists_full_blocks_with_thinking(self, dbm):
+        """含 thinking 的响应 → response 追加全量 blocks（顺序保持），旧字段不变。"""
+        import asyncio
+
+        _ensure_run(dbm, "run-blocks-rec")
+        recorder = TraceRecorder("run-blocks-rec", start_iteration=0)
+        resp = ChatResponse(
+            content="plan",
+            blocks=[
+                ThinkingBlock(thinking="let me think", signature="sig-1"),
+                TextBlock(text="here is my plan"),
+                ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"}),
+            ],
+            stop_reason="tool_use",
+            model="m",
+        )
+
+        async def chat(messages, *, tools=None, tool_choice=None):
+            return resp
+
+        wrapped = recorder.wrap_chat_fn(chat)
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+        step = next(
+            s
+            for s in dbm.agent_runs.get_steps("run-blocks-rec")
+            if s["name"] == "llm_chat"
+        )
+        response = json.loads(step["replay_delta"])["response"]
+        # 旧字段保持
+        assert response["stop_reason"] == "tool_use"
+        assert response["content"] == "plan"
+        assert response["tool_calls"][0]["id"] == "t1"
+        # 追加字段：全量 blocks（含 thinking），逐条与 model_dump 一致
+        assert response["blocks"] == [b.model_dump() for b in resp.blocks]
+        assert [b["type"] for b in response["blocks"]] == [
+            "thinking",
+            "text",
+            "tool_use",
+        ]
+
+    def test_wrap_chat_fn_persists_empty_blocks(self, dbm):
+        """无 blocks 的响应（end_turn）→ response["blocks"] 存空列表。"""
+        import asyncio
+
+        _ensure_run(dbm, "run-blocks-empty")
+        recorder = TraceRecorder("run-blocks-empty", start_iteration=0)
+        resp = ChatResponse(
+            content="done", blocks=[], stop_reason="end_turn", model="m"
+        )
+
+        async def chat(messages, *, tools=None, tool_choice=None):
+            return resp
+
+        wrapped = recorder.wrap_chat_fn(chat)
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+        step = next(
+            s
+            for s in dbm.agent_runs.get_steps("run-blocks-empty")
+            if s["name"] == "llm_chat"
+        )
+        response = json.loads(step["replay_delta"])["response"]
+        assert response["blocks"] == []
+
+    def test_large_thinking_blocks_round_trip_through_encryption(self, dbm, crypto_on):
+        """加密管道对更大 JSON 无影响：超长 thinking 块往返完整、不截断。"""
+        import asyncio
+
+        _ensure_run(dbm, "run-blocks-big")
+        big_thinking = "t" * 60_000
+        recorder = TraceRecorder("run-blocks-big", start_iteration=0)
+        resp = ChatResponse(
+            content="",
+            blocks=[
+                ThinkingBlock(thinking=big_thinking, signature="sig"),
+                ToolUseBlock(id="t1", name="x", input={}),
+            ],
+            stop_reason="tool_use",
+            model="m",
+        )
+
+        async def chat(messages, *, tools=None, tool_choice=None):
+            return resp
+
+        wrapped = recorder.wrap_chat_fn(chat)
+        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+
+        # crypto_on 下 get_steps 透明解密；往返完整
+        step = next(
+            s
+            for s in dbm.agent_runs.get_steps("run-blocks-big")
+            if s["name"] == "llm_chat"
+        )
+        response = json.loads(step["replay_delta"])["response"]
+        assert response["blocks"][0]["thinking"] == big_thinking
 
 
 class TestNo32KbErrorMechanism:

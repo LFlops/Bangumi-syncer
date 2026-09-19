@@ -111,6 +111,11 @@ class TraceRecorder:
                         for b in resp.blocks
                         if isinstance(b, ToolUseBlock)
                     ]
+                    # 全量 blocks（含 thinking/text）：思考模型的 thinking 块必须随
+                    # tool_use 回传，恢复路径 replay 据此重建 assistant 消息，否则
+                    # 断点续跑的下一轮请求会 400（与 live loop 的 list(resp.blocks) 对齐）。
+                    # 仅追加字段、不升级 schema：旧数据无 blocks 时读取方走 tool_calls 回退。
+                    blocks = [b.model_dump() for b in resp.blocks]
                     trace_end_span(
                         span_id,
                         status="ok",
@@ -122,6 +127,7 @@ class TraceRecorder:
                                 "stop_reason": resp.stop_reason,
                                 "content": resp.content,
                                 "tool_calls": tool_calls,
+                                "blocks": blocks,
                             }
                         },
                     )
