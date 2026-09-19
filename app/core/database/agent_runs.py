@@ -428,7 +428,11 @@ class AgentRunsRepository(BaseRepository):
         )
 
     def mark_no_suggestion(
-        self, run_id: str, stop_reason: str = "", last_error: str = ""
+        self,
+        run_id: str,
+        stop_reason: str = "",
+        last_error: str = "",
+        total_tokens: int = 0,
     ) -> bool:
         """标记无建议（预算耗尽 / 校验失败 / 无候选），终态"""
 
@@ -440,10 +444,11 @@ class AgentRunsRepository(BaseRepository):
             cursor = conn.execute(
                 """
                 UPDATE agent_runs
-                SET status='no_suggestion', stop_reason=?, last_error=?, ended_at=?
+                SET status='no_suggestion', stop_reason=?, last_error=?,
+                    total_tokens=?, ended_at=?
                 WHERE run_id=?
                 """,
-                (stop_reason, last_error, _now(), run_id),
+                (stop_reason, last_error, total_tokens, _now(), run_id),
             )
             return cursor.rowcount > 0
 

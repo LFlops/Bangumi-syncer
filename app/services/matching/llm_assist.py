@@ -924,7 +924,10 @@ def _handle_result(
             return "succeeded" if persisted else ""
         # 校验失败：不落库，标记 no_suggestion + last_error
         dbm.agent_runs.mark_no_suggestion(
-            run_id, stop_reason="submit_suggestion", last_error=err
+            run_id,
+            stop_reason="submit_suggestion",
+            last_error=err,
+            total_tokens=total_tokens,
         )
         return "no_suggestion"
 
@@ -950,7 +953,10 @@ def _handle_result(
                 return "succeeded" if persisted else ""
             perr = verr
         dbm.agent_runs.mark_no_suggestion(
-            run_id, stop_reason="exhausted", last_error=perr or "无建议"
+            run_id,
+            stop_reason="exhausted",
+            last_error=perr or "无建议",
+            total_tokens=total_tokens,
         )
         return "no_suggestion"
 
@@ -965,7 +971,9 @@ def _handle_result(
         return "failed"
 
     # end_turn：直接终止，无建议
-    dbm.agent_runs.mark_no_suggestion(run_id, stop_reason="end_turn")
+    dbm.agent_runs.mark_no_suggestion(
+        run_id, stop_reason="end_turn", total_tokens=total_tokens
+    )
     return "no_suggestion"
 
 

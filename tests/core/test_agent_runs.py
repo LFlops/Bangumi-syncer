@@ -477,6 +477,29 @@ class TestLastErrorRedaction:
         finally:
             dbm._connection._conn.close()
 
+    def test_mark_no_suggestion_records_total_tokens(self, tmp_path):
+        """mark_no_suggestion 写入 total_tokens（终态口径与 succeeded/failed 一致）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rnt1", "match", 1)
+            assert (
+                dbm.agent_runs.mark_no_suggestion("rnt1", "exhausted", total_tokens=77)
+                is True
+            )
+            assert dbm.agent_runs.get_run("rnt1")["total_tokens"] == 77
+        finally:
+            dbm._connection._conn.close()
+
+    def test_mark_no_suggestion_defaults_total_tokens_to_zero(self, tmp_path):
+        """未传 total_tokens → 默认 0（向后兼容既有调用）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("rnt2", "match", 1)
+            assert dbm.agent_runs.mark_no_suggestion("rnt2", "end_turn") is True
+            assert dbm.agent_runs.get_run("rnt2")["total_tokens"] == 0
+        finally:
+            dbm._connection._conn.close()
+
     @pytest.mark.parametrize(
         ("last_error", "leaked"),
         [

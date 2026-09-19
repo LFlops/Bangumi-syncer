@@ -171,7 +171,12 @@ async def continue_run(
         if last_response is None:
             # 全部轮次已完整记录 → 预算耗尽则落终态，否则以剩余轮次续跑通用循环
             if remaining <= 0:
-                _mark_exhausted(repo, run_id, note="replay 前")
+                _mark_exhausted(
+                    repo,
+                    run_id,
+                    note="replay 前",
+                    total_tokens=replay_result.total_tokens,
+                )
                 return
             await _execute_continuation(
                 dbm,
@@ -192,8 +197,12 @@ async def continue_run(
         tcs = last_response.get("tool_calls") or []
 
         if stop == "end_turn":
-            # 无建议：直接标记，不调 LLM
-            repo.mark_no_suggestion(run_id, stop_reason="end_turn")
+            # 无建议：直接标记，不调 LLM（透传 replay 累计 tokens，口径同其它终态）
+            repo.mark_no_suggestion(
+                run_id,
+                stop_reason="end_turn",
+                total_tokens=replay_result.total_tokens,
+            )
             return
 
         # 捕获终止工具调用（终局）→ 走场景校验落库路径
@@ -223,7 +232,12 @@ async def continue_run(
         # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
         remaining = max(0, remaining - 1)
         if remaining <= 0:
-            _mark_exhausted(repo, run_id, note="补执行后")
+            _mark_exhausted(
+                repo,
+                run_id,
+                note="补执行后",
+                total_tokens=replay_result.total_tokens,
+            )
             return
 
         await _execute_continuation(
@@ -254,16 +268,17 @@ async def continue_run(
         repo.increment_attempts(run_id, last_error=str(e))
 
 
-def _mark_exhausted(repo, run_id: str, *, note: str) -> None:
+def _mark_exhausted(repo, run_id: str, *, note: str, total_tokens: int = 0) -> None:
     """预算耗尽且无终局语义 → 落终态 no_suggestion/exhausted。
 
     G4：不能直接 return（否则 run 永久滞留 processing，下一轮恢复扫描又会重复捞起）。
+    ``total_tokens`` 为 replay 累计的历史轮次用量，透传至终态记录（口径与其它终态一致）。
     """
     logger.warning(
         f"🤖 恢复(replay)路径预算耗尽，run {run_id} {note}已无剩余轮次，"
         f"标记 no_suggestion"
     )
-    repo.mark_no_suggestion(run_id, stop_reason="exhausted")
+    repo.mark_no_suggestion(run_id, stop_reason="exhausted", total_tokens=total_tokens)
 
 
 def _current_run_status(repo, run_id: str) -> str:

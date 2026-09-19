@@ -2631,12 +2631,81 @@ async def test_handle_result_end_turn_still_no_suggestion(monkeypatch):
         sync_record_id=512,
         bgm=None,
         notification_service=None,
-        total_tokens=0,
+        total_tokens=321,
     )
 
     assert status == "no_suggestion"
     dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
-        "run-end-turn", stop_reason="end_turn"
+        "run-end-turn", stop_reason="end_turn", total_tokens=321
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_result_invalid_subject_id_passes_total_tokens(monkeypatch):
+    """submit 校验失败落 no_suggestion 时透传全轮累计 total_tokens。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    result = RunResult(
+        stop_reason="submit_suggestion",
+        suggestion={"subject_id": "999999", "reason": "非法"},
+    )
+    monkeypatch.setattr(
+        llm_assist, "_validate_subject_id", lambda sid: (False, "subject_id 非法")
+    )
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-invalid-sid",
+        result,
+        sync_record=_make_sync_record(sync_record_id=513),
+        sync_record_id=513,
+        bgm=None,
+        notification_service=None,
+        total_tokens=88,
+    )
+
+    assert status == "no_suggestion"
+    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+        "run-invalid-sid",
+        stop_reason="submit_suggestion",
+        last_error="subject_id 非法",
+        total_tokens=88,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_result_exhausted_no_suggestion_passes_total_tokens(monkeypatch):
+    """exhausted 且兜底解析无建议时落 no_suggestion 并透传 total_tokens。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    result = RunResult(stop_reason="exhausted", last_response=MagicMock())
+    monkeypatch.setattr(
+        llm_assist, "parse_suggestion", lambda content: (None, "无建议")
+    )
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-exhausted",
+        result,
+        sync_record=_make_sync_record(sync_record_id=514),
+        sync_record_id=514,
+        bgm=None,
+        notification_service=None,
+        total_tokens=99,
+    )
+
+    assert status == "no_suggestion"
+    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+        "run-exhausted",
+        stop_reason="exhausted",
+        last_error="无建议",
+        total_tokens=99,
     )
 
 
@@ -2762,6 +2831,7 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
     rr = _make_replay_result(
         executed=1,
         last_response={"stop_reason": "end_turn", "content": "x", "tool_calls": []},
+        total_tokens=222,
     )
     loop = AsyncMock()
     with (
@@ -2776,7 +2846,9 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
 
-    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="end_turn")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r", stop_reason="end_turn", total_tokens=222
+    )
     loop.assert_not_awaited()
 
 
@@ -3046,6 +3118,7 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
             "content": "go",
             "tool_calls": [missing],
         },
+        total_tokens=111,
     )
     loop = AsyncMock()
     backfill = AsyncMock()
@@ -3065,7 +3138,9 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
     # 不再续跑 loop，但必须落终态（否则 run 永久 processing）
     loop.assert_not_awaited()
     backfill.assert_not_awaited()
-    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r", stop_reason="exhausted", total_tokens=111
+    )
 
 
 def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
@@ -3075,6 +3150,7 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         executed=5,  # medium=5 → remaining=0
         missing=[],
         last_response=None,
+        total_tokens=333,
     )
     loop = AsyncMock()
     with (
@@ -3090,13 +3166,17 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
 
     loop.assert_not_awaited()
-    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r", stop_reason="exhausted", total_tokens=333
+    )
 
 
 def test_continue_run_replay_exhausted_logs_warning():
     """预算耗尽（replay 前）→ warning 且注明恢复(replay)路径，不得停留在 debug。"""
     repo = _make_continuation_repo()
-    rr = _make_replay_result(executed=5, missing=[], last_response=None)
+    rr = _make_replay_result(
+        executed=5, missing=[], last_response=None, total_tokens=444
+    )
     log = MagicMock()
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -3110,7 +3190,9 @@ def test_continue_run_replay_exhausted_logs_warning():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
 
-    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="exhausted")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r", stop_reason="exhausted", total_tokens=444
+    )
     warnings = [str(c.args[0]) for c in log.warning.call_args_list]
     assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
         f"预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
@@ -3172,6 +3254,7 @@ def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn(
         executed=5,  # medium=5 → remaining=0
         missing=[],
         last_response={"stop_reason": "end_turn", "content": "放弃", "tool_calls": []},
+        total_tokens=55,
     )
     loop = AsyncMock()
     with (
@@ -3186,7 +3269,9 @@ def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn(
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
 
-    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="end_turn")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r", stop_reason="end_turn", total_tokens=55
+    )
     loop.assert_not_awaited()
 
 
@@ -3202,6 +3287,7 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
             "content": "go",
             "tool_calls": [missing],
         },
+        total_tokens=66,
     )
     log = MagicMock()
     with (
@@ -3218,7 +3304,9 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r2", {"id": 1}, MagicMock()))
 
-    repo.mark_no_suggestion.assert_called_once_with("r2", stop_reason="exhausted")
+    repo.mark_no_suggestion.assert_called_once_with(
+        "r2", stop_reason="exhausted", total_tokens=66
+    )
     warnings = [str(c.args[0]) for c in log.warning.call_args_list]
     assert any("恢复" in m or "replay" in m.lower() for m in warnings), (
         f"补执行后预算耗尽应 warning 且注明恢复(replay)路径，实际 {warnings}"
