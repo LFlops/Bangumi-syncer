@@ -738,6 +738,9 @@ def reset_database_manager() -> None:
     _database_manager = None
 
 
+database_manager: DatabaseManager
+
+
 def __getattr__(name: str):
     """模块级懒加载，避免 import 时即打开 SQLite 连接。"""
     if name == "database_manager":
