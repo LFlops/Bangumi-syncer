@@ -348,7 +348,7 @@ class LlmMatchScheduler(BaseScheduler):
             except Exception as e:
                 logger.error(f"🤖 处理 run {run_id} 异常: {e}")
                 # 计数与达上限置终态在 repo 内单点事务完成，携带 last_error 供排查
-                repo.increment_attempts(run_id, last_error=str(e)[:500])
+                repo.increment_attempts(run_id, last_error=str(e))
         finally:
             _release_run(run_id)
 

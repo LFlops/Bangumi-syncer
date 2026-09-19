@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
+import sqlite3
 import time
 from dataclasses import asdict
 from datetime import datetime
@@ -980,18 +981,18 @@ async def run(
             dbm.agent_runs.mark_failed(
                 run_id,
                 stop_reason="llm_error",
-                last_error=str(e)[:500],
+                last_error=str(e),
                 total_tokens=span_recorder.total_tokens,
             )
             return "failed"
         # 可重试（429/5xx/超时）→ 累加 attempts；达上限时由仓储在**同一次调用事务内**
         # 单点置终态（status='failed' + last_error），此处不得再 mark_failed（避免双写）。
         logger.error(f"[llm_assist] run {run_id} 可重试 LLM 失败: {e}")
-        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e)[:500])
+        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e))
         return "failed" if attempts >= 3 else "processing"
     except Exception as e:
         logger.error(f"[llm_assist] run {run_id} LLM 调用异常: {e}")
-        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e)[:500])
+        attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e))
         return "failed" if attempts >= 3 else "processing"
 
     return await _handle_result_async(
@@ -1143,17 +1144,17 @@ async def continue_run(
         # LLM 调用失败：按可重试性分流
         if not e.retryable:
             logger.error(f"🤖 恢复续跑 {run_id} 确定性 LLM 失败: {e}")
-            repo.mark_failed(run_id, stop_reason="llm_error", last_error=str(e)[:500])
+            repo.mark_failed(run_id, stop_reason="llm_error", last_error=str(e))
         else:
             logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
-            repo.increment_attempts(run_id, last_error=str(e)[:500])
+            repo.increment_attempts(run_id, last_error=str(e))
     except Exception as e:
         # P2-3：附带当前 run 状态，便于区分「处理中异常」与「已终态后的异常」
         logger.error(
             f"🤖 恢复续跑 {run_id} 异常（当前 run 状态="
             f"{_current_run_status(repo, run_id)}）: {e}"
         )
-        repo.increment_attempts(run_id, last_error=str(e)[:500])
+        repo.increment_attempts(run_id, last_error=str(e))
 
 
 def _current_run_status(repo, run_id: str) -> str:
@@ -1507,9 +1508,17 @@ def _persist_and_notify(
             bgm_title=bgm_title,
         )
     except Exception as e:
-        # 落库异常不再裸抛（事务已回滚，run 仍为活性态）：终态化避免 run 悬空
-        # 被恢复扫描反复拾取、以及调度层双计数（increment_attempts 叠加）。
-        # 失败即记录并置 failed(stop_reason='persist_error')，返回 False 跳过通知。
+        # 落库异常不再裸抛（事务已回滚，run 仍为活性态）。
+        # 瞬时 DB 抖动（database is locked/busy）会随重试消失：保留活性态并累计
+        # attempts（达上限由仓储自动置 failed），避免永久丢弃用户建议；其余异常
+        # 属确定性失败，终态化 failed(stop_reason='persist_error') 防止 run 悬空。
+        if _is_transient_db_error(e):
+            logger.warning(
+                f"[llm_assist] run {run_id} 候选落库遇瞬时 DB 错误"
+                f"（保留活性态待重试）: {e}"
+            )
+            _mark_persist_transient(dbm, run_id, e)
+            return False
         logger.error(
             f"[llm_assist] run {run_id} 候选落库失败（已终态化 persist_error）: {e}"
         )
@@ -1529,6 +1538,33 @@ def _persist_and_notify(
     return True
 
 
+def _is_transient_db_error(error: Exception) -> bool:
+    """是否为可重试的瞬时 SQLite 错误（``database is locked`` / ``busy``）。
+
+    仅 ``sqlite3.OperationalError`` 且消息含 locked/busy（大小写不敏感）判定为
+    瞬时；``disk I/O error`` / ``IntegrityError`` 等确定性失败返回 False。
+    """
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def _mark_persist_transient(dbm, run_id: str, error: Exception) -> None:
+    """瞬时落库错误：保留 run 活性态，累计 attempts（达上限仓储自动置 failed）。
+
+    ``increment_attempts`` 自身失败（如 DB 仍不可用）不得静默：记 error 日志后
+    返回，run 保持活性态交由恢复扫描兜底，避免吞掉故障信号。
+    """
+    try:
+        dbm.agent_runs.increment_attempts(run_id, last_error=str(error))
+    except Exception as e:  # 累加自身失败：必须留痕，绝不静默
+        logger.error(
+            f"[llm_assist] run {run_id} 瞬时落库错误后累加 attempts 亦失败"
+            f"（保持活性待恢复扫描）: {e}"
+        )
+
+
 def _mark_persist_failed(dbm, run_id: str, error: Exception) -> None:
     """best-effort 把落库失败的 run 终态化为 failed(stop_reason='persist_error')。
 
@@ -1539,7 +1575,7 @@ def _mark_persist_failed(dbm, run_id: str, error: Exception) -> None:
         dbm.agent_runs.mark_failed(
             run_id,
             stop_reason="persist_error",
-            last_error=str(error)[:500],
+            last_error=str(error),
         )
     except Exception as e:  # 终态化自身失败：必须留痕，绝不静默
         logger.error(

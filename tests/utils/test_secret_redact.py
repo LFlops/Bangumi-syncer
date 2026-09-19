@@ -86,3 +86,18 @@ class TestRedactPassthrough:
 
     def test_empty_string_returned_as_is(self):
         assert redact_secrets("") == ""
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            123,
+            0,
+            {"a": 1},
+            ["x"],
+            Exception("x"),
+        ],
+        ids=["int", "zero", "dict", "list", "exception"],
+    )
+    def test_non_string_returned_as_is_without_raising(self, value):
+        """非 str 输入（int/dict/Exception 等）原样返回，不得抛 TypeError。"""
+        assert redact_secrets(value) is value

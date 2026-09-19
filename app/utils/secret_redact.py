@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # 遮蔽标记（所有模式统一使用，保持输出风格一致）
 MASK = "***"
@@ -88,11 +89,15 @@ def _replace(match: re.Match) -> str:
     )
 
 
-def redact_secrets(text: str | None) -> str | None:
+def redact_secrets(text: Any) -> Any:
     """遮蔽文本中的常见密钥模式（best-effort，不改变正常可读信息）。
 
     ``None`` / 空串原样返回；未命中任何敏感模式时原样返回。
+    非 ``str`` 输入（如 int / dict / Exception）原样返回，绝不抛 ``TypeError``
+    （调用方可能透传任意异常对象，脱敏工具不应成为新的故障点）。
     """
+    if not isinstance(text, str):
+        return text
     if not text:
         return text
     return _SECRET_RE.sub(_replace, text)

@@ -432,7 +432,9 @@ class AgentRunsRepository(BaseRepository):
     ) -> bool:
         """标记无建议（预算耗尽 / 校验失败 / 无候选），终态"""
 
-        last_error = redact_secrets(last_error)
+        # 先对完整文本脱敏、后截断：避免调用方预截断（如 str(e)[:500]）
+        # 把敏感值切在边界上导致模式失配而泄漏裸片段。
+        last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):
             cursor = conn.execute(
@@ -464,7 +466,8 @@ class AgentRunsRepository(BaseRepository):
         increment_attempts 达上限置终态后调用方再 mark_failed 造成双计。
         """
 
-        last_error = redact_secrets(last_error)
+        # 先对完整文本脱敏、后截断（见 mark_no_suggestion 注释）。
+        last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):
             cursor = conn.execute(
@@ -514,7 +517,8 @@ class AgentRunsRepository(BaseRepository):
         非 processing 态 / run 不存在 → 不计数，返回 0。
         """
 
-        last_error = redact_secrets(last_error)
+        # 先对完整文本脱敏、后截断（见 mark_no_suggestion 注释）。
+        last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):
             cursor = conn.execute(

@@ -853,6 +853,107 @@ def test_persist_and_notify_persist_error_marks_failed_no_raise(monkeypatch):
     ns.notify.assert_not_called()
 
 
+def test_persist_and_notify_transient_lock_error_keeps_run_retryable(monkeypatch):
+    """落库遇瞬时 ``database is locked``：保留 run 活性态重试，不终态化、不通知。
+
+    锁抖动会随重试消失，若直接 ``mark_failed`` 将永久丢弃用户建议；
+    正确处理是累计 attempts（达上限由仓储自动置 failed），run 仍可被恢复扫描拾取。
+    """
+    import sqlite3
+
+    run_id = "run-persist-locked"
+    sr_id = 38
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    assert database_manager.agent_runs.atomic_claim(run_id) is True  # → processing
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    real_conn = database_manager._connection._conn
+
+    class _Conn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, *args, **kwargs):
+            if args and "INSERT INTO pending_candidates" in args[0]:
+                raise sqlite3.OperationalError("database is locked")
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    ns = _make_notify()
+    result = llm_assist._persist_and_notify(
+        database_manager,
+        run_id,
+        sync_record=sr,
+        sync_record_id=sr_id,
+        bgm=None,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        total_tokens=0,
+        notification_service=ns,
+    )
+
+    assert result is False, "瞬时落库失败应返回 False（本次跳过通知）"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "processing", "瞬时锁抖动不得终态化（应保持活性待重试）"
+    assert run_row["attempts"] == 1, "瞬时失败必须累计 attempts 供上限判定"
+    assert run_row["stop_reason"] in ("", None)
+    assert not run_row["ended_at"], "未终态化则无 ended_at"
+    ns.notify.assert_not_called()
+
+
+def test_persist_and_notify_non_transient_error_still_marks_failed(monkeypatch):
+    """非瞬时落库异常（如 IntegrityError）：维持 failed/persist_error 终态语义。"""
+    import sqlite3
+
+    run_id = "run-persist-integrity"
+    sr_id = 39
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    assert database_manager.agent_runs.atomic_claim(run_id) is True
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    real_conn = database_manager._connection._conn
+
+    class _Conn:
+        def __init__(self, real):
+            self._real = real
+
+        def execute(self, *args, **kwargs):
+            if args and "INSERT INTO pending_candidates" in args[0]:
+                raise sqlite3.IntegrityError("boom")
+            return self._real.execute(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    monkeypatch.setattr(database_manager._connection, "_conn", _Conn(real_conn))
+
+    ns = _make_notify()
+    result = llm_assist._persist_and_notify(
+        database_manager,
+        run_id,
+        sync_record=sr,
+        sync_record_id=sr_id,
+        bgm=None,
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        total_tokens=0,
+        notification_service=ns,
+    )
+
+    assert result is False
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "failed"
+    assert run_row["stop_reason"] == "persist_error"
+    assert "boom" in (run_row["last_error"] or "")
+    ns.notify.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 无候选全链路（LLM 搜索补充 → 建议 → 落库）
 # ---------------------------------------------------------------------------

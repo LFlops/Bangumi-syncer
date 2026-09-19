@@ -504,6 +504,48 @@ class TestLastErrorRedaction:
         finally:
             dbm._connection._conn.close()
 
+    def test_last_error_redacted_before_truncation_across_500_boundary(self, tmp_path):
+        """敏感值横跨第 500 字符边界：必须先在完整文本脱敏、后截断（≤500）。
+
+        构造：100 字符前缀 + `` token=<700 字符密钥> `` + 结尾标记
+        ``TAIL-MARKER`` + 600 字符良性尾巴（脱敏后整体仍 >500，确保截断生效）。
+        - 先截断（旧顺序）：第 500 字符落在密钥值中段，脱敏后文本只剩
+          ``token=***``，结尾标记 ``TAIL-MARKER`` 一并被切掉；
+        - 不截断（旧 DB 行为）：脱敏后长度 >500，超出 API 暴露上限。
+        正确顺序（先脱敏后截断）：密钥完整遮蔽、结尾标记保留、长度恰为 500。
+        落库后以**独立连接**读取断言。
+        """
+        import sqlite3
+
+        run_id = "rd-trunc"
+        dbm = _make_db(tmp_path)
+        try:
+            secret = "S3CR3T-" * 100  # 700 字符，横跨第 500 字符边界
+            raw = "x" * 100 + f" token={secret} TAIL-MARKER " + "y" * 600
+            secret_start = raw.index(secret)
+            assert secret_start < 500 < secret_start + len(secret)
+            assert len(raw) > 500
+
+            dbm.agent_runs.create_pending(run_id, "match", 1)
+            assert dbm.agent_runs.mark_failed(run_id, "error", raw) is True
+
+            # 独立连接读取（绕过本进程连接缓存）
+            conn = sqlite3.connect(str(dbm.db_path))
+            try:
+                stored = conn.execute(
+                    "SELECT last_error FROM agent_runs WHERE run_id=?", (run_id,)
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            assert secret not in stored
+            assert "S3CR3T-" not in stored  # 无密钥片段残留
+            assert "token=***" in stored
+            assert "TAIL-MARKER" in stored  # 先脱敏才能在截断窗口内保留结尾标记
+            assert len(stored) == 500  # 脱敏后仍 >500，按上限截断
+        finally:
+            dbm._connection._conn.close()
+
 
 class TestRefreshStartedAt:
     """refresh_started_at：支持调用方注入时间戳（重入防护统一时间戳）"""
