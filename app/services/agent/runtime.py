@@ -96,7 +96,7 @@ async def run(
         # LLMCallError 携带 retryable 标志区分可重试/确定性失败
         if not e.retryable:
             # 确定性失败（401/403/400/refusal）→ 立即标记 failed，不浪费重试次数
-            logger.error(f"[llm_assist] run {run_id} 确定性 LLM 失败: {e}")
+            logger.error(f"[{hooks.task_type}] run {run_id} 确定性 LLM 失败: {e}")
             dbm.agent_runs.mark_failed(
                 run_id,
                 stop_reason="llm_error",
@@ -106,11 +106,11 @@ async def run(
             return "failed"
         # 可重试（429/5xx/超时）→ 累加 attempts；达上限时由仓储在**同一次调用事务内**
         # 单点置终态（status='failed' + last_error），此处不得再 mark_failed（避免双写）。
-        logger.error(f"[llm_assist] run {run_id} 可重试 LLM 失败: {e}")
+        logger.error(f"[{hooks.task_type}] run {run_id} 可重试 LLM 失败: {e}")
         attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e))
         return "failed" if attempts >= 3 else "processing"
     except Exception as e:
-        logger.error(f"[llm_assist] run {run_id} LLM 调用异常: {e}")
+        logger.error(f"[{hooks.task_type}] run {run_id} LLM 调用异常: {e}")
         attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e))
         return "failed" if attempts >= 3 else "processing"
 

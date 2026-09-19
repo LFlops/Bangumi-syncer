@@ -128,7 +128,7 @@ class TraceRecorder:
                 else:
                     # chat_fn 抛异常：写 error span 但不遮掩原始异常
                     logger.warning(
-                        f"[llm_assist] chat_fn 异常（iteration={iteration}），写 error span"
+                        f"[agent] chat_fn 异常（iteration={iteration}），写 error span"
                     )
                     trace_end_span(
                         span_id,

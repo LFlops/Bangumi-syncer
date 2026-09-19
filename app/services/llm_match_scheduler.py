@@ -7,9 +7,9 @@
 1. **清理**：终态且 ended_at 超保留期 → 先删 agent_steps 再删 agent_runs（级联）+ 日志
 2. **恢复扫描**：``processing`` 且 started_at 超时的遗留 run → 刷新 started_at
    → sync_record 缺失则 mark_failed；否则构造 bgm 后交由场景层公开入口
-   ``llm_assist.continue_run`` 完成 replay 重建与续跑（本调度器不触碰场景内部符号）
-3. **正常处理**：逐条原子拾取（由 llm_assist.run 内部 atomic_claim 负责）→
-    调 ``llm_assist.run`` → 异常捕获累加 attempts（≥3 标 failed）
+   场景运行入口（``get_scenario(task_type).continue_run``）完成 replay 重建与续跑（本调度器不触碰场景内部符号）
+3. **正常处理**：逐条原子拾取（由场景运行入口内部 atomic_claim 负责）→
+    调场景运行入口 ``get_scenario(task_type).run`` → 异常捕获累加 attempts（≥3 标 failed）
 
 recover 与 pending 统一入列后经 ``asyncio.Semaphore(llm_match_concurrency)`` 并发消费，
 单条 run 异常在包装层隔离记录，不影响同批其他 run。sync_record_id 尚未回填
@@ -35,8 +35,8 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.models.agent import AgentRunRecord
+from app.services.agent.registry import get_scenario
 from app.services.base.scheduler import BaseScheduler
-from app.services.matching import llm_assist as llm_assist_module
 from app.services.notification_service import get_notification_service
 from app.utils.bangumi_api import BangumiApi
 
@@ -247,7 +247,7 @@ class LlmMatchScheduler(BaseScheduler):
         2. 以**统一时间戳**对 started_at 做 CAS 刷新（expected=扫描到的值），
            防跨进程重复恢复：未抢到（值已被他人刷新/状态已变）则释放执行权返回
         3. sync_record 缺失 → mark_failed(error)
-        4. 否则构造 bgm → 调用场景层单一公开入口 ``llm_assist.continue_run``
+        4. 否则构造 bgm → 调用场景运行入口 ``get_scenario(task_type).continue_run``
            （replay / 补执行 / 续跑 / 落库与失败分流均在场景层内部完成）
 
         本方法只负责调度与兜底日志，不触碰场景层私有符号。
@@ -287,10 +287,10 @@ class LlmMatchScheduler(BaseScheduler):
             try:
                 # 续跑的场景内部逻辑（replay / 补执行 / loop / 落库 / 失败分流）
                 # 全部收敛在 continue_run 内；此处不再触碰其私有符号。
-                await llm_assist_module.continue_run(
+                await get_scenario(run.task_type).continue_run(
                     run_id,
-                    sync_record,
-                    bgm,
+                    sync_record=sync_record,
+                    bgm=bgm,
                     notification_service=get_notification_service(),
                 )
             except Exception as e:
@@ -333,12 +333,12 @@ class LlmMatchScheduler(BaseScheduler):
 
             bgm = self._build_bgm(sync_record)
             try:
-                # F5：thinking_level 统一从集中配置读取并透传给 llm_assist.run
+                # F5：thinking_level 统一从集中配置读取并透传给场景运行入口
                 # （config_override 由 llm_assist.run 内部从同一配置读取）。
                 match_cfg = config_manager.get_sync_llm_match_config()
                 thinking_level = match_cfg["llm_match_thinking_level"]
-                # atomic_claim / 状态流转 / 落库均在 llm_assist.run 内部完成
-                await llm_assist_module.run(
+                # atomic_claim / 状态流转 / 落库均在场景运行入口内部完成
+                await get_scenario(run.task_type).run(
                     run_id,
                     sync_record=sync_record,
                     bgm=bgm,

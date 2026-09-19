@@ -342,7 +342,7 @@ def test_recovery_missing_sync_record_marks_failed():
         ),
         patch.object(sched, "_get_sync_record", return_value=None),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
         ) as cont,
     ):
@@ -378,7 +378,7 @@ def test_recovery_present_sync_record_continues():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
         ) as cont,
     ):
@@ -413,7 +413,7 @@ def test_recover_run_calls_continue_run_single_entry():
             return_value=fake_svc,
         ),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=cont,
         ),
     ):
@@ -421,8 +421,8 @@ def test_recover_run_calls_continue_run_single_entry():
 
     cont.assert_awaited_once_with(
         "A",
-        sync_record,
-        fake_bgm,
+        sync_record=sync_record,
+        bgm=fake_bgm,
         notification_service=fake_svc,
     )
 
@@ -436,11 +436,8 @@ def test_scheduler_source_no_scenario_private_symbols():
         "_continue_replay",
         "_replay_missing_tool",
         "_append_tool_result",
-        "llm_assist_module._handle_result",
-        "llm_assist_module._build_default_chat_fn",
-        "llm_assist_module.TraceRecorder",
-        "llm_assist_module.register_match_tools",
-        "llm_assist_module.resolve_max_iterations_override",
+        "llm_assist_module",
+        "app.services.matching",
         "LLMCallError",
         "ToolUseBlock",
         "ToolResultBlock",
@@ -473,7 +470,7 @@ def test_process_pending_calls_llm_assist_run_per_item():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
 
@@ -501,7 +498,7 @@ def test_process_pending_respects_batch_limit_five():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
 
@@ -527,7 +524,7 @@ def test_run_exception_increments_attempts():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
 
@@ -554,7 +551,7 @@ def test_run_exception_attempts_reach_three_single_point_no_double_mark_failed()
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
 
@@ -584,7 +581,7 @@ def test_exception_in_one_run_does_not_stop_others():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
 
@@ -619,7 +616,7 @@ def test_process_run_passes_thinking_level_from_config():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         asyncio.run(sched._process_run(run))
 
@@ -649,7 +646,7 @@ def test_process_run_passes_notification_service_to_llm_assist_run():
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
         patch(
             "app.services.llm_match_scheduler.get_notification_service",
             return_value=fake_svc,
@@ -705,7 +702,7 @@ def test_recover_run_passes_caller_timestamp_to_refresh():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
         ),
     ):
@@ -754,7 +751,7 @@ def test_concurrent_recover_same_run_only_one_acquires():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             side_effect=_gated_continue,
         ),
     ):
@@ -784,7 +781,7 @@ def test_recover_run_cas_loser_skips_continuation_and_releases_active():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=cont,
         ),
     ):
@@ -819,7 +816,7 @@ def test_recover_run_releases_after_unexpected_exception():
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
         patch.object(sched, "_build_bgm", return_value=MagicMock()),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ),
     ):
@@ -849,7 +846,7 @@ def test_process_run_skips_active_run():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         asyncio.run(sched._process_run(_run_model(run_id="A", sync_record_id=42)))
 
@@ -1122,7 +1119,7 @@ def test_process_run_skips_run_without_sync_record_id(empty_id):
         ),
         patch("app.services.llm_match_scheduler.logger", log),
         patch("app.services.llm_match_scheduler._try_acquire_run", acquire_spy),
-        patch("app.services.llm_match_scheduler.llm_assist_module.run", run_mock),
+        patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         asyncio.run(sched._process_run(_run_model(run_id="a", sync_record_id=empty_id)))
 
@@ -1152,7 +1149,7 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
         patch("app.services.llm_match_scheduler.logger", log),
         patch("app.services.llm_match_scheduler._try_acquire_run", acquire_spy),
         patch(
-            "app.services.llm_match_scheduler.llm_assist_module.continue_run",
+            "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1}),
