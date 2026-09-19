@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
+from app.services.agent import loop as loop_module
 from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
     ChatResponse,
@@ -305,11 +306,11 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
     assert calls[0][1]["tool_choice"] is None
     assert calls[1][1]["tool_choice"] == "submit_suggestion"
 
-    # 第二轮请求收到的 messages 末尾应携带第一轮留下的预算消息 [剩余轮次：1]
+    # 第二轮请求收到的 messages 末尾应携带第一轮留下的末轮强化提示
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    assert last_msg.content == "[剩余轮次：1]"
+    assert last_msg.content == loop_module.FINAL_ROUND_BUDGET_MESSAGE
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +473,8 @@ async def test_max_iterations_exhausted_returns_last_response():
     assert result.stop_reason == "exhausted"
     assert result.last_response is not None
     assert result.last_response.stop_reason == "tool_use"
-    assert chat_fn.await_count == 2
+    # 2 轮循环 + 1 次兜底收尾调用
+    assert chat_fn.await_count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +493,7 @@ class _FakeBudgetRecorder:
 
 
 async def test_budget_record_budget_called_per_non_final_round_with_remaining():
-    """仅非末轮调用 record_budget，参数为 "[剩余轮次：N]"（末轮不产生幻影消息）。"""
+    """非末轮记录 "[剩余轮次：N]"，末轮记录强化文案；收尾再记录一次收尾提示。"""
     recorder = _FakeBudgetRecorder()
 
     chat_fn = AsyncMock(
@@ -512,8 +514,12 @@ async def test_budget_record_budget_called_per_non_final_round_with_remaining():
     )
 
     # 3 轮中前 2 轮递减后 remaining>0（2、1）→ 各记录一次；末轮递减后 remaining==0
-    # 的预算消息从未发给 LLM，不得记录
-    assert recorder.budget_calls == ["[剩余轮次：2]", "[剩余轮次：1]"]
+    # 的预算消息从未发给 LLM，不得记录；循环结束后收尾提示记录一次
+    assert recorder.budget_calls == [
+        "[剩余轮次：2]",
+        loop_module.FINAL_ROUND_BUDGET_MESSAGE,
+        loop_module.FINAL_RECOVERY_MESSAGE,
+    ]
     assert "[剩余轮次：0]" not in recorder.budget_calls
 
 
@@ -555,11 +561,11 @@ async def test_budget_appended_to_messages_even_without_recorder():
         recorder=None,
     )
 
-    # 第二轮请求收到的 messages 末尾应携带第一轮留下的预算消息 [剩余轮次：1]
+    # 第二轮请求收到的 messages 末尾应携带第一轮留下的末轮强化提示
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    assert last_msg.content == "[剩余轮次：1]"
+    assert last_msg.content == loop_module.FINAL_ROUND_BUDGET_MESSAGE
 
 
 async def test_budget_no_phantom_message_on_final_round():
@@ -591,7 +597,8 @@ async def test_budget_no_phantom_message_on_final_round():
     )
 
     assert result.stop_reason == "exhausted"
-    assert recorder.budget_calls == [], "末轮递减后 remaining==0，不应记录预算消息"
+    # 末轮递减后 remaining==0 不记录剩余轮次；循环后收尾提示记录一次
+    assert recorder.budget_calls == [loop_module.FINAL_RECOVERY_MESSAGE]
     phantom = [
         m.content
         for m in observed[0]
@@ -794,3 +801,237 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
     assert types == ["text", "thinking", "tool_use"]
     thinking_block = next(b for b in assistant_msg.content if b.type == "thinking")
     assert thinking_block.signature == "sig-1"
+
+
+# ---------------------------------------------------------------------------
+# 14. 末轮强化提示：remaining==1 的预算消息改为强化文案；非末轮不含
+# ---------------------------------------------------------------------------
+
+
+async def test_final_round_budget_message_is_strengthened():
+    """末轮（remaining==1）注入的预算消息含「最后一轮 / submit_suggestion / 不得再检索」。"""
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    # max_iterations=2：第一轮递减后 remaining==1 → 注入强化提示，第二轮请求可见
+    last_msg = calls[1][-1]
+    assert last_msg.role == "user"
+    assert isinstance(last_msg.content, str)
+    assert "最后一轮" in last_msg.content
+    assert "submit_suggestion" in last_msg.content
+    assert "不得再" in last_msg.content
+
+
+async def test_non_final_round_budget_message_not_strengthened():
+    """非末轮（remaining>1）仍是朴素文案，不含强化提示语义。"""
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    # 第一轮递减后 remaining==2 → 第二轮请求末尾是朴素预算消息
+    second_last = calls[1][-1]
+    assert second_last.role == "user"
+    assert second_last.content == "[剩余轮次：2]"
+    assert "最后一轮" not in second_last.content
+
+
+# ---------------------------------------------------------------------------
+# 15. 兜底收尾调用（for 循环自然结束后最多一次）
+# ---------------------------------------------------------------------------
+
+
+def _exhausting_chat(max_iterations: int, extra: list[ChatResponse]):
+    """构造 chat_fn：前 max_iterations 轮返回非终止工具，之后按 extra 依次返回。"""
+    calls: list[tuple[list[Message], dict]] = []
+    seq = list(extra)
+
+    def _side_effect(*args, **kwargs):
+        calls.append((list(args[0]), dict(kwargs)))
+        if len(calls) <= max_iterations:
+            return _resp("tool_use", [_tool_use("t", "search_bangumi")])
+        if seq:
+            return seq.pop(0)
+        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
+
+    return AsyncMock(side_effect=_side_effect), calls
+
+
+async def test_exhausted_final_recovery_submits_suggestion():
+    """耗尽后收尾调用返回 submit → stop_reason=submit_suggestion 且参数正确。"""
+    submit = _tool_use(
+        "s", "submit_suggestion", {"subject_id": "49892", "reason": "收尾确定"}
+    )
+    recovery = _resp("tool_use", [submit])
+    chat_fn, calls = _exhausting_chat(2, [recovery])
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "49892", "reason": "收尾确定"}
+    assert result.last_response is recovery
+    # 收尾请求的 messages 末尾为收尾提示
+    assert calls[2][0][-1].content == loop_module.FINAL_RECOVERY_MESSAGE
+
+
+async def test_exhausted_final_recovery_still_no_submit_returns_exhausted():
+    """耗尽后收尾仍不提交 → exhausted，last_response 为收尾响应。"""
+    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    chat_fn, _calls = _exhausting_chat(2, [recovery])
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "exhausted"
+    assert result.last_response is recovery
+
+
+async def test_exhausted_final_recovery_exception_returns_exhausted_not_crash():
+    """收尾调用抛异常 → best-effort 返回 exhausted（last_response 保持循环内最后一次）。"""
+    loop_resp = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    call_count = {"n": 0}
+
+    async def _chat(messages, *, tools=None, tool_choice=None):
+        call_count["n"] += 1
+        if call_count["n"] <= 2:  # max_iterations=2 的循环内两轮
+            return loop_resp
+        raise RuntimeError("收尾调用失败")
+
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=_chat,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "exhausted"
+    assert result.last_response is loop_resp
+
+
+async def test_exhausted_final_recovery_tools_only_terminal_schema():
+    """收尾调用仅传 terminal 工具的 schema，且 tool_choice=terminal；不执行其他工具。"""
+    recovery = _resp(
+        "tool_use", [_tool_use("s", "submit_suggestion", {"subject_id": "1"})]
+    )
+    chat_fn, calls = _exhausting_chat(2, [recovery])
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+    schemas = [
+        {"name": "search_bangumi"},
+        {"name": "submit_suggestion"},
+    ]
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=schemas,
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    # calls[2] 为收尾调用
+    assert calls[2][1]["tools"] == [{"name": "submit_suggestion"}]
+    assert calls[2][1]["tool_choice"] == "submit_suggestion"
+    # 收尾不执行任何非终止工具：tool_calls_fn 只被循环内两轮调用
+    assert tool_calls_fn.await_count == 2
+
+
+async def test_exhausted_final_recovery_called_exactly_once():
+    """收尾调用恰好一次：chat_fn 总调用数 = max_iterations + 1。"""
+    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    chat_fn, _calls = _exhausting_chat(2, [recovery])
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert chat_fn.await_count == 3  # 2 轮循环 + 1 次收尾
+
+
+async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
+    """收尾提示须经 recorder.record_budget 记录（恢复重放一致性）。"""
+    recorder = _FakeBudgetRecorder()
+    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    chat_fn, _calls = _exhausting_chat(2, [recovery])
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        recorder=recorder,
+    )
+
+    assert loop_module.FINAL_RECOVERY_MESSAGE in recorder.budget_calls

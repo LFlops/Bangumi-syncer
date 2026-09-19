@@ -1,9 +1,10 @@
 """IterationStrategy 预算策略注册表测试。
 
 覆盖：
-- MatchIterationStrategy 预设 off=1/low=2/medium=3/high=5，未知 level 兜底 3
+- MatchIterationStrategy 预设 off=1/low=2/medium=5/high=10，未知 level 兜底 medium=5
 - register 后 get_max_iterations 返回对应策略；不同 task_type 互不影响；重复注册覆盖
 - 优先级：config_override 最高 > 策略映射 > 默认兜底
+- 未注册 task_type 仍走保守默认兜底 off=1/low=2/medium=3/high=5
 """
 
 from __future__ import annotations
@@ -51,21 +52,21 @@ def test_match_iteration_strategy_low_returns_2():
     assert strategy.max_iterations("low") == 2
 
 
-def test_match_iteration_strategy_medium_returns_3():
+def test_match_iteration_strategy_medium_returns_5():
     strategy = MatchIterationStrategy()
-    assert strategy.max_iterations("medium") == 3
+    assert strategy.max_iterations("medium") == 5
 
 
-def test_match_iteration_strategy_high_returns_5():
+def test_match_iteration_strategy_high_returns_10():
     strategy = MatchIterationStrategy()
-    assert strategy.max_iterations("high") == 5
+    assert strategy.max_iterations("high") == 10
 
 
-def test_match_iteration_strategy_unknown_level_returns_3():
+def test_match_iteration_strategy_unknown_level_falls_back_to_medium():
     strategy = MatchIterationStrategy()
-    assert strategy.max_iterations("bogus") == 3
-    assert strategy.max_iterations("") == 3
-    assert strategy.max_iterations("ULTRA") == 3
+    assert strategy.max_iterations("bogus") == 5
+    assert strategy.max_iterations("") == 5
+    assert strategy.max_iterations("ULTRA") == 5
 
 
 # --- 默认注册（match 应随模块导入即注册） ---
@@ -79,8 +80,8 @@ def test_match_strategy_registered_by_default():
 def test_get_max_iterations_match_default_preset_levels():
     assert get_max_iterations("match", "off") == 1
     assert get_max_iterations("match", "low") == 2
-    assert get_max_iterations("match", "medium") == 3
-    assert get_max_iterations("match", "high") == 5
+    assert get_max_iterations("match", "medium") == 5
+    assert get_max_iterations("match", "high") == 10
 
 
 # --- 注册与 get_max_iterations 行为 ---
@@ -103,7 +104,7 @@ def test_get_max_iterations_different_task_types_isolated():
     )
     # match 始终保持自己的预设，不受 diagnostic 影响
     assert get_max_iterations("match", "off") == 1
-    assert get_max_iterations("match", "high") == 5
+    assert get_max_iterations("match", "high") == 10
     assert get_max_iterations("diagnostic", "off") == 9
 
 

@@ -1067,8 +1067,8 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
             return []
 
     ns = _make_notify()
-    # 每轮都调 search（失败），共 max_iterations(medium=3) 轮 → exhausted
-    chat = _chat_side_effect([_search_response() for _ in range(3)])
+    # 每轮都调 search（失败），共 max_iterations(medium=5) 轮 → exhausted
+    chat = _chat_side_effect([_search_response() for _ in range(5)])
 
     status = await llm_assist.run(
         run_id,
@@ -1106,12 +1106,20 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
     bgm = _make_bgm()
     ns = _make_notify()
 
-    # 每轮返回非终止工具调用 + 末轮 content 含 JSON（loop 跑满 medium=3 轮）
+    # 每轮返回非终止工具调用（跑满 medium=5 轮）；收尾调用末轮 content 含 JSON
     chat = _chat_side_effect(
         [
             _search_response('{"subject_id": "321", "reason": "兜底"}'),
             _search_response('{"subject_id": "321", "reason": "兜底"}'),
             _search_response('{"subject_id": "321", "reason": "兜底"}'),
+            _search_response('{"subject_id": "321", "reason": "兜底"}'),
+            _search_response('{"subject_id": "321", "reason": "兜底"}'),
+            # 第 6 次为兜底收尾调用（返回纯文本 JSON，不调用工具）
+            ChatResponse(
+                content='{"subject_id": "321", "reason": "兜底"}',
+                stop_reason="end_turn",
+                blocks=[],
+            ),
         ]
     )
 
@@ -1142,12 +1150,16 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
     bgm = _make_bgm()
     ns = _make_notify()
 
-    # 末轮 content 无 JSON
+    # 每轮返回非终止工具调用（跑满 medium=5 轮）；收尾调用末轮 content 无 JSON
     chat = _chat_side_effect(
         [
             _search_response("无意义的文本"),
             _search_response("无意义的文本"),
             _search_response("无意义的文本"),
+            _search_response("无意义的文本"),
+            _search_response("无意义的文本"),
+            # 第 6 次为兜底收尾调用（无 JSON）
+            ChatResponse(content="无意义的文本", stop_reason="end_turn", blocks=[]),
         ]
     )
 
@@ -1861,7 +1873,7 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
-    """场景2：run(thinking_level="high") → loop_run 收到 max_iterations=5。"""
+    """场景2：run(thinking_level="high") → loop_run 收到 max_iterations=10。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from app.services.agent.loop import RunResult
@@ -1893,9 +1905,9 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
             thinking_level="high",
         )
 
-    # 验证 max_iterations 直接传入 loop_run：high → 5
-    assert captured.get("max_iterations") == 5, (
-        f"loop_run 应收到 max_iterations=5，实际 captured={captured}"
+    # 验证 max_iterations 直接传入 loop_run：high → 10
+    assert captured.get("max_iterations") == 10, (
+        f"loop_run 应收到 max_iterations=10，实际 captured={captured}"
     )
 
 
@@ -2910,7 +2922,7 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
     repo = _make_continuation_repo()
     handle = MagicMock()
     seed = [Message(role="system", content="s"), Message(role="user", content="u")]
-    rr = _make_replay_result(executed=2, missing=[], last_response=None, messages=seed)
+    rr = _make_replay_result(executed=4, missing=[], last_response=None, messages=seed)
     loop = AsyncMock(return_value=RunResult(stop_reason="end_turn"))
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -2927,7 +2939,7 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
 
     loop.assert_awaited_once()
     assert loop.await_args.kwargs["seed_messages"] is seed
-    # medium=3，executed=2 → 剩余 1 轮
+    # medium=5，executed=4 → 剩余 1 轮
     assert loop.await_args.kwargs["max_iterations"] == 1
     handle.assert_called_once()
     assert handle.call_args[0][2].stop_reason == "end_turn"
@@ -3027,7 +3039,7 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
     repo = _make_continuation_repo()
     missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
     rr = _make_replay_result(
-        executed=2,  # medium=3 → remaining=1；补执行后 -1 → 0
+        executed=4,  # medium=5 → remaining=1；补执行后 -1 → 0
         missing=[missing],
         last_response={
             "stop_reason": "tool_use",
@@ -3060,7 +3072,7 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
     """replay 后剩余轮次已耗尽（remaining<=0）同样必须落终态。"""
     repo = _make_continuation_repo()
     rr = _make_replay_result(
-        executed=3,  # medium=3 → remaining=0
+        executed=5,  # medium=5 → remaining=0
         missing=[],
         last_response=None,
     )
@@ -3084,7 +3096,7 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
 def test_continue_run_replay_exhausted_logs_warning():
     """预算耗尽（replay 前）→ warning 且注明恢复(replay)路径，不得停留在 debug。"""
     repo = _make_continuation_repo()
-    rr = _make_replay_result(executed=3, missing=[], last_response=None)
+    rr = _make_replay_result(executed=5, missing=[], last_response=None)
     log = MagicMock()
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -3109,12 +3121,81 @@ def test_continue_run_replay_exhausted_logs_warning():
     )
 
 
+# G4b：终局优先于预算耗尽判定（恢复路径顺序调整） ------------------------------
+
+
+def test_continue_run_zero_remaining_with_submit_uses_terminal():
+    """remaining==0 + last_response 含 submit → 走 handle_terminal，不落 exhausted。"""
+    repo = _make_continuation_repo()
+    handle = MagicMock()
+    rr = _make_replay_result(
+        executed=5,  # medium=5 → remaining=0
+        missing=[],
+        last_response={
+            "stop_reason": "tool_use",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "s1",
+                    "name": "submit_suggestion",
+                    "input": {"subject_id": "123", "reason": "末轮已提交"},
+                }
+            ],
+        },
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.agent.runtime.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.matching.llm_assist._handle_result", handle),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    handle.assert_called_once()
+    result_arg = handle.call_args[0][2]
+    assert result_arg.stop_reason == "submit_suggestion"
+    assert result_arg.suggestion == {"subject_id": "123", "reason": "末轮已提交"}
+    repo.mark_no_suggestion.assert_not_called()
+    loop.assert_not_awaited()
+
+
+def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn():
+    """remaining==0 + last_response 为 end_turn → mark_no_suggestion('end_turn')。"""
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(
+        executed=5,  # medium=5 → remaining=0
+        missing=[],
+        last_response={"stop_reason": "end_turn", "content": "放弃", "tool_calls": []},
+    )
+    loop = AsyncMock()
+    with (
+        patch("app.services.agent.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.agent.runtime.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch("app.services.agent.runtime.loop_run", loop),
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
+
+    repo.mark_no_suggestion.assert_called_once_with("r", stop_reason="end_turn")
+    loop.assert_not_awaited()
+
+
 def test_continue_run_replay_exhausted_after_backfill_logs_warning():
     """补执行后预算耗尽 → warning 且注明恢复(replay)路径。"""
     repo = _make_continuation_repo()
     missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
     rr = _make_replay_result(
-        executed=2,
+        executed=4,
         missing=[missing],
         last_response={
             "stop_reason": "tool_use",

@@ -29,12 +29,16 @@ class IterationStrategy(Protocol):
 
 
 class MatchIterationStrategy:
-    """match 场景预设（骨架默认注册）。"""
+    """match 场景预设（骨架默认注册）。
 
-    PRESET = {"off": 1, "low": 2, "medium": 3, "high": 5}
+    medium=5 / high=10：思考模型（pro / eval）实测 3 轮偏紧，易在预算耗尽前
+    未产出结论；放宽轮次以覆盖「多轮检索 + 收尾」完整路径。
+    """
+
+    PRESET = {"off": 1, "low": 2, "medium": 5, "high": 10}
 
     def max_iterations(self, level: str) -> int:
-        return self.PRESET.get(level, 3)  # 未知 level 兜底 medium=3
+        return self.PRESET.get(level, self.PRESET["medium"])  # 未知 level 回落 medium
 
 
 def register_iteration_strategy(task_type: str, strategy: IterationStrategy) -> None:

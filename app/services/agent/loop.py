@@ -10,9 +10,14 @@
   （``tool_registry.execute_batch`` 做分段并行 gather/串行），按**独立结果槽位**逐条回填
   tool_result（重复 tool_use_id 时首个保留真实结果、后续为 duplicate 错误块）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
-- **透明预算**：每轮递减后仅当仍有后续轮次（remaining>0）才追加 ``[剩余轮次：N]``；
-  末轮（remaining==1 起手）强制 ``tool_choice=terminal``。末轮不再产生剩余 0 的幻影预算消息。
-- **预算钩子**：非末轮预算消息生成后调用 ``recorder.record_budget(budget_message)``，
+- **透明预算**：每轮递减后仅当仍有后续轮次（remaining>0）才追加预算消息；
+  remaining>1 为朴素 ``[剩余轮次：N]``，remaining==1 为强化文案
+  ``FINAL_ROUND_BUDGET_MESSAGE``（明确要求给出结论、禁止再检索）。末轮（remaining==1 起手）
+  强制 ``tool_choice=terminal``。末轮不再产生剩余 0 的幻影预算消息。
+- **兜底收尾**：for 循环自然结束（即将返回 exhausted）时追加**一次**收尾 LLM 调用
+  （``FINAL_RECOVERY_MESSAGE``，tools 仅 terminal schema、tool_choice=terminal），
+  best-effort 争取明确结论；不执行任何非终止工具，异常时降级为 exhausted，仅调用一次。
+- **预算钩子**：非末轮预算消息与收尾提示生成后调用 ``recorder.record_budget(...)``，
   由 recorder 内部决定并入哪条 span（同轮最后 tool_execute 或回退 llm_chat）。
   ``recorder=None`` 时整体跳过（可空实现）。
 
@@ -34,6 +39,21 @@ from app.services.llm.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 末轮（remaining==1）强化提示：思考模型在强制 tool_choice=terminal 被供应商降级为
+# auto 时容易不提交，明确要求给出结论（含放弃）并禁止再检索。
+FINAL_ROUND_BUDGET_MESSAGE = (
+    "[剩余轮次：1（最后一轮）] 必须调用 submit_suggestion 给出结论："
+    "若已确定推荐条目则提交 subject_id 与理由；若确实无法确定，也要调用并说明放弃理由。"
+    "不得再调用其他检索工具。"
+)
+
+# 兜底收尾：for 循环自然结束（即将 exhausted）时追加一次收尾调用，best-effort
+# 争取一个明确结论；该消息须经 recorder 预算通道记录，保证恢复重放一致性。
+FINAL_RECOVERY_MESSAGE = (
+    "[最终收尾] 轮次预算已耗尽。请立即调用 submit_suggestion 给出结论："
+    "若已确定则提交 subject_id 与理由；若确实无法确定也请调用并说明放弃理由。"
+)
 
 
 @dataclass
@@ -178,10 +198,73 @@ async def run(
         #    但该消息从未发给 LLM —— 形成「幻影预算消息」，故不注入也不记录。
         remaining -= 1
         if remaining > 0:
-            budget_message = f"[剩余轮次：{remaining}]"
+            budget_message = (
+                FINAL_ROUND_BUDGET_MESSAGE
+                if remaining == 1
+                else f"[剩余轮次：{remaining}]"
+            )
             messages.append(Message(role="user", content=budget_message))
             if recorder is not None:
                 recorder.record_budget(budget_message)
 
-    # 预算刚性耗尽（兜底由场景层 output_parser 解析 last_response）
-    return RunResult(stop_reason="exhausted", last_response=resp)
+    # 预算刚性耗尽：追加一次收尾 LLM 调用（best-effort，仅一次，不执行非终止工具），
+    # 尽量在返回 exhausted 前拿到明确结论。
+    return await _final_recovery(
+        chat_fn=chat_fn,
+        tools_schemas=tools_schemas,
+        tool_choice_terminal=tool_choice_terminal,
+        messages=messages,
+        recorder=recorder,
+        last_response=resp,
+    )
+
+
+async def _final_recovery(
+    *,
+    chat_fn: ChatFn,
+    tools_schemas: list[dict],
+    tool_choice_terminal: str,
+    messages: list[Message],
+    recorder: Any | None,
+    last_response: ChatResponse | None,
+) -> RunResult:
+    """耗尽后的兜底收尾调用（最多一次）。
+
+    - 追加 ``FINAL_RECOVERY_MESSAGE`` 并经 recorder 预算通道记录（重放一致性）
+    - tools 过滤为**仅** terminal schema，``tool_choice=terminal``
+    - 含 terminal tool_call → submit_suggestion；否则 exhausted（last_response=收尾响应）
+    - chat_fn 抛异常 → best-effort 捕获返回 exhausted（保留循环内最后一次响应），不重试
+    """
+    messages.append(Message(role="user", content=FINAL_RECOVERY_MESSAGE))
+    if recorder is not None:
+        recorder.record_budget(FINAL_RECOVERY_MESSAGE)
+
+    terminal_schemas = [
+        s
+        for s in tools_schemas
+        if isinstance(s, dict) and s.get("name") == tool_choice_terminal
+    ]
+    try:
+        recovery_resp = await chat_fn(
+            messages, tools=terminal_schemas, tool_choice=tool_choice_terminal
+        )
+    except Exception as e:
+        # best-effort：收尾失败不应让 run 更糟，保留循环内最后一次可用响应
+        logger.warning("收尾调用失败（best-effort 降级为 exhausted）: %s", e)
+        return RunResult(stop_reason="exhausted", last_response=last_response)
+
+    terminal_tc = next(
+        (
+            tc
+            for tc in _extract_tool_calls(recovery_resp)
+            if tc.name == tool_choice_terminal
+        ),
+        None,
+    )
+    if terminal_tc is not None:
+        return RunResult(
+            stop_reason="submit_suggestion",
+            suggestion=terminal_tc.input,
+            last_response=recovery_resp,
+        )
+    return RunResult(stop_reason="exhausted", last_response=recovery_resp)

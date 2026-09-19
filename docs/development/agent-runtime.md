@@ -50,16 +50,39 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
    可重试 → `increment_attempts`（≥3 由仓储单点转 failed）；
 6. 终局交 `handle_terminal`。
 
+#### 轮次预算与收尾
+
+- **预设映射**（`MatchIterationStrategy.PRESET`）：`off=1 / low=2 / medium=5 / high=10`；
+  未知 `thinking_level` 回落 `medium`（5）。未注册 `task_type` 仍走保守默认兜底
+  （`off=1 / low=2 / medium=3 / high=5`）。
+- **末轮强化提示**：`remaining == 1` 时预算消息不再是朴素 `[剩余轮次：1]`，而是
+  `FINAL_ROUND_BUDGET_MESSAGE`——明确「最后一轮 / 必须调用 `submit_suggestion` 给出结论
+  （推荐或明确放弃）/ 不得再调用检索工具」。用于对冲供应商把强制 `tool_choice=terminal`
+  降级为 `auto` 导致思考模型不提交的情况。
+- **兜底收尾调用**：`for` 循环自然结束（即将返回 `exhausted`）时，追加**恰好一次**
+  收尾 LLM 调用（仅 live 路径）：
+  - 追加 `FINAL_RECOVERY_MESSAGE` 并经 `recorder.record_budget(...)` 记录（重放一致性）；
+  - `tools` 过滤为**仅** terminal schema，`tool_choice=terminal`；
+  - 含 terminal tool_call → `submit_suggestion`；否则 `exhausted`（`last_response` 为收尾响应）；
+  - chat_fn 抛异常 → best-effort 降级为 `exhausted`（保留循环内最后一次响应），不重试。
+
 ### continue_run（恢复路径，唯一公开续跑入口）
 
 1. 场景解析 thinking_level / max_iterations；
-2. `trace.replay` 从 `agent_steps` 重建消息与终局响应；预算耗尽 → `no_suggestion(exhausted)`；
-3. 按 `last_response` 分派：
-   - `None`（轮次已完整记录）→ 续跑 loop；
+2. `trace.replay` 从 `agent_steps` 重建消息与终局响应；
+3. **终局优先**（先于预算耗尽判定）按 `last_response` 分派：
    - `end_turn` → `mark_no_suggestion`；
-   - `terminal_tool` → 场景 `handle_terminal`（tokens 取 replay 累计）；
-   - 含 tool_use → 补执行缺失只读工具（写 tool span 自包含）→ 续跑 loop；
-4. 异常在函数内部消化（不向调度器抛出）。
+   - `terminal_tool`（或 tool_calls 含终止工具）→ 场景 `handle_terminal`（tokens 取 replay 累计）；
+   - `None`（轮次已完整记录）→ 预算耗尽则 `no_suggestion(exhausted)`，否则续跑 loop；
+   - 含 tool_use → 补执行缺失只读工具（写 tool span 自包含）→ 预算够则续跑 loop；
+4. 非终局且 `remaining <= 0` → `no_suggestion(exhausted)`（避免 run 永久滞留 `processing`）；
+5. 异常在函数内部消化（不向调度器抛出）。
+
+> 顺序说明：末轮可能已产出 `submit` 但 run 中断，若先判预算耗尽会误判 `exhausted` 丢失提交，
+> 故终局语义必须先消费。
+>
+> 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run`）。恢复路径预算耗尽时不再发起
+> 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_no_suggestion`）。
 
 ## 新增一个 Agent 场景
 

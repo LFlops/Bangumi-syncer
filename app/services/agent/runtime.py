@@ -136,12 +136,16 @@ async def continue_run(
     流程：
     1. 场景钩子解析 thinking_level / max_iterations（集中配置单一来源）
     2. ``trace.replay`` 重建可续跑消息列表与终局响应
-    3. ``remaining <= 0`` → 落终态 no_suggestion/exhausted（否则 run 永久滞留 processing）
-    4. ``last_response`` 分派：
+    3. ``last_response`` 终局优先分派（**先于**预算耗尽判定）：
        - ``end_turn`` → 直接 mark_no_suggestion（不调 LLM）
        - ``terminal_tool``（或 tool_calls 含终止工具）→ 走场景终局处理
+       - ``None``（全部轮次已完整记录）→ 若预算耗尽则落终态，否则续跑 loop
        - 含 tool_use → 补执行缺失只读工具 + 回填结果后续跑 loop
-    5. ``last_response`` 为 None → 全部轮次已完整记录，直接续跑 loop
+    4. ``remaining <= 0`` 且非终局 → 落终态 no_suggestion/exhausted
+       （否则 run 永久滞留 processing）
+
+    顺序说明：末轮可能已产出 submit 但 run 中断，若先判预算耗尽会误判 exhausted
+    丢失提交，故终局语义必须先消费。
 
     失败分流（与既有语义一致）：
     - ``LLMCallError(retryable=False)`` → ``mark_failed(stop_reason='llm_error')``
@@ -162,19 +166,13 @@ async def continue_run(
         # seed 由 replay 从 agent_steps 的 seed 行提取，无需此处重建
         replay_result = trace.replay(run_id)
         remaining = max_iterations - replay_result.executed_iterations
-        if remaining <= 0:
-            # G4：轮次预算已耗尽，不能直接 return（否则 run 永久滞留 processing，
-            # 下一轮恢复扫描又会重复捞起）→ 落终态 no_suggestion/exhausted
-            logger.warning(
-                f"🤖 恢复(replay)路径预算耗尽，run {run_id} 已无剩余轮次，"
-                f"标记 no_suggestion"
-            )
-            repo.mark_no_suggestion(run_id, stop_reason="exhausted")
-            return
 
         last_response = replay_result.last_response
         if last_response is None:
-            # 全部轮次已完整记录 → 以剩余轮次续跑通用循环
+            # 全部轮次已完整记录 → 预算耗尽则落终态，否则以剩余轮次续跑通用循环
+            if remaining <= 0:
+                _mark_exhausted(repo, run_id, note="replay 前")
+                return
             await _execute_continuation(
                 dbm,
                 run_id,
@@ -188,7 +186,8 @@ async def continue_run(
             )
             return
 
-        # F2：终局响应直接分派，避免无谓重调 LLM
+        # F2：终局响应直接分派（**先于**预算耗尽判定），避免无谓重调 LLM 与
+        # 末轮已 submit 却被误判 exhausted 丢失提交。
         stop = last_response.get("stop_reason")
         tcs = last_response.get("tool_calls") or []
 
@@ -224,12 +223,7 @@ async def continue_run(
         # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
         remaining = max(0, remaining - 1)
         if remaining <= 0:
-            # G4：同上，补执行后预算耗尽也必须落终态而非静默返回
-            logger.warning(
-                f"🤖 恢复(replay)路径预算耗尽，run {run_id} 补执行后已无"
-                f"剩余轮次，标记 no_suggestion"
-            )
-            repo.mark_no_suggestion(run_id, stop_reason="exhausted")
+            _mark_exhausted(repo, run_id, note="补执行后")
             return
 
         await _execute_continuation(
@@ -258,6 +252,18 @@ async def continue_run(
             f"{_current_run_status(repo, run_id)}）: {e}"
         )
         repo.increment_attempts(run_id, last_error=str(e))
+
+
+def _mark_exhausted(repo, run_id: str, *, note: str) -> None:
+    """预算耗尽且无终局语义 → 落终态 no_suggestion/exhausted。
+
+    G4：不能直接 return（否则 run 永久滞留 processing，下一轮恢复扫描又会重复捞起）。
+    """
+    logger.warning(
+        f"🤖 恢复(replay)路径预算耗尽，run {run_id} {note}已无剩余轮次，"
+        f"标记 no_suggestion"
+    )
+    repo.mark_no_suggestion(run_id, stop_reason="exhausted")
 
 
 def _current_run_status(repo, run_id: str) -> str:
