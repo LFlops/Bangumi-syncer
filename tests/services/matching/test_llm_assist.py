@@ -16,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.core.database import database_manager, set_database_manager
-from app.services.agent import recorder as agent_recorder
+from app.services.agent import recorder as agent_recorder, runtime as agent_runtime
 from app.services.agent.loop import RunResult
 from app.services.agent.trace import ReplayResult
 from app.services.llm.models import (
@@ -1653,7 +1653,7 @@ async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
 
     run_id = "run-f5"
     sr_id = 50
@@ -1691,7 +1691,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
 
     run_id = "run-f5b"
     sr_id = 51
@@ -1743,7 +1743,7 @@ async def test_run_non_positive_config_override_falls_back_to_none(
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
 
     run_id = f"run-g3-{tag}"
     sr_id = 70
@@ -1789,7 +1789,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
 
     run_id = "run-g3-invalid"
     sr_id = 71
@@ -1912,7 +1912,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
         captured.update(kwargs)
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(llm_assist, "loop_run", _fake_loop_run)
+    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop_run)
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
@@ -2790,10 +2790,10 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
@@ -2829,10 +2829,10 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -2879,10 +2879,10 @@ def test_continue_run_submit_uses_replayed_total_tokens():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -2918,11 +2918,11 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
-        patch("app.services.matching.llm_assist._replay_missing_tool", backfill),
+        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime._replay_missing_tool", backfill),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
@@ -2950,10 +2950,10 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -2986,11 +2986,11 @@ def test_continue_run_continuation_sums_replay_and_new_round_tokens():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
-        patch("app.services.matching.llm_assist.TraceRecorder", trace_recorder_cls),
+        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.TraceRecorder", trace_recorder_cls),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3026,7 +3026,7 @@ def _run_continue_run_with_config(raw_max: str):
         patch("app.services.matching.llm_assist.get_max_iterations", _gmi),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch("app.services.matching.llm_assist.logger", log),
@@ -3075,11 +3075,11 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist._replay_missing_tool", backfill),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime._replay_missing_tool", backfill),
+        patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
@@ -3103,10 +3103,10 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
@@ -3124,10 +3124,10 @@ def test_continue_run_replay_exhausted_logs_warning():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.logger", log),
+        patch("app.services.agent.runtime.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r", {"id": 1}, MagicMock()))
@@ -3161,12 +3161,12 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.logger", log),
-        patch("app.services.matching.llm_assist._replay_missing_tool", new=AsyncMock()),
-        patch("app.services.matching.llm_assist.loop_run", new=AsyncMock()),
+        patch("app.services.agent.runtime.logger", log),
+        patch("app.services.agent.runtime._replay_missing_tool", new=AsyncMock()),
+        patch("app.services.agent.runtime.loop_run", new=AsyncMock()),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r2", {"id": 1}, MagicMock()))
@@ -3199,7 +3199,7 @@ def test_continue_run_llm_call_error_retryable_false_marks_failed():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
@@ -3231,7 +3231,7 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
@@ -3263,15 +3263,15 @@ def test_continue_run_outer_exception_logs_current_run_status():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
             "app.services.matching.llm_assist._build_default_chat_fn",
             return_value=_chat_fn,
         ),
-        patch("app.services.matching.llm_assist.loop_run", boom_loop),
-        patch("app.services.matching.llm_assist.logger", log),
+        patch("app.services.agent.runtime.loop_run", boom_loop),
+        patch("app.services.agent.runtime.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(llm_assist.continue_run("r-outer-err", {"id": 1}, MagicMock()))
@@ -3331,7 +3331,7 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
 
     before = _count_tool_results(messages)
     asyncio.run(
-        llm_assist._replay_missing_tool(
+        agent_runtime._replay_missing_tool(
             {"id": "t2", "name": "get_subject_detail", "input": {"subject_id": "2"}},
             registry,
             messages,
@@ -3390,7 +3390,7 @@ def test_replay_missing_write_tool_appends_placeholder_tool_result():
     ]
 
     asyncio.run(
-        llm_assist._replay_missing_tool(
+        agent_runtime._replay_missing_tool(
             {"id": "w1", "name": "write_mapping", "input": {}}, registry, messages
         )
     )
@@ -3410,7 +3410,7 @@ def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
     messages: list = []
 
     asyncio.run(
-        llm_assist._replay_missing_tool(
+        agent_runtime._replay_missing_tool(
             {"id": "s1", "name": "submit_suggestion", "input": {"subject_id": "1"}},
             registry,
             messages,
@@ -3431,7 +3431,7 @@ def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
     messages: list = []
 
     asyncio.run(
-        llm_assist._replay_missing_tool(
+        agent_runtime._replay_missing_tool(
             {"id": "u1", "name": "ghost_tool", "input": {}}, registry, messages
         )
     )
@@ -3461,7 +3461,7 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
     messages: list = []
 
     asyncio.run(
-        llm_assist._replay_missing_tool(
+        agent_runtime._replay_missing_tool(
             {"id": "t9", "name": "get_subject_detail", "input": {}},
             registry,
             messages,
@@ -3683,7 +3683,7 @@ def test_continue_run_respects_thinking_level(monkeypatch):
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
@@ -3742,7 +3742,7 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager", cm),
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
@@ -3924,9 +3924,7 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
         raise LLMCallError("500 boom", retryable=True)
 
     with (
-        patch(
-            "app.services.matching.llm_assist.get_database_manager", return_value=dbm
-        ),
+        patch("app.services.agent.runtime.get_database_manager", return_value=dbm),
         patch("app.services.matching.llm_assist.config_manager") as cm,
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -4443,10 +4441,10 @@ def test_continue_run_submit_tail_runs_off_event_loop_thread():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
         patch(
             "app.services.matching.llm_assist._handle_result",
             side_effect=_capture,
@@ -4476,10 +4474,10 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
         patch("app.services.agent.trace.replay", return_value=rr),
         patch("app.services.matching.llm_assist.config_manager") as cm,
         patch(
-            "app.services.matching.llm_assist.get_database_manager",
+            "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.matching.llm_assist.loop_run", loop),
+        patch("app.services.agent.runtime.loop_run", loop),
         patch(
             "app.services.matching.llm_assist._handle_result",
             side_effect=_capture,
