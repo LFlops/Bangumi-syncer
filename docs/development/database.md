@@ -114,7 +114,7 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
 | `agent_runs` | 一次会话的状态机 | `run_id`、`task_type`、`status`、`stop_reason`、`total_tokens`、时间列 |
 | `agent_steps` | 每轮 LLM 调用 / 每次工具执行的 span | `span_id`、`name`、`status`、`model`、`tokens`、`latency_ms`、`tool_name`、`iteration`、`sequence`、`replay_delta` |
 
-`agent_runs.status` 枚举：`pending` / `processing` / `succeeded` / `no_suggestion` / `failed` / `cancelled`（`exhausted` 仅作 `stop_reason` 与 `enqueue_match_run` 的入队决策 `decision`，不作状态）。Agent 表为业务无关的通用状态机，不持有 `applied` / `rejected` 等业务特化终态——旧库中的 `applied` / `rejected` 已由迁移（`_migrate_agent_run_terminal_statuses`）归并为 `succeeded`；用户处理结果改由 `pending_candidates`（`status` + `resolved_at`）承载。
+`agent_runs.status` 枚举：`pending` / `processing` / `succeeded` / `no_suggestion` / `failed` / `cancelled`（`exhausted` 仅作 `stop_reason` 与 `enqueue_match_run` 的入队决策 `decision`，不作状态）。Agent 表为业务无关的通用状态机，不持有 `applied` / `rejected` 等业务特化终态；用户处理结果由 `pending_candidates`（`status` + `resolved_at`）承载。
 
 ### 双职责模型
 
