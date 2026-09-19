@@ -8,9 +8,10 @@
   Prompt 注入防护，用户输入以 ``---`` 分隔符隔离
 - ``_MATCH_HOOKS``（``ScenarioHooks``）：向通用运行时提供匹配场景的全部业务
   差异点（工具注册 / seed / chat 构建 / 预算解析 / 终局处理）
-- ``run`` / ``continue_run``：场景入口薄封装，转发到 ``agent.runtime``——
-  run 编排与恢复续跑状态机为通用能力（可被其它 Agent 场景复用），本模块仅
-  保留匹配业务：条目校验 / 候选落库（pending_candidates）/ 通知 / 业务键
+- ``get_scenario_runtime``：场景运行入口工厂（供 ``agent.registry`` 惰性装配与
+  测试直调）——run 编排与恢复续跑状态机为通用能力（见 ``agent.runtime``，可被
+  其它 Agent 场景复用），本模块仅保留匹配业务：条目校验 / 候选落库
+  （pending_candidates）/ 通知 / 业务键
 
 事务：候选写入（pending_candidates.candidates_json）与 agent_runs 状态更新在
 **单一数据库事务**内完成（``database_manager._execute_with_lock`` 包裹两条
@@ -29,12 +30,11 @@ import sqlite3
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from app.core.config import config_manager
 from app.core.database.agent_runs import apply_cancelled
 from app.core.logging import logger
-from app.services.agent import runtime as agent_runtime
 from app.services.agent.budget import get_max_iterations
 from app.services.agent.loop import RunResult
 from app.services.agent.recorder import (
@@ -399,7 +399,6 @@ def _persist_llm_candidate(
     reason: str,
     stop_reason: str,
     total_tokens: int = 0,
-    bgm: Any = None,
     bgm_title: str = "",
 ) -> int | None:
     """在单一事务内：写 pending_candidates（candidates_json 唯一写入源）+ 置 succeeded。
@@ -697,7 +696,7 @@ def _build_default_chat_fn(thinking_level: str):
 
 
 # ---------------------------------------------------------------------------
-# 场景适配：匹配场景 ScenarioHooks + 运行入口薄封装
+# 场景适配：匹配场景 ScenarioHooks + 运行入口工厂
 # （通用编排与恢复状态机见 app/services/agent/runtime.py）
 # ---------------------------------------------------------------------------
 
@@ -787,52 +786,6 @@ def get_scenario_runtime() -> ScenarioRuntime:
     )
 
 
-async def run(
-    run_id: str,
-    *,
-    sync_record: dict,
-    bgm: Any,
-    thinking_level: str,
-    chat_fn: Callable | None = None,
-    notification_service: Any | None = None,
-    span_recorder: Any | None = None,
-) -> str:
-    """执行一次 LLM 匹配增强任务（场景入口薄封装；通用编排见 agent.runtime.run）。
-
-    status 取值：``succeeded`` / ``no_suggestion`` / ``failed`` / ``processing``
-    （调度轮次重试中）/ ``skipped``（并发抢占失败，由调用方忽略）。
-    """
-    return await agent_runtime.run(
-        run_id,
-        hooks=_MATCH_HOOKS,
-        ctx=_MatchContext(sync_record=sync_record, bgm=bgm),
-        thinking_level=thinking_level,
-        chat_fn=chat_fn,
-        notification_service=notification_service,
-        span_recorder=span_recorder,
-    )
-
-
-async def continue_run(
-    run_id: str,
-    sync_record: dict,
-    bgm: Any,
-    *,
-    notification_service=None,
-) -> None:
-    """恢复续跑场景入口（薄封装；通用状态机见 agent.runtime.continue_run）。
-
-    由调度器在崩溃遗留 run 的恢复路径调用，是场景层对外开放的唯一续跑入口
-    （调度器不触碰本模块任何 ``_`` 前缀私有符号）。
-    """
-    await agent_runtime.continue_run(
-        run_id,
-        hooks=_MATCH_HOOKS,
-        ctx=_MatchContext(sync_record=sync_record, bgm=bgm),
-        notification_service=notification_service,
-    )
-
-
 async def _handle_result_async(
     dbm,
     run_id: str,
@@ -848,8 +801,8 @@ async def _handle_result_async(
 
     ``_handle_result`` 内部含阻塞调用——``_validate_subject_id``（SyncService
     → ``api.get_subject``）与 ``_prefetch_bgm_name``（``bgm.get_subject``）都是
-    同步 HTTP，且链路可能触发限速器同步 sleep；而三个调用方
-    （``run`` / ``continue_run`` / ``_execute_continuation``）均在事件循环上运行，
+    同步 HTTP，且链路可能触发限速器同步 sleep；而运行时的 run / continue_run /
+    _execute_continuation 三条路径均在事件循环上运行，
     直接调用会阻塞心跳协程与同一循环内的其他任务。
 
     线程安全前提（已核查，故整链在线程池执行 = 方案 A）：
@@ -892,11 +845,11 @@ def _handle_result(
     ``total_tokens`` 由调用方传入**全轮累计值**，不再从 ``result.last_response``
     取末轮值；三条路径的来源与口径如下：
 
-    - 首次执行（:func:`run`）：传实时 ``TraceRecorder.total_tokens``（本次全部轮次）。
-    - 恢复续跑 submit 分支（:func:`continue_run` 捕获到 ``submit_suggestion`` 终局）：
+    - 首次执行（runtime.run）：传实时 ``TraceRecorder.total_tokens``（本次全部轮次）。
+    - 恢复续跑 submit 分支（runtime.continue_run 捕获到 ``submit_suggestion`` 终局）：
       无实时 recorder 覆盖历史轮次，传 ``ReplayResult.total_tokens``（由
       ``agent_steps`` 的 llm_chat span 累计重建的历史口径）。
-    - 恢复续跑 loop 分支（:func:`_execute_continuation`）：传
+    - 恢复续跑 loop 分支（runtime._execute_continuation）：传
       ``ReplayResult.total_tokens + TraceRecorder.total_tokens``
       （历史轮次 + 本次新轮次，避免只记新轮丢历史）。
     """
@@ -1016,7 +969,6 @@ def _persist_and_notify(
             reason=reason,
             stop_reason=stop_reason,
             total_tokens=total_tokens,
-            bgm=bgm,
             bgm_title=bgm_title,
         )
     except Exception as e:

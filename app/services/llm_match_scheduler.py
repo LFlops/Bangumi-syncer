@@ -306,7 +306,7 @@ class LlmMatchScheduler(BaseScheduler):
     # ------------------------------------------------------------------
 
     async def _process_run(self, run: AgentRunRecord) -> None:
-        """处理单条 pending run：查 sync_record → llm_assist.run → 异常重试。
+        """处理单条 pending run：查 sync_record → 场景运行入口 run → 异常重试。
 
         入口取得本进程执行权，防止恢复扫描误捞正在处理的 run（T7 并发化后尤为关键）；
         未取得执行权（本进程已有协程在处理）直接跳过，且不释放他人持有的执行权。
@@ -334,7 +334,7 @@ class LlmMatchScheduler(BaseScheduler):
             bgm = self._build_bgm(sync_record)
             try:
                 # F5：thinking_level 统一从集中配置读取并透传给场景运行入口
-                # （config_override 由 llm_assist.run 内部从同一配置读取）。
+                # （config_override 由场景运行入口内部从同一配置读取）。
                 match_cfg = config_manager.get_sync_llm_match_config()
                 thinking_level = match_cfg["llm_match_thinking_level"]
                 # atomic_claim / 状态流转 / 落库均在场景运行入口内部完成

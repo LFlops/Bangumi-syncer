@@ -118,4 +118,4 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 
 > 历史：`llm_assist.py` 曾混居通用状态机与匹配业务（1583 行）；commit `2cda3bb`
 > 将 `TraceRecorder` 迁入 `agent/recorder.py`，`5110e46` 抽取 `agent/runtime.py`
-> 与 `ScenarioHooks` 协议，场景层收缩为「匹配业务 + 薄封装」。
+> 与 `ScenarioHooks` 协议，场景层收缩为「匹配业务 + 运行入口工厂」。

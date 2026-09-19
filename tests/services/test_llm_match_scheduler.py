@@ -625,8 +625,8 @@ def test_process_run_passes_thinking_level_from_config():
     assert kwargs.get("thinking_level") == "high"
 
 
-def test_process_run_passes_notification_service_to_llm_assist_run():
-    """生产路径：_process_run 调 llm_assist.run 时必须传入非 None 的 notification_service。"""
+def test_process_run_passes_notification_service_to_scenario_runtime_run():
+    """生产路径：_process_run 调 ScenarioRuntime.run 时必须传入非 None 的 notification_service。"""
     sched = LlmMatchScheduler()
     repo = _make_repo()
     run = _run_model(run_id="a", sync_record_id=1)
