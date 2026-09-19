@@ -469,3 +469,54 @@ class TestLlmFieldProjection:
             assert row["llm_reason"] == "bk理由"
         finally:
             dbm._connection._conn.close()
+
+    def test_projects_non_str_subject_and_reason_without_raising(self, tmp_path):
+        """混合脏类型（list subject_id / int reason / 非 dict 条目）→ 投影不抛。
+
+        实际实现：``subject_id``/``reason`` 非 None/"" 时统一 ``str()`` 兜底，
+        因此 list → "[111]"、int → "3"，并覆盖旧列值（非回退）。
+        """
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm,
+                json.dumps(
+                    [
+                        "非 dict 条目",
+                        {"subject_id": [111], "source": "llm_assist", "reason": 3},
+                        42,
+                    ],
+                    ensure_ascii=False,
+                ),
+                llm_subject_id="999",
+                llm_reason="列内旧理由",
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "[111]"
+            assert rec["llm_reason"] == "3"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_projects_dict_subject_id_as_string_repr(self, tmp_path):
+        """dict 类型 subject_id → ``str(dict)`` 兜底；reason=0 也应投影（非空值语义）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            cid = self._insert(
+                dbm,
+                json.dumps(
+                    [
+                        {
+                            "subject_id": {"id": 1},
+                            "source": "llm_assist",
+                            "reason": 0,
+                        }
+                    ]
+                ),
+                llm_subject_id="999",
+                llm_reason="列内旧理由",
+            )
+            rec = dbm.get_pending_candidate_by_id(cid)
+            assert rec["llm_subject_id"] == "{'id': 1}"
+            assert rec["llm_reason"] == "0"
+        finally:
+            dbm._connection._conn.close()

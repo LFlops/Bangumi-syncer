@@ -390,6 +390,62 @@ async def test_display_json_malformed_delta_returns_empty_object(app, mock_db):
     assert steps[0]["display_json"] == {}
 
 
+async def test_display_json_llm_chat_content_list_returns_nested_original(app, mock_db):
+    """content 为 list → display_json 原样返回嵌套列表（不 500、不字符串化）。"""
+    segments = [{"type": "text", "text": "分段文本"}]
+    delta = json.dumps(
+        {"response": {"stop_reason": "end_turn", "content": segments, "tool_calls": []}}
+    )
+    steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
+
+    display = steps[0]["display_json"]
+    assert display["stop_reason"] == "end_turn"
+    assert display["content"] == segments
+
+
+async def test_display_json_llm_chat_content_object_returns_nested_original(
+    app, mock_db
+):
+    """content 为对象（dict）→ display_json 原样返回嵌套对象。"""
+    content = {"blocks": ["a", "b"], "n": 2}
+    delta = json.dumps({"response": {"stop_reason": "end_turn", "content": content}})
+    steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
+
+    assert steps[0]["display_json"]["content"] == content
+
+
+async def test_display_json_no_truncatable_str_field_returns_empty_and_warns(
+    app, mock_db
+):
+    """超限预览中字段全为非 str（无可截断字符串）→ 返回 {} 且记 warning。"""
+    # stop_reason 非 str（int）+ content 为超大 dict：两个字段都不可按字符串截断
+    delta = json.dumps(
+        {"response": {"stop_reason": 123, "content": {"blob": "y" * 5000}}}
+    )
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
+
+    assert steps[0]["display_json"] == {}
+    mock_logger.warning.assert_called_once()
+    assert "无可截断字符串字段" in str(mock_logger.warning.call_args.args[0])
+
+
+async def test_display_json_truncation_not_converging_returns_empty_and_warns(
+    app, mock_db
+):
+    """仅有的 str 字段截断至空后仍超限（巨大非 str 负载）→ 收敛失败返回 {} 且记 warning。"""
+    delta = json.dumps(
+        {"response": {"stop_reason": "x" * 100, "content": {"blob": "y" * 5000}}}
+    )
+    with patch.object(agent_runs_module, "logger") as mock_logger:
+        steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
+
+    assert steps[0]["display_json"] == {}
+    # 多轮截断仍超限（非「无可截断」分支），走收敛失败分支
+    mock_logger.warning.assert_called_once()
+    assert "截断多轮后仍超限" in str(mock_logger.warning.call_args.args[0])
+
+
 # ---------------------------------------------------------------------------
 # 时间字段 ISO 化测试
 # ---------------------------------------------------------------------------

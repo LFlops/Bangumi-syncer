@@ -18,6 +18,7 @@ from app.utils.truncate import (
     _build_truncation_shell,
     _safe_json_dumps,
     truncate_json,
+    truncate_text_with_marker,
 )
 
 
@@ -147,3 +148,41 @@ class TestTruncateFailureLogging:
         msgs = [str(c.args[0]) for c in mock_logger.error.call_args_list if c.args]
         assert any("JSON" in m for m in msgs), msgs
         mock_logger.warning.assert_not_called()
+
+
+class TestTruncateTextWithMarkerTinyBudget:
+    """truncate_text_with_marker 极小预算防御分支（预算容不下完整标记）。
+
+    正常预算（2KB）下不可达，仅在预算 ≤ 标记字节数时退化。
+    """
+
+    def test_budget_equals_marker_length_returns_full_marker_and_warns(self):
+        """max_bytes == 标记字节数 → 返回完整标记并记 warning，且 ≤ 预算。"""
+        marker_len = len(SHRINKED_MARKER.encode("utf-8"))
+
+        with patch("app.utils.truncate.logger") as mock_logger:
+            result = truncate_text_with_marker("x" * 100, marker_len)
+
+        assert result == SHRINKED_MARKER
+        assert len(result.encode("utf-8")) <= marker_len
+        mock_logger.warning.assert_called_once()
+        assert "预算过小" in str(mock_logger.warning.call_args.args[0])
+
+    def test_budget_below_marker_length_returns_marker_prefix_and_warns(self):
+        """max_bytes < 标记字节数 → 返回标记前缀片段，不抛异常且 ≤ 预算。"""
+        with patch("app.utils.truncate.logger") as mock_logger:
+            result = truncate_text_with_marker("x" * 100, 5)
+
+        assert result == "...[s"
+        assert len(result.encode("utf-8")) == 5
+        mock_logger.warning.assert_called_once()
+        assert "预算过小" in str(mock_logger.warning.call_args.args[0])
+
+    def test_zero_budget_returns_empty_string_and_warns(self):
+        """max_bytes == 0 → 返回空串并记 warning。"""
+        with patch("app.utils.truncate.logger") as mock_logger:
+            result = truncate_text_with_marker("x" * 100, 0)
+
+        assert result == ""
+        mock_logger.warning.assert_called_once()
+        assert "预算过小" in str(mock_logger.warning.call_args.args[0])
