@@ -166,6 +166,39 @@ def _read_full_candidate(candidate_id):
     }
 
 
+def _read_candidate_via_independent_connection(sync_record_id):
+    """用**独立 sqlite3 连接**读取候选行，验证落库已提交（不依赖同连接未提交视图）。
+
+    返回 ``(id, status, candidates_json)``；无行返回 ``None``。
+    """
+    import sqlite3
+
+    db_path = str(database_manager._connection.db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT id, status, candidates_json FROM pending_candidates "
+            "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
+            (sync_record_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def _read_run_via_independent_connection(run_id):
+    """用**独立 sqlite3 连接**读取 agent_runs 行（status, stop_reason）。"""
+    import sqlite3
+
+    db_path = str(database_manager._connection.db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        return conn.execute(
+            "SELECT status, stop_reason FROM agent_runs WHERE run_id=?", (run_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+
 def _assert_candidate_written(sync_record_id, subject_id="123", reason="跨季匹配"):
     row = _read_candidate(sync_record_id)
     assert row is not None, "pending_candidates 行应已写入"
@@ -1124,6 +1157,171 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
     assert run_row["status"] == "pending"  # 原始状态，未 succeeded
     row = _read_candidate(sr_id)
     assert row["llm_subject_id"] == ""  # 候选写入被回滚
+
+
+# ---------------------------------------------------------------------------
+# 事务提交：落库必须显式 commit，独立连接可见（不依赖同连接未提交视图）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_candidate_committed_and_visible_to_independent_connection(
+    monkeypatch,
+):
+    """复检 P1：run 落库后必须已 commit——独立 sqlite3 连接应能看到候选行与
+    agent_runs 终态，而非停留在主连接未提交事务中。"""
+    run_id = "run-commit-visible"
+    sr_id = 1001
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+
+    status = await llm_assist.run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=_chat_side_effect([_submit_response("888", "提交可见")]),
+        notification_service=None,
+        span_recorder=None,
+    )
+
+    assert status == "succeeded"
+
+    # 独立连接读取候选行：若事务未提交（悬挂），此查询读不到
+    row = _read_candidate_via_independent_connection(sr_id)
+    assert row is not None, "落库完成后候选行必须对独立连接可见（已 commit）"
+    assert row[1] == "pending", f"候选行 status 应为 pending，实际 {row[1]}"
+    cands = json.loads(row[2])
+    assert any(str(c.get("subject_id")) == "888" for c in cands), (
+        "独立连接应读到本次 LLM 候选"
+    )
+
+    # agent_runs 终态同样必须已提交可见
+    run_row = _read_run_via_independent_connection(run_id)
+    assert run_row is not None, "agent_runs 行必须对独立连接可见"
+    assert run_row[0] == "succeeded", f"run status 应为 succeeded，实际 {run_row[0]}"
+    assert run_row[1] == "submit_suggestion"
+
+
+def test_persist_llm_candidate_race_skip_commits_cancelled_state(monkeypatch):
+    """复检 P1：竞态跳过路径（返回 None）同样必须 commit——run 的 cancelled
+    终态要能被独立连接看到，不得依赖后续写操作代提交。"""
+    run_id = "run-race-skip-commit"
+    sr_id = 1002
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    # 既有候选已被用户处理（confirmed）→ 事务内 apply_cancelled 写 cancelled 后
+    # 返回 None（跳过信号）；该取消写入同样必须显式提交。
+    cid = database_manager.log_pending_candidate(
+        request_title=f"race-skip-{sr_id}",
+        request_season=1,
+        user_name="alice",
+        source="plex",
+        candidates=[{"subject_id": "111", "name": "A", "score": 0.8}],
+        sync_record_id=sr_id,
+    )
+    assert cid
+    assert database_manager.update_pending_candidate_status(cid, "confirmed", "111")
+    sr = _make_sync_record(with_candidates=True, sync_record_id=sr_id)
+
+    returned = llm_assist._persist_llm_candidate(
+        database_manager,
+        run_id=run_id,
+        sync_record_id=sr_id,
+        sync_record=sr,
+        business_key=build_match_business_key(
+            sr["user_name"], sr["title"], sr["season"]
+        ),
+        subject_id="123",
+        reason="r",
+        stop_reason="submit_suggestion",
+        bgm=None,
+    )
+
+    assert returned is None, "守卫命中 0 行应返回 None（跳过通知）"
+    # 独立连接可见 cancelled 终态（证明本轮事务已提交）
+    run_row = _read_run_via_independent_connection(run_id)
+    assert run_row is not None
+    assert run_row[0] == "cancelled"
+    assert run_row[1] == "user_resolved"
+
+
+# ---------------------------------------------------------------------------
+# 并发通知覆盖：两个独立 run 并发收尾，各自恰好一次、无丢失/无重复
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch):
+    """复检 P2-2：两个独立 run（不同 run_id / sync_record）经 asyncio.gather
+    并发执行收尾落库路径。
+
+    ``_handle_result_async`` 在线程池执行 ``_persist_and_notify``，真实触发
+    ``DatabaseConnection._lock`` 串行化。断言：
+    - 两个 run 均成功落库且终态正确；
+    - 通知各自恰好一次（总计 2，无丢失、无交叉重复）；
+    - 并发过程无 ``database is locked`` 等异常。
+    """
+    run_a, sr_a, sid_a = "run-conc-a", 1003, "1111"
+    run_b, sr_b, sid_b = "run-conc-b", 1004, "2222"
+    database_manager.agent_runs.create_pending(run_a, "match", sr_a)
+    database_manager.agent_runs.create_pending(run_b, "match", sr_b)
+
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    ns = _make_notify()
+
+    results = await asyncio.gather(
+        llm_assist.run(
+            run_a,
+            sync_record=_make_sync_record(sync_record_id=sr_a),
+            bgm=_make_bgm(),
+            thinking_level="medium",
+            chat_fn=_chat_side_effect([_submit_response(sid_a, "并发A")]),
+            notification_service=ns,
+            span_recorder=None,
+        ),
+        llm_assist.run(
+            run_b,
+            sync_record=_make_sync_record(sync_record_id=sr_b),
+            bgm=_make_bgm(),
+            thinking_level="medium",
+            chat_fn=_chat_side_effect([_submit_response(sid_b, "并发B")]),
+            notification_service=ns,
+            span_recorder=None,
+        ),
+        return_exceptions=True,
+    )
+
+    # 无并发异常（含 sqlite3.OperationalError: database is locked）
+    errors = [r for r in results if isinstance(r, BaseException)]
+    assert not errors, f"并发 run 不应抛异常（含 database is locked），实际 {errors}"
+    assert results == ["succeeded", "succeeded"], (
+        f"两个 run 均应 succeeded，实际 {results}"
+    )
+
+    # 两个 run 均落库且终态正确（独立连接可见各 sync_record 行）
+    for sr_id, sid in ((sr_a, sid_a), (sr_b, sid_b)):
+        row = _read_candidate_via_independent_connection(sr_id)
+        assert row is not None, f"sync_record_id={sr_id} 的候选行应已提交"
+        assert row[1] == "pending"
+        cands = json.loads(row[2])
+        assert any(str(c.get("subject_id")) == sid for c in cands)
+
+    # 通知：总计恰好 2，每个 subject 恰好一次（无丢失 / 无交叉重复）
+    assert ns.notify.call_count == 2, (
+        f"两个 run 应各通知一次（总计 2），实际 {ns.notify.call_count}"
+    )
+    notified_subjects = sorted(
+        call.kwargs.get("top_candidate_id") for call in ns.notify.call_args_list
+    )
+    assert notified_subjects == sorted([sid_a, sid_b]), (
+        f"通知 subject 应为 [{sid_a}, {sid_b}] 各一次，实际 {notified_subjects}"
+    )
+    reasons = sorted(call.kwargs.get("llm_reason") for call in ns.notify.call_args_list)
+    assert reasons == sorted(["并发A", "并发B"]), (
+        f"通知 reason 应各自匹配，实际 {reasons}"
+    )
 
 
 # ---------------------------------------------------------------------------

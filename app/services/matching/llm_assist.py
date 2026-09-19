@@ -786,7 +786,20 @@ def _persist_llm_candidate(
             return None
         return candidate_id
 
-    return dbm._execute_with_lock(_write)
+    def _write_committed(conn):
+        """包一层显式提交：``_execute_with_lock`` 正常路径不会 commit。
+
+        ``_write`` 有多个返回路径（正常 candidate_id / 竞态跳过 None /
+        succeeded 守卫命中 None），全部都要先落库再返回，否则事务悬挂在连接上，
+        仅靠后续其他写操作的 commit 或连接关闭（回滚）才生效——独立连接读不到
+        已"完成"的落库结果。异常路径不在此 commit，交由
+        ``_execute_with_lock`` 统一 rollback。
+        """
+        result = _write(conn)
+        conn.commit()
+        return result
+
+    return dbm._execute_with_lock(_write_committed)
 
 
 # ---------------------------------------------------------------------------
