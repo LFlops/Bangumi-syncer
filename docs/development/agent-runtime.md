@@ -43,7 +43,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 ### run（正常路径）
 
 1. 原子抢占 run（`atomic_claim`，失败返回 `"skipped"`）；
-2. per-run `ToolRegistry` + 场景工具注册（并发隔离，不写模块单例）；
+2. per-run `ToolRegistry` + 场景工具注册（并发隔离）；
 3. `build_seed` → 写 seed span；`resolve_max_iterations` 解析预算；
 4. `loop.py` 编排（chat span / tool span / 预算消息由 recorder 记录）；
 5. LLM 异常分流：`LLMCallError(retryable=False)` → `failed(llm_error)`；

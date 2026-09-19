@@ -1500,7 +1500,7 @@ def test_register_match_tools_overwrite_no_warning(caplog):
     registry = ToolRegistry()
     bgm = _make_bgm()
 
-    # 连续两次注册到同一（模块单例）registry：第二次应覆盖 handler（G1），且不刷 warning
+    # 连续两次注册到同一 registry：第二次应覆盖 handler（G1），且不刷 warning
     with caplog.at_level(logging.WARNING):
         llm_assist.register_match_tools(registry, bgm)
         llm_assist.register_match_tools(registry, bgm)
@@ -3497,7 +3497,7 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
             for tc in tool_calls
         }
 
-    # per-run registry：不再取模块单例，patch 类方法以覆盖任意实例
+    # per-run registry：patch 类方法以覆盖任意实例
     monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     async def _go():
@@ -3575,7 +3575,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
             for tc in tool_calls
         }
 
-    # per-run registry：不再取模块单例，patch 类方法以覆盖任意实例
+    # per-run registry：patch 类方法以覆盖任意实例
     monkeypatch.setattr(ToolRegistry, "execute_batch", _eb)
 
     async def _go():

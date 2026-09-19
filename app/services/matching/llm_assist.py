@@ -247,10 +247,9 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         ),
     ]
     for d in defns:
-        # G1：必须**始终覆盖**注册。handler 是捕获本次 ``bgm`` 的闭包，若沿用已存在的
-        # 定义（幂等跳过），模块单例 registry 会把首个 run 的 bgm（及其 access_token）
-        # 钉死，导致多用户 / 跨 run 复用错误账号。quiet=True：覆盖属预期语义，
-        # 只打 debug 不刷 warning（F7）。
+        # G1：必须**始终覆盖**注册。handler 是捕获本次 ``bgm`` 的闭包，若幂等跳过
+        # 已存在的定义，则会钉死首个 bgm（及其 access_token），导致多用户 / 跨 run
+        # 复用错误账号。quiet=True：覆盖属预期语义，只打 debug 不刷 warning（F7）。
         registry.register(d, quiet=True)
     return defns
 

@@ -58,7 +58,7 @@ async def run(
         return "skipped"
 
     # per-run ToolRegistry（评论#7）：每个 run 独立实例，handler 闭包只绑定本次
-    # ctx（含访问凭据），避免并发入口下共享单例互相覆盖导致串账号。
+    # ctx（含访问凭据），避免并发入口下互相覆盖导致串账号。
     registry = ToolRegistry()
     defns = hooks.register_tools(registry, ctx)
     tools_schemas = [d.to_schema() for d in defns]
@@ -296,7 +296,7 @@ async def _execute_continuation(
     recorder 需锚定到已发生的轮次（补执行 tool span 与既有 chat span 同轮），
     并让续跑 chat 从 ``executed_iterations + 1`` 开始。
     """
-    # per-run ToolRegistry（评论#7）：续跑同样使用独立实例，不写模块单例
+    # per-run ToolRegistry（评论#7）：续跑同样使用独立实例
     registry = ToolRegistry()
     defns = hooks.register_tools(registry, ctx)
     tools_schemas = [d.to_schema() for d in defns]
