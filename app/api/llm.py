@@ -15,7 +15,7 @@ from ..models.summary import (
     LLMTestResponse,
     LLMUsageStatsResponse,
 )
-from ..services.llm import Message, get_llm_client, reset_llm_client
+from ..services.llm import LLMCallError, Message, get_llm_client, reset_llm_client
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/llm", tags=["llm"])
@@ -36,7 +36,6 @@ async def get_llm_config(_=Depends(get_current_user_flexible)):
         temperature=cfg.get("temperature", 0.7),
         timeout=cfg.get("timeout", 60),
         provider=cfg.get("provider", "openai_compat"),
-        thinking_level=cfg.get("thinking_level", "off"),
     )
 
 
@@ -75,18 +74,19 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
             max_tokens=8,
         )
         latency = int((time.time() - t0) * 1000)
-        # chat() 永不抛异常，重试耗尽时返回空响应
-        # H1：仅以 content 是否为空判定失败（model 存在但 content 为空仍算失败）
+        # chat() 重试耗尽时抛 LLMCallError（由下方 except 捕获）；
+        # 成功路径可能因 max_tokens=8 截停导致 content 为空——以 content 是否为空判定失败
         if not response.content:
-            return LLMTestResponse(
-                success=False, message="LLM 调用失败（所有重试已耗尽）"
-            )
+            return LLMTestResponse(success=False, message="LLM 调用失败（返回空内容）")
         return LLMTestResponse(
             success=True,
             message="连接成功",  # 不含回复正文（短回复截停无展示价值）
             model=response.model,
             latency_ms=latency,
         )
+    except LLMCallError as e:
+        # 重试耗尽或确定性错误（401/403/refusal 等）
+        return LLMTestResponse(success=False, message=str(e))
     except Exception as e:
         return LLMTestResponse(success=False, message=str(e))
 

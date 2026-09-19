@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import html
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -512,14 +513,16 @@ class NotificationService:
                 else "剧场版"
             )
             fmt_data = _SafeFormatDict(data)
-            fmt_data.setdefault("title", data.get("title", "unknown"))
+            # 标题强制 HTML 转义，防止 XSS / 模板注入
+            # 注意：data 中已含 title，必须用赋值覆盖而非 setdefault
+            fmt_data["title"] = html.escape(str(data.get("title", "unknown")))
             fmt_data.setdefault("ep_label", ep_label)
             try:
                 title = meta.in_app_title_template.format_map(fmt_data)
             except Exception:
-                title = data.get("title", "unknown")
+                title = html.escape(str(data.get("title", "unknown")))
         else:
-            title = data.get("title", "unknown")
+            title = html.escape(str(data.get("title", "unknown")))
 
         body = (
             custom_body
@@ -527,6 +530,13 @@ class NotificationService:
             or data.get("error_message", "")
             or data.get("message", "")
         )
+
+        # Agent 标识：LLM 建议场景，站内信正文前缀 [AI 建议] 并透传原因
+        # llm_reason 强制 HTML 转义，防止 XSS / 模板注入（与标题一致）
+        if data.get("is_llm_suggestion"):
+            ai_prefix = "[AI 建议] "
+            llm_reason = html.escape(str(data.get("llm_reason", "") or ""))
+            body = f"{ai_prefix}{llm_reason}"
 
         try:
             self._get_db_manager().insert_notification(in_app_type, title, body, ref_id)

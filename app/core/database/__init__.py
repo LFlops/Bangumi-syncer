@@ -20,6 +20,7 @@ from typing import Any, Optional
 from ..logging import logger as logger
 from .accounts import BangumiAccountRepository, OAuthStateRepository
 from .agent_memory import AgentMemoryRepository
+from .agent_runs import AgentRunsRepository
 from .connection import (
     FEINIU_MIN_UPDATE_WATERMARK_META_KEY as FEINIU_MIN_UPDATE_WATERMARK_META_KEY,
     INBOX_ERROR_BACKFILL_META_KEY as INBOX_ERROR_BACKFILL_META_KEY,
@@ -59,6 +60,7 @@ class DatabaseManager:
         self._oauth_state = OAuthStateRepository(self._connection)
         self.llm_usage = LLMUsageRepository(self._connection)
         self.memory = AgentMemoryRepository(self._connection)
+        self.agent_runs = AgentRunsRepository(self._connection)
         self._pending = PendingCandidatesRepository(self._connection)
         self._pending_sync = PendingSyncQueueRepository(self._connection)
         # 公开别名（消费标记写/清归 memory 域，业务层经此只读访问同步记录）
@@ -252,6 +254,7 @@ class DatabaseManager:
         candidates: Optional[list] = None,
         trace: Optional[dict] = None,
         sync_record_id: Optional[int] = None,
+        business_key: str = "",
     ) -> Optional[int]:
         """沉淀一条待确认候选"""
         return self._pending.log_pending_candidate(
@@ -264,6 +267,7 @@ class DatabaseManager:
             candidates=candidates,
             trace=trace,
             sync_record_id=sync_record_id,
+            business_key=business_key,
         )
 
     def get_pending_candidates(
@@ -282,6 +286,12 @@ class DatabaseManager:
     ) -> Optional[dict[str, Any]]:
         """获取单条待确认候选详情"""
         return self._pending.get_pending_candidate_by_id(candidate_id)
+
+    def get_pending_candidate_by_sync_record_id(
+        self, sync_record_id: int
+    ) -> Optional[dict[str, Any]]:
+        """按 sync_record_id 查询关联的候选记录（records 页「查看候选」入口）"""
+        return self._pending.get_pending_candidate_by_sync_record_id(sync_record_id)
 
     def update_pending_candidate_status(
         self,
@@ -307,6 +317,7 @@ class DatabaseManager:
         status: str,
         confirmed_subject_id: str = "",
         exclude_id: Optional[int] = None,
+        business_key: str = "",
     ) -> int:
         """批量更新同 key 的 pending 候选状态，返回受影响行数"""
         return self._pending.resolve_similar_pending_candidates(
@@ -317,6 +328,7 @@ class DatabaseManager:
             status=status,
             confirmed_subject_id=confirmed_subject_id,
             exclude_id=exclude_id,
+            business_key=business_key,
         )
 
     # ------------------------------------------------------------------
@@ -724,6 +736,9 @@ def reset_database_manager() -> None:
     """复位数据库管理器单例，下次访问时重建。"""
     global _database_manager
     _database_manager = None
+
+
+database_manager: DatabaseManager
 
 
 def __getattr__(name: str):

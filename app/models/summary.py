@@ -17,15 +17,14 @@ class LLMConfigResponse(BaseModel):
     temperature: float = 0.7
     timeout: int = 60
     provider: str = "openai_compat"
-    thinking_level: str = "off"
 
 
 class LLMConfigUpdate(BaseModel):
     """PUT /llm 请求
 
-    provider / thinking_level 为受控枚举：在 API 边界用 Literal 收口，
+    provider 为受控枚举：在 API 边界用 Literal 收口，
     非法值直接 422，避免脏值写入配置后在运行时才暴露（如未知 provider
-    延迟到客户端构建才抛错、未知 thinking_level 被静默降级为 off）。
+    延迟到客户端构建才抛错）。
     """
 
     api_base: Optional[str] = None
@@ -35,7 +34,6 @@ class LLMConfigUpdate(BaseModel):
     temperature: Optional[float] = None
     timeout: Optional[int] = None
     provider: Optional[Literal["openai_compat", "anthropic_compat"]] = None
-    thinking_level: Optional[Literal["off", "low", "medium", "high"]] = None
 
 
 class LLMTestResponse(BaseModel):
@@ -60,6 +58,8 @@ class SummaryJobCreate(BaseModel):
     # 记忆特性（未发布）：0=关闭；1–1000=注入最近 N 条摘要（对齐 prune 上限）
     memory_limit: int = Field(default=0, ge=0, le=1000)
     related_limit: int = Field(default=0, ge=0, le=1000)  # 0=关；>0=同剧关联最近 N 条
+    # 任务级思考强度：off/low/medium/high，默认 off（对齐全局 LLM 配置缺省）
+    thinking_level: Literal["off", "low", "medium", "high"] = "off"
 
 
 class SummaryJobUpdate(BaseModel):
@@ -74,6 +74,8 @@ class SummaryJobUpdate(BaseModel):
     enabled: Optional[bool] = None
     memory_limit: Optional[int] = Field(default=None, ge=0, le=1000)
     related_limit: Optional[int] = Field(default=None, ge=0, le=1000)
+    # 任务级思考强度：None 表示不修改（部分更新语义）
+    thinking_level: Optional[Literal["off", "low", "medium", "high"]] = None
 
 
 class SummaryJobResponse(BaseModel):
@@ -90,6 +92,8 @@ class SummaryJobResponse(BaseModel):
     related_limit: int = 0
     # 只读的 notification_type，供前端展示
     notification_type: str = ""
+    # 任务级思考强度（默认 off，对齐全局 LLM 配置缺省）
+    thinking_level: str = "off"
 
     @classmethod
     def from_config_dict(cls, data: dict) -> "SummaryJobResponse":
@@ -119,6 +123,11 @@ class SummaryJobResponse(BaseModel):
         if not isinstance(enabled, bool):
             enabled = str(enabled).lower() in ("true", "1")
 
+        # thinking_level：先归一化（去空格+小写），仅接受合法枚举值，否则回落 off
+        thinking_level = str(data.get("thinking_level", "off") or "off").strip().lower()
+        if thinking_level not in ("off", "low", "medium", "high"):
+            thinking_level = "off"
+
         return cls(
             name=str(data.get("name", "")),
             cron=str(data.get("cron", "0 21 * * *")),
@@ -130,6 +139,7 @@ class SummaryJobResponse(BaseModel):
             memory_limit=_limit("memory_limit"),
             related_limit=_limit("related_limit"),
             notification_type=notif_type,
+            thinking_level=thinking_level,
         )
 
 

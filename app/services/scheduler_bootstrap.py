@@ -52,6 +52,12 @@ def register_all() -> None:
         JobSpec(scheduler_id="bangumi_replay", runner=bangumi_replay_scheduler)
     )
 
+    from .llm_match_scheduler import llm_match_scheduler
+
+    scheduler_registry.register_spec(
+        JobSpec(scheduler_id="llm_match", runner=llm_match_scheduler)
+    )
+
     from .airing_today_scheduler import airing_today_scheduler
 
     scheduler_registry.register_spec(

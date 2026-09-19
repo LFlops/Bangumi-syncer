@@ -23,6 +23,8 @@ from app.services.llm.models import (
     TextBlock,
     ThinkingBlock,
     ThinkingLevel,
+    ToolResultBlock,
+    ToolUseBlock,
     Usage,
 )
 from app.services.llm.providers.base import BaseProvider
@@ -138,12 +140,39 @@ class AnthropicProvider(BaseProvider):
             "model": kwargs.get("model", self.model),
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "temperature": kwargs.get("temperature", self.temperature),
-            "messages": [
-                self._to_wire_message(m) for m in messages if m.role != "system"
-            ],
+            "messages": self._merge_tool_result_messages(
+                [self._to_wire_message(m) for m in messages if m.role != "system"]
+            ),
         }
         if system_parts:
             body["system"] = "\n\n".join(system_parts)
+
+        # tools / tool_choice：工具协议 wire 规范化（provider 拥有 wire 格式，
+        # agent/场景层保持 provider 无关）。
+        # - tools 元素含 input_schema → 原样透传；含 parameters（内部 flat 形态）
+        #   → 转换为 {"name", "description", "input_schema": parameters}；其余字段
+        #   （如 cache_control）一并无损保留。
+        # - tool_choice 字符串 → {"type":"tool","name":<str>}；dict → 透传；
+        #   None → 不发送该键。
+        tools = kwargs.get("tools")
+        if tools is not None:
+            body["tools"] = [self._normalize_anthropic_tool(t) for t in tools]
+        tool_choice = kwargs.get("tool_choice")
+        if tool_choice is not None:
+            normalized_tc = self._normalize_anthropic_tool_choice(tool_choice)
+            if (
+                self._force_tool_choice_degraded
+                and isinstance(normalized_tc, dict)
+                and normalized_tc.get("type") in ("tool", "any")
+            ):
+                # 端点级降级（client 依据服务端拒绝置位）：该端点不支持强制
+                # 工具选择（如 thinking 模式约束），改为 auto。
+                logger.warning(
+                    "已按端点约束将强制 tool_choice 降级为 auto"
+                    "（该端点不支持强制工具选择）"
+                )
+                normalized_tc = {"type": "auto"}
+            body["tool_choice"] = normalized_tc
 
         # thinking_level：每任务 kwargs 覆盖 > 全局默认；模型不支持时降级；
         # 端点拒绝过扩展参数时（_extras_disabled）不再发送
@@ -165,7 +194,45 @@ class AnthropicProvider(BaseProvider):
             body["temperature"] = (
                 1  # Anthropic 要求 thinking 开启时 temperature 必须为 1
             )
+            # thinking 模式不支持强制工具选择（Anthropic/DeepSeek 约束：
+            # tool_choice 仅 auto/none 可用）→ 降级 auto 并告警；收尾依赖模型
+            # 自行提交（场景侧 output_parser 兜底解析文本建议）。
+            forced = body.get("tool_choice")
+            if isinstance(forced, dict) and forced.get("type") in ("tool", "any"):
+                logger.warning(
+                    "thinking 模式不支持强制 tool_choice，已降级为 auto"
+                    "（收尾依赖模型自行调用终止工具）"
+                )
+                body["tool_choice"] = {"type": "auto"}
         return body
+
+    @staticmethod
+    def _normalize_anthropic_tool(tool: dict) -> dict:
+        """将工具 schema 规范化为 Anthropic wire 形态。
+
+        - 含 input_schema → 原样透传（已是 Anthropic 形态）；
+        - 含 parameters（内部 flat 形态）→ 转为 input_schema；
+        - 其余字段（cache_control 等）一并无损保留。
+        """
+        if "input_schema" in tool:
+            return tool
+        result: dict[str, Any] = {
+            "name": tool["name"],
+            "description": tool["description"],
+        }
+        if "parameters" in tool:
+            result["input_schema"] = tool["parameters"]
+        for k, v in tool.items():
+            if k not in ("name", "description", "parameters"):
+                result[k] = v
+        return result
+
+    @staticmethod
+    def _normalize_anthropic_tool_choice(tool_choice: Any) -> Any:
+        """字符串 tool_choice → {"type":"tool","name":<str>}；dict → 透传。"""
+        if isinstance(tool_choice, str):
+            return {"type": "tool", "name": tool_choice}
+        return tool_choice
 
     def _thinking_enabled(self, level: str, model: str) -> int:
         """返回 budget_tokens；模型不支持或 level=off 时返回 0。"""
@@ -178,20 +245,74 @@ class AnthropicProvider(BaseProvider):
     def _system_text(self, content: str | list[ContentBlock]) -> str:
         """提取 system 消息文本：str 直接用，list 取 text block 拼接（其余类型跳过）。
 
-        多块拼接与多条 system 消息的合并（\n\n）保持同一分隔语义，避免 Phase 2
+        多块拼接与多条 system 消息的合并（\n\n）保持同一分隔语义，避免
         记忆注入产出多块 system 时与多条 system 消息行为不一致。
         """
         if isinstance(content, str):
             return content
         return "\n\n".join(b.text for b in content if isinstance(b, TextBlock))
 
+    @staticmethod
+    def _merge_tool_result_messages(wire_messages: list[dict]) -> list[dict]:
+        """合并连续的 tool_result user 消息为单条。
+
+        Anthropic 协议要求 assistant 的全部 ``tool_use`` 由**紧随其后同一条
+        消息**中的 ``tool_result`` 一一响应。agent 循环按 provider 无关契约
+        逐条追加（assistant tool_use × N → user(tr1) → user(tr2) → ...），
+        此处归一化收敛，避免第 2..N 个 tool_use 悬空（真实端点 400：
+        "``tool_use`` ids were found without ``tool_result`` blocks
+        immediately after"）。纯文本 user 消息（如预算提示）不合并，
+        保持原有交替语义。
+        """
+
+        def _is_tool_result(msg: dict) -> bool:
+            return msg.get("role") == "user" and any(
+                isinstance(b, dict) and b.get("type") == "tool_result"
+                for b in (msg.get("content") or [])
+            )
+
+        merged: list[dict] = []
+        for msg in wire_messages:
+            if _is_tool_result(msg) and merged and _is_tool_result(merged[-1]):
+                merged[-1]["content"] = list(merged[-1].get("content") or []) + list(
+                    msg.get("content") or []
+                )
+                continue
+            merged.append(msg)
+        return merged
+
     def _to_wire_message(self, m: Message) -> dict:
         """内部消息 → Anthropic wire 消息（content 统一为 blocks 数组）。"""
         if isinstance(m.content, str):
             blocks = [{"type": "text", "text": m.content}]
         else:
-            blocks = [block.model_dump(exclude_none=True) for block in m.content]
+            blocks = [self._to_wire_block(block) for block in m.content]
         return {"role": m.role, "content": blocks}
+
+    def _to_wire_block(self, block: ContentBlock) -> dict:
+        """内部 content block → Anthropic wire content block。
+
+        工具协议：
+        - ToolUseBlock → {"type": "tool_use", "id", "name", "input"}（assistant 消息，1:1）
+        - ToolResultBlock → {"type": "tool_result", "tool_use_id", "content", "is_error"}（user 消息）
+        其余类型沿用 model_dump（exclude_none）保持向后行为一致。block 若携带
+        cache_control 等透传字段，model_dump 已含则一并透传。
+        """
+        if isinstance(block, ToolUseBlock):
+            return {
+                "type": "tool_use",
+                "id": block.id,
+                "name": block.name,
+                "input": block.input,
+            }
+        if isinstance(block, ToolResultBlock):
+            return {
+                "type": "tool_result",
+                "tool_use_id": block.tool_use_id,
+                "content": block.content,
+                "is_error": block.is_error,
+            }
+        return block.model_dump(exclude_none=True)
 
     def _parse_response(self, data: dict) -> ChatResponse:
         """Anthropic wire 格式 → 内部模型。"""
@@ -212,9 +333,18 @@ class AnthropicProvider(BaseProvider):
                 )
             elif btype == "redacted_thinking":
                 blocks.append(RedactedThinkingBlock(data=block.get("data", "")))
+            elif btype == "tool_use":
+                # 工具调用请求块：转为内部 ToolUseBlock，
+                # stop_reason 为 "tool_use" 时由调用方驱动 agent 循环执行工具。
+                blocks.append(
+                    ToolUseBlock(
+                        id=block.get("id", ""),
+                        name=block.get("name", ""),
+                        input=block.get("input", {}) or {},
+                    )
+                )
             else:
-                # 未知 block 类型（如 tool_use）：跳过 + warning，不崩溃
-                # （正式解析在 Phase 2.1）
+                # 真正未知的 block 类型：跳过 + warning，不崩溃
                 logger.warning(f"未知 content block 类型 {btype!r}，已跳过")
 
         # Anthropic usage 字段映射：input_tokens → prompt_tokens,

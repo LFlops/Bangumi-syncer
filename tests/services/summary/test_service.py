@@ -656,7 +656,7 @@ class TestExecuteJob:
         data = mock_ns.notify.call_args.kwargs
         assert data["tokens_used"] == 0
 
-    # ── 记忆注入（Phase 2.0.2）──────────────────────────────────────
+    # ── 记忆注入 ──────────────────────────────────────
 
     @staticmethod
     def _svc_with_real_memory(temp_dir, job_name="test_job"):
@@ -698,11 +698,13 @@ class TestExecuteJob:
         messages = mock_client.chat.call_args.args[0]
         assert messages[0].content == "You are a helpful assistant."
         assert "历史执行上下文" not in messages[0].content
+        # user 消息同样不含历史小节（素材位于 user 末尾，关闭时整段不出现）
+        assert "历史执行上下文" not in messages[1].content
         svc.memory.extract_and_store.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_memory_injects_recent_context(self, temp_dir, reset_singletons):
-        """R1：memory_limit>0 → system prompt 含历史上下文（最近 2 条摘要）。"""
+        """R1：memory_limit>0 → 历史素材进 user 消息末尾，system 仅留引导语。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         db.memory.store_and_mark(
             MemoryEntry(
@@ -738,11 +740,68 @@ class TestExecuteJob:
 
         messages = mock_client.chat.call_args.args[0]
         assert len([m for m in messages if m.role == "system"]) == 1
-        assert "## 历史执行上下文" in messages[0].content
-        assert "- 昨日看了芙莉莲" in messages[0].content
-        assert "- 用户反馈：不要太啰嗦" in messages[0].content
-        # 原文 system prompt 保留在注入内容之后
+        # system：仅引导语 + 用户自定义提示词，不含小节标题与素材本身
+        assert "背景参考" in messages[0].content
+        assert "## 历史执行上下文" not in messages[0].content
+        assert "- 昨日看了芙莉莲" not in messages[0].content
+        assert "- 用户反馈：不要太啰嗦" not in messages[0].content
+        # 用户自定义提示词原样保留在 system
         assert "You are a helpful assistant." in messages[0].content
+        # user：明细之后追加历史小节（标题 + 素材行）
+        assert messages[1].role == "user"
+        assert "## 历史执行上下文" in messages[1].content
+        assert "- 昨日看了芙莉莲" in messages[1].content
+        assert "- 用户反馈：不要太啰嗦" in messages[1].content
+        # 素材位于明细之后（观影记录段在前，历史小节在后）
+        assert messages[1].content.index("观影记录") < messages[1].content.index(
+            "## 历史执行上下文"
+        )
+
+    @pytest.mark.asyncio
+    async def test_preview_excludes_memory_material(self, temp_dir, reset_singletons):
+        """预览（generate_summary）不注入历史素材，也不加引导语。"""
+        svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
+        db.memory.store_and_mark(
+            MemoryEntry(
+                task_type="summary",
+                task_id="summary-test_job",
+                run_id="run-1",
+                summary="昨日看了芙莉莲",
+            ),
+            [],
+        )
+        config = _make_config(memory_limit=5)
+        _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            _llm_patch,
+        ):
+            await svc.generate_summary(config)
+
+        messages = mock_client.chat.call_args.args[0]
+        assert messages[0].content == "You are a helpful assistant."
+        assert "背景参考" not in messages[0].content
+        assert "历史执行上下文" not in messages[1].content
+        assert "昨日看了芙莉莲" not in messages[1].content
+
+    @pytest.mark.asyncio
+    async def test_memory_guidance_is_soft_constraint(self, temp_dir, reset_singletons):
+        """R1b：引导语为软约束措辞（背景参考），不含'必须/强制'等硬指令。"""
+        from app.services.summary.service import (
+            _MEMORY_GUIDANCE,
+            _MEMORY_SECTION,
+        )
+
+        assert "背景参考" in _MEMORY_GUIDANCE
+        assert "必须" not in _MEMORY_GUIDANCE
+        assert "强制" not in _MEMORY_GUIDANCE
+        # 引导语只说明素材位置，不再自带小节标题（标题随素材落在 user 消息）
+        assert _MEMORY_SECTION not in _MEMORY_GUIDANCE
 
     @pytest.mark.asyncio
     async def test_recent_limit_passed_to_service(self, temp_dir, reset_singletons):
@@ -852,7 +911,12 @@ class TestExecuteJob:
     async def test_consumed_records_excluded_from_prompt(
         self, temp_dir, reset_singletons
     ):
-        """S2：本任务已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
+        """S2：本任务已消费记录不进观影明细区（信息由摘要承继）；未消费记录正常。
+
+        历史素材（head 行为）作为背景附在 user 消息末尾的
+        `## 历史执行上下文` 小节，因此仅断言**明细区**不含已消费记录，
+        记忆素材本身允许出现该标题。
+        """
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         # 先写入本任务的记忆条目（run-own 属于本任务），再标记对应记录已消费
         db.memory.store_and_mark(
@@ -887,8 +951,12 @@ class TestExecuteJob:
             await svc.execute_job(config)
 
         user_content = mock_client.chat.call_args.args[0][1].content
-        assert "番剧A" not in user_content  # 本任务已消费 → 排除
-        assert "番剧B" in user_content  # 未消费 → 保留
+        # 明细区（`## 历史执行上下文` 之前）不含已消费记录、含未消费记录
+        detail_zone, _, memory_zone = user_content.partition("## 历史执行上下文")
+        assert "番剧A" not in detail_zone  # 本任务已消费 → 从明细排除
+        assert "番剧B" in detail_zone  # 未消费 → 保留在明细
+        # 记忆素材区：历史摘要作为背景附在 user 末尾（head 行为），可含该标题
+        assert "昨日看了番剧A" in memory_zone
 
     @pytest.mark.asyncio
     async def test_consumed_by_other_task_kept_in_prompt(
@@ -1208,7 +1276,7 @@ class TestIncrementalWindow:
 
 
 class TestEmptyContentWithModel:
-    """H1：空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
+    """空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
 
     @pytest.mark.asyncio
     async def test_empty_content_with_model_name_sends_failure(
@@ -1233,7 +1301,7 @@ class TestEmptyContentWithModel:
 
 
 class TestRelatedIndependentOfMemoryLimit:
-    """M1：related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
+    """related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
 
     @pytest.mark.asyncio
     async def test_related_works_when_memory_limit_zero(

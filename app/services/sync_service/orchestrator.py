@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import traceback
+import uuid
 from typing import TYPE_CHECKING, Any
 
 from ...core.logging import get_sync_run_id, logger, sync_log_context
@@ -27,6 +28,10 @@ from .retry import MARK_QUEUED
 
 if TYPE_CHECKING:
     from . import SyncService
+
+# 匹配增强入队决策策略参数（配置类参数，禁止默认值兜底，调用处显式传入）
+MATCH_ASSIST_REUSE_WINDOW_DAYS = 30  # rejected 候选复用窗口（天）
+MATCH_ASSIST_MAX_TOTAL_ATTEMPTS = 10  # 同键累计失败上限（达上限不再新建 run）
 
 
 class SyncOrchestrator:
@@ -353,7 +358,69 @@ class SyncOrchestrator:
             }
             trace.final_status = "error"
             trace.final_message = "未找到匹配的番剧"
+
+        # ===== 匹配增强接入：开关开 + LLM 可用时提交 AI 评估任务 =====
+        # 顺序契约：入队决策前移到 trace 写入之前，trace 记录的 run_id 必须等于
+        # 实际承担本次评估的 run（新建 or 复用在途/历史 run）。
+        # 幂等：同一 trace 已含 llm_assist step（异常重入）则跳过整个增强。
+        assist_configured = self._match_assist_enabled()
+        assist_enabled = assist_configured and not any(
+            s.stage == "llm_assist" for s in trace.steps
+        )
+
+        actual_run_id: str | None = None
+        decision = ""
+        if assist_enabled:
+            from ..matching.identity import build_match_business_key
+            from . import database_manager
+
+            business_key = build_match_business_key(
+                user_name=item.user_name,
+                title=item.title,
+                season=item.season,
+            )
+            new_run_id = str(uuid.uuid4())
+            try:
+                # 决策策略参数显式传入（配置类参数，禁止默认值兜底）；
+                # reuse_*/in_flight 仅刷新关联与主指针，不重跑 LLM、不重写候选展示。
+                result = database_manager.agent_runs.enqueue_match_run(
+                    run_id=new_run_id,
+                    business_key=business_key,
+                    sync_record_id=None,
+                    reuse_window_days=MATCH_ASSIST_REUSE_WINDOW_DAYS,
+                    max_total_attempts=MATCH_ASSIST_MAX_TOTAL_ATTEMPTS,
+                    accepted_mapping_valid=self._accepted_mapping_valid(item),
+                )
+                decision = result.get("decision", "")
+                actual_run_id = result.get("run_id", new_run_id)
+                logger.info(
+                    f"匹配增强任务入队: decision={decision}, run_id={actual_run_id}, "
+                    f"business_key={business_key}"
+                )
+            except Exception as e:
+                # 降级：入队失败不阻塞主匹配流程，trace 仍记录失败决策便于排查
+                decision = "enqueue_failed"
+                actual_run_id = new_run_id
+                logger.warning(f"匹配增强任务入队失败（不影响主流程）: {e}")
+            llm_step = trace.start_step("llm_assist")
+            llm_step.status = "pending"
+            # reason 与 decision 语义保持一致：降级（enqueue_failed）时不得谎报已提交
+            llm_step.reason = (
+                "评估任务入队失败" if decision == "enqueue_failed" else "已提交 AI 评估"
+            )
+            llm_step.processed_payload = {
+                "run_id": actual_run_id,
+                "decision": decision,
+            }
+
+        # llm_assist step 已在 finish 前挂入；to_dict 与 finish 会自动收尾当前 step
         trace.finish()
+
+        not_found_message = (
+            "未找到匹配的番剧（已启用 AI 匹配评估，稍后可在「待确认」页查看建议）"
+            if assist_configured
+            else "未找到匹配的番剧"
+        )
 
         sync_record_id = self._persist_sync_record(
             trace,
@@ -367,6 +434,10 @@ class SyncOrchestrator:
             ),
         )
 
+        # persist 后关联落库：created 为回填主指针，in_flight/复用为刷新主指针
+        if assist_enabled and decision != "enqueue_failed" and actual_run_id:
+            self._link_run_sync_record(actual_run_id, sync_record_id, decision)
+
         from . import notification_service
 
         notification_service.notify(
@@ -374,14 +445,80 @@ class SyncOrchestrator:
             item,
             actual_source,
             in_app_ref_id=sync_record_id,
-            error_message="未找到匹配的番剧",
+            error_message=not_found_message,
         )
         # 匹配失败且有候选时，沉淀到 pending_candidates 供用户手动确认
         self._sync._sediment_pending_candidate(
             item, actual_source, trace, sync_record_id=sync_record_id
         )
         status_holder[0] = "error"
-        return SyncResponse(status="error", message="未找到匹配的番剧")
+        return SyncResponse(status="error", message=not_found_message)
+
+    # ------------------------------------------------------------------
+    # 匹配增强接入辅助：开关/配置判定 + 任务去重落库
+    # ------------------------------------------------------------------
+
+    def _match_assist_enabled(self) -> bool:
+        """判定是否启用 LLM 匹配增强。
+
+        开关关或 LLM 配置（api_key）缺失时返回 False 并给出说明日志，
+        原失败逻辑不受影响。
+        """
+        try:
+            from . import config_manager
+
+            raw = config_manager.get("sync", "llm_match_assist", fallback=False)
+            enabled = str(raw).strip().lower() in ("true", "1", "yes", "on")
+            if not enabled:
+                return False
+            llm_cfg = config_manager.get_llm_config() or {}
+            api_key = llm_cfg.get("api_key", "")
+        except Exception as e:
+            logger.warning(f"读取匹配增强配置失败（按未启用处理）: {e}")
+            return False
+        if not api_key:
+            logger.info("LLM 配置缺失，匹配增强已禁用")
+            return False
+        return True
+
+    def _link_run_sync_record(
+        self, run_id: str, sync_record_id: int, decision: str
+    ) -> None:
+        """persist 后回填 run↔sync_record 关联与调度主指针（失败不阻塞主流程）。
+
+        - created：run 入库时无 sync_record_id，此处回填主指针
+        - in_flight / reuse_*：刷新主指针，并补一条关联（多对一，幂等）
+        """
+        from . import database_manager
+
+        try:
+            database_manager.agent_runs.add_run_sync_record_link(
+                run_id, sync_record_id, decision
+            )
+            database_manager.agent_runs.update_run_sync_record_id(
+                run_id, sync_record_id
+            )
+        except Exception as e:
+            logger.warning(f"写入 run↔sync_record 关联失败（不影响主流程）: {e}")
+
+    def _accepted_mapping_valid(self, item: CustomItem) -> bool:
+        """校验 accepted（候选已确认）的映射是否仍有效（能查到 subject_id）。
+
+        accepted 候选复用判定用：映射有效 → 复用历史成功结果（不限时间）；
+        已被删除 → 重新评估。查询异常返回 False（重新评估更安全）并记录告警。
+        """
+        try:
+            from ..mapping_service import mapping_service
+
+            subject_id, _, _ = mapping_service.find_mapping(
+                item.title, item.ori_title or "", int(item.season)
+            )
+            return bool(subject_id)
+        except Exception as e:
+            logger.warning(
+                f"校验 accepted 映射有效性失败（按无效处理，将重新评估）: {e}"
+            )
+            return False
 
     # ------------------------------------------------------------------
     # 执行阶段管线（episode_resolve → cross_season → sync_action → result）

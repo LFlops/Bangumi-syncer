@@ -36,19 +36,6 @@
                     <option value="anthropic_compat">anthropic_compat</option>
                 </select>
             </div>
-            <div class="col-md-6">
-                <label class="form-label">思考强度
-                    <i class="bi bi-question-circle ms-1 text-muted"
-                       data-bs-toggle="tooltip"
-                       title="off/low/medium/high；anthropic_compat 映射 extended thinking 的 budget_tokens（2048/4096/8192），openai_compat 映射 reasoning_effort（仅 o 系列模型生效，其余模型自动忽略）"></i>
-                </label>
-                <select class="form-select" id="llm-thinking-level" name="llm.thinking_level">
-                    <option value="off">off</option>
-                    <option value="low">low</option>
-                    <option value="medium">medium</option>
-                    <option value="high">high</option>
-                </select>
-            </div>
             <div class="col-md-4">
                 <label class="form-label">模型</label>
                 <input class="form-control"
