@@ -29,6 +29,7 @@ from app.utils.bangumi_api.rate_limit import (
     DEFAULT_ACQUIRE_TIMEOUT,
     DEFAULT_BURST,
     DEFAULT_RATE,
+    MAX_CONFIGURABLE_RATE,
     RateLimiter,
     RateLimitTimeoutError,
     get_bgm_rate_limiter,
@@ -451,6 +452,102 @@ async def test_sync_and_async_share_same_bucket_state():
 
 
 # ---------------------------------------------------------------------------
+# 场景 8（取消回滚）：acquire_async 在等待期间被取消时归还预约扣减
+#
+# 预约（reserve）在锁内一次性扣减令牌（并可能折算冻结债务），真正使用令牌
+# 发生在 ``await`` 返回之后。若等待期间任务被 cancel，扣减必须冲销，否则
+# 令牌桶被永久拖累（透支再也不恢复）。
+# ---------------------------------------------------------------------------
+
+
+async def test_acquire_async_cancel_rolls_back_reserved_token():
+    """等待期间被取消：已预约的令牌在锁内归还，不残留透支"""
+    limiter = RateLimiter(rate=1.0, burst=1)
+
+    await limiter.acquire_async()  # 耗尽唯一令牌
+    with limiter._lock:
+        before = limiter._tokens
+
+    task = asyncio.create_task(limiter.acquire_async(timeout=30.0))
+    await asyncio.sleep(0.05)  # 让任务进入 asyncio.sleep 等待
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with limiter._lock:
+        after = limiter._tokens
+    # 自然补充约 0.05s 令牌；若未回滚则残留约 -1.0 的透支
+    assert after == pytest.approx(0.05, abs=0.05)
+    assert after > before
+
+
+async def test_acquire_async_cancel_rolls_back_freeze_debt():
+    """预约已折算 429 冻结债务时，取消也要一并冲销该债务"""
+    limiter = RateLimiter(rate=1.0, burst=1)
+
+    await limiter.acquire_async()  # 耗尽唯一令牌
+    limiter.notify_rate_limited(0.0)  # 冻结 60s，预约会折算约 60 令牌债务
+
+    task = asyncio.create_task(limiter.acquire_async(timeout=4000.0))
+    await asyncio.sleep(0.05)
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with limiter._lock:
+        after = limiter._tokens
+    # 冻结债务必须随预约一起冲销；未回滚则残留约 -60
+    assert after == pytest.approx(0.05, abs=0.1)
+
+
+async def test_acquire_async_cancel_rolls_back_wait_loop_freeze_extension_debt():
+    """等待循环中 429 冻结延长追加的债务，取消时也要冲销"""
+    limiter = RateLimiter(rate=100.0, burst=1)
+
+    await limiter.acquire_async()  # 耗尽唯一令牌
+
+    task = asyncio.create_task(limiter.acquire_async(timeout=4000.0))
+    await asyncio.sleep(0.005)  # 首轮预约约 0.01s
+    limiter.notify_rate_limited(0.0)  # 冻结 60s，下一轮 _remaining_wait 折算债务
+    await asyncio.sleep(0.05)  # 等首轮结束、进入冻结等待轮
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with limiter._lock:
+        after = limiter._tokens
+    # 全部债务（含循环追加）冲销后回到自然水平（burst 上限 1）
+    assert after == pytest.approx(1.0, abs=0.2)
+    assert after > -1.0
+
+
+def test_remaining_wait_logs_freeze_extension_debt():
+    """等待期间冻结延长时，记录 debug 日志（延长秒数与折算债务）"""
+    clock = FakeClock()
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock)
+
+    limiter.notify_rate_limited(60.0)  # t=1000 冻结至 1060
+    reserved_act, _ = limiter._reserve(timeout=4000.0)
+
+    limiter.notify_rate_limited(120.0)  # 第二次冻结延长至 1120
+    with patch("app.utils.bangumi_api.rate_limit.logger") as mock_logger:
+        remaining, new_act, _reason, extra_debt = limiter._remaining_wait(reserved_act)
+
+    assert new_act == pytest.approx(1120.0)
+    assert extra_debt == pytest.approx(60.0)
+    assert remaining == pytest.approx(120.0)
+    mock_logger.debug.assert_called()
+    msgs = [str(c.args[0]) for c in mock_logger.debug.call_args_list if c.args]
+    assert any("60" in m for m in msgs), msgs
+
+
+# ---------------------------------------------------------------------------
 # 场景 2：多实例共享同一令牌桶
 # ---------------------------------------------------------------------------
 
@@ -838,6 +935,39 @@ def test_config_values_applied(monkeypatch):
 
     assert limiter.rate == pytest.approx(2.0)
     assert limiter.burst == 5
+
+
+def test_config_rate_above_upper_bound_is_clamped(monkeypatch):
+    """api_rate_limit 超过上界时截断到 MAX_CONFIGURABLE_RATE，避免极端 rate 债务"""
+    reset_bgm_rate_limiter(None)
+    _patch_config(monkeypatch, {"api_rate_limit": "1000000", "api_rate_burst": "5"})
+
+    limiter = get_bgm_rate_limiter()
+
+    assert limiter.rate == pytest.approx(MAX_CONFIGURABLE_RATE)
+    assert limiter.burst == 5
+
+
+def test_config_rate_at_upper_bound_is_kept(monkeypatch):
+    """恰好等于上界的 api_rate_limit 原样生效（边界不误伤）"""
+    reset_bgm_rate_limiter(None)
+    _patch_config(monkeypatch, {"api_rate_limit": str(MAX_CONFIGURABLE_RATE)})
+
+    limiter = get_bgm_rate_limiter()
+
+    assert limiter.rate == pytest.approx(MAX_CONFIGURABLE_RATE)
+
+
+def test_config_rate_clamp_logs_warning_with_truncated_value(monkeypatch):
+    """截断超限 rate 时记 warning，并说明被截断的原始值"""
+    reset_bgm_rate_limiter(None)
+    _patch_config(monkeypatch, {"api_rate_limit": "1000000"})
+
+    with patch("app.utils.bangumi_api.rate_limit.logger") as mock_logger:
+        get_bgm_rate_limiter()
+
+    warnings = [str(c.args[0]) for c in mock_logger.warning.call_args_list if c.args]
+    assert any("1000000" in msg for msg in warnings), warnings
 
 
 @pytest.mark.parametrize(

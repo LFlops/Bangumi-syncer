@@ -17,6 +17,8 @@ Bangumi 官方公开 API 已限流（社区实测约 300 请求/分钟/IP，超�
 - 构造支持注入 ``clock`` / ``sleep``，便于测试不真实等待；
 - 模块级惰性单例 :func:`get_bgm_rate_limiter`，从 ``[bangumi]`` 段读取
   ``api_rate_limit``（默认 1/s）与 ``api_rate_burst``（默认 3），解析失败回退默认；
+  ``api_rate_limit`` 在配置层截断到 :data:`MAX_CONFIGURABLE_RATE`（100/s），
+  防止极端速率与长冻结相乘产生巨额令牌债务；
 - 收到 429 时由 :meth:`RateLimiter.notify_rate_limited` 冻结令牌桶：
   默认 60s，连续命中按 60→120→240 指数延长，上限 3600s；
   成功请求由 :meth:`RateLimiter.notify_success` 重置升级计数。
@@ -37,6 +39,7 @@ __all__ = [
     "DEFAULT_BURST",
     "DEFAULT_COOLDOWN",
     "DEFAULT_RATE",
+    "MAX_CONFIGURABLE_RATE",
     "MAX_COOLDOWN",
     "RateLimitTimeoutError",
     "RateLimiter",
@@ -48,6 +51,12 @@ DEFAULT_RATE = 1.0
 DEFAULT_BURST = 3
 DEFAULT_COOLDOWN = 60.0
 MAX_COOLDOWN = 3600.0
+
+# 可配置速率的合理上界（个/秒）。
+# 冻结/等待延长会把「额外秒数 × rate」折算为令牌债务；若 rate 被配置得极大，
+# 一次长冻结即可产生数万乃至更大的债务，令令牌桶长期瘫痪。配置层读取时统一
+# 截断到该上界（不影响 ``RateLimiter`` 自身的构造语义，测试可用高速率实例）。
+MAX_CONFIGURABLE_RATE = 100.0
 
 # 单次 acquire 允许预约（排队）的最长等待秒数，超过则放弃并抛
 # RateLimitTimeoutError，避免请求被无上限地挂起。
@@ -131,10 +140,12 @@ class RateLimiter:
         Raises:
             RateLimitTimeoutError: 预约所需等待超过 ``timeout``。
         """
-        reserved_act = self._reserve(timeout)
+        reserved_act, _reserved_debt = self._reserve(timeout)
         total_wait = 0.0
         while True:
-            remaining, reserved_act, reason = self._remaining_wait(reserved_act)
+            remaining, reserved_act, reason, _extra_debt = self._remaining_wait(
+                reserved_act
+            )
             if remaining <= 0:
                 return total_wait
             total_wait += remaining
@@ -149,6 +160,13 @@ class RateLimiter:
         ``asyncio.sleep``，因此不会阻塞事件循环。与同步 :meth:`acquire`
         共享同一令牌桶状态，同一实例上混用安全。
 
+        取消语义：预约在锁内已一次性扣减令牌（含冻结折算债务），令牌真正被
+        "使用" 发生在 ``await`` 正常返回之后。若等待期间任务被
+        ``CancelledError`` 取消，必须在锁内冲销本预约的全部扣减
+        （初始 1 令牌 + ``_reserve`` 冻结债务 + 等待循环中
+        :meth:`_remaining_wait` 追加的冻结债务），否则令牌桶被永久透支；
+        冲销后原样 ``raise``，绝不吞掉取消。
+
         Args:
             timeout: 同 :meth:`acquire`。
 
@@ -157,19 +175,32 @@ class RateLimiter:
 
         Raises:
             RateLimitTimeoutError: 预约所需等待超过 ``timeout``。
+            asyncio.CancelledError: 等待期间任务被取消（冲销预约后原样抛出）。
         """
-        reserved_act = self._reserve(timeout)
+        reserved_act, reserved_debt = self._reserve(timeout)
         total_wait = 0.0
-        while True:
-            remaining, reserved_act, reason = self._remaining_wait(reserved_act)
-            if remaining <= 0:
-                return total_wait
-            total_wait += remaining
-            self._log_wait(remaining, reason)
-            await asyncio.sleep(remaining)
+        try:
+            while True:
+                remaining, reserved_act, reason, extra_debt = self._remaining_wait(
+                    reserved_act
+                )
+                # 累计本次预约的全部扣减，供取消时精确冲销
+                reserved_debt += extra_debt
+                if remaining <= 0:
+                    return total_wait
+                total_wait += remaining
+                self._log_wait(remaining, reason)
+                await asyncio.sleep(remaining)
+        except asyncio.CancelledError:
+            with self._lock:
+                self._tokens += reserved_debt
+            logger.info(
+                f"⏳ acquire_async 等待被取消，已回滚预约扣减 {reserved_debt:.2f} 令牌"
+            )
+            raise
 
-    def _reserve(self, timeout: float) -> float:
-        """锁内完成令牌预约，返回预约的放行时刻（单调时钟）
+    def _reserve(self, timeout: float) -> tuple[float, float]:
+        """锁内完成令牌预约，返回 ``(预约放行时刻, 本预约扣减的令牌总量)``
 
         预扣算法（参考 Go ``reserveN``）：
         - 令牌可用时刻 ``bucket_act``：足够则为 ``now``，否则为
@@ -178,6 +209,9 @@ class RateLimiter:
         - 提交时 ``_tokens -= 1``，并把冻结造成的额外延时
           ``(act - bucket_act) * rate`` 一并折算为令牌债务，使冻结解除后
           排队的请求之间仍保持 ``1/rate`` 间隔（不超发）。
+
+        返回的第二项是本次预约累计扣减的令牌数（``1 + 冻结折算债务``），
+        供 :meth:`acquire_async` 在等待被取消时精确冲销。
 
         若 ``act - now > timeout``，则不修改任何状态并抛
         :class:`RateLimitTimeoutError`（等价于回滚预约，不影响其他等待者）。
@@ -202,32 +236,54 @@ class RateLimiter:
 
             # 预扣一个令牌；冻结额外延时折算为令牌债务，令后来者排在其后
             self._tokens -= 1.0
+            reserved_debt = 1.0
             freeze_extra = act - bucket_act
             if freeze_extra > 0:
-                self._tokens -= freeze_extra * self.rate
-            return act
+                debt = freeze_extra * self.rate
+                self._tokens -= debt
+                reserved_debt += debt
+                logger.debug(
+                    f"⏳ 预约受 429 冻结推迟 {freeze_extra:.2f}s，"
+                    f"折算令牌债务 {debt:.2f}"
+                )
+            return act, reserved_debt
 
-    def _remaining_wait(self, reserved_act: float) -> tuple[float, float, str]:
-        """锁内复查预约状态，返回 ``(还需等待秒数, 最新放行时刻, 等待原因)``
+    def _remaining_wait(self, reserved_act: float) -> tuple[float, float, str, float]:
+        """锁内复查预约状态，返回 ``(还需等待秒数, 最新放行时刻, 等待原因, 本轮追加债务)``
 
         等待期间可能收到更长的 429 冻结（:meth:`notify_rate_limited`）。此处
         把超出原预约时刻的部分折算为令牌债务，保证冻结解除后仍严格执行 FIFO：
         后到但尚未预约的请求会排在当前等待者之后，不会抢先放行。
+
+        不变式：所有南向 Bangumi 请求均经本令牌桶门控（见模块 docstring），
+        等待期间不会再有请求真正触网产生新的 429；``_frozen_until`` 只会被
+        :meth:`notify_rate_limited` 单向延长，且每次延长都把尚未放行者推到
+        更晚时刻（等价于让其排到队尾）。因此延长不会让**已放行者**倒挂——
+        已放行者的 ``reserved_act`` 早于或等于冻结起点，其放行时刻已是过去，
+        延长只影响尚未放行者，FIFO 顺序保持单调不减。
+
+        返回的第四项为本轮新折算的令牌债务增量（未延长时为 ``0.0``），供
+        :meth:`acquire_async` 累计后在被取消时精确冲销。
         """
         with self._lock:
             now = self._clock()
             self._refill(now)
+            extra_debt = 0.0
             if self._frozen_until > reserved_act:
                 extra = self._frozen_until - reserved_act
-                self._tokens -= extra * self.rate
+                extra_debt = extra * self.rate
+                self._tokens -= extra_debt
                 reserved_act = self._frozen_until
+                logger.debug(
+                    f"⏳ 429 冻结延长 {extra:.2f}s，折算令牌债务 {extra_debt:.2f}"
+                )
             remaining = reserved_act - now
             reason = (
                 "Bangumi API 429 冷却等待"
                 if self._frozen_until > now
                 else "Bangumi API 限速等待"
             )
-            return remaining, reserved_act, reason
+            return remaining, reserved_act, reason, extra_debt
 
     def _refill(self, now: float) -> None:
         """按经过时间补充令牌（上限为 burst）"""
@@ -315,6 +371,21 @@ def _read_positive_float(raw: object, default: float) -> float:
     return value
 
 
+def _clamp_configurable_rate(rate: float) -> float:
+    """把配置读取到的速率截断到 :data:`MAX_CONFIGURABLE_RATE`
+
+    这是**配置层**的防御，不改变 ``RateLimiter.__init__`` 的语义（后者仍允许
+    任意正值，便于测试注入高速率实例）。超限时记 warning 并说明被截断的值。
+    """
+    if rate > MAX_CONFIGURABLE_RATE:
+        logger.warning(
+            f"⏳ api_rate_limit={rate}/s 超过配置上界 "
+            f"{MAX_CONFIGURABLE_RATE}/s，已截断为 {MAX_CONFIGURABLE_RATE}/s"
+        )
+        return MAX_CONFIGURABLE_RATE
+    return rate
+
+
 def _read_positive_int(raw: object, default: int) -> int:
     try:
         value = int(str(raw).strip())
@@ -333,9 +404,11 @@ def get_bgm_rate_limiter() -> RateLimiter:
     if _limiter is None:
         with _limiter_lock:
             if _limiter is None:
-                rate = _read_positive_float(
-                    config_manager.get("bangumi", "api_rate_limit", fallback=1),
-                    DEFAULT_RATE,
+                rate = _clamp_configurable_rate(
+                    _read_positive_float(
+                        config_manager.get("bangumi", "api_rate_limit", fallback=1),
+                        DEFAULT_RATE,
+                    )
                 )
                 burst = _read_positive_int(
                     config_manager.get("bangumi", "api_rate_burst", fallback=3),
