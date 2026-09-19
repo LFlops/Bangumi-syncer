@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from app.core.config import config_manager
 from app.core.database import get_database_manager
+from app.core.database.agent_runs import apply_cancelled
 from app.core.logging import logger
 from app.services.agent import trace
 from app.services.agent.budget import get_max_iterations
@@ -645,13 +646,9 @@ def _persist_llm_candidate(
 
         if row is not None and row[2] != "pending":
             # 用户已处理（confirmed/rejected）→ 不复活候选，run 标 cancelled 并跳过。
-            # 注意：必须在 _write 事务内直写 SQL（复用 mark_cancelled 会因
-            # _run_write 再次取锁造成嵌套写锁），SQL 语义与 mark_cancelled 守卫一致。
-            conn.execute(
-                "UPDATE agent_runs SET status='cancelled', stop_reason=?, ended_at=? "
-                "WHERE run_id=? AND status IN ('pending','processing')",
-                (_STOP_REASON_USER_RESOLVED, int(time.time()), run_id),
-            )
+            # 事务内直调 apply_cancelled（单一 SQL 入口，不二次取锁），
+            # SQL 与源状态守卫与 mark_cancelled 完全一致。
+            apply_cancelled(conn, run_id, stop_reason=_STOP_REASON_USER_RESOLVED)
             logger.info(
                 f"[llm_assist] run {run_id} 候选(pending_candidates.id={row[0]}) "
                 f"状态={row[2]} 已被用户处理，跳过落库并标 run cancelled"
@@ -700,11 +697,8 @@ def _persist_llm_candidate(
                 )
             if cursor.rowcount == 0:
                 # SELECT 后被并发处理：带守卫 UPDATE 未命中，同样不复活。
-                conn.execute(
-                    "UPDATE agent_runs SET status='cancelled', stop_reason=?, "
-                    "ended_at=? WHERE run_id=? AND status IN ('pending','processing')",
-                    (_STOP_REASON_USER_RESOLVED, int(time.time()), run_id),
-                )
+                # 事务内直调 apply_cancelled（单一 SQL 入口，不二次取锁）。
+                apply_cancelled(conn, run_id, stop_reason=_STOP_REASON_USER_RESOLVED)
                 logger.info(
                     f"[llm_assist] run {run_id} 候选(pending_candidates.id="
                     f"{existing_id}) 在落库瞬间被并发处理，跳过落库并标 run cancelled"

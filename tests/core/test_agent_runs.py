@@ -275,6 +275,39 @@ class TestStatusTransitions:
         finally:
             dbm._connection._conn.close()
 
+    def test_apply_cancelled_matches_mark_cancelled_semantics(self, tmp_path):
+        """apply_cancelled 与 mark_cancelled 语义一致：守卫/stop_reason/ended_at。
+
+        事务内直调入口（不取锁），SQL 与源状态守卫须与 mark_cancelled 完全相同。
+        """
+        from app.core.database.agent_runs import apply_cancelled
+
+        dbm = _make_db(tmp_path)
+        try:
+            conn = dbm._connection._conn
+
+            # 活性态（processing）→ 守卫放行，写 stop_reason 与 ended_at
+            dbm.agent_runs.create_pending("ac-live", "match", 1)
+            assert dbm.agent_runs.atomic_claim("ac-live") is True
+            assert apply_cancelled(conn, "ac-live", stop_reason="user_resolved") is True
+            run = dbm.agent_runs.get_run("ac-live")
+            assert run["status"] == "cancelled"
+            assert run["stop_reason"] == "user_resolved"
+            assert run["ended_at"] > 0
+
+            # 非活性态（succeeded）→ 守卫拒绝，原值不变
+            dbm.agent_runs.create_pending("ac-done", "match", 2)
+            assert dbm.agent_runs.atomic_claim("ac-done") is True
+            assert dbm.agent_runs.mark_succeeded("ac-done") is True
+            assert (
+                apply_cancelled(conn, "ac-done", stop_reason="user_resolved") is False
+            )
+            run = dbm.agent_runs.get_run("ac-done")
+            assert run["status"] == "succeeded"
+            assert run["stop_reason"] == ""
+        finally:
+            dbm._connection._conn.close()
+
     def test_same_key_two_failed_runs_sum_is_two(self, tmp_path):
         """同键两条 failed run → SUM(total_attempts)=2（累计失败次数）"""
         dbm = _make_db(tmp_path)

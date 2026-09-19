@@ -101,6 +101,27 @@ def _decrypt_replay_delta(stored: Any) -> str:
         return stored if isinstance(stored, str) else ""
 
 
+def apply_cancelled(conn, run_id: str, *, stop_reason: str) -> bool:
+    """事务内 cancelled 写入口：SQL 与源状态守卫与 mark_cancelled 完全相同。
+
+    供已持有写锁/在事务内执行的调用方直接调用（**不二次取锁**，避免
+    ``_run_write`` 嵌套写锁）。守卫为活性态 ``pending`` / ``processing``，
+    非活性态（succeeded / no_suggestion / failed / 已 cancelled）返回 False，
+    原值不变；``ended_at`` 写 ``_now()``（epoch 秒，与其它终态口径一致）。
+
+    返回是否真正改写（受影响行数 > 0）。
+    """
+    cursor = conn.execute(
+        """
+        UPDATE agent_runs
+        SET status='cancelled', stop_reason=?, ended_at=?
+        WHERE run_id=? AND status IN ('pending','processing')
+        """,
+        (stop_reason, _now(), run_id),
+    )
+    return cursor.rowcount > 0
+
+
 class AgentRunsRepository(BaseRepository):
     """agent_runs / agent_steps 的增删改查与状态机流转"""
 
@@ -470,18 +491,13 @@ class AgentRunsRepository(BaseRepository):
         等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
 
         写 ``ended_at``（epoch 秒，与其它终态方法口径一致）。
+
+        SQL 与源状态守卫收敛到模块级 :func:`apply_cancelled`（单一入口），
+        本方法在其外层保留 ``_run_write`` 取锁与错误消息。
         """
 
         def _write(conn):
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='cancelled', stop_reason=?, ended_at=?
-                WHERE run_id=? AND status IN ('pending','processing')
-                """,
-                (stop_reason, _now(), run_id),
-            )
-            return cursor.rowcount > 0
+            return apply_cancelled(conn, run_id, stop_reason=stop_reason)
 
         return self._run_write(
             _write, error_msg="标记 agent_run cancelled 失败", default=False

@@ -1292,6 +1292,9 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
     bgm.get_subject.return_value = {"name": "N", "name_cn": "NC"}
 
     conn = MagicMock()
+    # apply_cancelled 会读取 cursor.rowcount 做比较；真实连接该值为 int，
+    # 显式设为 0 避免 MagicMock 与非整型比较报错（此处不关心具体改写结果）。
+    conn.execute.return_value.rowcount = 0
     captured = {}
     real_get = bgm.get_subject
 
