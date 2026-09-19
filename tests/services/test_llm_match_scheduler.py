@@ -139,6 +139,9 @@ def test_get_driver_config_empty_cron_fails_loud():
     assert any("llm_match_cron" in m for m in errors), (
         f"空串 cron 应记 error 且指明配置项，实际 {errors}"
     )
+    assert any("原值=''" in m for m in errors), (
+        f"空串 cron 的 error 日志应含原值，实际 {errors}"
+    )
 
 
 def test_get_driver_config_blank_cron_fails_loud():
@@ -156,6 +159,9 @@ def test_get_driver_config_blank_cron_fails_loud():
     errors = [str(c.args[0]) for c in log.error.call_args_list]
     assert any("llm_match_cron" in m for m in errors), (
         f"空白 cron 应记 error 且指明配置项，实际 {errors}"
+    )
+    assert any("原值='   '" in m for m in errors), (
+        f"空白 cron 的 error 日志应含原值，实际 {errors}"
     )
 
 

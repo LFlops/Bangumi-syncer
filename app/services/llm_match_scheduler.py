@@ -124,7 +124,8 @@ class LlmMatchScheduler(BaseScheduler):
         """返回含 sync_interval（cron）的配置。
 
         cron 空串/非法时 **fail-loud**（见 ``_resolve_cron_or_fail``）：集中 getter
-        已移除默认值兜底，若此处不拦截，基类 ``_schedule_or_refresh_job`` 的
+        仅对 ini 缺键提供 fallback 默认，显式空值/非法值会原样透出，由此处 fail-loud
+        校验拦截；若此处不拦截，基类 ``_schedule_or_refresh_job`` 的
         ``or DEFAULT_CRON`` / ``_parse_cron`` 会静默回落默认值，掩盖用户的配置错误。
         """
         return {"sync_interval": self._resolve_cron_or_fail()}
