@@ -97,10 +97,10 @@ _STOP_REASON_USER_RESOLVED = "user_resolved"
 # 校验（委托 SyncService._validate_subject_id，可整体 mock）
 # ---------------------------------------------------------------------------
 
-_sync_service_instance = None
+_sync_service_instance: SyncService | None = None
 
 
-def _get_sync_service():
+def _get_sync_service() -> SyncService:
     """惰性获取 SyncService 单例（仅成功路径调用一次）。
 
     ``SyncService`` 类已在模块头部导入（无导入环，见 P2-2 AST 守卫测试），
