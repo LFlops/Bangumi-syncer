@@ -1,19 +1,22 @@
-"""Agent 场景注册表（composition root）。
+"""Agent 场景注册表（纯机制）。
 
 通用组件（如调度器）按 ``task_type`` 获取场景运行入口
-(:class:`ScenarioRuntime`)；具体场景以「模块路径 + 工厂函数名」惰性登记，
-避免通用层反向依赖场景模块（场景模块可自由 import 本注册表）。
+(:class:`ScenarioRuntime`)。本模块只提供「登记 / 查询」机制，**不感知任何具体
+场景**：场景运行入口由**应用装配层**（``app/services/scenarios.py``，
+Composition Root）静态 import 场景工厂后调用 :func:`register_scenario` 注入。
+如此既让场景工厂的静态分析可见（LSP 可解析调用），又保留「通用层不反向依赖
+场景模块」的解耦（装配层位于应用层，不是 agent 通用层）。
 
-新增场景：实现 ``ScenarioHooks`` 与 ``make_ctx``，并在
-``_SCENARIO_PROVIDERS`` 登记 ``task_type -> (模块路径, 工厂函数名)``。
+新增场景：实现 ``ScenarioHooks`` 与 ``make_ctx``，提供 ``ScenarioRuntime``
+工厂，并在装配层 ``wire_scenarios`` 静态 import 该工厂并登记 ``task_type``。
 """
 
 from __future__ import annotations
 
-import importlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime
 from app.services.agent.scenario import ScenarioHooks
 
@@ -66,18 +69,39 @@ class ScenarioRuntime:
         )
 
 
-# task_type → (场景模块路径, 工厂函数名)；工厂返回 ScenarioRuntime
-_SCENARIO_PROVIDERS: dict[str, tuple[str, str]] = {
-    "match": ("app.services.matching.llm_assist", "get_scenario_runtime"),
-}
+# task_type → 已装配的场景运行入口；由应用装配层 register_scenario 注入
+_scenarios: dict[str, ScenarioRuntime] = {}
+
+
+def register_scenario(task_type: str, runtime: ScenarioRuntime) -> None:
+    """登记场景运行入口（覆盖语义，幂等）。
+
+    重复登记属预期（应用启动与测试 conftest 可能各装配一次），只打
+    debug/info，**不打 warning**。
+    """
+    if task_type in _scenarios:
+        logger.debug(f"[registry] 覆盖已登记的场景: {task_type!r}")
+    else:
+        logger.info(f"[registry] 登记 Agent 场景: {task_type!r}")
+    _scenarios[task_type] = runtime
 
 
 def get_scenario(task_type: str) -> ScenarioRuntime:
-    """按 task_type 获取场景运行入口（惰性加载场景模块）。"""
+    """按 task_type 获取已装配的场景运行入口。
+
+    - 表为空：抛 ``KeyError``，提示需先装配（应用启动由
+      ``scheduler_bootstrap.register_all()`` 触发，测试由 conftest 触发）
+    - 未注册该 task_type：抛 ``KeyError``，消息含已登记列表
+    """
+    if not _scenarios:
+        raise KeyError(
+            f"场景未装配: {task_type!r}（应用启动由 "
+            f"scheduler_bootstrap.register_all() 触发，测试由 conftest 触发）"
+        )
     try:
-        module_path, factory_name = _SCENARIO_PROVIDERS[task_type]
+        return _scenarios[task_type]
     except KeyError as e:
-        raise KeyError(f"未注册的 Agent 场景: {task_type!r}") from e
-    module = importlib.import_module(module_path)
-    factory = getattr(module, factory_name)
-    return factory()
+        registered = sorted(_scenarios)
+        raise KeyError(
+            f"未注册的 Agent 场景: {task_type!r}（已注册: {registered}）"
+        ) from e
