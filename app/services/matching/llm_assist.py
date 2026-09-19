@@ -801,8 +801,8 @@ async def _handle_result_async(
 
     ``_handle_result`` 内部含阻塞调用——``_validate_subject_id``（SyncService
     → ``api.get_subject``）与 ``_prefetch_bgm_name``（``bgm.get_subject``）都是
-    同步 HTTP，且链路可能触发限速器同步 sleep；而运行时的 run / continue_run /
-    _execute_continuation 三条路径均在事件循环上运行，
+    同步 HTTP，且链路可能触发限速器同步 sleep；而运行时的 run / continue_run
+    两条路径（后者内部含 _execute_continuation 子步骤）均在事件循环上运行，
     直接调用会阻塞心跳协程与同一循环内的其他任务。
 
     线程安全前提（已核查，故整链在线程池执行 = 方案 A）：
@@ -849,7 +849,7 @@ def _handle_result(
     - 恢复续跑 submit 分支（runtime.continue_run 捕获到 ``submit_suggestion`` 终局）：
       无实时 recorder 覆盖历史轮次，传 ``ReplayResult.total_tokens``（由
       ``agent_steps`` 的 llm_chat span 累计重建的历史口径）。
-    - 恢复续跑 loop 分支（runtime._execute_continuation）：传
+    - 恢复续跑 loop 分支（runtime.continue_run 内部的 _execute_continuation 子步骤）：传
       ``ReplayResult.total_tokens + TraceRecorder.total_tokens``
       （历史轮次 + 本次新轮次，避免只记新轮丢历史）。
     """
