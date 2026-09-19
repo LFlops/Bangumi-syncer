@@ -165,7 +165,9 @@ class RateLimiter:
         ``CancelledError`` 取消，必须在锁内冲销本预约的全部扣减
         （初始 1 令牌 + ``_reserve`` 冻结债务 + 等待循环中
         :meth:`_remaining_wait` 追加的冻结债务），否则令牌桶被永久透支；
-        冲销后原样 ``raise``，绝不吞掉取消。
+        冲销后夹紧到 ``burst``（等待期间 :meth:`_refill` 可能已把令牌补到
+        ``burst``，直接相加会把 ``_tokens`` 推过桶容量），最后原样 ``raise``，
+        绝不吞掉取消。
 
         Args:
             timeout: 同 :meth:`acquire`。
@@ -193,7 +195,9 @@ class RateLimiter:
                 await asyncio.sleep(remaining)
         except asyncio.CancelledError:
             with self._lock:
-                self._tokens += reserved_debt
+                # 等待期间 _remaining_wait 的 _refill 可能已在负桶上补令牌；
+                # 桶容量即上限，回滚净债务后夹紧，避免 _tokens 超过 burst（超发）。
+                self._tokens = min(self._tokens + reserved_debt, self.burst)
             logger.info(
                 f"⏳ acquire_async 等待被取消，已回滚预约扣减 {reserved_debt:.2f} 令牌"
             )

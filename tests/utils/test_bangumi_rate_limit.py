@@ -522,9 +522,46 @@ async def test_acquire_async_cancel_rolls_back_wait_loop_freeze_extension_debt()
 
     with limiter._lock:
         after = limiter._tokens
-    # 全部债务（含循环追加）冲销后回到自然水平（burst 上限 1）
-    assert after == pytest.approx(1.0, abs=0.2)
-    assert after > -1.0
+    # 桶容量即上限：回滚不得把令牌推过 burst
+    assert after <= limiter.burst + 1e-9
+    # 回滚有效：全部债务（含循环追加）被冲销，未残留透支
+    assert after >= 0.0
+
+
+async def test_acquire_async_cancel_clamps_tokens_to_burst_after_freeze():
+    """复现 edge：rate=100/burst=1，令牌占满后等待期间收到 429 冻结并取消
+
+    首轮预约把桶扣减为负；等待循环里的 ``_refill`` 会在负桶上补令牌，取消时
+    直接把净债务加回会把 ``_tokens`` 推过桶容量（实测约 1.09）。桶容量即上限，
+    回滚必须夹紧到 ``burst``，且后续 acquire 不被永久拖累、不超发。
+    """
+    limiter = RateLimiter(rate=100.0, burst=1)
+
+    await limiter.acquire_async()  # 耗尽唯一令牌
+    task = asyncio.create_task(limiter.acquire_async(timeout=4000.0))
+    await asyncio.sleep(0.005)  # 首轮预约约 0.01s
+    limiter.notify_rate_limited(0.0)  # 冻结 60s，下一轮折算债务
+    await asyncio.sleep(0.05)  # 等首轮结束、进入冻结等待轮
+    assert not task.done()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    with limiter._lock:
+        after = limiter._tokens
+    assert after <= limiter.burst + 1e-9  # 桶容量即上限，不得超发
+    assert after >= 0.0  # 回滚有效：未残留透支（不被永久拖累）
+
+    # 冻结仍在内存中（60s），测试直接清除以便验证后续行为
+    with limiter._lock:
+        limiter._frozen_until = 0.0
+
+    # 不被永久拖累：令牌可用，首个请求立即放行
+    assert await limiter.acquire_async(timeout=0.001) == pytest.approx(0.0)
+    # 不超发：容量仅 1，紧随其后的请求必须按 1/rate 排队（约 0.01s > timeout）
+    with pytest.raises(RateLimitTimeoutError):
+        await limiter.acquire_async(timeout=0.001)
 
 
 def test_remaining_wait_logs_freeze_extension_debt():
