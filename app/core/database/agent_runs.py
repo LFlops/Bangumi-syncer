@@ -17,7 +17,8 @@
 关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - increment_attempts：调度轮次失败计数，>=3 单点置 failed（同事务携带 last_error）
-- mark_failed：状态守卫（仅 pending/processing 可转 failed，非活性态 rowcount=0）
+- mark_failed / mark_succeeded / mark_no_suggestion：状态守卫 first-wins
+  （仅 pending/processing 可转终态，非活性态 rowcount=0 → 返回 False，不覆盖先到终态）
 - refresh_started_at：ts 为空/非正值取当前时间（保证 started_at>0 可被恢复扫描拾取）
 - enqueue_match_run：单事务内完成 created / in_flight / 复用 / exhausted 决策；
   内部异常向上抛出（仅并发唯一索引冲突兜底复用），决策策略参数必填
@@ -410,14 +411,22 @@ class AgentRunsRepository(BaseRepository):
     def mark_succeeded(
         self, run_id: str, stop_reason: str = "", total_tokens: int = 0
     ) -> bool:
-        """标记成功（产出建议并通过校验），记录终态时间"""
+        """标记成功（产出建议并通过校验），记录终态时间。
+
+        **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 succeeded；
+        对 ``no_suggestion`` / ``failed`` / ``cancelled`` / 已 ``succeeded``
+        等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
+
+        守卫为 first-wins：双跑 / 超时取消后恢复续跑与原执行者竞态时，
+        后到者的落库不覆盖先到终态。
+        """
 
         def _write(conn):
             cursor = conn.execute(
                 """
                 UPDATE agent_runs
                 SET status='succeeded', stop_reason=?, total_tokens=?, ended_at=?
-                WHERE run_id=?
+                WHERE run_id=? AND status IN ('pending','processing')
                 """,
                 (stop_reason, total_tokens, _now(), run_id),
             )
@@ -434,7 +443,15 @@ class AgentRunsRepository(BaseRepository):
         last_error: str = "",
         total_tokens: int = 0,
     ) -> bool:
-        """标记无建议（预算耗尽 / 校验失败 / 无候选），终态"""
+        """标记无建议（预算耗尽 / 校验失败 / 无候选），终态。
+
+        **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 no_suggestion；
+        对 ``succeeded`` / ``failed`` / ``cancelled`` / 已 ``no_suggestion``
+        等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
+
+        守卫为 first-wins：双跑 / 超时取消后恢复续跑与原执行者竞态时，
+        后到者的落库不覆盖先到终态。
+        """
 
         # 先对完整文本脱敏、后截断：避免调用方预截断（如 str(e)[:500]）
         # 把敏感值切在边界上导致模式失配而泄漏裸片段。
@@ -446,7 +463,7 @@ class AgentRunsRepository(BaseRepository):
                 UPDATE agent_runs
                 SET status='no_suggestion', stop_reason=?, last_error=?,
                     total_tokens=?, ended_at=?
-                WHERE run_id=?
+                WHERE run_id=? AND status IN ('pending','processing')
                 """,
                 (stop_reason, last_error, total_tokens, _now(), run_id),
             )

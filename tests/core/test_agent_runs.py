@@ -329,6 +329,144 @@ class TestStatusTransitions:
             dbm._connection._conn.close()
 
 
+class TestSucceededNoSuggestionTerminalGuard:
+    """mark_succeeded / mark_no_suggestion 终态守卫（first-wins）。
+
+    仅 pending/processing 活性态可转 succeeded/no_suggestion；对已终态
+    （succeeded/no_suggestion/failed/cancelled）再次调用不生效（返回 False，
+    原 status 与字段保持不变），避免双跑/恢复续跑竞态覆盖先到终态。
+    """
+
+    def test_mark_succeeded_from_processing_sets_terminal_fields(self, tmp_path):
+        """processing → succeeded 成功，写 stop_reason/total_tokens/ended_at。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("sg1", "match", 1)
+            assert dbm.agent_runs.atomic_claim("sg1") is True
+
+            assert (
+                dbm.agent_runs.mark_succeeded(
+                    "sg1", stop_reason="submit_suggestion", total_tokens=123
+                )
+                is True
+            )
+            run = dbm.agent_runs.get_run("sg1")
+            assert run["status"] == "succeeded"
+            assert run["stop_reason"] == "submit_suggestion"
+            assert run["total_tokens"] == 123
+            assert run["ended_at"] > 0
+        finally:
+            dbm._connection._conn.close()
+
+    def test_mark_succeeded_from_pending_sets_terminal(self, tmp_path):
+        """pending 亦为活性态：未抢占直接 mark_succeeded 仍成功（向后兼容）。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("sg2", "match", 1)
+            assert dbm.agent_runs.mark_succeeded("sg2", stop_reason="end_turn") is True
+            assert dbm.agent_runs.get_run("sg2")["status"] == "succeeded"
+        finally:
+            dbm._connection._conn.close()
+
+    def test_mark_no_suggestion_from_processing_sets_terminal_fields(self, tmp_path):
+        """processing → no_suggestion 成功，写 stop_reason/last_error/total_tokens。"""
+        dbm = _make_db(tmp_path)
+        try:
+            dbm.agent_runs.create_pending("nsg1", "match", 1)
+            assert dbm.agent_runs.atomic_claim("nsg1") is True
+
+            assert (
+                dbm.agent_runs.mark_no_suggestion(
+                    "nsg1",
+                    stop_reason="exhausted",
+                    last_error="无建议",
+                    total_tokens=55,
+                )
+                is True
+            )
+            run = dbm.agent_runs.get_run("nsg1")
+            assert run["status"] == "no_suggestion"
+            assert run["stop_reason"] == "exhausted"
+            assert run["last_error"] == "无建议"
+            assert run["total_tokens"] == 55
+            assert run["ended_at"] > 0
+        finally:
+            dbm._connection._conn.close()
+
+    @staticmethod
+    def _to_terminal(dbm, run_id: str, terminal: str) -> None:
+        """构造任一终态（含哨兵字段值，便于验证守卫不改写）。"""
+        dbm.agent_runs.create_pending(run_id, "match", 1)
+        assert dbm.agent_runs.atomic_claim(run_id) is True
+        if terminal == "succeeded":
+            assert (
+                dbm.agent_runs.mark_succeeded(
+                    run_id, stop_reason="first", total_tokens=11
+                )
+                is True
+            )
+        elif terminal == "no_suggestion":
+            assert (
+                dbm.agent_runs.mark_no_suggestion(
+                    run_id, stop_reason="first", last_error="first-err", total_tokens=22
+                )
+                is True
+            )
+        elif terminal == "failed":
+            assert dbm.agent_runs.mark_failed(run_id, "first", "first-err", 33) is True
+        elif terminal == "cancelled":
+            assert dbm.agent_runs.mark_cancelled(run_id, stop_reason="first") is True
+        else:  # pragma: no cover - 防御分支：非法 terminal 参数须显式失败
+            raise AssertionError(f"未知终态构造参数: {terminal}")
+
+    @pytest.mark.parametrize(
+        "terminal", ["succeeded", "no_suggestion", "failed", "cancelled"]
+    )
+    def test_mark_succeeded_guard_rejects_terminal_states(self, tmp_path, terminal):
+        """已终态再 mark_succeeded → False，且原终态与全字段读回不变。"""
+        dbm = _make_db(tmp_path)
+        try:
+            self._to_terminal(dbm, "sg-guard", terminal)
+            before = dbm.agent_runs.get_run("sg-guard")
+
+            assert (
+                dbm.agent_runs.mark_succeeded(
+                    "sg-guard", stop_reason="second", total_tokens=999
+                )
+                is False
+            )
+            after = dbm.agent_runs.get_run("sg-guard")
+            assert after == before
+            assert after["status"] == terminal
+        finally:
+            dbm._connection._conn.close()
+
+    @pytest.mark.parametrize(
+        "terminal", ["succeeded", "no_suggestion", "failed", "cancelled"]
+    )
+    def test_mark_no_suggestion_guard_rejects_terminal_states(self, tmp_path, terminal):
+        """已终态再 mark_no_suggestion → False，且原终态与全字段读回不变。"""
+        dbm = _make_db(tmp_path)
+        try:
+            self._to_terminal(dbm, "ns-guard", terminal)
+            before = dbm.agent_runs.get_run("ns-guard")
+
+            assert (
+                dbm.agent_runs.mark_no_suggestion(
+                    "ns-guard",
+                    stop_reason="second",
+                    last_error="second-err",
+                    total_tokens=999,
+                )
+                is False
+            )
+            after = dbm.agent_runs.get_run("ns-guard")
+            assert after == before
+            assert after["status"] == terminal
+        finally:
+            dbm._connection._conn.close()
+
+
 class TestIncrementAttempts:
     """increment_attempts：计数与达上限置终态单点完成"""
 
