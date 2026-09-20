@@ -19,6 +19,20 @@ recover 与 pending 统一入列后经 ``asyncio.Semaphore(llm_match_concurrency
 重入防护：本进程正在处理的 run 记入模块级 ``_active_run_ids``，恢复扫描与正常处理
 均跳过，避免「进程活着但处理慢」被误判为崩溃遗留而双跑；恢复开始时以统一时间戳
 抢占刷新 started_at。跨进程死进程恢复仍由 list_stale_processing 超时判定兜底。
+
+超时闭环（APScheduler / cron 架构不变，仅加两层超时，超时值动态推算、不新增配置项）：
+
+1. **per-run 动态超时（主防线）**：``compute_match_run_timeout`` 按
+   ``max_iterations × ([llm] timeout + 工具超时30s) + 缓冲120s`` 推算单 run 上限，
+   在 ``_consume`` 内以 ``asyncio.wait_for`` 施压。任一 run 协程 hang（不抛异常、
+   不返回）→ **wait_for 超时会 cancel 该协程** → ``_recover_run`` / ``_process_run``
+   的 ``finally: _release_run`` 执行（执行权释放）→ run 仍为 ``processing`` →
+   下一 tick 恢复扫描断点续跑；同批其他 run 不受影响。
+2. **tick 级兜底**：``_run_sync_job`` 以 ``wait_for(_run_round(...), run_timeout + 60)``
+   包住整轮，防「fn 之外」的意外 hang 让 tick 永不结束（``max_instances=1`` 下会
+   导致后续触发全部被跳过、整个调度停摆）。tick 超时会取消 gather 内全部 run →
+   各自释放执行权 → 下一轮恢复（罕见兜底，可接受）。
+3. ``CancelledError`` 不得被吞：超时取消会传播到内部协程，各 ``finally`` 正常执行。
 """
 
 from __future__ import annotations
@@ -35,10 +49,15 @@ from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.models.agent import AgentRunRecord
+from app.services.agent.budget import compute_match_run_timeout
 from app.services.agent.registry import get_scenario
 from app.services.base.scheduler import BaseScheduler
 from app.services.notification_service import get_notification_service
 from app.utils.bangumi_api import BangumiApi
+
+# tick 级兜底超时缓冲（秒）：gather 并发等待最慢 run 后再加一段收尾余量。
+# tick_timeout = run_timeout + TICK_TIMEOUT_BUFFER
+TICK_TIMEOUT_BUFFER = 60.0
 
 # ---------------------------------------------------------------------------
 # 进程级 active run 防护
@@ -167,20 +186,62 @@ class LlmMatchScheduler(BaseScheduler):
         return True
 
     async def _run_sync_job(self) -> None:
-        """单轮调度：清理 → 恢复扫描 → pending 共享信号量并发消费。
+        """单轮调度入口：启用检查 + tick 级兜底超时。
 
-        recover 任务先入列（保证崩溃遗留优先被接管），与 pending 任务共用同一
-        并发限额；单条 run 的异常在消费包装层被隔离并记录，不影响同批其他 run。
+        - per-run 动态超时（主防线）在 ``_run_round`` 的 ``_consume`` 内实现；
+        - 本方法以 ``wait_for`` 为整轮加 tick 兜底，防「fn 之外」的意外 hang
+          让 tick 永不结束（``max_instances=1`` 下会连锁跳过后续触发、调度停摆）；
+          超时取消会传播到 ``gather`` 内各 run（各自 finally 释放执行权），
+          下一轮恢复扫描续跑。
         """
         if not self._is_enabled():
             return
 
-        dbm = get_database_manager()
-        repo = dbm.agent_runs
-
         # llm_match_* 配置统一走集中 getter，本轮只读取一次后复用；每次调度周期
         # 重新读取，保证 Web 保存配置后的热更新语义不变。
         match_cfg = config_manager.get_sync_llm_match_config()
+        llm_timeout = self._resolve_llm_timeout()
+        # 单 run 动态上限（不新增配置项）：按 thinking_level × LLM/工具超时推算
+        run_timeout = compute_match_run_timeout(match_cfg, llm_timeout)
+        tick_timeout = run_timeout + TICK_TIMEOUT_BUFFER
+        try:
+            await asyncio.wait_for(
+                self._run_round(match_cfg, run_timeout), timeout=tick_timeout
+            )
+        except asyncio.TimeoutError:
+            # CancelledError 不在此捕获：取消已传播至内部协程，各自 finally 正常执行
+            logger.error(
+                f"🤖 调度轮整体超时（>{tick_timeout:.0f}s），已取消，下一轮重试"
+            )
+
+    @staticmethod
+    def _resolve_llm_timeout() -> float:
+        """读取 ``[llm] timeout``（秒）；读取异常 / 非法值 / 非正数 → 回退 60。
+
+        与 ``config_manager.get_llm_config`` 的默认 timeout=60 保持一致；此处不引入
+        新配置项，仅做健壮性兜底，保证超时推算不因脏配置失败。
+        """
+        try:
+            raw = config_manager.get_llm_config().get("timeout", 60)
+            value = float(raw)
+        except Exception as e:
+            logger.warning(f"🤖 读取 LLM timeout 失败，回退 60s: {type(e).__name__}")
+            return 60.0
+        if value <= 0:
+            logger.warning(f"🤖 LLM timeout={raw!r} 非正数，回退 60s")
+            return 60.0
+        return value
+
+    async def _run_round(self, match_cfg: dict, run_timeout: float) -> None:
+        """单轮调度主体：清理 → 恢复扫描 → pending 共享信号量并发消费。
+
+        ``run_timeout`` 为单 run 动态超时（``compute_match_run_timeout`` 推算）。
+        ``_consume`` 内 ``asyncio.wait_for`` 超时会 cancel ``fn`` 协程，进而触发
+        ``_recover_run`` / ``_process_run`` 的 ``finally: _release_run`` 释放执行权；
+        run 仍为 ``processing`` → 下一 tick 恢复扫描断点续跑，同批其他 run 不受影响。
+        """
+        dbm = get_database_manager()
+        repo = dbm.agent_runs
 
         # 1. 滑动窗口轮转清理（终态超窗 + 活性过期死行，单条 DELETE）
         retention_days = match_cfg["llm_match_retention_days"]
@@ -220,11 +281,22 @@ class LlmMatchScheduler(BaseScheduler):
         failures = 0
 
         async def _consume(fn, run: AgentRunRecord) -> None:
-            """单条消费包装：受共享信号量约束，异常隔离不影响同批其他 run。"""
+            """单条消费包装：受共享信号量约束，异常/超时隔离不影响同批其他 run。
+
+            ``wait_for`` 超时会 cancel ``fn`` 协程（非抛异常）；``CancelledError``
+            在 Python 3.8+ 属 ``BaseException``，不会被下方 ``except Exception``
+            吞掉，故能正常传播至 ``fn`` 的 ``finally`` 释放执行权。
+            """
             nonlocal failures
             async with sem:
                 try:
-                    await fn(run)
+                    await asyncio.wait_for(fn(run), timeout=run_timeout)
+                except asyncio.TimeoutError:
+                    failures += 1
+                    logger.error(
+                        f"🤖 run {run.run_id} 执行超时（>{run_timeout:.0f}s），"
+                        f"已取消，留待恢复扫描续跑"
+                    )
                 except Exception as e:
                     failures += 1
                     logger.error(f"🤖 处理 run {run.run_id} 异常: {e}")

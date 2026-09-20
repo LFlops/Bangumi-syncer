@@ -9,11 +9,14 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from app.services.agent.budget import (
     _ITERATION_STRATEGIES,
     MatchIterationStrategy,
+    compute_match_run_timeout,
     get_max_iterations,
     register_iteration_strategy,
 )
@@ -151,3 +154,69 @@ def test_get_max_iterations_config_override_none_falls_through_to_strategy():
         == get_max_iterations("diagnostic", "off")
         == 5
     )
+
+
+# --- 调度器单 run 超时推算（compute_match_run_timeout） ---
+#
+# run_timeout = max_iterations × (llm_timeout + TOOL_TIMEOUT=30) + BUFFER=120
+# llm_timeout=60 时：off=1→210 / low=2→300 / medium=5→570 / high=10→1020
+
+
+def _match_cfg(level: str, override="") -> dict:
+    return {
+        "llm_match_thinking_level": level,
+        "llm_match_max_iterations": override,
+    }
+
+
+@pytest.mark.parametrize(
+    "level,expected",
+    [
+        ("off", 210.0),
+        ("low", 300.0),
+        ("medium", 570.0),
+        ("high", 1020.0),
+    ],
+)
+def test_compute_match_run_timeout_by_thinking_level(level, expected):
+    """按 thinking_level 推算：max_iterations × (llm_timeout + 工具超时) + 缓冲。"""
+    assert compute_match_run_timeout(_match_cfg(level), 60) == expected
+
+
+def test_compute_match_run_timeout_override_takes_priority():
+    """显式 max_iterations 覆盖生效：override=3 → 3×90+120=390。"""
+    assert compute_match_run_timeout(_match_cfg("high", "3"), 60) == 390.0
+
+
+def test_compute_match_run_timeout_scales_with_llm_timeout():
+    """llm_timeout 变化等比反映到 run_timeout（medium：5×90+120=570 → 5×150+120=870）。"""
+    assert compute_match_run_timeout(_match_cfg("medium"), 120) == 870.0
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_compute_match_run_timeout_blank_override_silently_falls_back(blank):
+    """空值覆盖（None/空串/空白）→ 静默回退 thinking_level 映射，不告警。"""
+    log = MagicMock()
+    with patch("app.services.agent.budget.logger", log):
+        result = compute_match_run_timeout(_match_cfg("medium", blank), 60)
+    assert result == 570.0
+    log.warning.assert_not_called()
+
+
+def test_compute_match_run_timeout_invalid_override_warns_and_falls_back():
+    """非法整数覆盖 → warning + 回退 thinking_level 映射。"""
+    log = MagicMock()
+    with patch("app.services.agent.budget.logger", log):
+        result = compute_match_run_timeout(_match_cfg("low", "abc"), 60)
+    assert result == 300.0
+    log.warning.assert_called_once()
+
+
+@pytest.mark.parametrize("bad", ["0", "-2"])
+def test_compute_match_run_timeout_non_positive_override_warns_and_falls_back(bad):
+    """非正数覆盖（<=0）→ warning + 回退 thinking_level 映射。"""
+    log = MagicMock()
+    with patch("app.services.agent.budget.logger", log):
+        result = compute_match_run_timeout(_match_cfg("off", bad), 60)
+    assert result == 210.0
+    log.warning.assert_called_once()

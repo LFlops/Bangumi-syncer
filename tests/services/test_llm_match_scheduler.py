@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1313,3 +1314,211 @@ def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
     assert secret not in msg, "日志不得包含原始异常文本（可能含 access_token）"
     assert "ValueError" in msg, "应保留异常类型便于诊断"
     assert "alice" in msg, "应保留用户维度便于定位"
+
+
+# ---------------------------------------------------------------------------
+# 超时闭环：per-run 动态超时（主防线）+ tick 级兜底
+#
+# 缺陷背景：run 协程 hang（不抛异常、不返回）→ finally: _release_run 永不执行
+# → 执行权泄漏 + tick 永不结束（max_instances=1）→ 整个 match 调度永久停摆。
+# 修复：wait_for 超时会 cancel 协程 → finally 释放执行权 → 下一 tick 恢复续跑。
+# ---------------------------------------------------------------------------
+
+
+def test_run_sync_job_passes_dynamic_run_timeout_to_round():
+    """动态推算 run_timeout（medium + llm timeout 60 → 570）并下传给调度轮。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()  # thinking medium；get_llm_config 不含 timeout → 默认 60
+    spy = MagicMock(return_value=570.0)
+    round_mock = AsyncMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.compute_match_run_timeout", spy),
+        patch.object(sched, "_run_round", round_mock),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    spy.assert_called_once()
+    called_cfg, called_llm_timeout = spy.call_args.args
+    assert called_cfg["llm_match_thinking_level"] == "medium"
+    assert called_llm_timeout == 60.0
+    round_mock.assert_awaited_once()
+    assert round_mock.call_args.args[1] == 570.0, "动态 run_timeout 应传入调度轮"
+
+
+def test_run_sync_job_llm_timeout_invalid_falls_back_to_60():
+    """[llm] timeout 非法值 → 回退 60 再参与推算。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    cm.get_llm_config.return_value = {"api_key": "k", "timeout": "not-a-number"}
+    spy = MagicMock(return_value=570.0)
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.compute_match_run_timeout", spy),
+        patch.object(sched, "_run_round", AsyncMock()),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert spy.call_args.args[1] == 60.0
+
+
+def test_run_sync_job_llm_timeout_getter_exception_falls_back_to_60():
+    """get_llm_config 抛异常 → 回退 60（不因超时推算失败中断调度）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    # 第 1 次供 _is_enabled 启用检查；第 2 次（_resolve_llm_timeout）抛异常
+    cm.get_llm_config.side_effect = [{"api_key": "k"}, RuntimeError("boom")]
+    spy = MagicMock(return_value=570.0)
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.llm_match_scheduler.compute_match_run_timeout", spy),
+        patch.object(sched, "_run_round", AsyncMock()),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert spy.call_args.args[1] == 60.0
+    assert log.warning.called, "回退应记 warning 便于诊断"
+
+
+def test_per_run_timeout_cancels_hang_releases_active_and_isolates():
+    """单 run hang → 超时取消、释放执行权、同批其他 run 不受影响。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_pending.return_value = [
+        {"run_id": "hang", "task_type": "match", "sync_record_id": 1},
+        {"run_id": "ok", "task_type": "match", "sync_record_id": 2},
+    ]
+    finished: list[str] = []
+
+    async def _run_side_effect(run_id, **kwargs):
+        if run_id == "hang":
+            await asyncio.Event().wait()  # 永不 set → hang
+        finished.append(run_id)
+
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch(
+            "app.services.llm_match_scheduler.compute_match_run_timeout",
+            return_value=0.05,
+        ),
+        patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
+        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch(
+            "app.services.agent.registry.ScenarioRuntime.run",
+            side_effect=_run_side_effect,
+        ),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert "hang" not in finished, "hang run 不应完成"
+    assert "ok" in finished, "同批其他 run 应正常完成（隔离）"
+    assert "hang" not in sched_module._active_run_ids, (
+        "超时取消后 finally 必须释放执行权，否则恢复扫描永久跳过"
+    )
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("超时" in m and "hang" in m for m in errors), (
+        f"超时应记 error（含 run_id），实际 {errors}"
+    )
+
+
+def test_per_run_timeout_leaves_run_processing_then_recovery_continues():
+    """超时 run 不得被误标失败/计数；下一轮恢复扫描能续跑（闭环）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_pending.return_value = [
+        {"run_id": "hang", "task_type": "match", "sync_record_id": 1}
+    ]
+
+    async def _hang(run_id, **kwargs):
+        await asyncio.Event().wait()
+
+    def _common_patchers():
+        """每轮新建 patcher（_patch 对象不可跨 with 复用）。"""
+        return [
+            patch("app.services.llm_match_scheduler.config_manager", cm),
+            patch(
+                "app.services.llm_match_scheduler.get_database_manager",
+                return_value=_make_dbm(repo),
+            ),
+            patch(
+                "app.services.llm_match_scheduler.compute_match_run_timeout",
+                return_value=0.05,
+            ),
+            patch.object(
+                sched, "_get_sync_record", return_value={"id": 1, "title": "t"}
+            ),
+            patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        ]
+
+    def _enter(*extra):
+        stack = contextlib.ExitStack()
+        for p in _common_patchers():
+            stack.enter_context(p)
+        for p in extra:
+            stack.enter_context(p)
+        return stack
+
+    # 第一轮：pending hang → 超时取消
+    with _enter(
+        patch("app.services.agent.registry.ScenarioRuntime.run", side_effect=_hang)
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    repo.mark_failed.assert_not_called()
+    repo.increment_attempts.assert_not_called()
+    assert "hang" not in sched_module._active_run_ids
+
+    # 第二轮：run 仍为 processing → 恢复扫描捞起 → continue_run 续跑
+    repo.list_pending.return_value = []
+    repo.list_stale_processing.return_value = [
+        {"run_id": "hang", "task_type": "match", "sync_record_id": 1}
+    ]
+    cont = AsyncMock()
+    with _enter(
+        patch("app.services.agent.registry.ScenarioRuntime.continue_run", new=cont)
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    cont.assert_awaited_once()
+
+
+def test_tick_timeout_cancels_hanging_round_and_returns():
+    """tick 兜底：调度轮整体 hang → wait_for 取消、测试不悬挂、finally 执行。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    log = MagicMock()
+    state = {"cancelled": False}
+
+    async def _hang_round(match_cfg, run_timeout):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            state["cancelled"] = True  # 证明取消传播到内部（未被吞）
+
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.compute_match_run_timeout",
+            return_value=0.05,
+        ),
+        patch("app.services.llm_match_scheduler.TICK_TIMEOUT_BUFFER", 0.1),
+        patch("app.services.llm_match_scheduler.logger", log),
+        patch.object(sched, "_run_round", new=_hang_round),
+    ):
+        asyncio.run(sched._run_sync_job())
+
+    assert state["cancelled"] is True, (
+        "tick 取消应传播到 _run_round（CancelledError 不得被吞）"
+    )
+    errors = [str(c.args[0]) for c in log.error.call_args_list]
+    assert any("整体超时" in m for m in errors), f"tick 超时应记 error，实际 {errors}"

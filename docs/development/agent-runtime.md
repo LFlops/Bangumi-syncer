@@ -108,6 +108,11 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 
 - **恢复续跑收敛为单一入口 `continue_run`**：调度器只调用公开入口，不触碰场景
   私有符号（有源码级守卫测试）。
+- **超时闭环**：`llm_match` 调度器为单 run 施加**动态超时**（`compute_match_run_timeout`：
+  `max_iterations × ([llm] timeout + 工具 30s) + 缓冲 120s`），并为整轮加 tick 兜底
+  （`run_timeout + 60s`）。超时由 `asyncio.wait_for` 取消协程 → 恢复路径的 `finally`
+  释放进程内执行权 → run 保持 `processing` → 下一 tick 恢复扫描断点续跑；APScheduler/cron
+  结构不变（超时值动态推算，不新增配置项）。
 - **调度器不依赖场景模块**：经 `agent.registry.get_scenario(task_type)` 获取
   `ScenarioRuntime`（组合模式）；新增任务类型时调度骨架可复用。
 - **场景钩子实现内部以场景模块全局名引用依赖**（而非闭包硬绑定），保持可

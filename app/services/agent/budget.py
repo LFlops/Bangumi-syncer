@@ -11,11 +11,18 @@
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
+
+from app.core.logging import logger
 
 # 默认兜底：未知 task_type 或未注册策略时使用
 _DEFAULT_FALLBACK: dict[str, int] = {"off": 1, "low": 2, "medium": 3, "high": 5}
 _DEFAULT_FALLBACK_LEVEL = 3
+
+# 单工具执行超时：与 app/services/llm/tools.py 的 ToolRegistry.execute 默认超时（30s）同步
+_TOOL_TIMEOUT_SECONDS = 30.0
+# 兜底缓冲：覆盖兜底收尾调用 / 恢复补执行 / 落库开销
+_RUN_TIMEOUT_BUFFER_SECONDS = 120.0
 
 # task_type -> IterationStrategy 注册表
 _ITERATION_STRATEGIES: dict[str, IterationStrategy] = {}
@@ -68,6 +75,62 @@ def get_max_iterations(
 def register_defaults() -> None:
     """注册骨架内置默认策略（幂等，供后续扩展或测试显式调用）。"""
     register_iteration_strategy("match", MatchIterationStrategy())
+
+
+def _resolve_match_iterations_override(raw_max: Any, log: Any = None) -> int | None:
+    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（自包含实现）。
+
+    语义与 ``app/services/matching/llm_assist.py::resolve_max_iterations_override``
+    保持一致（该函数为场景内实现，而调度器源码有 AST 守卫禁止引用场景私有符号，
+    故此处独立复刻、不 import 复用）：
+    - 空值（None / 空串 / 纯空白）→ None（静默，属默认配置）
+    - 非法整数 → None + 告警
+    - 非正数（<=0）→ None + 告警（否则 max_iterations<=0 会让循环空跑）
+    """
+    _log = log if log is not None else logger
+    if raw_max is None:
+        return None
+    text = str(raw_max).strip()
+    if text == "":
+        return None
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        _log.warning(
+            f"[budget] llm_match_max_iterations={raw_max!r} 非法整数，"
+            f"已忽略该覆盖（回退思考强度策略默认）"
+        )
+        return None
+    if value <= 0:
+        _log.warning(
+            f"[budget] llm_match_max_iterations={value} 必须为正整数，"
+            f"已忽略该覆盖（回退思考强度策略默认）"
+        )
+        return None
+    return value
+
+
+def compute_match_run_timeout(match_cfg: dict, llm_timeout: float) -> float:
+    """推算 llm_match 单 run 的最大执行时长（动态推算，不新增配置项）。
+
+    ``run_timeout = max_iterations × (llm_timeout + TOOL_TIMEOUT) + BUFFER``
+
+    - ``max_iterations``：按 thinking_level 策略映射，显式覆盖优先
+    - ``TOOL_TIMEOUT=30s``：与 ``app/services/llm/tools.py`` 的
+      ``ToolRegistry.execute`` 默认超时同步（每轮至多一次工具调用的耗时上限）
+    - ``BUFFER=120s``：覆盖兜底收尾调用 / 恢复补执行 / 落库开销
+    """
+    thinking_level = match_cfg.get("llm_match_thinking_level", "medium")
+    override = _resolve_match_iterations_override(
+        match_cfg.get("llm_match_max_iterations")
+    )
+    max_iterations = get_max_iterations(
+        "match", thinking_level, config_override=override
+    )
+    return (
+        max_iterations * (llm_timeout + _TOOL_TIMEOUT_SECONDS)
+        + _RUN_TIMEOUT_BUFFER_SECONDS
+    )
 
 
 # 模块导入即注册 match 默认策略，确保通用骨架开箱可用
