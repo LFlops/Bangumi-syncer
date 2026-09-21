@@ -39,13 +39,15 @@ eval/
 ### 黄金集（`golden/*.jsonl`，每行一条）
 
 ```json
-{"id": "m001", "source": "issue#182",
+{"id": "m001", "source": "issue#182", "scenario": "S11_同名不同年份",
  "input": {"title": "无职转生：到了异世界就拿出真本事", "ori_title": "", "season": 3,
            "episode": 1, "release_date": "2026-07-04", "media_type": "episode"},
  "expect": {"subject_id": 501963, "acceptable_ids": [501963], "expect_stop": "submit_suggestion"},
  "tags": ["cjk", "season-shift"], "note": "期望 501963"}
 ```
 
+- `scenario`：输入形态分类，取值对齐 `scripts/gen_golden_cases.py` 的 `SCENARIOS`
+  （见下节），用于报告聚合与扩集查漏补缺；`tags` 保留自定义细分标注。
 - `expect_stop`：`submit_suggestion`（应给出建议）或 `no_suggestion`（负样本）。
 - 案例来源建议：GitHub issues 中的匹配错误报告（输入 + 正确条目号），标注后用
   Bangumi API 校验 `subject_id` 存在性与标题吻合。
@@ -67,6 +69,56 @@ eval/
   回放逐轮校验，任何 prompt/消息序列/工具协议变化都会失败（硬锁）。
 - cassette 是测试夹具：与 golden 一起走代码评审；提交前做敏感信息扫描
   （不得含 token/key 等模式）。
+
+## 场景分类（对齐 scripts/golden_*）
+
+### 两套 golden 的关系（注意区分）
+
+| | `eval/golden/`（本文档） | `scripts/golden_data/`（上游脚本） |
+| --- | --- | --- |
+| 被测对象 | **规则层失手之后**的 LLM 兜底 | **规则匹配管线本身** |
+| 数据来源 | 真实 issue/PR 误配案例（人工标注） | bangumi-data / archive **采样生成**（seed 固定） |
+| 判定 | 命中率 vs 人工 oracle | 与基线快照比对（行为变没变）+ oracle 命中率（护栏 ≥ 0.90） |
+| 运行 | L1 回放进 CI；L2 手动 | 纯手动（`scripts/golden_check.py`，改动管线前后各跑） |
+
+两套体系测同一条业务链路的**前后两段**，数据互不重叠、互为补充。本黄金集的
+`scenario` 字段**单向对齐** `scripts/gen_golden_cases.py` 的 `SCENARIOS` 字典
+（不改动上游文件），以保证两类数据可用同一套术语聚合解读。
+
+### 场景清单（SCENARIOS）
+
+| 场景 | 定义（媒体库输入形态） |
+| --- | --- |
+| S1_原名精确 | JP 原名 + 首播日期，期望命中自身 |
+| S2_中文名精确 | 中文名 + 首播日期，期望命中自身 |
+| S3_季后缀 | 原名 +「 第二季」且 season=2，考验季后缀剥离 |
+| S4_无日期 | 原名但无首播日期（年份消歧失效） |
+| S5_剧场版前缀剥离 | 「劇場版 X」条目，用剥离前缀后的 X 查询 |
+| S6_三次元 | 三次元条目（仅 scripts L2 使用） |
+| S7_短标题碰撞 | 短标题（≤ 5 字）易被长标题包含，期望命中自身 |
+| S8_模糊typo | 原名随机替换 1 字符，考验模糊兜底 |
+| S9_全角半角 | 原名 ASCII 转全角，考验归一化 |
+| S10_同名多版本 | 同一原名多版本，用原名 + **最早**年份查询 |
+| S11_同名不同年份 | 同名多版本中取**非最早**版本 + 其年份，考验日期消歧 |
+| S12_日期漂移 | 首播日期 +400 天（超扫描门槛），考验扫描兜底 |
+| S13_无匹配负例 | 不存在的标题，期望不命中（防阈值放宽误配） |
+
+### 现有案例映射（10 条）
+
+| id | scenario | 备注 |
+| --- | --- | --- |
+| m001~m005、m007、m008、m010 | `S11_同名不同年份` | 季偏移 / 同名多版本消歧（首批案例集中于此） |
+| m006 | `S5_剧场版前缀剥离` | 剧场版匹配失败 |
+| m009 | `S7_短标题碰撞` | 通用词被长标题包含（Friends） |
+| （待补） | `S8` / `S9` / `S12` / `S13` | typo / 全角半角 / 日期漂移 / 负样本 |
+
+### 语义差异与扩展规则
+
+- scripts 的 S 分类描述"规则管线**期望能处理**的输入形态"；本黄金集的 S 分类描述
+  "**LLM 兜底要修正**的失败模式"——对齐的是**题目类型（输入形态）**的词汇，
+  判定标准各自保留。
+- scripts 没有的输入形态：**新增编号**（如 `S14_通用词跨语言碰撞`）并在本表登记，
+  保持单向对齐；若未来被上游采纳再反向合并。
 
 ## 运行手册
 
@@ -110,7 +162,9 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
   也不动摇主结论；
 - 建议定期人工抽检校准（记录 judge 与人工一致率）。
 
-## 首轮结果（2026-09-19，3 条案例）
+## 跑分记录
+
+### 首轮（2026-09-19，3 条案例）
 
 | 模型 / 路径 | top1 | judge |
 | --- | --- | --- |
@@ -129,11 +183,21 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
 遗留问题（恢复路径 thinking 回传、no_suggestion 的 tokens 口径、预算调优等）
 见项目内部归档（`remain/eval_round1_findings.md`）。
 
+### 扩集后（2026-09-20，10 条案例，flash · medium=5 轮）
+
+- **10/10 全中**（季偏移 8 条 + 剧场版 + 通用词），总 tokens ≈ 17.5 万；
+- L1 回放 10/10 一致；`tests/eval` 17 passed；
+- **环境快照注意**：cassette 里的工具结果（搜索返回）携带录制时的外部 API 状态
+  （如 v0/legacy 搜索通道、数据时间）——同一模型同一输入的跑分**跨时间不可直接对比**，
+  L2 数字需标注环境与日期。
+
 ## 演进方向
 
-1. 黄金集扩至 20~30 条（继续从 issues 的匹配错误报告挖掘），覆盖 CJK / 罗马音 /
-   季偏移 / 同名多义 / typo / 负样本；
-2. L1 进 CI（`tests/eval/test_golden_replay.py` + fixture 安全扫描 + 指纹守卫自测）；
-3. 恢复/重放路径的 thinking 块支持（与 `agent/runtime` 的 replay 重建同步升级）；
-4. judge 人工抽检校准与成本上报（`llm_usage_logs`，`job_name="eval"`）；
-5. 维护者可选 opt-in：为 L2 配置 secrets 后按 label/定时触发（默认不启用）。
+1. 黄金集扩至 20~30 条：第二批按「场景分类」清单补齐（`S8`/`S9`/`S12`/`S13` 优先），
+   并做 dev/holdout 切分（holdout 优先真实来源案例）；
+2. ~~L1 进 CI~~ ✅ 已完成（`tests/eval/`：10 条回放 + fixture 安全扫描 + 零网络守卫）；
+3. ~~恢复/重放路径 thinking 块支持~~ ✅ 已完成（recorder 存全量 blocks + replay 重建消费）；
+4. ~~provider/thinking 兼容与预算调优~~ ✅ 已完成（thinking 回传、tool_choice 降级、
+   动态超时、终态守卫；详见 `remain/eval_round1_findings.md`）；
+5. judge 人工抽检校准与成本上报（`llm_usage_logs`，`job_name="eval"`）；
+6. 维护者可选 opt-in：为 L2 配置 secrets 后按 label/定时触发（默认不启用）。
