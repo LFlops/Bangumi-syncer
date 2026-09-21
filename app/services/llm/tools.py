@@ -13,8 +13,9 @@ import json
 import logging
 import re
 from collections import UserDict
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal, Optional, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
@@ -82,7 +83,7 @@ class ToolDefinition:
     parameters: dict
     handler: Callable[[dict], Any]
     access: ToolAccess
-    readonly: Optional[bool] = None
+    readonly: bool | None = None
 
     def __post_init__(self) -> None:
         if self.readonly is None:
@@ -112,7 +113,7 @@ class BatchResults(UserDict):
       warning 日志（避免覆盖契约被静默破坏的悬垂分支）。
     """
 
-    def __init__(self, ordered: Optional[list[tuple[str, Any]]] = None) -> None:
+    def __init__(self, ordered: list[tuple[str, Any]] | None = None) -> None:
         self.ordered: list[tuple[str, Any]] = list(ordered or [])
         super().__init__()
         for tool_use_id, result in self.ordered:
@@ -137,14 +138,14 @@ class ToolSpanRecorder(Protocol):
     （await 前 start、完成后 end）调用，不持有时钟，不感知时间。
     """
 
-    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> Optional[str]:
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None:
         """记录工具执行开始；返回 span_id（或 None 表示无需记录）。"""
 
     def end_tool(
         self,
         span_id: str,
         *,
-        result: Optional[ToolResultBlock] = None,
+        result: ToolResultBlock | None = None,
         error: str = "",
     ) -> None:
         """记录工具执行结束。
@@ -176,7 +177,7 @@ class ToolRegistry:
                 logger.warning("工具 %r 重复注册，已覆盖旧定义", defn.name)
         self._tools[defn.name] = defn
 
-    def get(self, name: str) -> Optional[ToolDefinition]:
+    def get(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
 
     def is_readonly(self, name: str) -> bool:
@@ -272,7 +273,7 @@ class ToolRegistry:
         self,
         tool_calls: list[ToolUseBlock],
         *,
-        recorder: Optional[ToolSpanRecorder] = None,
+        recorder: ToolSpanRecorder | None = None,
     ) -> "BatchResults":
         """分段并行批量执行。
 
@@ -324,7 +325,7 @@ class ToolRegistry:
                         for idx, t in seg
                     ]
                 )
-                for (idx, _), r in zip(seg, seg_results):
+                for (idx, _), r in zip(seg, seg_results, strict=True):
                     slots[idx] = r
                 i = j
             else:
@@ -338,7 +339,7 @@ class ToolRegistry:
         tc: ToolUseBlock,
         dup_block: ToolResultBlock,
         *,
-        recorder: Optional[ToolSpanRecorder],
+        recorder: ToolSpanRecorder | None,
         sequence: int,
     ) -> None:
         """为重复 tool_use_id 的占位错误块记录 span（有 span，is_error）。"""
@@ -361,7 +362,7 @@ class ToolRegistry:
         self,
         tc: ToolUseBlock,
         *,
-        recorder: Optional[ToolSpanRecorder] = None,
+        recorder: ToolSpanRecorder | None = None,
         sequence: int = 0,
     ) -> Any:
         """执行单条并统一包装为 ToolResultBlock / TerminalCapture。
@@ -370,10 +371,10 @@ class ToolRegistry:
         （必达）。保持现有异常语义不变：异常被吞掉转为错误块（不上抛）；
         ``end_tool`` 的 ``error`` 参数携带异常类型名，``result`` 置 None。
         """
-        span_id: Optional[str] = None
+        span_id: str | None = None
         if recorder is not None:
             span_id = recorder.start_tool(tc, sequence=sequence)
-        result_for_recorder: Optional[ToolResultBlock] = None
+        result_for_recorder: ToolResultBlock | None = None
         error_for_recorder: str = ""
         try:
             result = await self.execute(tc.name, tc.input)

@@ -105,7 +105,7 @@ class TestContentBlockUnion:
             ToolUseBlock,
             ToolResultBlock,
         ]
-        for raw, klass in zip(cases, expected):
+        for raw, klass in zip(cases, expected, strict=True):
             block = adapter.validate_python(raw)
             assert isinstance(block, klass)
             assert block.type == raw["type"]

@@ -6,7 +6,7 @@
 
 import json
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from ..logging import logger
 from .base_repository import BaseRepository
@@ -15,7 +15,7 @@ from .base_repository import BaseRepository
 _LLM_CANDIDATE_SOURCE = "llm_assist"
 
 
-def _project_llm_fields(record: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _project_llm_fields(record: dict[str, Any] | None) -> dict[str, Any] | None:
     """以 candidates_json 为唯一真相源，投影 llm_subject_id / llm_reason。
 
     规则：
@@ -73,11 +73,11 @@ class PendingCandidatesRepository(BaseRepository):
         request_episode: int = 0,
         user_name: str = "",
         source: str = "",
-        candidates: Optional[list[dict[str, Any]]] = None,
-        trace: Optional[dict[str, Any]] = None,
-        sync_record_id: Optional[int] = None,
+        candidates: list[dict[str, Any]] | None = None,
+        trace: dict[str, Any] | None = None,
+        sync_record_id: int | None = None,
         business_key: str = "",
-    ) -> Optional[int]:
+    ) -> int | None:
         """沉淀一条待确认候选，返回记录 id（失败时 None）。
 
         去重策略：
@@ -175,7 +175,7 @@ class PendingCandidatesRepository(BaseRepository):
         self,
         limit: int = 50,
         offset: int = 0,
-        status: Optional[str] = None,
+        status: str | None = None,
     ) -> dict[str, Any]:
         """获取待确认候选列表，返回 {records, total, limit, offset}"""
 
@@ -210,7 +210,8 @@ class PendingCandidatesRepository(BaseRepository):
             )
             cols = [d[0] for d in cursor.description]
             records = [
-                _project_llm_fields(dict(zip(cols, row))) for row in cursor.fetchall()
+                _project_llm_fields(dict(zip(cols, row, strict=True)))
+                for row in cursor.fetchall()
             ]
             return {
                 "records": records,
@@ -225,9 +226,7 @@ class PendingCandidatesRepository(BaseRepository):
             default={"records": [], "total": 0, "limit": limit, "offset": offset},
         )
 
-    def get_pending_candidate_by_id(
-        self, candidate_id: int
-    ) -> Optional[dict[str, Any]]:
+    def get_pending_candidate_by_id(self, candidate_id: int) -> dict[str, Any] | None:
         """获取单条待确认候选详情（含 trace_json）"""
 
         def _read(conn):
@@ -245,13 +244,13 @@ class PendingCandidatesRepository(BaseRepository):
             if not row:
                 return None
             cols = [d[0] for d in cursor.description]
-            return _project_llm_fields(dict(zip(cols, row)))
+            return _project_llm_fields(dict(zip(cols, row, strict=True)))
 
         return self._run_read(_read, error_msg="获取待确认候选详情失败", default=None)
 
     def get_pending_candidate_by_sync_record_id(
         self, sync_record_id: int
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """按 sync_record_id 查询最新候选记录（含 trace_json）
 
         用于 records 页「查看候选」入口：根据同步记录跳转到关联的候选详情。
@@ -265,8 +264,8 @@ class PendingCandidatesRepository(BaseRepository):
         return self._read_sync_record(sync_record_id, None)
 
     def _read_sync_record(
-        self, sync_record_id: int, status: Optional[str]
-    ) -> Optional[dict[str, Any]]:
+        self, sync_record_id: int, status: str | None
+    ) -> dict[str, Any] | None:
         """内部读：按 sync_record_id 查候选，可按 status 过滤"""
         sql = """
             SELECT id, created_at, request_title, request_ori_title,
@@ -288,15 +287,13 @@ class PendingCandidatesRepository(BaseRepository):
             if not row:
                 return None
             cols = [d[0] for d in cursor.description]
-            return _project_llm_fields(dict(zip(cols, row)))
+            return _project_llm_fields(dict(zip(cols, row, strict=True)))
 
         return self._run_read(
             _read, error_msg="按 sync_record_id 查候选失败", default=None
         )
 
-    def find_latest_by_business_key(
-        self, business_key: str
-    ) -> Optional[dict[str, Any]]:
+    def find_latest_by_business_key(self, business_key: str) -> dict[str, Any] | None:
         """按 business_key 查最近一条候选（pending/confirmed/rejected，按 id DESC）。
 
         供 run 入队决策的「结果复用由业务子状态驱动」判定：
@@ -322,7 +319,7 @@ class PendingCandidatesRepository(BaseRepository):
             if not row:
                 return None
             cols = [d[0] for d in cursor.description]
-            return _project_llm_fields(dict(zip(cols, row)))
+            return _project_llm_fields(dict(zip(cols, row, strict=True)))
 
         return self._run_read(
             _read, error_msg="按 business_key 查候选失败", default=None
@@ -372,7 +369,7 @@ class PendingCandidatesRepository(BaseRepository):
         source: str,
         status: str,
         confirmed_subject_id: str = "",
-        exclude_id: Optional[int] = None,
+        exclude_id: int | None = None,
         business_key: str = "",
     ) -> int:
         """批量更新同 key 的 pending 候选状态，返回受影响行数。

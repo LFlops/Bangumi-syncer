@@ -20,7 +20,6 @@ Agent 追踪查询 API
 
 import json
 from datetime import datetime, timezone
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
@@ -87,7 +86,7 @@ def _is_admin_user(current_user: dict) -> bool:
     return bool(admin_name) and current_user.get("username") == admin_name
 
 
-def _resolve_owner_user_name(run: dict) -> Optional[str]:
+def _resolve_owner_user_name(run: dict) -> str | None:
     """经 sync_record_id 解析会话归属用户（无则 None）。"""
     sync_record_id = run.get("sync_record_id")
     if not sync_record_id:
@@ -103,7 +102,7 @@ def _resolve_owner_user_name(run: dict) -> Optional[str]:
 
 
 def _log_access_denied(
-    endpoint: str, run_id: str, current_user: dict, reason: str, owner: Optional[str]
+    endpoint: str, run_id: str, current_user: dict, reason: str, owner: str | None
 ) -> None:
     """拒绝访问追踪记录时记录审计日志（不静默）。"""
     logger.warning(
@@ -138,7 +137,7 @@ def _load_authorized_run(run_id: str, current_user: dict, endpoint: str) -> dict
     raise _trace_not_found()
 
 
-def _iso_from_epoch(ts) -> Optional[str]:
+def _iso_from_epoch(ts) -> str | None:
     """epoch 秒整数 → ISO 8601 字符串（统一 UTC，形如 ``...+00:00``）；0/None/非数字 → None。"""
     if not ts:
         return None

@@ -173,7 +173,6 @@ class AnthropicProvider(BaseProvider):
                 )
                 normalized_tc = {"type": "auto"}
             body["tool_choice"] = normalized_tc
-
         # thinking_level：每任务 kwargs 覆盖 > 全局默认；模型不支持时降级；
         # 端点拒绝过扩展参数时（_extras_disabled）不再发送
         level = kwargs.get("thinking_level", self.thinking_level)

@@ -34,8 +34,7 @@ class TestLLMConfigResponse:
         assert model.temperature == 0.7
         assert model.timeout == 60
         assert model.provider == "openai_compat"
-        # thinking_level 字段已移除
-        assert not hasattr(model, "thinking_level")
+        assert model.thinking_level == "off"
 
     def test_override_values(self):
         """验证显式字段值可被接受。"""
@@ -102,10 +101,11 @@ class TestLLMConfigUpdate:
         assert data["model"] == "gpt-4"
         assert "api_base" not in data
 
-    def test_valid_provider_accepted(self):
-        """provider 的合法枚举值可被接受。"""
-        model = LLMConfigUpdate(provider="anthropic_compat")
+    def test_valid_enum_values_accepted(self):
+        """provider / thinking_level 的合法枚举值可被接受。"""
+        model = LLMConfigUpdate(provider="anthropic_compat", thinking_level="high")
         assert model.provider == "anthropic_compat"
+        assert model.thinking_level == "high"
 
     def test_invalid_provider_rejected(self):
         """非法 provider 在模型层抛 ValidationError。"""
@@ -114,13 +114,12 @@ class TestLLMConfigUpdate:
         with pytest.raises(ValidationError):
             LLMConfigUpdate(provider="banana")
 
-    def test_thinking_level_field_removed(self):
-        """thinking_level 字段已从 LLMConfigUpdate 模型移除。"""
-        model = LLMConfigUpdate(model="gpt-4")
-        data = model.model_dump(exclude_none=True)
-        assert "thinking_level" not in data
-        # 模型 schema 中不应定义该字段
-        assert "thinking_level" not in LLMConfigUpdate.model_fields
+    def test_invalid_thinking_level_rejected(self):
+        """非法 thinking_level 在模型层抛 ValidationError（不静默兜底为 off）。"""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            LLMConfigUpdate(thinking_level="banana")
 
 
 # ========== LLMTestResponse ==========
@@ -211,21 +210,6 @@ class TestSummaryJobCreate:
         assert model.memory_limit == 0
         assert model.related_limit == 1000
 
-    def test_thinking_level_default_is_off(self):
-        """创建任务未指定 thinking_level 时默认值为 off。"""
-        model = SummaryJobCreate()
-        assert model.thinking_level == "off"
-
-    def test_thinking_level_high_accepted(self):
-        """合法的 thinking_level 值可被接受。"""
-        model = SummaryJobCreate(thinking_level="high")
-        assert model.thinking_level == "high"
-
-    def test_thinking_level_invalid_rejected(self):
-        """非法 thinking_level 值在模型层抛 ValidationError。"""
-        with pytest.raises(ValidationError):
-            SummaryJobCreate(thinking_level="turbo")
-
 
 # ========== SummaryJobUpdate ==========
 
@@ -293,21 +277,6 @@ class TestSummaryJobUpdate:
         model = SummaryJobUpdate(memory_limit=0, related_limit=1000)
         assert model.memory_limit == 0
         assert model.related_limit == 1000
-
-    def test_thinking_level_default_is_none(self):
-        """更新时不传 thinking_level 默认为 None（表示不修改）。"""
-        model = SummaryJobUpdate()
-        assert model.thinking_level is None
-
-    def test_thinking_level_low_accepted(self):
-        """合法的 thinking_level 值可被接受。"""
-        model = SummaryJobUpdate(thinking_level="low")
-        assert model.thinking_level == "low"
-
-    def test_thinking_level_invalid_rejected(self):
-        """非法 thinking_level 值在模型层抛 ValidationError。"""
-        with pytest.raises(ValidationError):
-            SummaryJobUpdate(thinking_level="turbo")
 
 
 # ========== SummaryJobResponse ==========
@@ -464,46 +433,6 @@ class TestSummaryJobResponse:
         assert model.lookback_days == 1  # 默认 1
         assert model.max_records == -1  # 默认 -1（不限制）
 
-    def test_thinking_level_default_is_off(self):
-        """SummaryJobResponse 默认 thinking_level 为 off。"""
-        model = SummaryJobResponse(
-            name="Test",
-            cron="0 21 * * *",
-            lookback_days=1,
-            user_name="",
-            system_prompt="",
-            max_records=200,
-            enabled=True,
-        )
-        assert model.thinking_level == "off"
-
-    def test_from_config_dict_reads_thinking_level(self):
-        """from_config_dict 从字典读取 thinking_level。"""
-        data = {
-            "name": "Test",
-            "thinking_level": "high",
-        }
-        model = SummaryJobResponse.from_config_dict(data)
-        assert model.thinking_level == "high"
-
-    def test_from_config_dict_thinking_level_missing_defaults_off(self):
-        """from_config_dict 缺少 thinking_level 时默认 off。"""
-        data = {"name": "Test"}
-        model = SummaryJobResponse.from_config_dict(data)
-        assert model.thinking_level == "off"
-
-    def test_from_config_dict_thinking_level_case_insensitive(self):
-        """from_config_dict 大写 'HIGH' 归一化为 'high'。"""
-        data = {"name": "Test", "thinking_level": "HIGH"}
-        model = SummaryJobResponse.from_config_dict(data)
-        assert model.thinking_level == "high"
-
-    def test_from_config_dict_thinking_level_invalid_falls_back(self):
-        """from_config_dict 非法值 'turbo' 回落 'off'。"""
-        data = {"name": "Test", "thinking_level": "turbo"}
-        model = SummaryJobResponse.from_config_dict(data)
-        assert model.thinking_level == "off"
-
 
 # ========== SummaryJobTestResponse ==========
 
@@ -641,8 +570,8 @@ class TestGetLLMConfig:
                 assert response.json()["api_key"] == ""
 
     @pytest.mark.asyncio
-    async def test_returns_config_without_thinking_level(self):
-        """BDD 场景1: GET /api/llm/conf 响应不含 thinking_level 键。"""
+    async def test_returns_provider_and_thinking_level(self):
+        """Scenario 6.2: GET /llm 返回 provider 与 thinking_level。"""
         from httpx import ASGITransport, AsyncClient
 
         app = self._create_test_app()
@@ -655,6 +584,7 @@ class TestGetLLMConfig:
                 "temperature": 0.7,
                 "timeout": 60,
                 "provider": "anthropic_compat",
+                "thinking_level": "high",
             }
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
@@ -662,12 +592,11 @@ class TestGetLLMConfig:
                 response = await client.get("/api/llm/conf")
                 data = response.json()
                 assert data["provider"] == "anthropic_compat"
-                # 响应中不应包含 thinking_level 键
-                assert "thinking_level" not in data
+                assert data["thinking_level"] == "high"
 
     @pytest.mark.asyncio
-    async def test_returns_provider_default_openai_compat(self):
-        """未配置 provider 时返回缺省值 openai_compat。"""
+    async def test_returns_thinking_level_default(self):
+        """Scenario 6.3: 未配置 provider/thinking_level 时返回缺省值。"""
         from httpx import ASGITransport, AsyncClient
 
         app = self._create_test_app()
@@ -686,7 +615,7 @@ class TestGetLLMConfig:
                 response = await client.get("/api/llm/conf")
                 data = response.json()
                 assert data["provider"] == "openai_compat"
-                assert "thinking_level" not in data
+                assert data["thinking_level"] == "off"
 
     def _create_test_app(self):
         """创建一个带有认证覆盖的 FastAPI 测试应用。"""
@@ -742,8 +671,8 @@ class TestUpdateLLMConfig:
                 mock_cm.reload_config.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_updates_provider(self):
-        """PUT 保存 provider。"""
+    async def test_updates_provider_and_thinking_level(self):
+        """Scenario 6.1: PUT 保存 provider 与 thinking_level。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
@@ -762,50 +691,19 @@ class TestUpdateLLMConfig:
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
-                payload = {"provider": "anthropic_compat"}
+                payload = {"provider": "anthropic_compat", "thinking_level": "medium"}
                 response = await client.put("/api/llm/conf", json=payload)
                 assert response.status_code == 200
                 assert response.json()["status"] == "success"
 
-                assert mock_cm.set_config.call_count == 1
+                assert mock_cm.set_config.call_count == 2
                 options = [c.args[1] for c in mock_cm.set_config.call_args_list]
-                assert set(options) == {"provider"}
+                assert set(options) == {"provider", "thinking_level"}
                 # 均写入 [llm] 段
                 assert all(
                     c.args[0] == "llm" for c in mock_cm.set_config.call_args_list
                 )
                 mock_cm.reload_config.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_put_ignores_thinking_level(self):
-        """BDD 场景2: PUT 请求体含 thinking_level 时被忽略（不写入配置，不报错）。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.llm import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with patch("app.api.llm.config_manager") as mock_cm:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                payload = {"provider": "anthropic_compat", "thinking_level": "high"}
-                response = await client.put("/api/llm/conf", json=payload)
-                assert response.status_code == 200
-                assert response.json()["status"] == "success"
-
-                # thinking_level 不应被写入配置
-                options = [c.args[1] for c in mock_cm.set_config.call_args_list]
-                assert "thinking_level" not in options
-                assert "provider" in options
 
     @pytest.mark.asyncio
     async def test_empty_update_is_accepted(self):
@@ -839,10 +737,11 @@ class TestUpdateLLMConfig:
         "payload",
         [
             {"provider": "banana"},
+            {"thinking_level": "banana"},
         ],
     )
-    async def test_invalid_provider_rejected(self, payload):
-        """非法 provider 应在 API 边界被拒绝（422），不写入配置。"""
+    async def test_invalid_enum_values_rejected(self, payload):
+        """非法 provider / thinking_level 应在 API 边界被拒绝（422），不写入配置。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
@@ -1188,47 +1087,6 @@ class TestListSummaryJobs:
                 data = response.json()
                 assert data["data"] == []
 
-    @pytest.mark.asyncio
-    async def test_returns_thinking_level_in_response(self):
-        """GET /api/summary/jobs 响应中包含 thinking_level 字段。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with patch("app.api.summary_jobs.config_manager") as mock_cm:
-            mock_cm.get_summary_configs.return_value = [
-                {
-                    "id": 1,
-                    "name": "Thinking Summary",
-                    "cron": "0 21 * * *",
-                    "lookback_days": 1,
-                    "user_name": "",
-                    "system_prompt": "",
-                    "max_records": 200,
-                    "enabled": True,
-                    "thinking_level": "medium",
-                },
-            ]
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.get("/api/summary/jobs")
-                assert response.status_code == 200
-                data = response.json()
-                assert data["status"] == "success"
-                assert len(data["data"]) == 1
-                assert data["data"][0]["thinking_level"] == "medium"
-
 
 class TestCreateSummaryJob:
     """POST /api/summary/jobs 端点测试。"""
@@ -1272,111 +1130,6 @@ class TestCreateSummaryJob:
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_create_with_thinking_level_high_returns_200(self):
-        """Scenario: 创建带思考强度的总结任务，thinking_level 透传至 save_summary_config。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with (
-            patch("app.api.summary_jobs.config_manager") as mock_cm,
-            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
-        ):
-            mock_scheduler.apply_config_after_save = AsyncMock()
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                payload = {
-                    "name": "Thinking Job",
-                    "thinking_level": "high",
-                }
-                response = await client.post("/api/summary/jobs", json=payload)
-                assert response.status_code == 200
-                data = response.json()
-                assert data["status"] == "success"
-                call_args = mock_cm.save_summary_config.call_args[0][0]
-                assert call_args["thinking_level"] == "high"
-
-    @pytest.mark.asyncio
-    async def test_create_without_thinking_level_defaults_to_off(self):
-        """Scenario: 创建任务未指定 thinking_level 时默认 off。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with (
-            patch("app.api.summary_jobs.config_manager") as mock_cm,
-            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
-        ):
-            mock_scheduler.apply_config_after_save = AsyncMock()
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                payload = {"name": "Default Thinking Job"}
-                response = await client.post("/api/summary/jobs", json=payload)
-                assert response.status_code == 200
-                data = response.json()
-                assert data["status"] == "success"
-                call_args = mock_cm.save_summary_config.call_args[0][0]
-                assert call_args["thinking_level"] == "off"
-
-    @pytest.mark.asyncio
-    async def test_create_with_invalid_thinking_level_returns_422(self):
-        """Scenario: 非法 thinking_level 值被拒绝（422）。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with (
-            patch("app.api.summary_jobs.config_manager") as mock_cm,
-            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
-        ):
-            mock_scheduler.apply_config_after_save = AsyncMock()
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                payload = {
-                    "name": "Bad Thinking Job",
-                    "thinking_level": "turbo",
-                }
-                response = await client.post("/api/summary/jobs", json=payload)
-                assert response.status_code == 422
-                mock_cm.save_summary_config.assert_not_called()
-
 
 class TestUpdateSummaryJob:
     """PUT /api/summary/jobs/{id} 端点测试。"""
@@ -1418,40 +1171,6 @@ class TestUpdateSummaryJob:
                 assert call_args["name"] == "Updated Job"
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_update_with_thinking_level_low(self):
-        """Scenario: 更新 thinking_level 透传至 save_summary_config。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with (
-            patch("app.api.summary_jobs.config_manager") as mock_cm,
-            patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
-        ):
-            mock_scheduler.apply_config_after_save = AsyncMock()
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                payload = {"thinking_level": "low"}
-                response = await client.put("/api/summary/jobs/3", json=payload)
-                assert response.status_code == 200
-                data = response.json()
-                assert data["status"] == "success"
-                call_args = mock_cm.save_summary_config.call_args[0][0]
-                assert call_args["thinking_level"] == "low"
 
 
 class TestDeleteSummaryJob:
@@ -1495,6 +1214,94 @@ class TestDeleteSummaryJob:
                 )
                 mock_cm.reload_config.assert_called_once()
                 mock_scheduler.apply_config_after_save.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_delete_memory_clear_failure_returns_500(self):
+        """记忆清理异常 → 500（不得假成功：配置已删但记忆残留需用户重试）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                mock_memory.clear_task.side_effect = RuntimeError("db down")
+                response = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert response.status_code == 500
+                assert (
+                    response.json()["detail"]
+                    == "删除任务失败：记忆清理异常，请稍后重试"
+                )
+                # 顺序前置证据：clear 失败时配置尚未删除，任务仍可寻址重试
+                mock_cm.delete_summary_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_delete_retry_self_heals_after_clear_failure(self):
+        """首次 clear 失败 → 500；重试 clear 成功 → 配置删除、200（幂等自愈）。
+
+        顺序前置（clear → delete_config）保证失败时旧配置仍在，用户重试即可收敛。
+        """
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                # 第一次 clear 抛异常，第二次成功
+                mock_memory.clear_task.side_effect = [RuntimeError("db down"), None]
+
+                first = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert first.status_code == 500
+                mock_cm.delete_summary_config.assert_not_called()
+
+                second = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert second.status_code == 200
+                assert second.json()["status"] == "success"
+                mock_cm.delete_summary_config.assert_called_once_with("Dad Summary")
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_memory_before_deleting_config(self):
+        """成功路径顺序：clear_task 先于 delete_summary_config（旧名保持可寻址）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                # 把 memory_service.clear_task 挂到 config_manager 上以统一记录调用顺序
+                mock_cm.attach_mock(mock_memory.clear_task, "clear_task")
+
+                response = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert response.status_code == 200
+
+                call_names = [c[0] for c in mock_cm.mock_calls]
+                assert "clear_task" in call_names
+                assert "delete_summary_config" in call_names
+                assert call_names.index("clear_task") < call_names.index(
+                    "delete_summary_config"
+                )
 
 
 class TestTestSummaryJob:
@@ -1658,54 +1465,6 @@ class TestTestSummaryJob:
                 assert data["error_message"]
                 assert data["record_count"] == 3
 
-    @pytest.mark.asyncio
-    async def test_llm_call_error_returns_success_false_not_500(self):
-        """T4：generate_summary 抛 LLMCallError → 返回 success=False（不得 500）。"""
-        from fastapi import FastAPI
-        from httpx import ASGITransport, AsyncClient
-
-        from app.api.deps import get_current_user_flexible
-        from app.api.summary_jobs import router
-        from app.services.llm.client import LLMCallError
-
-        app = FastAPI()
-        app.include_router(router)
-
-        async def mock_auth(request=None, credentials=None):
-            return {"username": "testuser"}
-
-        app.dependency_overrides[get_current_user_flexible] = mock_auth
-
-        with (
-            patch("app.api.summary_jobs.config_manager") as mock_cm,
-            patch("app.api.summary_jobs.summary_service") as mock_service,
-        ):
-            mock_cm.get_summary_configs.return_value = [
-                {
-                    "id": 1,
-                    "name": "Error Job",
-                    "cron": "0 21 * * *",
-                    "lookback_days": 1,
-                    "user_name": "",
-                    "system_prompt": "",
-                    "max_records": 200,
-                    "enabled": True,
-                },
-            ]
-            mock_service.generate_summary = AsyncMock(
-                side_effect=LLMCallError("401 Unauthorized", retryable=False)
-            )
-
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                response = await client.post("/api/summary/jobs/Error%20Job/test")
-                assert response.status_code == 200
-                data = response.json()
-                assert data["success"] is False
-                assert "LLM 调用失败" in data["error_message"]
-                assert "401" in data["error_message"]
-
 
 class TestTriggerSummaryJob:
     """POST /api/summary/jobs/{id}/trigger 端点测试。"""
@@ -1753,6 +1512,52 @@ class TestTriggerSummaryJob:
                 data = response.json()
                 assert data["status"] == "success"
                 assert "Trigger Job" in data["message"]
+                mock_service.execute_job.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_trigger_returns_skipped_when_already_running(self):
+        """execute_job 返回 False（任务已执行中）→ 200 + status=skipped + 中文提示。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.summary_jobs import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        with (
+            patch("app.api.summary_jobs.config_manager") as mock_cm,
+            patch("app.api.summary_jobs.summary_service") as mock_service,
+        ):
+            mock_cm.get_summary_configs.return_value = [
+                {
+                    "id": 1,
+                    "name": "Busy Job",
+                    "cron": "0 21 * * *",
+                    "lookback_days": 1,
+                    "user_name": "",
+                    "system_prompt": "",
+                    "max_records": 200,
+                    "enabled": True,
+                },
+            ]
+            mock_service.execute_job = AsyncMock(return_value=False)
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/summary/jobs/Busy%20Job/trigger")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "skipped"
+                assert "任务正在执行中" in data["message"]
+                assert "已跳过" in data["message"]
                 mock_service.execute_job.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2036,6 +1841,7 @@ class TestClearMemoryApi:
                     "/api/summary/jobs/daily/clear-memory", json={"confirm": True}
                 )
                 assert response.status_code == 500
+                assert response.json()["detail"] == "清空任务记忆失败，请稍后重试"
 
 
 class TestRenameMemoryLinkage:
@@ -2066,6 +1872,74 @@ class TestRenameMemoryLinkage:
                 )
 
     @pytest.mark.asyncio
+    async def test_rename_memory_failure_returns_500(self):
+        """记忆迁移异常 → 500（不得假成功：记忆未跟随改名需用户重试）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_sched,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_sched.apply_config_after_save = AsyncMock()
+                mock_memory.rename_task.side_effect = RuntimeError("db down")
+                response = await client.put(
+                    "/api/summary/jobs/daily",
+                    json={"name": "daily2"},
+                )
+                assert response.status_code == 500
+                assert (
+                    response.json()["detail"]
+                    == "任务改名失败：记忆迁移异常，请稍后重试"
+                )
+                # 顺序前置证据：rename 失败时旧名配置仍在，任务仍可寻址重试
+                mock_cm.rename_notification_type.assert_not_called()
+                mock_cm.save_summary_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rename_migrates_memory_before_config_rename(self):
+        """成功路径顺序：rename_task 先于 rename_notification_type（旧名保持可寻址）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.memory_service") as mock_memory,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_sched,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_sched.apply_config_after_save = AsyncMock()
+                mock_cm.attach_mock(mock_memory.rename_task, "rename_task")
+
+                response = await client.put(
+                    "/api/summary/jobs/daily",
+                    json={"name": "daily2"},
+                )
+                assert response.status_code == 200
+
+                call_names = [c[0] for c in mock_cm.mock_calls]
+                assert "rename_task" in call_names
+                assert "rename_notification_type" in call_names
+                assert call_names.index("rename_task") < call_names.index(
+                    "rename_notification_type"
+                )
+                # 配置改名仍在 save_summary_config 之前
+                assert call_names.index("rename_notification_type") < call_names.index(
+                    "save_summary_config"
+                )
+
+    @pytest.mark.asyncio
     async def test_rename_same_name_no_migration(self):
         """改名与原名相同 → 不触发记忆迁移。"""
         from httpx import ASGITransport, AsyncClient
@@ -2087,6 +1961,161 @@ class TestRenameMemoryLinkage:
                     json={"cron": "0 8 * * *"},
                 )
                 mock_memory.rename_task.assert_not_called()
+
+
+class TestSummaryJobRuntimeSyncDegradation:
+    """持久层成功后，运行时同步（reload/apply）失败只降级为日志，接口仍 200。
+
+    持久层（ini/SQLite）已经成功，内存重载/调度器同步失败不应误报 500——
+    否则用户会误以为操作失败而重试，而重试寻址已失效（配置已删/已改名）。
+    """
+
+    @pytest.mark.asyncio
+    async def test_delete_returns_200_when_reload_fails(self):
+        """DELETE：reload_config 抛异常 → 仍 200，配置已删除。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+                patch("app.api.summary_jobs.memory_service"),
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                mock_cm.reload_config.side_effect = RuntimeError("reload boom")
+                response = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.delete_summary_config.assert_called_once_with("Dad Summary")
+
+    @pytest.mark.asyncio
+    async def test_delete_returns_200_when_apply_fails(self):
+        """DELETE：apply_config_after_save 抛异常 → 仍 200。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+                patch("app.api.summary_jobs.memory_service"),
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock(
+                    side_effect=RuntimeError("apply boom")
+                )
+                response = await client.delete("/api/summary/jobs/Dad%20Summary")
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.delete_summary_config.assert_called_once_with("Dad Summary")
+
+    @pytest.mark.asyncio
+    async def test_update_returns_200_when_reload_fails(self):
+        """PUT：reload_config 抛异常 → 仍 200，配置已保存。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                mock_cm.reload_config.side_effect = RuntimeError("reload boom")
+                response = await client.put(
+                    "/api/summary/jobs/daily", json={"cron": "0 8 * * *"}
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.save_summary_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_returns_200_when_apply_fails(self):
+        """PUT：apply_config_after_save 抛异常 → 仍 200。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_cm.get_summary_configs.return_value = [{"name": "daily"}]
+                mock_scheduler.apply_config_after_save = AsyncMock(
+                    side_effect=RuntimeError("apply boom")
+                )
+                response = await client.put(
+                    "/api/summary/jobs/daily", json={"cron": "0 8 * * *"}
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.save_summary_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_returns_200_when_reload_fails(self):
+        """POST：reload_config 抛异常 → 仍 200，配置已保存。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                mock_cm.reload_config.side_effect = RuntimeError("reload boom")
+                response = await client.post(
+                    "/api/summary/jobs", json={"name": "New Job"}
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.save_summary_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_create_returns_200_when_apply_fails(self):
+        """POST：apply_config_after_save 抛异常 → 仍 200。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock(
+                    side_effect=RuntimeError("apply boom")
+                )
+                response = await client.post(
+                    "/api/summary/jobs", json={"name": "New Job"}
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "success"
+                mock_cm.save_summary_config.assert_called_once()
 
 
 class TestMemoryStatsApi:
@@ -2129,7 +2158,7 @@ class TestMemoryStatsApi:
         """有记忆：count/chars 正确；估算 = (min(count,limit)+related)×avg×0.7。"""
         from httpx import ASGITransport, AsyncClient
 
-        from app.services.memory.models import MemoryEntry
+        from app.models.memory import MemoryEntry
 
         app = _make_summary_app()
         entries = [
@@ -2161,6 +2190,43 @@ class TestMemoryStatsApi:
         assert data["injected_estimate_tokens"] == 141
 
     @pytest.mark.asyncio
+    async def test_stats_excludes_placeholder_rows(self):
+        """T2：摘要失败占位行（summary=""）不计入 total_count/chars/avg 与注入估算。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.models.memory import MemoryEntry
+
+        app = _make_summary_app()
+        entries = [
+            MemoryEntry(run_id="r-ok", summary="有效摘要" * 10),  # 40 字
+            MemoryEntry(
+                run_id="r-placeholder", summary="", outcome="summary_failed"
+            ),  # 占位行
+        ]
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch(
+                    "app.api.summary_jobs.database_manager.memory.get_recent",
+                    return_value=entries,
+                ),
+            ):
+                mock_cm.get_summary_configs.return_value = [
+                    {"name": "daily", "memory_limit": "5", "related_limit": "0"}
+                ]
+                response = await client.get("/api/summary/jobs/daily/memory-stats")
+
+        data = response.json()["data"]
+        assert data["total_count"] == 1  # 只统计有效行
+        assert data["total_chars"] == 40
+        assert data["avg_chars"] == 40
+        # (min(1,5)+0) × 40 × 0.7 = 28
+        assert data["injected_estimate_tokens"] == 28
+
+    @pytest.mark.asyncio
     async def test_stats_missing_job_404(self):
         from httpx import ASGITransport, AsyncClient
 
@@ -2182,7 +2248,7 @@ class TestMemoryStatsEstimateM11:
     async def test_stats_includes_related_when_memory_zero(self):
         from httpx import ASGITransport, AsyncClient
 
-        from app.services.memory.models import MemoryEntry
+        from app.models.memory import MemoryEntry
 
         app = _make_summary_app()
         entries = [MemoryEntry(run_id="r-1", summary="芙莉莲S1E10" * 10)]  # 80 字

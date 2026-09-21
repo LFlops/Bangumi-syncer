@@ -1,5 +1,5 @@
 """
-配置页注释悬浮化改造测试（TDD 红阶段）
+配置页注释悬浮化改造测试
 
 目标：验证 config 页面中原本以 ``<small class="text-muted">`` 平铺的 8 处注释，
 全部改为 label/按钮旁的问号图标
@@ -8,7 +8,7 @@
 
 参照：``templates/config/_bangumi_data.html`` 中"使用本地缓存"的写法。
 
-该改造尚未实现，因此本文件的测试当前**应当失败（红）**。
+改造已实现，本文件的测试当前全部通过（绿）。
 """
 
 import re
@@ -106,6 +106,18 @@ def test_llm_api_base_comment_becomes_tooltip_icon():
     title = _find_tooltip_title(llm, "OpenAI 兼容接口请以 /v1 结尾填写完整地址")
     assert title is not None, (
         "LLM 卡片『API 地址』旁应出现问号图标，title 含『OpenAI 兼容接口请以 /v1 结尾填写完整地址』"
+    )
+
+
+def test_llm_thinking_level_comment_becomes_tooltip_icon():
+    """LLM 卡片 思考强度 label 旁应出现问号图标，title 同时覆盖双 provider 映射。"""
+    _, llm, _ = _fetch_config_html()
+    title = _find_tooltip_title(llm, "reasoning_effort")
+    assert title is not None, (
+        "LLM 卡片『思考强度』旁应出现问号图标，title 含『reasoning_effort』"
+    )
+    assert "budget_tokens" in title, (
+        "思考强度图标 title 需同时含『budget_tokens』，实际 title={title!r}"
     )
 
 
@@ -209,6 +221,22 @@ def test_summary_modal_all_tooltips_have_bs_container():
 
 
 # ---------------------------------------------------------------------------
+# 测试结果弹窗：预览与实跑差异提示
+# ---------------------------------------------------------------------------
+
+
+def test_summary_test_result_modal_has_preview_hint():
+    """测试结果弹窗应提示预览与定时执行结果可能不同（预览不启用增量窗口与记忆注入）。"""
+    text, _, _ = _fetch_config_html()
+    seg = _slice_between(
+        text, 'id="summaryTestResultModal"', 'id="notificationRuleModal"'
+    )
+    assert "预览不启用增量窗口与记忆注入" in seg, (
+        "测试结果弹窗应包含『预览不启用增量窗口与记忆注入』差异提示"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 边界：无注释字段不新增图标
 # ---------------------------------------------------------------------------
 
@@ -242,3 +270,22 @@ def test_summary_user_field_has_no_tooltip():
         text, '<label class="form-label">用户名', 'id="summary-job-user"'
     )
     assert 'data-bs-toggle="tooltip"' not in seg, "用户名字段不应新增悬浮注释图标"
+
+
+# ---------------------------------------------------------------------------
+# 触发任务：任务执行中被跳过（skipped）时的前端提示
+# ---------------------------------------------------------------------------
+
+
+def test_trigger_summary_job_handles_skipped_status():
+    """triggerSummaryJob 应处理 skipped 状态，展示"任务正在执行中"提示且不用 danger。"""
+    text, _, _ = _fetch_config_html()
+    signature = "async function triggerSummaryJob(name)"
+    start = text.index(signature)
+    # 到下一个顶层函数定义之前（跳过函数自身的定义行）。
+    end = text.index("function ", start + len(signature))
+    seg = text[start:end]
+    assert "'skipped'" in seg, "triggerSummaryJob 应判断 d.status === 'skipped'"
+    assert "正在执行中" in seg, (
+        "triggerSummaryJob 的 skipped 分支应包含『正在执行中』提示文案"
+    )

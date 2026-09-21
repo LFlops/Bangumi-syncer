@@ -14,7 +14,6 @@
 """
 
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -37,7 +36,7 @@ def _enqueue(
     dbm: DatabaseManager,
     run_id: str,
     business_key: str,
-    sync_record_id: Optional[int] = None,
+    sync_record_id: int | None = None,
     accepted_mapping_valid: bool = _ACCEPTED_MAPPING_VALID,
 ) -> dict:
     """测试辅助：显式传入决策策略参数调用 enqueue_match_run（无默认值兜底）。
@@ -54,7 +53,7 @@ def _enqueue(
     )
 
 
-def _set_status(dbm, run_id: str, status: str, ended_at: Optional[int] = None) -> None:
+def _set_status(dbm, run_id: str, status: str, ended_at: int | None = None) -> None:
     """测试辅助：直接改写 run 状态（绕过业务方法，便于构造超期场景）。
 
     ``ended_at`` 为 epoch 秒整数（与当前 schema 一致）。

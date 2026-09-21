@@ -292,7 +292,7 @@ def test_acquire_reservations_are_fifo_with_monotonic_wait():
         pytest.approx(2.0),
         pytest.approx(3.0),
     ]
-    intervals = [b - a for a, b in zip(aborter.calls, aborter.calls[1:])]
+    intervals = [b - a for a, b in zip(aborter.calls, aborter.calls[1:], strict=False)]
     assert intervals == [pytest.approx(1.0), pytest.approx(1.0)]
 
 

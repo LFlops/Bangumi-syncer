@@ -9,8 +9,6 @@ dict 行经 ``model_validate`` 转为模型后以属性访问消费，避免 ``r
 保证调度器对 schema 演进保持兼容。
 """
 
-from typing import Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -19,10 +17,10 @@ class AgentRunRecord(BaseModel):
 
     model_config = {"extra": "allow"}
 
-    id: Optional[int] = Field(None, description="自增主键")
+    id: int | None = Field(None, description="自增主键")
     run_id: str = Field(..., description="会话唯一标识")
     task_type: str = Field(..., description="任务类型（如 match）")
-    sync_record_id: Optional[int] = Field(
+    sync_record_id: int | None = Field(
         None, description="关联同步记录 id（persist 后回填，存在毫秒级窗口）"
     )
     business_key: str = Field("", description="业务去重键")
@@ -31,7 +29,7 @@ class AgentRunRecord(BaseModel):
     attempts: int = Field(0, description="调度轮次失败计数")
     total_attempts: int = Field(0, description="业务键维度累计失败次数")
     last_attempt_at: int = Field(0, description="最近一次尝试时间（epoch 秒）")
-    last_error: Optional[str] = Field(None, description="最近一次错误")
+    last_error: str | None = Field(None, description="最近一次错误")
     total_tokens: int = Field(0, description="全轮累计 token 用量")
     started_at: int = Field(0, description="开始时间（epoch 秒）")
     ended_at: int = Field(0, description="结束时间（epoch 秒）")

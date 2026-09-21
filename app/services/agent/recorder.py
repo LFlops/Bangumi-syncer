@@ -15,9 +15,9 @@ span 的读写细节由 :mod:`app.services.agent.trace` 承担。
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
-from typing import Callable
 
 from app.core.logging import logger
 from app.services.agent.loop import ChatFn

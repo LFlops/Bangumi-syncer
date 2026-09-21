@@ -10,7 +10,6 @@
 import asyncio
 import json
 import logging
-from typing import Optional
 
 import pytest
 
@@ -768,7 +767,7 @@ class FakeClock:
 class FakeRecorder:
     """记录 start/end 调用顺序与 span 区间的假 recorder。"""
 
-    def __init__(self, clock: Optional[FakeClock] = None) -> None:
+    def __init__(self, clock: FakeClock | None = None) -> None:
         self.clock = clock or FakeClock()
         self.events: list[dict] = []
         self._counter: int = 0
@@ -792,7 +791,7 @@ class FakeRecorder:
         self,
         span_id: str,
         *,
-        result: Optional[ToolResultBlock] = None,
+        result: ToolResultBlock | None = None,
         error: str = "",
     ) -> None:
         self.events.append(

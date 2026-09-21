@@ -437,16 +437,14 @@ class TestAnthropicProviderFactory:
         assert provider.max_tokens == 2000
         assert provider.temperature == 0.7
         assert provider.timeout == 60
-        # provider 构造函数 thinking_level 默认 "off"（不从全局配置读取）
+        # 测试 cfg 未提供 thinking_level → provider 构造函数默认 "off"
         assert provider.thinking_level == "off"
 
-    def test_build_provider_does_not_read_global_thinking_level(
-        self, reset_llm_singleton
-    ):
-        """BDD 场景3: _build_provider() 构造的 provider 不再从 config 读 thinking_level。
+    def test_build_provider_reads_global_thinking_level(self, reset_llm_singleton):
+        """_build_provider() 构造的 provider 会读取全局 config 的 thinking_level。
 
-        即使 config 字典中残留 thinking_level 键，provider 实例的 thinking_level
-        仍为构造函数默认值 "off"（per-call kwargs 覆盖机制保留，但不从全局配置读取）。
+        config 中的 thinking_level 作为 provider 构造默认值；per-call kwargs
+        仍可覆盖（每任务思考强度优先于全局默认）。
         """
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.anthropic import AnthropicProvider
@@ -461,8 +459,23 @@ class TestAnthropicProviderFactory:
 
         provider = client._provider
         assert isinstance(provider, AnthropicProvider)
-        # provider 的 thinking_level 应为构造函数默认 "off"，而非从 config 读取的 "high"
-        assert provider.thinking_level == "off"
+        # provider 的 thinking_level 来自全局 config（测试 cfg 显式给 "high"）
+        assert provider.thinking_level == "high"
+
+    def test_openai_provider_accepts_thinking_level(self, reset_llm_singleton):
+        """Phase 2.2：双 provider 统一传 thinking_level（openai 侧映射 reasoning_effort）。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        cfg = _make_config("openai_compat", thinking_level="high")
+        with patch(
+            "app.services.llm.client.config_manager.get_llm_config",
+            return_value=cfg,
+        ):
+            client = LLMClient()
+
+        assert isinstance(client._provider, OpenAICompatProvider)
+        assert client._provider.thinking_level == "high"
 
     def test_unknown_provider_raises(self, reset_llm_singleton):
         """Scenario 4.2: 非法 provider 抛 ValueError 并提示支持列表。"""

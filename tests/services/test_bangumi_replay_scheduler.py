@@ -207,7 +207,7 @@ class TestGetStatus:
 
 
 def _bangumi_account_config(**overrides) -> dict:
-    """get_active_bangumi_config() 的有效返回值"""
+    """get_primary_bangumi_config() 的有效返回值"""
     cfg = {"username": "testuser", "access_token": "testtoken", "private": False}
     cfg.update(overrides)
     return cfg
@@ -237,7 +237,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -271,7 +271,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -291,7 +291,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -311,7 +311,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -332,7 +332,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager"),
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(username=""),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -349,7 +349,7 @@ class TestProbeApiSingleMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager"),
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(access_token=""),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -371,7 +371,7 @@ class TestProbeApiMultiMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(username="u1", access_token="t1"),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -400,7 +400,7 @@ class TestProbeApiMultiMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager"),
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=None,
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -417,7 +417,7 @@ class TestProbeApiMultiMode:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager"),
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=None,
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -654,7 +654,7 @@ class TestProbeApiResetsUnreachableFlags:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -677,7 +677,7 @@ class TestProbeApiResetsUnreachableFlags:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,
@@ -703,7 +703,7 @@ class TestProbeApiResetsUnreachableFlags:
         with (
             patch("app.services.bangumi_replay_scheduler.config_manager") as cm,
             patch(
-                "app.core.accounts.get_active_bangumi_config",
+                "app.core.accounts.get_primary_bangumi_config",
                 return_value=_bangumi_account_config(),
             ),
             patch("app.utils.bangumi_api.BangumiApi") as mock_cls,

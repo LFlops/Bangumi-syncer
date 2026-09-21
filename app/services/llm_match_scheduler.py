@@ -44,7 +44,7 @@ from typing import Any
 from apscheduler.triggers.cron import CronTrigger
 from pydantic import ValidationError
 
-from app.core.accounts import get_active_bangumi_config
+from app.core.accounts import get_primary_bangumi_config
 from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
@@ -442,7 +442,7 @@ class LlmMatchScheduler(BaseScheduler):
         """从用户配置构造 BangumiApi 实例（失败返回 None，交由场景层降级）。"""
         user_name = (sync_record or {}).get("user_name")
         try:
-            cfg = get_active_bangumi_config(user_name)
+            cfg = get_primary_bangumi_config(user_name)
             if not cfg or not cfg.get("username") or not cfg.get("access_token"):
                 logger.debug("🤖 无可用 Bangumi 账号配置，bgm 为 None")
                 return None

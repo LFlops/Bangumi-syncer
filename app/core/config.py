@@ -5,10 +5,11 @@
 import os
 import platform
 import threading
+from collections.abc import Callable
 from configparser import ConfigParser
 from datetime import date as _date
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from .config_schema import (
     all_env_overrides,
@@ -27,7 +28,7 @@ from .startup_info import startup_info
 _BANGUMI_NON_ACCOUNT_SECTIONS: tuple[str, ...] = non_account_bangumi_sections()
 
 
-def parse_media_server_username_value(raw: Optional[str]) -> list[str]:
+def parse_media_server_username_value(raw: str | None) -> list[str]:
     """解析 media_server_username 配置值（英文或中文逗号分隔）为去重前的用户名列表。"""
     if raw is None:
         return []
@@ -53,7 +54,7 @@ class ConfigManager:
         self._ensure_default_config()
 
         # 配置缓存
-        self._config_cache: Optional[ConfigParser] = None
+        self._config_cache: ConfigParser | None = None
         self._last_modified = 0
 
         # 配置变更追踪：版本号自增 + 变更监听回调。
@@ -617,6 +618,7 @@ class ConfigManager:
             "max_tokens": 2000,
             "temperature": 0.7,
             "timeout": 60,
+            "thinking_level": "off",
             "retention_days": 365,
         }
         raw = self.get_section(LLM_SECTION, {})
@@ -624,6 +626,8 @@ class ConfigManager:
         # 空字符串会覆盖默认值（{**defaults, **raw} 语义），对关键枚举字段兜底
         if not merged.get("provider"):
             merged["provider"] = "openai_compat"
+        if not merged.get("thinking_level"):
+            merged["thinking_level"] = "off"
         # 确保类型正确（使用 is not None 以允许 0 等 falsy 值）
         if merged.get("max_tokens") is not None:
             merged["max_tokens"] = int(merged["max_tokens"])
@@ -1045,7 +1049,7 @@ config_manager = ConfigManager()
 # 可注入钩子：默认返回模块级单例；测试/DI 可通过 set_config_manager 替换。
 # 注意：仅显式调用 get_config_manager() 的消费方会感知替换，
 # 直接 ``from ..core.config import config_manager`` 的代码仍用默认单例。
-_config_manager_override: Optional[ConfigManager] = None
+_config_manager_override: ConfigManager | None = None
 
 
 def get_config_manager() -> ConfigManager:

@@ -33,10 +33,14 @@ from ..utils.bangumi_api.collection import (
     invalidate_watching_cache,
 )
 from ..utils.bangumi_api.factory import (
-    build_bangumi_api_from_active_config as _build_bangumi_api,
+    build_bangumi_api_from_primary_config as _build_bangumi_api,
 )
 from ..utils.bangumi_archive import bangumi_archive
 from ..utils.bangumi_archive._store import archive_store
+from ..utils.bangumi_constants import (
+    SUBJECT_TYPE_ANIME,
+    SUBJECT_TYPE_REAL,
+)
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/airing-calendar", tags=["airing-calendar"])
@@ -113,8 +117,8 @@ class BangumiAccountInfo(BaseModel):
 class BangumiAccountsResponse(BaseModel):
     mode: str = Field(description="同步模式：single=单用户，multi=多用户")
     accounts: list[BangumiAccountInfo] = Field(description="已配置的 Bangumi 账号列表")
-    active: Optional[str] = Field(
-        None, description="当前活跃账号段名（单用户为 'bangumi'，多用户取首个映射）"
+    primary: Optional[str] = Field(
+        None, description="当前首选账号段名（单用户为 'bangumi'，多用户取首个映射）"
     )
 
 
@@ -135,7 +139,7 @@ async def list_bangumi_accounts(
     """
     from app.core.accounts import (
         count_bangumi_accounts,
-        get_active_bangumi_account,
+        get_primary_bangumi_account,
         get_user_mappings,
         list_bangumi_accounts as _list_accounts,
     )
@@ -162,12 +166,12 @@ async def list_bangumi_accounts(
             # DB 异常时回退到全量返回，避免阻断卡片加载
             pass
 
-    active_acc = get_active_bangumi_account()
-    active = active_acc.get("section_name") if active_acc else None
+    primary_acc = get_primary_bangumi_account()
+    primary = primary_acc.get("section_name") if primary_acc else None
 
     # 列表长度=1 即单用户，无需 sync.mode 判断；mode 字段仅供前端 dropdown 显示判断
     mode = "multi" if len(accounts) > 1 else "single"
-    return BangumiAccountsResponse(mode=mode, accounts=accounts, active=active)
+    return BangumiAccountsResponse(mode=mode, accounts=accounts, primary=primary)
 
 
 def _resolve_accessible_account(user: dict, requested: Optional[str]) -> Optional[str]:
@@ -284,13 +288,13 @@ async def get_airing_calendar(
     start_str = today_str
     end_str = end_date.isoformat()
 
-    # 类型筛选：0=全部(2,6), 2=动画, 6=三次元
-    if subject_type == 2:
-        subject_types: tuple[int, ...] = (2,)
-    elif subject_type == 6:
-        subject_types = (6,)
+    # 类型筛选：0=全部，2=动画(SUBJECT_TYPE_ANIME)，6=三次元(SUBJECT_TYPE_REAL)
+    if subject_type == SUBJECT_TYPE_ANIME:
+        subject_types: tuple[int, ...] = (SUBJECT_TYPE_ANIME,)
+    elif subject_type == SUBJECT_TYPE_REAL:
+        subject_types = (SUBJECT_TYPE_REAL,)
     else:
-        subject_types = (2, 6)
+        subject_types = (SUBJECT_TYPE_ANIME, SUBJECT_TYPE_REAL)
 
     # "我的追番"必须配置 Bangumi 账号：按 account 段名构造（多用户切换）
     # 多用户隔离：校验当前用户是否有权访问指定 account，防止越权查看他人账号

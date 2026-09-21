@@ -27,9 +27,9 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from app.services.llm.models import (
     ChatResponse,
@@ -91,7 +91,7 @@ def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
     """
     ordered = getattr(results, "ordered", None)
     if isinstance(ordered, list) and len(ordered) == len(tool_calls):
-        if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls)):
+        if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls, strict=True)):
             return [result for _, result in ordered]
         logger.debug("ordered 槽位与 tool_calls 不一致，回退 dict 取值")
     getter = getattr(results, "get", None)
@@ -182,7 +182,7 @@ async def run(
 
         # ⑥ 逐条：追加 tool_result
         aligned = _align_results(tool_calls, results)
-        for tc, result in zip(tool_calls, aligned):
+        for tc, result in zip(tool_calls, aligned, strict=True):
             if result is None or not isinstance(result, ToolResultBlock):
                 # 防御：缺失结果或非 ToolResultBlock（如极少数 TerminalCapture 泄漏）跳过
                 logger.warning(

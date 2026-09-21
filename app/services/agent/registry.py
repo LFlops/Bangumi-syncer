@@ -13,8 +13,9 @@ Composition Root）静态 import 场景工厂后调用 :func:`register_scenario`
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime

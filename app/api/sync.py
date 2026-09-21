@@ -8,7 +8,7 @@ import json
 import time
 import traceback
 from collections.abc import AsyncGenerator
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sse_starlette.sse import EventSourceResponse
@@ -258,12 +258,12 @@ async def get_sync_records(
     request: Request,
     limit: int = Query(10, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    status: Optional[str] = None,
-    user_name: Optional[str] = None,
-    source: Optional[str] = None,
-    source_prefix: Optional[str] = None,
-    match_method: Optional[str] = None,
-    match_platform: Optional[str] = None,
+    status: str | None = None,
+    user_name: str | None = None,
+    source: str | None = None,
+    source_prefix: str | None = None,
+    match_method: str | None = None,
+    match_platform: str | None = None,
     skip_count: bool = Query(False),
     include_poster: bool = Query(False),
     current_user: dict = Depends(get_current_user_flexible),
@@ -304,9 +304,9 @@ async def get_match_records(
     request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=200),
-    status: Optional[str] = None,
-    match_method: Optional[str] = None,
-    match_platform: Optional[str] = None,
+    status: str | None = None,
+    match_method: str | None = None,
+    match_platform: str | None = None,
     current_user: dict = Depends(get_current_user_flexible),
 ):
     """获取匹配记录列表（含匹配追踪字段）"""
@@ -357,7 +357,7 @@ async def get_match_trace(
 # ===== 待确认候选（候选沉淀 + 确认 UI） =====
 
 
-def _enrich_candidate_with_agent_run(record: Optional[dict]) -> Optional[dict]:
+def _enrich_candidate_with_agent_run(record: dict | None) -> dict | None:
     """为候选记录附加关联 agent run 信息（前端徽标 / AI 评估过程折叠区用）。
 
     - 经 sync_record_id 查最新 agent_runs（任意状态），取其 status 与 run_id；
@@ -398,7 +398,7 @@ async def get_pending_candidates(
     request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=200),
-    status: Optional[str] = None,
+    status: str | None = None,
     current_user: dict = Depends(get_current_user_flexible),
 ):
     """获取待确认候选列表"""

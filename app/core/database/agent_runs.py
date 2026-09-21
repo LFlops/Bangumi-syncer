@@ -29,7 +29,7 @@ import json
 import sqlite3
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from ...utils.secret_redact import redact_secrets
 from ..logging import logger
@@ -134,7 +134,7 @@ class AgentRunsRepository(BaseRepository):
         self,
         run_id: str,
         task_type: str,
-        sync_record_id: Optional[int] = None,
+        sync_record_id: int | None = None,
         *,
         business_key: str = "",
     ) -> int:
@@ -164,7 +164,7 @@ class AgentRunsRepository(BaseRepository):
         run_id: str,
         business_key: str,
         *,
-        sync_record_id: Optional[int] = None,
+        sync_record_id: int | None = None,
         reuse_window_days: int,
         max_total_attempts: int,
         accepted_mapping_valid: bool,
@@ -323,7 +323,7 @@ class AgentRunsRepository(BaseRepository):
         reuse_window_days: int,
         accepted_mapping_valid: bool,
         now_ts: int,
-    ) -> Optional[str]:
+    ) -> str | None:
         """按业务候选子状态给出复用决策；返回 None 表示需新建重新评估。
 
         只读查询与主决策同事务执行（避免读写间隙竞态）。
@@ -356,7 +356,7 @@ class AgentRunsRepository(BaseRepository):
         )
         return None
 
-    def _find_active_run_id(self, business_key: str) -> Optional[str]:
+    def _find_active_run_id(self, business_key: str) -> str | None:
         """按 business_key 查在途（pending/processing）run_id，无则 None。
 
         仅用于唯一索引并发冲突兜底（同键在途已存在时复用）。
@@ -373,7 +373,7 @@ class AgentRunsRepository(BaseRepository):
         return self._run_read(_read, error_msg="查询在途 agent_run 失败", default=None)
 
     @staticmethod
-    def _find_latest_by_business_key(conn, business_key: str) -> Optional[dict]:
+    def _find_latest_by_business_key(conn, business_key: str) -> dict | None:
         """按 business_key 查最近一条 run（任意状态，按 id DESC），无则 None。"""
         cursor = conn.execute(
             "SELECT * FROM agent_runs WHERE business_key=? ORDER BY id DESC LIMIT 1",
@@ -383,7 +383,7 @@ class AgentRunsRepository(BaseRepository):
         if not row:
             return None
         cols = [d[0] for d in cursor.description]
-        return dict(zip(cols, row))
+        return dict(zip(cols, row, strict=True))
 
     def atomic_claim(self, run_id: str) -> bool:
         """原子抢占：仅当 status='pending' 时置 processing。
@@ -570,8 +570,8 @@ class AgentRunsRepository(BaseRepository):
     def refresh_started_at(
         self,
         run_id: str,
-        ts: Optional[int] = None,
-        expected_started_at: Optional[int] = None,
+        ts: int | None = None,
+        expected_started_at: int | None = None,
     ) -> bool:
         """恢复扫描时刷新 started_at（仅 processing 态有效）。
 
@@ -697,7 +697,7 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="刷新 agent_run sync_record_id 失败", default=False
         )
 
-    def find_latest_by_sync_record(self, sync_record_id: int) -> Optional[dict]:
+    def find_latest_by_sync_record(self, sync_record_id: int) -> dict | None:
         """按 sync_record_id 查最新一条会话，无则 None。
 
         优先走关联表 agent_run_sync_records（多对一：N 条集级 record 关联
@@ -721,7 +721,7 @@ class AgentRunsRepository(BaseRepository):
             row = cursor.fetchone()
             if row:
                 cols = [d[0] for d in cursor.description]
-                return dict(zip(cols, row))
+                return dict(zip(cols, row, strict=True))
 
             # 兼容历史数据：回退按 agent_runs.sync_record_id 主指针查询
             cursor = conn.execute(
@@ -733,7 +733,7 @@ class AgentRunsRepository(BaseRepository):
             if not row:
                 return None
             cols = [d[0] for d in cursor.description]
-            return dict(zip(cols, row))
+            return dict(zip(cols, row, strict=True))
 
         return self._run_read(_read, error_msg="查询最新 agent_run 失败", default=None)
 
@@ -747,7 +747,7 @@ class AgentRunsRepository(BaseRepository):
                 (limit,),
             )
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+            return [dict(zip(cols, r, strict=True)) for r in cursor.fetchall()]
 
         return self._run_read(
             _read, error_msg="列出 pending agent_run 失败", default=[]
@@ -767,13 +767,13 @@ class AgentRunsRepository(BaseRepository):
                 (cutoff,),
             )
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, r)) for r in cursor.fetchall()]
+            return [dict(zip(cols, r, strict=True)) for r in cursor.fetchall()]
 
         return self._run_read(
             _read, error_msg="列出超时 processing agent_run 失败", default=[]
         )
 
-    def get_run(self, run_id: str) -> Optional[dict]:
+    def get_run(self, run_id: str) -> dict | None:
         """按 run_id 查询单条会话"""
 
         def _read(conn):
@@ -782,7 +782,7 @@ class AgentRunsRepository(BaseRepository):
             if not row:
                 return None
             cols = [d[0] for d in cursor.description]
-            return dict(zip(cols, row))
+            return dict(zip(cols, row, strict=True))
 
         return self._run_read(_read, error_msg="查询 agent_run 失败", default=None)
 
@@ -889,7 +889,7 @@ class AgentRunsRepository(BaseRepository):
             cols = [d[0] for d in cursor.description]
             rows = []
             for r in cursor.fetchall():
-                d = dict(zip(cols, r))
+                d = dict(zip(cols, r, strict=True))
                 d["replay_delta"] = _decrypt_replay_delta(d.get("replay_delta"))
                 rows.append(d)
             return rows

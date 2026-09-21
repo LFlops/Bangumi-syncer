@@ -1296,7 +1296,7 @@ def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
     }
     with (
         patch(
-            "app.services.llm_match_scheduler.get_active_bangumi_config",
+            "app.services.llm_match_scheduler.get_primary_bangumi_config",
             return_value={"username": "u1", "access_token": secret},
         ),
         patch("app.services.llm_match_scheduler.config_manager", cm),

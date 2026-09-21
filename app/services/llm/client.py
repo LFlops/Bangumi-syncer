@@ -38,19 +38,30 @@ def _format_error_detail(e: Exception) -> str:
 
 
 # 端点拒绝扩展参数的响应特征（大小写不敏感子串匹配）。
-# OpenAI: "Unrecognized request argument supplied: reasoning_effort"；
-# Anthropic: invalid_request_error；网关实现各异 —— 以宽泛特征兕底。
-# M8：模式串含 Anthropic 文案；状态码放行 400/422（pydantic 网关）。
+# 模式串已收窄到具体短语，避免网关无关文案（如 "model does not support streaming"、
+# "unrecognized model"）被误判为参数拒绝。
+# OpenAI canonical: "Unrecognized request argument supplied: <param>" → "unrecognized request argument"；
+# 网关变体: "unrecognized parameter '<param>' is not supported" → "unrecognized parameter"。
+# thinking/reasoning 类: "does not support thinking" / "does not support reasoning"。
+# 其余（unknown parameter / unexpected keyword / invalid request argument / extra fields not permitted）保持裸短语。
+# M8：状态码放行 400/422（pydantic 网关）。
 _PARAM_REJECTION_PATTERNS = (
-    "unrecognized",
+    "unrecognized request argument",
+    "unrecognized parameter",
     "unknown parameter",
     "unexpected keyword",
     "invalid request argument",
     "extra fields not permitted",
-    "invalid_request_error",
-    "does not support",
+    "does not support thinking",
+    "does not support reasoning",
+    # 强制 tool_choice 被 thinking 模式拒绝的实测文案（DeepSeek anthropic 兼容层）：
+    # "Thinking mode does not support this tool_choice"
+    "does not support this tool_choice",
 )
 
+# Anthropic invalid_request_error 覆盖过广（消息格式错误等无关 400 也用该 type），
+# 须与扩展参数关键字组合才判定为参数拒绝。
+_PARAM_KEYWORDS = ("thinking", "reasoning", "budget_tokens")
 _PARAM_REJECTION_STATUSES = (400, 422)
 
 
@@ -62,7 +73,10 @@ def _is_param_rejection(e: Exception) -> bool:
     if resp is None or resp.status_code not in _PARAM_REJECTION_STATUSES:
         return False
     text = (resp.text or "").lower()
-    return any(p in text for p in _PARAM_REJECTION_PATTERNS)
+    if any(p in text for p in _PARAM_REJECTION_PATTERNS):
+        return True
+    # 复合判定：Anthropic invalid_request_error + 扩展参数关键字
+    return "invalid_request_error" in text and any(k in text for k in _PARAM_KEYWORDS)
 
 
 # M7/M9：确定性错误 —— 重试无意义（refusal / 鉴权 / 参数类 / 不存在）
@@ -128,6 +142,8 @@ def _build_provider(
         "temperature": cfg["temperature"],
         "timeout": cfg["timeout"],
         "proxy": proxy,
+        # 双 provider 构造函数均接受 thinking_level（openai 侧映射 reasoning_effort）
+        "thinking_level": cfg.get("thinking_level", "off"),
     }
     return cls(**kwargs)
 

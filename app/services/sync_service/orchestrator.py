@@ -191,7 +191,20 @@ class SyncOrchestrator:
                     status_holder,
                 )
 
-            # 13. 标记成功收尾：通知 + 收藏归档 + 持久化
+            # 13. 其余 Bangumi 账号补标记（同一媒体服务器用户名绑定多个账号）
+            other_results = self._sync._mark_episode_for_other_accounts(
+                item, bgm, bgm_se_id, bgm_ep_id, bgm_title
+            )
+            account_outcomes = self._sync._build_account_outcomes(
+                item,
+                bgm,
+                other_results,
+                "success",
+                self._sync._format_mark_status_message(mark_status),
+                primary_mark_status=mark_status,
+            )
+
+            # 14. 标记成功收尾：通知 + 收藏归档 + 持久化
             return self._finalize_success(
                 item,
                 actual_source,
@@ -203,6 +216,7 @@ class SyncOrchestrator:
                 exec_ctx.current_outputs.get("message", ""),
                 trace,
                 status_holder,
+                account_results=account_outcomes,
             )
         except Exception as e:
             logger.error(f"自定义同步处理出错: {e}")
@@ -649,11 +663,22 @@ class SyncOrchestrator:
         result_message: str,
         trace: MatchTrace,
         status_holder: list[str],
+        account_results: list[dict] | None = None,
     ) -> SyncResponse:
         """标记成功：通知 + 收藏归档 + 持久化 + 组装 SyncResponse"""
         # 通知 mark_success/mark_skipped（result_message 已由 ResultStep 结算）
         self._sync._apply_sync_status(
-            item, actual_source, bgm_se_id, bgm_ep_id, bgm_title, mark_status
+            item,
+            actual_source,
+            bgm_se_id,
+            bgm_ep_id,
+            bgm_title,
+            mark_status,
+            bgm_username=str(getattr(bgm, "username", "") or ""),
+        )
+        # 其余账号结果可能与首选不同（已看过跳过/标记失败），逐账号发送通知
+        self._sync._notify_account_outcomes(
+            item, actual_source, bgm_se_id, bgm_ep_id, bgm_title, account_results
         )
 
         self._sync._mark_subject_completed_if_needed(item, bgm, bgm_se_id, bgm_title)
@@ -669,6 +694,7 @@ class SyncOrchestrator:
             episode_id=bgm_ep_id,
             message=result_message,
             bgm_title=bgm_title,
+            account_results=account_results,
         )
 
         result = SyncResponse(
@@ -687,6 +713,7 @@ class SyncOrchestrator:
                 "match_platform": self._sync._extract_matched_platform(
                     trace, bgm_se_id
                 ),
+                "account_results": account_results,
             },
         )
         status_holder[0] = result.status
@@ -833,6 +860,7 @@ class SyncOrchestrator:
         episode_id: str | None,
         message: str,
         bgm_title: str = "",
+        account_results: list[dict] | None = None,
     ) -> int:
         """统一收口 trace→DB 的 finish+to_dict+log 样板（原 5 处重复）
 
@@ -859,4 +887,5 @@ class SyncOrchestrator:
             match_score=trace.final_score,
             match_platform=match_platform,
             match_trace=trace.to_dict(),
+            account_results=account_results,
         )
