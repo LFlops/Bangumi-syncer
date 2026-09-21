@@ -23,7 +23,7 @@ from app.core.config_schema import (
 )
 from app.core.logging import resolved_dev_log_file_path
 
-# 日志级别白名单（与 mcp_logs.py 保持一致）
+# 日志级别白名单（get_logs 参数校验）
 VALID_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
 
 
