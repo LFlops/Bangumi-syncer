@@ -36,14 +36,18 @@ description: 部署、接入、配置与排障 Bangumi-syncer（把 Jellyfin/Emb
    - 完成 Bangumi 账号 OAuth 授权
    - 填写媒体服务器登录用户名（同步匹配的关键依据）
    - 参考文档：`/getting-started`
-3. **MCP 接入**：
+3. **地址核对（MCP 接入前）**：
+   - 判断 `{base}` 的主机：为 `localhost` / `127.0.0.1` → 无需处理，直接进入下一步
+   - 否则（局域网 IP / 域名 / 反代）：**先**引导用户打开 BS 管理页「配置 → 开发与代理」，在「MCP 服务公共 URL」点「一键填入当前访问地址」（或手工填入 `{base}`），保存并重启 BS，再注册 MCP 服务
+   - 原因：MCP 的 OAuth issuer 必须与客户端访问地址一致；否则客户端会拿到 localhost 地址，导致授权发现失败
+4. **MCP 接入**：
    - 按**你自身平台**的 MCP 配置方式，将 `{base}/mcp` 注册为远程 MCP 服务（Streamable HTTP，OAuth 自动发现，无需静态 Token）
    - 触发授权：用户在浏览器 consent 页点击 Allow。服务端默认只发放只读（`read`）；若后续需要由你修改配置，需在授权中授予读写（`read write`）——若你的平台支持声明 OAuth scope，请声明 `read write`；服务端 metadata 已广播可用 scope
    - 完成后执行「场景 C：只读验证」
-4. **媒体源配置**（按类型分流）：
+5. **媒体源配置**（按类型分流）：
    - **Webhook 类**（Jellyfin / Emby / Plex / Tautulli / 通用 webhook）：在文档 `/usage/` 找到对应页面，指导用户在媒体服务器侧填写回调地址；这类配置无法通过 MCP 代改
    - **配置类**（飞牛 / fongmi / Trakt）：先 `get_current_config` 侦察 → 给出「变更计划表」（`section.key`：现值 → 目标值 → 原因）→ 用户确认 → 用 `update_config` 逐项执行 → 复读验证
-5. **验证**：引导用户触发一次测试同步（`POST {base}/test-sync`，需登录态）或播放一集；用 `get_logs` 查看结果；必要时到 Bangumi 个人主页确认
+6. **验证**：引导用户触发一次测试同步（`POST {base}/test-sync`，需登录态）或播放一集；用 `get_logs` 查看结果；必要时到 Bangumi 个人主页确认
 
 ## 场景 C：只读验证（接入后自检）
 
@@ -59,6 +63,7 @@ description: 部署、接入、配置与排障 Bangumi-syncer（把 Jellyfin/Emb
 - 改配置：严格走「计划 → 用户确认 → 执行 → 复读验证」流程
 - 排障输出：结论先行；按可能性排出根因与证据（引用日志行）；修复动作区分「可由你代改」与「需用户人工操作」；给出验证方式
 - 常见问题对照：文档 `/config/mcp`
+- MCP 授权异常（授权跳转到 localhost / 授权发现失败 / issuer 不匹配）→ 检查「MCP 服务公共 URL」是否与访问地址一致；非 localhost 部署须先按「场景 B 第 3 步」配置并重启 BS
 - 具体领域步骤（媒体源接入、配置项含义等）以文档页面为准，不在本技能内凭记忆展开
 
 ## 安全约束（硬性，不可妥协）
