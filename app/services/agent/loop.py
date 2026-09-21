@@ -100,6 +100,56 @@ def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
     return [getter(tc.id) for tc in tool_calls]
 
 
+def _inject_veto_hint(
+    messages: list[Message], terminal_tc: ToolUseBlock, hint: str
+) -> None:
+    """veto 暂缓：注入与 terminal tool_use 配对的 tool_result（闭合会话协议）。
+
+    OpenAI/Anthropic 协议要求 assistant 的 tool_use 后必须跟配对 tool_result，
+    不能只注入 user 文本。
+    """
+    messages.append(
+        Message(
+            role="user",
+            content=[
+                ToolResultBlock(
+                    tool_use_id=terminal_tc.id, content=hint, is_error=False
+                )
+            ],
+        )
+    )
+
+
+def _record_veto_tool(
+    recorder: Any | None,
+    terminal_tc: ToolUseBlock,
+    hint: str,
+    *,
+    sequence: int,
+) -> None:
+    """把 veto 伪执行落 tool_execute span，保证 replay 重建的消息与 live 一致。
+
+    ``sequence`` 与 ``execute_batch`` 的约定一致：工具在 ``tool_calls`` 中的下标。
+    ``recorder`` 为 None 时跳过（可空实现）。
+    """
+    if recorder is None:
+        return
+    span_id = recorder.start_tool(terminal_tc, sequence=sequence)
+    if span_id is None:
+        # 记录器选择不落 span（如可空实现）：仍需可观测，避免静默
+        logger.debug(
+            "veto terminal 工具 %s 未获得 span_id，跳过 replay 落 span",
+            terminal_tc.name,
+        )
+        return
+    recorder.end_tool(
+        span_id,
+        result=ToolResultBlock(
+            tool_use_id=terminal_tc.id, content=hint, is_error=False
+        ),
+    )
+
+
 async def run(
     *,
     chat_fn: ChatFn,
@@ -109,6 +159,7 @@ async def run(
     tool_choice_terminal: str,
     seed_messages: list[Message],
     recorder: Any | None = None,
+    veto_terminal: Callable[[dict], str | None] | None = None,
 ) -> RunResult:
     """运行轻量 Agent 循环，返回 ``RunResult``。
 
@@ -122,10 +173,14 @@ async def run(
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）
     - ``recorder``：可选预算记录器（鸭子类型 ``record_budget(str)``），None 时跳过钩子
+    - ``veto_terminal``：可选终止提交软护栏。非 None 时，命中终止工具的轮次会先询问
+      该回调（入参=terminal input）；返回提示文案则**不终止**、注入配对 tool_result 后
+      继续一轮（仅拦一次，且末轮不拦）。返回 None / 回调为 None 时行为与现状一致。
     """
     messages: list[Message] = list(seed_messages)
     remaining = max_iterations
     resp: ChatResponse | None = None
+    vetoed = False
 
     for _iteration in range(max_iterations):
         # 末轮（remaining==1 起手）强制 terminal 收尾；其余轮不指定 tool_choice
@@ -167,15 +222,31 @@ async def run(
         messages.append(Message(role="assistant", content=assistant_blocks))
 
         # ④ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
-        terminal_tc = next(
-            (tc for tc in tool_calls if tc.name == tool_choice_terminal), None
-        )
+        terminal_tc: ToolUseBlock | None = None
+        terminal_idx = -1
+        for idx, tc in enumerate(tool_calls):
+            if tc.name == tool_choice_terminal:
+                terminal_tc = tc
+                terminal_idx = idx
+                break
         if terminal_tc is not None:
-            return RunResult(
-                stop_reason="submit_suggestion",
-                suggestion=terminal_tc.input,
-                last_response=resp,
-            )
+            # 软护栏（veto）：非末轮 + 本 run 尚未拦过时，先询问一次场景回调。
+            # 末轮强收尾优先（remaining==1 不拦）；只拦一次避免无限暂缓。
+            hint = ""
+            if veto_terminal is not None and remaining > 1 and not vetoed:
+                hint = veto_terminal(terminal_tc.input or {}) or ""
+            if not hint:
+                return RunResult(
+                    stop_reason="submit_suggestion",
+                    suggestion=terminal_tc.input,
+                    last_response=resp,
+                )
+            # 暂缓：不终止、不执行其他工具，注入配对 tool_result 后消耗一轮预算继续。
+            vetoed = True
+            _inject_veto_hint(messages, terminal_tc, hint)
+            _record_veto_tool(recorder, terminal_tc, hint, sequence=terminal_idx)
+            remaining -= 1
+            continue
 
         # ⑤ 分段并行执行（循环把整批交给 tool_calls_fn，由 execute_batch 内部 gather/串行）
         results = await tool_calls_fn(tool_calls)

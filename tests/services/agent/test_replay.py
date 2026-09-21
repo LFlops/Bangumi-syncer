@@ -377,6 +377,72 @@ class TestReplayRebuildsFullBlocks:
         assistant = next(m for m in result.messages if m.role == "assistant")
         assert any(isinstance(b, ThinkingBlock) for b in assistant.content)
 
+    def test_replay_matches_live_loop_messages_with_veto(self, dbm):
+        """端到端一致性：veto 注入的 tool_result 在 replay 重建中与 live 一致。"""
+        import asyncio
+
+        from app.services.agent import loop as loop_module
+        from app.services.agent.recorder import TraceRecorder
+
+        _ensure_run(dbm, "run-veto-eq")
+        seed = [
+            Message(role="system", content="sys"),
+            Message(role="user", content="ctx"),
+        ]
+        uncertain = ChatResponse(
+            content="",
+            blocks=[
+                ToolUseBlock(
+                    id="s1",
+                    name="submit_suggestion",
+                    input={"subject_id": "1", "reason": "暂推荐，存在不确定性"},
+                )
+            ],
+            stop_reason="tool_use",
+            model="m",
+        )
+        final = ChatResponse(content="done", blocks=[], stop_reason="end_turn")
+        live_contexts: list[list] = []
+        counter = {"n": 0}
+
+        recorder = TraceRecorder("run-veto-eq", start_iteration=0)
+        recorder.write_seed_row(seed)
+
+        async def chat(messages, *, tools=None, tool_choice=None):
+            live_contexts.append(list(messages))
+            counter["n"] += 1
+            return uncertain if counter["n"] == 1 else final
+
+        async def tools_fn(tool_calls):
+            return {}
+
+        asyncio.run(
+            loop_module.run(
+                chat_fn=recorder.wrap_chat_fn(chat),
+                tools_schemas=[],
+                tool_calls_fn=tools_fn,
+                max_iterations=3,
+                tool_choice_terminal="submit_suggestion",
+                seed_messages=seed,
+                recorder=recorder,
+                veto_terminal=lambda args: "请再核对",
+            )
+        )
+
+        result = trace.replay("run-veto-eq")
+
+        # live 第二轮请求前的完整上下文 == replay 重建的 messages（含 veto tool_result）
+        assert live_contexts[1] == result.messages
+        veto_blocks = [
+            b
+            for m in result.messages
+            if isinstance(m.content, list)
+            for b in m.content
+            if isinstance(b, ToolResultBlock) and b.tool_use_id == "s1"
+        ]
+        assert veto_blocks, "veto 注入的 tool_result 应可从 replay 重建"
+        assert veto_blocks[0].content == "请再核对"
+
     def test_falls_back_to_tool_calls_when_blocks_absent(self, dbm):
         """旧数据无 ``blocks`` 字段 → 回退 tool_calls 重建（与修复前一致）。"""
         _write_seed(dbm, "run-old", [])

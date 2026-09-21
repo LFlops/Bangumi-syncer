@@ -1035,3 +1035,211 @@ async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
     )
 
     assert loop_module.FINAL_RECOVERY_MESSAGE in recorder.budget_calls
+
+
+# ---------------------------------------------------------------------------
+# 16. 终止提交软护栏（veto）：一次暂缓 + tool_result 注入 + recorder 落 span
+# ---------------------------------------------------------------------------
+
+
+class _FakeToolRecorder(_FakeBudgetRecorder):
+    """记录 start_tool / end_tool 调用（veto 伪执行落 span 断言用）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started: list[tuple[str, ToolUseBlock, int]] = []
+        self.ended: list[tuple[str, ToolResultBlock | None, str]] = []
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str:
+        span_id = f"span-{len(self.started)}"
+        self.started.append((span_id, tool_use, sequence))
+        return span_id
+
+    def end_tool(
+        self,
+        span_id: str,
+        *,
+        result: ToolResultBlock | None = None,
+        error: str = "",
+    ) -> None:
+        self.ended.append((span_id, result, error))
+
+
+def _collect_tool_results(messages: list[Message]) -> list[ToolResultBlock]:
+    return [
+        b
+        for m in messages
+        if isinstance(m.content, list)
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    ]
+
+
+async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
+    """veto 返回提示 → 首次 submit 不终止，注入 tool_result，下一轮放行。"""
+    first = _tool_use(
+        "ts1", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
+    )
+    second = _tool_use(
+        "ts2", "submit_suggestion", {"subject_id": "2", "reason": "确定"}
+    )
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [first if len(calls) == 1 else second])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock()
+    veto_inputs: list[dict] = []
+
+    def _veto(args: dict) -> str | None:
+        veto_inputs.append(args)
+        return None if args.get("subject_id") == "2" else "请再核对"
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        veto_terminal=_veto,
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "2", "reason": "确定"}
+    # 首次 submit 被暂缓：其他工具不执行
+    tool_calls_fn.assert_not_awaited()
+    # 第二轮请求携带注入的 veto tool_result（配对 terminal tool_use）
+    blocks = _collect_tool_results(calls[1])
+    veto_blocks = [b for b in blocks if b.tool_use_id == "ts1"]
+    assert veto_blocks, "应注入 terminal tool_use 配对的 tool_result"
+    assert veto_blocks[0].content == "请再核对"
+    assert veto_blocks[0].is_error is False
+    # 首次 submit 被询问过（第二次因「已 veto 过」直接放行，见另一用例）
+    assert [v["subject_id"] for v in veto_inputs] == ["1"]
+
+
+async def test_veto_happens_at_most_once_per_run():
+    """veto 只拦一次：第二次 terminal 不再调 veto、直接终止。"""
+    submit = _tool_use(
+        "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
+    )
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [submit])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    veto_calls: list[dict] = []
+
+    def _veto(args: dict) -> str | None:
+        veto_calls.append(args)
+        return "暂缓"
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        veto_terminal=_veto,
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    # veto 仅调用一次（第二次 terminal 因「已 veto 过」直接放行，不再询问）
+    assert len(veto_calls) == 1
+    assert chat_fn.await_count == 2
+
+
+async def test_veto_not_applied_on_final_round():
+    """末轮（remaining==1 起手）强收尾优先：不 veto，直接终止。"""
+    submit = _tool_use(
+        "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
+    )
+    chat_fn = AsyncMock(return_value=_resp("tool_use", [submit]))
+    veto_calls: list[dict] = []
+
+    def _veto(args: dict) -> str | None:
+        veto_calls.append(args)
+        return "暂缓"
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=1,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        veto_terminal=_veto,
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    # 末轮不 veto：回调根本不被调用
+    assert veto_calls == []
+    chat_fn.assert_awaited_once()
+
+
+async def test_veto_none_behaves_like_current_behavior():
+    """veto_terminal=None 时行为与现状一致：submit 立即终止。"""
+    submit = _tool_use(
+        "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
+    )
+    chat_fn = AsyncMock(return_value=_resp("tool_use", [submit]))
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        veto_terminal=None,
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    chat_fn.assert_awaited_once()
+
+
+async def test_veto_records_injected_tool_result_span_for_replay():
+    """veto 伪执行须经 recorder 落 tool_execute span（replay 一致性）。"""
+    first = _tool_use("ts1", "submit_suggestion", {"subject_id": "1"})
+    second = _tool_use("ts2", "submit_suggestion", {"subject_id": "2"})
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [first if len(calls) == 1 else second])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    recorder = _FakeToolRecorder()
+
+    await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=AsyncMock(),
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        recorder=recorder,
+        veto_terminal=lambda args: "请再核对",
+    )
+
+    # 仅 veto 伪执行落 span（terminal 分支不经 execute_batch）
+    assert len(recorder.started) == 1
+    _span_id, tool_use, sequence = recorder.started[0]
+    assert tool_use.id == "ts1"
+    # sequence 与 execute_batch 约定一致：terminal 在 tool_calls 中的下标
+    assert sequence == 0
+    assert len(recorder.ended) == 1
+    ended_result = recorder.ended[0][1]
+    assert ended_result is not None
+    assert ended_result.tool_use_id == "ts1"
+    assert ended_result.content == "请再核对"
+    assert ended_result.is_error is False

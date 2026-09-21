@@ -4721,3 +4721,209 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
     assert seen["ident"] != main_ident, (
         "续跑收尾链应在工作线程执行，不得占用事件循环线程"
     )
+
+
+# ---------------------------------------------------------------------------
+# give_up 放弃协议 + 终止提交软护栏（veto）
+# ---------------------------------------------------------------------------
+
+# 负样本真实 reason（来自 golden cassette m011/m012），用于验证 veto 命中
+_M011_REASON = (
+    "标题\u201c特典映像\u201d过于泛化（仅意为\u201c特典影像\u201d），"
+    "无父系列/年份等线索，无法唯一确定。"
+    "检索到多个同名特典条目（男子高校生の日常、我的英雄学院、BLACK LAGOON、加速世界等）。"
+    "其中\u201c男子高校生の日常 特典映像\u201d(72767)名称最直接匹配且为完整6话特典，"
+    "暂推荐，但存在较大不确定性。"
+)
+_M012_REASON = (
+    "未找到名为「Formula 1 2025 赛季回顾」的条目。"
+    "Bangumi 上 F1 相关条目仅有 Netflix 纪录片《一级方程式：疾速求生》第1-5季"
+    "（2019-2023）及 2025 年电影《F1：狂飙飞车》(id 560263)。"
+    "若该媒体实为 F1 题材电影，最接近的是 560263；"
+    "但标题「2025赛季回顾」与现有条目均不符，无法确认，故仅作最接近推荐，建议人工复核。"
+)
+
+# 正向样本代表理由（真实 cassette 风格），必须零误伤
+_CONFIDENT_REASONS = [
+    "标题「无职转生 第三季 ～到了异世界就拿出真本事～」对应 Bangumi 条目 501963"
+    "「無職転生Ⅲ ～異世界行ったら本気だす～」，放送开始 2026-07-04，"
+    "与线索中的季数3及开播日期完全一致。",
+    "标题「逃げ上手の若君 第二期」、放送开始 2026-07-17、季数2 与线索完全一致，"
+    "为《擅长逃跑的殿下》第二季（CloverWorks，山崎雄太监督）。",
+    "标题 Friends、季 1、开播日期 1994-09-22 完全匹配 Bangumi 条目 3864"
+    "「老友记 第一季 / Friends (Season 1)」（NBC，1994-09-22 开播，24集）。",
+    "标题\u201c狐独摇滚\u201d应为\u201c孤独摇滚！\u201d（ぼっち・ざ・ろっく！）的误写，"
+    "开播日期2022-10-08与条目完全一致，季1对应TV本篇，故推荐ID 328609。",
+]
+
+
+def test_submit_suggestion_schema_exposes_give_up_and_relaxed_required():
+    """give_up 协议：schema 新增 give_up 布尔属性，required 放宽为仅 reason。"""
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, _make_bgm())
+
+    defn = registry.get("submit_suggestion")
+    assert defn is not None
+    props = defn.parameters["properties"]
+    assert props["give_up"]["type"] == "boolean"
+    assert props["give_up"]["default"] is False
+    assert defn.parameters["required"] == ["reason"]
+    assert "give_up" in defn.description
+
+
+def test_match_hooks_registers_veto_terminal():
+    """匹配场景 hooks 注册 veto 回调（runtime 据此透传给 loop）。"""
+    assert llm_assist._MATCH_HOOKS.veto_terminal is llm_assist._match_veto_terminal
+
+
+def test_match_veto_terminal_hits_negative_sample_reasons():
+    """m011/m012 真实不确定理由 → 返回暂缓提示（命中标记）。"""
+    for reason in (_M011_REASON, _M012_REASON):
+        hint = llm_assist._match_veto_terminal({"subject_id": "1", "reason": reason})
+        assert hint is not None, f"不确定理由应触发 veto: {reason[:30]}"
+        assert "提交暂缓" in hint
+        assert "give_up=true" in hint
+
+
+def test_match_veto_terminal_no_false_positive_on_confident_reasons():
+    """18 条正向案例风格理由 → 不命中（零误伤）。"""
+    for reason in _CONFIDENT_REASONS:
+        hint = llm_assist._match_veto_terminal({"subject_id": "1", "reason": reason})
+        assert hint is None, f"确定理由不应触发 veto: {reason[:30]}"
+
+
+def test_match_veto_terminal_passes_give_up_and_missing_reason():
+    """give_up=true 是被鼓励行为，放行；无 reason 亦放行。"""
+    assert (
+        llm_assist._match_veto_terminal({"give_up": True, "reason": "无法确定，故放弃"})
+        is None
+    )
+    assert llm_assist._match_veto_terminal({"subject_id": "1"}) is None
+
+
+def test_handle_result_give_up_marks_no_suggestion_without_persist_or_notify(
+    monkeypatch,
+):
+    """give_up=true → no_suggestion/give_up，不落库、不通知、不校验 subject_id。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    ns = _make_notify()
+    persist_spy = MagicMock(return_value=True)
+    validate_calls = {"n": 0}
+
+    def _validate(sid):
+        validate_calls["n"] += 1
+        return (True, "")
+
+    monkeypatch.setattr(llm_assist, "_persist_and_notify", persist_spy)
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", _validate)
+
+    result = RunResult(
+        stop_reason="submit_suggestion",
+        suggestion={"give_up": True, "reason": "确实无法确定，放弃"},
+    )
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-give-up",
+        result,
+        sync_record=_make_sync_record(sync_record_id=520),
+        sync_record_id=520,
+        bgm=_make_bgm(),
+        notification_service=ns,
+        total_tokens=42,
+    )
+
+    assert status == "no_suggestion"
+    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+        "run-give-up", stop_reason="give_up", total_tokens=42
+    )
+    assert persist_spy.call_count == 0
+    ns.notify.assert_not_called()
+    assert validate_calls["n"] == 0
+
+
+def test_handle_result_give_up_false_takes_normal_submit_path(monkeypatch):
+    """give_up 缺省 / False → 走既有校验落库路径（行为不变）。"""
+    from unittest.mock import MagicMock
+
+    from app.services.agent.loop import RunResult
+
+    dbm = MagicMock()
+    persist_spy = MagicMock(return_value=True)
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    monkeypatch.setattr(llm_assist, "_persist_and_notify", persist_spy)
+
+    result = RunResult(
+        stop_reason="submit_suggestion",
+        suggestion={"subject_id": "123", "reason": "确定", "give_up": False},
+    )
+
+    status = llm_assist._handle_result(
+        dbm,
+        "run-give-up-false",
+        result,
+        sync_record=_make_sync_record(sync_record_id=521),
+        sync_record_id=521,
+        bgm=_make_bgm(),
+        notification_service=None,
+        total_tokens=7,
+    )
+
+    assert status == "succeeded"
+    assert persist_spy.call_count == 1
+    dbm.agent_runs.mark_no_suggestion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeypatch):
+    """端到端：不确定 submit 被 veto → 下一轮 give_up → 终态 no_suggestion。"""
+    run_id = "run-veto-giveup"
+    sr_id = 7711
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
+
+    uncertain = ChatResponse(
+        content="",
+        stop_reason="tool_use",
+        blocks=[
+            ToolUseBlock(
+                id="s1",
+                name="submit_suggestion",
+                input={"subject_id": "123", "reason": _M011_REASON},
+            )
+        ],
+    )
+    give_up = ChatResponse(
+        content="",
+        stop_reason="tool_use",
+        blocks=[
+            ToolUseBlock(
+                id="s2",
+                name="submit_suggestion",
+                input={"give_up": True, "reason": "确实无法确定，放弃"},
+            )
+        ],
+    )
+    chat = _chat_side_effect([uncertain, give_up])
+    ns = _make_notify()
+
+    status = await llm_assist.get_scenario_runtime().run(
+        run_id,
+        sync_record=sr,
+        bgm=_make_bgm(),
+        thinking_level="medium",
+        chat_fn=chat,
+        notification_service=ns,
+        span_recorder=None,
+    )
+
+    assert status == "no_suggestion"
+    run_row = database_manager.agent_runs.get_run(run_id)
+    assert run_row["status"] == "no_suggestion"
+    assert run_row["stop_reason"] == "give_up"
+    ns.notify.assert_not_called()
+    assert _read_candidate(sr_id) is None, "give_up 不应落库任何候选"

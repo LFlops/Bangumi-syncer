@@ -76,8 +76,10 @@ _SYSTEM_SUFFIX = (
     "表示剩余可交互轮次（每轮可执行多个工具）；"
     "请在预算内尽快完成检索与决策。\n\n"
     "[收尾要求]\n"
-    "若已确定推荐条目，调用 submit_suggestion；若确实无法确定，"
-    "也请调用 submit_suggestion 并在 reason 中说明放弃原因。"
+    "若已确定推荐条目，调用 submit_suggestion(subject_id, reason)；\n"
+    "若确实无法确定（标题过于泛化、多个候选无法用日期/季数区分等），\n"
+    "调用 submit_suggestion(give_up=true, reason) 明确放弃——放弃是正确结果，\n"
+    "提交一个你不确定的推荐比放弃更糟。"
 )
 
 # 用户隔离分隔符（用户输入与指令区分离）
@@ -224,14 +226,16 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         ),
         ToolDefinition(
             name="submit_suggestion",
-            description="提交最终推荐：subject_id 与 reason。调用即终止。",
+            description=(
+                "提交最终推荐；若确实无法确定，可用 give_up=true 明确放弃。调用即终止。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "subject_id": {
                         "type": "string",
                         "pattern": r"^\d+$",
-                        "description": "推荐的 Bangumi 条目 ID",
+                        "description": "推荐条目 ID；give_up=true 时可省略",
                         "minLength": 1,
                     },
                     "reason": {
@@ -239,8 +243,13 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
                         "description": "推荐理由（纯文本）",
                         "maxLength": 200,
                     },
+                    "give_up": {
+                        "type": "boolean",
+                        "description": "无法确定时置 true 明确放弃（不推荐任何条目）",
+                        "default": False,
+                    },
                 },
-                "required": ["subject_id", "reason"],
+                "required": ["reason"],
             },
             handler=_noop,
             access="terminal",
@@ -737,6 +746,41 @@ def _match_resolve_max_iterations(thinking_level: str) -> int:
     return get_max_iterations("match", thinking_level, config_override=config_override)
 
 
+# 终止提交软护栏（veto）：模型提交的 reason 中若出现下列不确定表述，
+# 暂缓一次并促其最后核对/明确放弃。标记集刻意保守（21 条正向案例 reason 均不含），
+# 追求零误伤；give_up=true 属被鼓励行为，直接放行。
+_VETO_MARKERS = (
+    "无法确定",
+    "不确定",
+    "暂推荐",
+    "无法确认",
+    "无法唯一确定",
+    "存在较大不确定性",
+    "暂时无法",
+    "无法判断",
+)
+
+
+def _match_veto_terminal(args: dict) -> str | None:
+    """匹配场景的终止提交软护栏回调（见 ``ScenarioHooks.veto_terminal``）。
+
+    返回 None = 放行；返回字符串 = 暂缓提示文案。
+    """
+    if args.get("give_up"):
+        return None  # 放弃是被鼓励行为，放行
+    reason = str(args.get("reason") or "")
+    hit = next((m for m in _VETO_MARKERS if m in reason), None)
+    if hit is None:
+        return None  # 无不确定表述 → 放行（零误伤）
+    return (
+        "[提交暂缓] 你的理由中表达了不确定性（命中：「" + hit + "」）。"
+        "请做最后一次核对：\n"
+        "1) 用系列名或其他关键词再搜索一轮，确认没有名称或日期更吻合的条目；\n"
+        "2) 若仍无法确定，调用 submit_suggestion(give_up=true, reason=...) 明确放弃——"
+        "放弃是正确结果，提交不确定的推荐比放弃更糟。"
+    )
+
+
 async def _match_handle_terminal(
     dbm,
     run_id: str,
@@ -768,6 +812,7 @@ _MATCH_HOOKS = ScenarioHooks(
     resolve_thinking_level=_match_resolve_thinking_level,
     resolve_max_iterations=_match_resolve_max_iterations,
     handle_terminal=_match_handle_terminal,
+    veto_terminal=_match_veto_terminal,
 )
 
 
@@ -857,6 +902,17 @@ def _handle_result(
 
     if stop == "submit_suggestion":
         suggestion = result.suggestion or {}
+        if suggestion.get("give_up"):
+            # 放弃协议：模型明确放弃 → 不落库、不通知，直接记 no_suggestion。
+            # 这是被鼓励的正确终态（好于提交不确定的推荐），reason 仅作观测。
+            logger.info(
+                f"[llm_assist] run {run_id} LLM 明确放弃（give_up）："
+                f"{str(suggestion.get('reason', '') or '')[:200]}"
+            )
+            dbm.agent_runs.mark_no_suggestion(
+                run_id, stop_reason="give_up", total_tokens=total_tokens
+            )
+            return "no_suggestion"
         sid = str(suggestion.get("subject_id", "") or "")
         reason = str(suggestion.get("reason", "") or "")
         ok, err = _validate_subject_id(sid)

@@ -43,3 +43,7 @@ class ScenarioHooks:
     resolve_max_iterations: Callable[[str], int]
     #: 终局处理（校验/落库/通知），返回终态 status 字符串
     handle_terminal: Callable[..., Awaitable[str]]
+    #: 终止提交软护栏（veto）：入参为 terminal 工具调用 input；返回 None=放行，
+    #: 返回字符串=暂缓提示文案（loop 注入配对 tool_result 后继续一轮，仅拦一次）。
+    #: None 时行为与现状完全一致（零回归）。
+    veto_terminal: Callable[[dict], str | None] | None = None

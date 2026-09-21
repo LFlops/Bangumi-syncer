@@ -92,6 +92,8 @@ async def run(
             tool_choice_terminal=hooks.terminal_tool,
             seed_messages=seed,
             recorder=span_recorder,
+            # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
+            veto_terminal=getattr(hooks, "veto_terminal", None),
         )
     except LLMCallError as e:
         # LLMCallError 携带 retryable 标志区分可重试/确定性失败
@@ -352,6 +354,8 @@ async def _execute_continuation(
         tool_choice_terminal=hooks.terminal_tool,
         seed_messages=replay_result.messages,
         recorder=span_recorder,
+        # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
+        veto_terminal=getattr(hooks, "veto_terminal", None),
     )
     await hooks.handle_terminal(
         dbm,
