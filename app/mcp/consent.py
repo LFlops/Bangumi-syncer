@@ -10,6 +10,7 @@ import hmac
 from typing import TYPE_CHECKING
 from urllib.parse import urlencode
 
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
@@ -36,6 +37,9 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
     # 从 query（GET）或 form（POST）获取 request_token；POST 的 form 在此提取一次
     # 并在下方 CSRF 校验处复用，避免重复 await request.form()。
     form = None
+    # 显式联合类型：GET 来自 query（str），POST 来自 form（str | UploadFile），
+    # 下方统一按 isinstance(str) 收窄。
+    raw: str | UploadFile | None
     if request.method == "GET":
         raw = request.query_params.get("request_token")
     else:
