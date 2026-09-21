@@ -407,6 +407,31 @@ class TestRSAKeyManager:
         assert result is not None
         assert result["sub"] == "user1"
 
+    def test_load_non_rsa_private_key_raises_value_error(self, tmp_path):
+        """加载非 RSA 私钥（Ed25519）时应抛出清晰的 ValueError，而非静默赋值。"""
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+
+        from app.mcp.keys import RSAKeyManager
+
+        private_path = tmp_path / "private.pem"
+        public_path = tmp_path / "public.pem"
+        ed_key = ed25519.Ed25519PrivateKey.generate()
+        private_path.write_bytes(
+            ed_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+
+        manager = RSAKeyManager(
+            private_key_path=str(private_path),
+            public_key_path=str(public_path),
+        )
+
+        with pytest.raises(ValueError, match="不是 RSA 私钥"):
+            manager.load_or_generate()
+
 
 # ---------------------------------------------------------------------------
 # OAuth Provider 单元测试（T3）

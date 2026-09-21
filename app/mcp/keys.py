@@ -96,16 +96,20 @@ class RSAKeyManager:
             self.generate_keys()
 
     def _load_private_key(self) -> None:
-        """从磁盘加载私钥。"""
+        """从磁盘加载私钥，并校验其确为 RSA 私钥。"""
         with open(self.private_key_path, "rb") as f:
-            self._private_key = serialization.load_pem_private_key(
-                f.read(), password=None
-            )
+            key = serialization.load_pem_private_key(f.read(), password=None)
+        if not isinstance(key, rsa.RSAPrivateKey):
+            raise ValueError(f"私钥文件不是 RSA 私钥: {self.private_key_path}")
+        self._private_key = key
 
     def _load_public_key(self) -> None:
-        """从磁盘加载公钥。"""
+        """从磁盘加载公钥，并校验其确为 RSA 公钥。"""
         with open(self.public_key_path, "rb") as f:
-            self._public_key = serialization.load_pem_public_key(f.read())
+            key = serialization.load_pem_public_key(f.read())
+        if not isinstance(key, rsa.RSAPublicKey):
+            raise ValueError(f"公钥文件不是 RSA 公钥: {self.public_key_path}")
+        self._public_key = key
 
     def _ensure_private_key_permissions(self) -> None:
         """对已有私钥强制设置仅属主（0o600）权限。"""

@@ -33,12 +33,17 @@ def _consent_login_redirect(request_token: str) -> RedirectResponse:
 
 async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Response:
     """处理 consent 页面的 GET/POST，可作为 custom_route 处理器使用。"""
-    # 从 query（GET）或 form（POST）获取 request_token
+    # 从 query（GET）或 form（POST）获取 request_token；POST 的 form 在此提取一次
+    # 并在下方 CSRF 校验处复用，避免重复 await request.form()。
+    form = None
     if request.method == "GET":
-        request_token = request.query_params.get("request_token")
+        raw = request.query_params.get("request_token")
     else:
         form = await request.form()
-        request_token = form.get("request_token")
+        raw = form.get("request_token")
+
+    # 统一收窄为 str：query/form 取值可能是 UploadFile，排除后按缺失处理。
+    request_token = raw if isinstance(raw, str) else None
 
     if not request_token:
         return HTMLResponse("<h1>Error: missing request_token</h1>", status_code=400)
@@ -73,11 +78,13 @@ async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Re
             )
         return HTMLResponse(provider._render_consent_form(context))
 
-    # POST：校验 CSRF token
-    form = await request.form()
+    # POST：校验 CSRF token（form 已在函数开头提取并复用）
+    assert form is not None
     action = form.get("action", "deny")
     rt = str(request_token)
-    submitted_csrf = form.get("csrf_token")
+    raw_csrf = form.get("csrf_token")
+    # 同样收窄为 str：非字符串（如 UploadFile）视为未提交 CSRF。
+    submitted_csrf = raw_csrf if isinstance(raw_csrf, str) else None
 
     # 在任何删除操作之前查找待处理 auth
     pending_info = provider._pending_auths.get(rt)

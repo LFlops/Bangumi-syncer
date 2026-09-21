@@ -21,12 +21,12 @@ import time
 from typing import Any
 from urllib.parse import urlsplit
 
-from fastmcp.server.auth import OAuthProvider
+from fastmcp.server.auth import AccessToken, OAuthProvider
 from fastmcp.server.auth.cimd import CIMDClientManager
 from fastmcp.server.auth.redirect_validation import is_loopback_host
 from mcp.server.auth.handlers.metadata import MetadataHandler
 from mcp.server.auth.provider import (
-    AccessToken,
+    AccessToken as SDKAccessToken,
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
@@ -36,7 +36,7 @@ from mcp.server.auth.provider import (
 from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyUrl
+from pydantic import AnyHttpUrl, AnyUrl
 from starlette.routing import Route
 
 from app.core.security import security_manager
@@ -108,6 +108,11 @@ class BangumiOAuthProvider(OAuthProvider):
         self.auth_enabled = auth_enabled
         self.auth_username = auth_username
 
+        # 元数据重建用的强类型 URL：基类属性类型为 AnyHttpUrl | None，
+        # 而 build_metadata / metadata.issuer 要求非空 AnyHttpUrl，这里显式收窄。
+        self._metadata_base_url = AnyHttpUrl(str(base_url))
+        self._metadata_issuer_url = AnyHttpUrl(str(issuer))
+
         # 实际发放的默认 scope：客户端不请求 scope 时只给 read（安全默认）。
         # 与 _ALLOWED_SCOPES（校验允许集）区分：后者用于通过 SDK 的 scope 校验。
         self._default_scopes = ["read"]
@@ -143,12 +148,12 @@ class BangumiOAuthProvider(OAuthProvider):
                 and route.path == "/.well-known/oauth-authorization-server"
             ):
                 metadata = build_metadata(
-                    self.base_url,
+                    self._metadata_base_url,
                     self.service_documentation_url,
                     self.client_registration_options or ClientRegistrationOptions(),
                     self.revocation_options or RevocationOptions(),
                 )
-                metadata.issuer = self.issuer_url
+                metadata.issuer = self._metadata_issuer_url
                 metadata.client_id_metadata_document_supported = True
                 metadata_handler = MetadataHandler(metadata)
                 routes[i] = Route(
@@ -190,8 +195,9 @@ class BangumiOAuthProvider(OAuthProvider):
         # 强制执行 client 数量上限
         if len(self._clients) >= self.MAX_CLIENTS:
             raise RegistrationError(
+                "invalid_client_metadata",
                 f"Client registration limit reached ({self.MAX_CLIENTS}). "
-                "Cannot register new clients."
+                "Cannot register new clients.",
             )
         self._clients[client_info.client_id] = client_info
 
@@ -459,10 +465,12 @@ class BangumiOAuthProvider(OAuthProvider):
         对 RefreshToken：从 refresh token 存储中移除。
         """
         self._cleanup_expired_state()
-        if isinstance(token, AccessToken):
+        if isinstance(token, SDKAccessToken):
+            # 运行时用 SDK 基类判定：FastMCP 的 AccessToken 是其子类，二者都能识别
+            # （load_access_token 返回 FastMCP 子类，外部直接构造 SDK 实例亦兼容）。
             # P1-2：在吊销集合中记录 jti，使 verify_token 拒绝该 token。
             # 同时存储该 token 的 exp，以便之后惰性清理该记录。
-            jti = token.claims.get("jti")
+            jti = (token.claims or {}).get("jti")
             if jti:
                 self._revoked_tokens[jti] = float(
                     token.expires_at or (time.time() + self.token_expiry_seconds)
