@@ -15,6 +15,7 @@ FastMCP OAuthProvider（app.mcp.provider）的测试。
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import time
 from urllib.parse import parse_qs, urlparse
@@ -76,7 +77,7 @@ class TestRSAKeyManager:
 
     def test_generate_creates_valid_keypair(self, tmp_path):
         """generate_keys 应生成合法的 RSA 密钥对。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -99,7 +100,7 @@ class TestRSAKeyManager:
 
     def test_load_or_generate_creates_on_first_run(self, tmp_path):
         """load_or_generate 在密钥不存在时应创建密钥。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -114,7 +115,7 @@ class TestRSAKeyManager:
 
     def test_load_or_generate_loads_existing(self, tmp_path):
         """load_or_generate 不应覆盖已存在的密钥。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -136,7 +137,7 @@ class TestRSAKeyManager:
 
     def test_load_or_generate_recovers_missing_public_key(self, tmp_path):
         """私钥存在 + 公钥缺失：重新派生公钥，保留私钥。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -176,7 +177,7 @@ class TestRSAKeyManager:
 
     def test_load_or_generate_generates_pair_when_private_missing(self, tmp_path):
         """私钥缺失：生成一对全新的匹配密钥。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -204,7 +205,7 @@ class TestRSAKeyManager:
 
     def test_public_key_pem_returns_public_key_bytes(self, tmp_path):
         """get_public_key_pem 应返回 PEM 格式的公钥。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -219,7 +220,7 @@ class TestRSAKeyManager:
 
     def test_sign_jwt_creates_valid_jwt(self, tmp_path):
         """sign_jwt 应生成以 RS256 签名的 JWT。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -240,7 +241,7 @@ class TestRSAKeyManager:
 
     def test_verify_jwt_rejects_expired(self, tmp_path):
         """verify_jwt 对已过期的 JWT 应返回 None。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -256,7 +257,7 @@ class TestRSAKeyManager:
 
     def test_verify_jwt_rejects_bad_signature(self, tmp_path):
         """verify_jwt 对签名错误的 JWT 应返回 None。"""
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         private_path = tmp_path / "private.pem"
         public_path = tmp_path / "public.pem"
@@ -271,6 +272,55 @@ class TestRSAKeyManager:
         token = jwt.encode(claims, other_private, algorithm="RS256")
         assert manager.verify_jwt(token) is None
 
+    def test_verify_jwt_过期token_返回None并记录warning(self, tmp_path, caplog):
+        """verify_jwt 对过期 token 应返回 None，并记录含「过期」的 warning。"""
+        from app.mcp.keys import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+
+        token = manager.sign_jwt({"sub": "user1", "exp": int(time.time()) - 100})
+
+        with caplog.at_level(logging.WARNING, logger="app.mcp.keys"):
+            result = manager.verify_jwt(token)
+
+        assert result is None
+        assert "过期" in caplog.text
+        # 严禁把 token 原文写进日志
+        assert token not in caplog.text
+
+    def test_verify_jwt_签名错误token_返回None并记录验证失败warning(
+        self, tmp_path, caplog
+    ):
+        """verify_jwt 对签名错误 token 应返回 None，并记录含「验证失败」的 warning。
+
+        日志只允许打印异常类型名，不得泄露 token 原文。
+        """
+        from app.mcp.keys import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+
+        other_private, _ = _generate_keypair()
+        token = jwt.encode(
+            {"sub": "user1", "exp": int(time.time()) + 3600},
+            other_private,
+            algorithm="RS256",
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.mcp.keys"):
+            result = manager.verify_jwt(token)
+
+        assert result is None
+        assert "验证失败" in caplog.text
+        assert token not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # OAuth Provider 单元测试（T3）
@@ -282,7 +332,7 @@ class TestOAuthProviderUnit:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -716,7 +766,7 @@ class TestMemoryStateTTL:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -900,7 +950,7 @@ class TestConsentFlow:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -1046,7 +1096,7 @@ class TestCIMDIntegration:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -1195,7 +1245,7 @@ class TestMetadataInjection:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -2168,7 +2218,7 @@ class TestOAuthFullFlow:
 
     def test_consent_login_redirect_next_is_safe_relative_path(self):
         """登录重定向 helper 构造的 next 始终是站内相对路径（开放重定向护栏）。"""
-        from app.mcp.provider import _consent_login_redirect
+        from app.mcp.consent import _consent_login_redirect
 
         for raw_token in (
             "plain-token",
@@ -2201,7 +2251,7 @@ class TestDCRFallback:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
@@ -2331,7 +2381,7 @@ class TestSecurityFixes:
 
     @pytest.fixture
     def rsa_manager(self, tmp_path):
-        from app.mcp.provider import RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),

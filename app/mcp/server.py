@@ -13,12 +13,9 @@ from starlette.responses import Response
 from app.core.config import config_manager
 from app.core.security import security_manager
 
-from .provider import (
-    REFRESH_TOKEN_TTL,
-    BangumiOAuthProvider,
-    RSAKeyManager,
-    handle_consent,
-)
+from .consent import handle_consent
+from .keys import RSAKeyManager
+from .provider import REFRESH_TOKEN_TTL, BangumiOAuthProvider
 from .tools import get_current_config, get_logs, update_config
 
 # RSA 密钥默认存放目录（相对 cwd 的项目数据目录）：Docker 镜像 WORKDIR=/app

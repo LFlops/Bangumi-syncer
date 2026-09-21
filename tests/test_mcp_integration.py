@@ -785,7 +785,8 @@ class TestProviderInjection:
     @pytest.fixture
     def custom_provider(self, tmp_path):
         """构造 issuer 为可辨识自定义值的 BangumiOAuthProvider。"""
-        from app.mcp.provider import BangumiOAuthProvider, RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
+        from app.mcp.provider import BangumiOAuthProvider
 
         rsa_manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),

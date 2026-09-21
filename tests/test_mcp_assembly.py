@@ -46,7 +46,8 @@ def test_装配入口默认路径注册consent():
 
 def test_装配入口注入provider路径注册consent(tmp_path):
     """create_mcp_app(provider=...) 返回的 app 同样必须注册 /consent。"""
-    from app.mcp.provider import BangumiOAuthProvider, RSAKeyManager
+    from app.mcp.keys import RSAKeyManager
+    from app.mcp.provider import BangumiOAuthProvider
     from app.mcp.server import create_mcp_app
 
     rsa_manager = RSAKeyManager(

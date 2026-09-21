@@ -1,12 +1,14 @@
 """Bangumi-syncer 的 FastMCP OAuthProvider 实现。
 
 实现内容：
-- RSA 密钥管理（RS256 JWT 签名）
 - OAuthProvider（FastMCP 4），含 authorize/token/register
 - auth.enabled 分支（通过 security_manager 校验 BS 会话，或使用配置的用户名）
-- consent 页面（允许/拒绝），带 CSRF 保护
+- consent 授权页（允许/拒绝），带 CSRF 保护
 - Dynamic Client Registration（RFC 7591）
 - CIMD（Client ID Metadata Document）集成
+
+RSA 密钥管理见 :mod:`app.mcp.keys`；``/consent`` HTTP 处理器见
+:mod:`app.mcp.consent`。
 """
 
 from __future__ import annotations
@@ -14,15 +16,11 @@ from __future__ import annotations
 import hmac
 import html
 import logging
-import os
 import secrets
 import time
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
-import jwt
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
 from fastmcp.server.auth import OAuthProvider
 from fastmcp.server.auth.cimd import CIMDClientManager
 from fastmcp.server.auth.redirect_validation import is_loopback_host
@@ -39,12 +37,11 @@ from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.server.auth.settings import ClientRegistrationOptions, RevocationOptions
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import AnyUrl
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
 from starlette.routing import Route
 
-from app.core.public_url import redirect_public
 from app.core.security import security_manager
+
+from .keys import RSAKeyManager
 
 logger = logging.getLogger(__name__)
 
@@ -59,161 +56,6 @@ REFRESH_TOKEN_TTL = 30 * 24 * 3600  # 30 天
 # 因此请求 "read write" 必须落在允许集内，否则报 invalid_scope。
 # 注意这不改变发放策略——客户端未显式请求 scope 时仍按 _default_scopes 只发 "read"。
 _ALLOWED_SCOPES = ("read", "write")
-
-
-class RSAKeyManager:
-    """管理用于 JWT 签名（RS256）的 RSA 密钥对。"""
-
-    def __init__(
-        self,
-        private_key_path: str,
-        public_key_path: str,
-    ) -> None:
-        self.private_key_path = private_key_path
-        self.public_key_path = public_key_path
-        self._private_key: rsa.RSAPrivateKey | None = None
-        self._public_key: rsa.RSAPublicKey | None = None
-
-    @staticmethod
-    def _ensure_parent_dir(path: str) -> None:
-        """确保目标文件的父目录存在（任意自定义路径均可写入）。
-
-        路径不含目录部分时回退到当前目录 ``.``。
-        """
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-
-    def generate_keys(self) -> None:
-        """生成新的 RSA 密钥对并保存到磁盘。"""
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=2048,
-        )
-        self._private_key = private_key
-        self._public_key = private_key.public_key()
-
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-
-        # 确保目录存在
-        self._ensure_parent_dir(self.private_key_path)
-
-        with open(self.private_key_path, "wb") as f:
-            f.write(private_pem)
-        # 将私钥权限设为仅属主可读写（chmod 600）
-        os.chmod(self.private_key_path, 0o600)
-        self._write_public_key()
-
-    def load_or_generate(self) -> None:
-        """从磁盘加载已有密钥；未找到则生成新密钥对。
-
-        若仅存在私钥，则会从该私钥重新派生公钥（私钥绝不会被替换）。只有私钥
-        缺失才会触发生成新密钥对，因此意外删除公钥不会使此前已签发的 JWT
-        失效；只要私钥仍在，公钥就能随时按需重建，既有 token 的有效性
-        不受影响。
-        """
-        if os.path.exists(self.private_key_path):
-            self._load_private_key()
-            self._ensure_private_key_permissions()
-            if os.path.exists(self.public_key_path):
-                self._load_public_key()
-            else:
-                logger.warning(
-                    "Public key %s missing; re-deriving it from private key %s",
-                    self.public_key_path,
-                    self.private_key_path,
-                )
-                self._write_public_key()
-        else:
-            logger.info(
-                "Private key %s not found; generating new RSA key pair",
-                self.private_key_path,
-            )
-            self.generate_keys()
-
-    def _load_private_key(self) -> None:
-        """从磁盘加载私钥。"""
-        with open(self.private_key_path, "rb") as f:
-            self._private_key = serialization.load_pem_private_key(
-                f.read(), password=None
-            )
-
-    def _load_public_key(self) -> None:
-        """从磁盘加载公钥。"""
-        with open(self.public_key_path, "rb") as f:
-            self._public_key = serialization.load_pem_public_key(f.read())
-
-    def _ensure_private_key_permissions(self) -> None:
-        """对已有私钥强制设置仅属主（0o600）权限。"""
-        current_mode = os.stat(self.private_key_path).st_mode & 0o777
-        if current_mode != 0o600:
-            logger.warning(
-                "Private key %s had mode 0o%o; enforcing owner-only 0o600",
-                self.private_key_path,
-                current_mode,
-            )
-            os.chmod(self.private_key_path, 0o600)
-
-    def _write_public_key(self) -> None:
-        """从已加载的私钥派生公钥并持久化。"""
-        self._public_key = self.private_key.public_key()
-        public_pem = self._public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-        self._ensure_parent_dir(self.public_key_path)
-        with open(self.public_key_path, "wb") as f:
-            f.write(public_pem)
-
-    @property
-    def private_key(self) -> rsa.RSAPrivateKey:
-        if self._private_key is None:
-            raise RuntimeError("Keys not loaded. Call load_or_generate() first.")
-        return self._private_key
-
-    @property
-    def public_key(self) -> rsa.RSAPublicKey:
-        if self._public_key is None:
-            raise RuntimeError("Keys not loaded. Call load_or_generate() first.")
-        return self._public_key
-
-    def get_private_key_pem(self) -> bytes:
-        """获取 PEM 格式的私钥。"""
-        return self.private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.NoEncryption(),
-        )
-
-    def get_public_key_pem(self) -> bytes:
-        """获取 PEM 格式的公钥。"""
-        return self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-
-    def sign_jwt(self, claims: dict[str, Any]) -> str:
-        """用 RS256 对 JWT 签名；若缺失 jti 则补充以保证唯一性。"""
-        if "jti" not in claims:
-            claims["jti"] = secrets.token_urlsafe(16)
-        return jwt.encode(claims, self.get_private_key_pem(), algorithm="RS256")
-
-    def verify_jwt(
-        self, token: str, audience: str | None = None
-    ) -> dict[str, Any] | None:
-        """用公钥验证 JWT，返回 claims；无效则返回 None。"""
-        try:
-            return jwt.decode(
-                token,
-                self.get_public_key_pem(),
-                algorithms=["RS256"],
-                audience=audience,
-                options={"verify_aud": audience is not None},
-            )
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-            return None
 
 
 class BangumiOAuthProvider(OAuthProvider):
@@ -671,8 +513,7 @@ class BangumiOAuthProvider(OAuthProvider):
             del self._revoked_tokens[jti]
 
         logger.debug(
-            "Cleaned in-memory OAuth state: pending=%d auth_codes=%d "
-            "refresh_tokens=%d revoked=%d",
+            "已清理内存态 OAuth 数据：待处理=%d 授权码=%d 刷新令牌=%d 已吊销=%d",
             len(expired_pending),
             len(expired_codes),
             len(expired_refresh),
@@ -788,112 +629,3 @@ class BangumiOAuthProvider(OAuthProvider):
         </body>
         </html>
         """
-
-
-def _consent_login_redirect(request_token: str) -> RedirectResponse:
-    """未登录访问 /consent 时重定向到登录页，登录成功后回跳 consent。
-
-    ``next`` 为**不含 base_path** 的站内路径（与 ``app.api.pages._login_redirect``
-    语义一致），且整体 urlencode，前端 ``static/js/auth.js`` 读取后会校验其为
-    站内路径再回跳（开放重定向护栏）。
-    """
-    consent_path = f"/consent?{urlencode({'request_token': request_token})}"
-    return redirect_public(f"/login?{urlencode({'next': consent_path})}")
-
-
-async def handle_consent(request: Request, provider: BangumiOAuthProvider) -> Response:
-    """处理 consent 页面的 GET/POST，可作为 custom_route 处理器使用。"""
-    # 从 query（GET）或 form（POST）获取 request_token
-    if request.method == "GET":
-        request_token = request.query_params.get("request_token")
-    else:
-        form = await request.form()
-        request_token = form.get("request_token")
-
-    if not request_token:
-        return HTMLResponse("<h1>Error: missing request_token</h1>", status_code=400)
-
-    # 从 cookie 中提取 session token
-    session_token = None
-    cookie = request.headers.get("cookie")
-    if cookie:
-        # 解析 cookie 以查找 session token
-        for part in cookie.split(";"):
-            part = part.strip()
-            if part.startswith("session_token="):
-                session_token = part.split("=", 1)[1]
-                break
-
-    if request.method == "GET":
-        # 当 auth.enabled=True 时先校验会话
-        if provider.auth_enabled:
-            if session_token:
-                session = security_manager.validate_session(session_token)
-                if not session:
-                    return _consent_login_redirect(str(request_token))
-            else:
-                return _consent_login_redirect(str(request_token))
-
-        context = await provider.get_consent_context(
-            request_token, session_token=session_token
-        )
-        if context is None:
-            return HTMLResponse(
-                "<h1>Error: invalid or expired request</h1>", status_code=400
-            )
-        return HTMLResponse(provider._render_consent_form(context))
-
-    # POST：校验 CSRF token
-    form = await request.form()
-    action = form.get("action", "deny")
-    rt = str(request_token)
-    submitted_csrf = form.get("csrf_token")
-
-    # 在任何删除操作之前查找待处理 auth
-    pending_info = provider._pending_auths.get(rt)
-    if pending_info is None:
-        return HTMLResponse(
-            "<h1>Error: invalid or expired request</h1>", status_code=400
-        )
-
-    # 校验 CSRF token（一次性使用，绑定到该待处理 auth）
-    expected_csrf = pending_info.get("csrf_token", "")
-    if not submitted_csrf or not hmac.compare_digest(
-        str(submitted_csrf), str(expected_csrf)
-    ):
-        return HTMLResponse("<h1>Error: invalid CSRF token</h1>", status_code=403)
-
-    redirect_uri = pending_info["redirect_uri"]
-    state = pending_info.get("state")
-
-    if action == "allow":
-        # 当 auth_enabled=True 时，在 POST 允许时重新校验会话
-        username = provider.auth_username
-        if provider.auth_enabled:
-            if session_token:
-                session = security_manager.validate_session(session_token)
-                if not session:
-                    return _consent_login_redirect(rt)
-                username = session.get("username", provider.auth_username)
-            else:
-                return _consent_login_redirect(rt)
-        auth_code = await provider.handle_consent_allow(
-            rt, username=username, csrf_token=submitted_csrf
-        )
-        params: dict[str, str] = {"code": auth_code}
-        if state:
-            params["state"] = state
-        return RedirectResponse(
-            url=f"{redirect_uri}?{urlencode(params)}", status_code=302
-        )
-    else:
-        await provider.handle_consent_deny(rt)
-        params = {
-            "error": "access_denied",
-            "error_description": "User denied authorization",
-        }
-        if state:
-            params["state"] = state
-        return RedirectResponse(
-            url=f"{redirect_uri}?{urlencode(params)}", status_code=302
-        )

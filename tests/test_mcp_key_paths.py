@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-from app.mcp.provider import RSAKeyManager
+from app.mcp.keys import RSAKeyManager
 
 
 class TestDefaultKeyPaths:

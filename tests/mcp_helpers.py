@@ -13,7 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.mcp.provider import BangumiOAuthProvider, RSAKeyManager
+from app.mcp.keys import RSAKeyManager
+from app.mcp.provider import BangumiOAuthProvider
 from app.mcp.server import create_mcp_app
 
 

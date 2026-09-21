@@ -450,7 +450,8 @@ class TestCIMDProviderIntegration:
 
     @pytest.fixture
     def provider(self, tmp_path):
-        from app.mcp.provider import BangumiOAuthProvider, RSAKeyManager
+        from app.mcp.keys import RSAKeyManager
+        from app.mcp.provider import BangumiOAuthProvider
 
         rsa_manager = RSAKeyManager(
             private_key_path=str(tmp_path / "private.pem"),
