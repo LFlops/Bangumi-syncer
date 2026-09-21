@@ -31,6 +31,7 @@ from .llm_usage import LLMUsageRepository
 from .pending_candidates import PendingCandidatesRepository
 from .pending_sync_queue import PendingSyncQueueRepository
 from .sync_records import SyncRecordsRepository
+from .title_blacklist import TitleBlacklistRepository
 from .trakt import TraktRepository
 
 
@@ -61,6 +62,7 @@ class DatabaseManager:
         self.memory = AgentMemoryRepository(self._connection)
         self._pending = PendingCandidatesRepository(self._connection)
         self._pending_sync = PendingSyncQueueRepository(self._connection)
+        self._title_blacklist = TitleBlacklistRepository(self._connection)
         # 公开别名（消费标记写/清归 memory 域，业务层经此只读访问同步记录）
         self.sync_records = self._sync
         # 原 ``_init_database`` 末尾的 backfill 调用移到此处：
@@ -139,11 +141,13 @@ class DatabaseManager:
         match_score: float | None = None,
         match_platform: str = "",
         match_trace: dict | None = None,
+        account_results: list | None = None,
     ) -> int | None:
         """记录同步日志到数据库，返回新记录 id（失败时 None）
 
         匹配追踪相关字段会一并写入 sync_records 表的 match_* 列，
-        并将完整 trace 序列化为 JSON 存入 match_trace 列。
+        并将完整 trace 序列化为 JSON 存入 match_trace 列。account_results
+        为各 Bangumi 账号的标记结果列表，序列化后存入 account_results 列。
         """
         return self._sync.log_sync_record(
             user_name=user_name,
@@ -162,6 +166,7 @@ class DatabaseManager:
             match_score=match_score,
             match_platform=match_platform,
             match_trace=match_trace,
+            account_results=account_results,
         )
 
     def get_sync_records(
@@ -316,6 +321,54 @@ class DatabaseManager:
             confirmed_subject_id=confirmed_subject_id,
             exclude_id=exclude_id,
         )
+
+    # ------------------------------------------------------------------
+    # TitleBlacklistRepository 转发（reject 负样本学习）
+    # ------------------------------------------------------------------
+
+    def add_title_blacklist(
+        self,
+        request_title: str,
+        subject_id: str,
+        user_name: str = "",
+        source: str = "",
+    ) -> bool:
+        """记录一条标题级负样本黑名单（幂等）。"""
+        return self._title_blacklist.add(
+            request_title=request_title,
+            subject_id=subject_id,
+            user_name=user_name,
+            source=source,
+        )
+
+    def bulk_add_title_blacklist(
+        self,
+        request_title: str,
+        subject_ids: list[str],
+        user_name: str = "",
+        source: str = "",
+    ) -> int:
+        """批量记录黑名单，返回新增条数。"""
+        return self._title_blacklist.bulk_add(
+            request_title=request_title,
+            subject_ids=subject_ids,
+            user_name=user_name,
+            source=source,
+        )
+
+    def get_title_blacklist(self, request_title: str) -> set[str]:
+        """返回该标题被拉黑的 subject_id 集合。"""
+        return self._title_blacklist.get_blocked_subject_ids(request_title)
+
+    def remove_title_blacklist(self, request_title: str, subject_id: str) -> bool:
+        """移除某标题下的单个黑名单条目。"""
+        return self._title_blacklist.remove(
+            request_title=request_title, subject_id=subject_id
+        )
+
+    def clear_title_blacklist(self, request_title: str) -> int:
+        """清空某标题的全部黑名单。"""
+        return self._title_blacklist.clear_for_title(request_title)
 
     # ------------------------------------------------------------------
     # PendingSyncQueueRepository 转发
@@ -551,17 +604,21 @@ class DatabaseManager:
         """列出全部账号（列表长度=1 即单用户，无需单/多判断）。"""
         return self._bangumi_accounts.list_accounts()
 
-    def get_active_bangumi_account(self) -> dict | None:
-        """获取当前激活账号；无激活时返回首个。"""
-        return self._bangumi_accounts.get_active_account()
+    def get_primary_bangumi_account(self) -> dict | None:
+        """获取当前首选账号；无首选时返回首个。"""
+        return self._bangumi_accounts.get_primary_account()
 
     def delete_bangumi_account(self, section_name: str) -> bool:
         """删除账号。"""
         return self._bangumi_accounts.delete_account(section_name)
 
-    def set_active_bangumi_account(self, section_name: str) -> bool:
-        """将指定账号设为激活。"""
-        return self._bangumi_accounts.set_active(section_name)
+    def set_primary_bangumi_account(self, section_name: str) -> bool:
+        """将指定账号设为首选。"""
+        return self._bangumi_accounts.set_primary(section_name)
+
+    def set_enabled_bangumi_account(self, section_name: str, enabled: bool) -> bool:
+        """启用/停用指定账号；停用后该账号不参与任务同步。"""
+        return self._bangumi_accounts.set_enabled(section_name, enabled)
 
     def update_bangumi_account_token(self, section_name: str, token: dict) -> bool:
         """仅更新令牌相关字段（OAuth 授权/刷新后回写）。"""
