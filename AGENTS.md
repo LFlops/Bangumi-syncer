@@ -77,6 +77,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 - **「关闸/降级」类安全参数必须正反对照的端到端测试**：只断言 `provider.required_scopes == []` 属属性层，中间件即使忽略该属性也仍绿。凡开关安全门槛的参数，BDD 须同时覆盖「开启→拒绝」与「关闭→放行」，走完整链路、不 mock。
 - **测试 helper 封装生产入口时须断言参数对象同一性**：helper 构造 provider A 却把 provider B 传给 `create_mcp_app(...)` 时测试仍绿，未测到预期配置。至少一例用 spy/monkeypatch 断言 `called_kwargs["provider"] is <helper 构造的对象>`。
 - **契约字段（尤其 OAuth metadata）用精确相等断言，禁止子集断言**：断言 `"read" in scopes_supported` 在无声扩权为 `["read","write","admin"]` 时仍绿，必须写 `== ["read","write"]` 精确锁定。
+- **BDD 场景清单与测试必须逐类对照**：场景列举 N 类失败输入（如「过期/签名错误/aud 不匹配」三类 token），测试必须逐类命中且用精确断言锁定，不允许「测了两类算覆盖三类」。例：verify_jwt 的 BDD 写了三类，实际只测 expired/signature，aud 错误零覆盖，直到圆桌评审才被发现。
+- **报「缺少防护/校验」前先核对实现侧既有约束**：曾把「alg 篡改无防护」报为 P1，实际 `jwt.decode(..., algorithms=["RS256"])` 已锁定算法并由 PyJWT 层防御，属误报。报缺失前必须 grep 实现中的等价约束（算法白名单、Pydantic 边界、开关等）。
 
 ## 安全与敏感信息
 

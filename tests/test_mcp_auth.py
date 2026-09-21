@@ -273,7 +273,7 @@ class TestRSAKeyManager:
         assert manager.verify_jwt(token) is None
 
     def test_verify_jwt_过期token_返回None并记录warning(self, tmp_path, caplog):
-        """verify_jwt 对过期 token 应返回 None，并记录含「过期」的 warning。"""
+        """verify_jwt 对过期 token 应返回 None，并记录 WARNING 级 ExpiredSignatureError。"""
         from app.mcp.keys import RSAKeyManager
 
         manager = RSAKeyManager(
@@ -288,6 +288,11 @@ class TestRSAKeyManager:
             result = manager.verify_jwt(token)
 
         assert result is None
+        # 锁定日志级别 + 异常类型名，不依赖中文文案
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warning_records, "过期 token 必须记录 WARNING 级别日志"
+        assert any("ExpiredSignatureError" in r.getMessage() for r in warning_records)
+        # 中文关键词作为附加语义确认
         assert "过期" in caplog.text
         # 严禁把 token 原文写进日志
         assert token not in caplog.text
@@ -295,7 +300,7 @@ class TestRSAKeyManager:
     def test_verify_jwt_签名错误token_返回None并记录验证失败warning(
         self, tmp_path, caplog
     ):
-        """verify_jwt 对签名错误 token 应返回 None，并记录含「验证失败」的 warning。
+        """verify_jwt 对签名错误 token 应返回 None，并记录 WARNING 级 InvalidSignatureError。
 
         日志只允许打印异常类型名，不得泄露 token 原文。
         """
@@ -318,8 +323,89 @@ class TestRSAKeyManager:
             result = manager.verify_jwt(token)
 
         assert result is None
+        # 锁定日志级别 + 异常类型名，不依赖中文文案
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warning_records, "签名错误 token 必须记录 WARNING 级别日志"
+        assert any("InvalidSignatureError" in r.getMessage() for r in warning_records)
+        # 中文关键词作为附加语义确认
         assert "验证失败" in caplog.text
         assert token not in caplog.text
+
+    def test_verify_jwt_audience不匹配_返回None并记录warning(self, tmp_path, caplog):
+        """verify_jwt 在 audience 不匹配时应返回 None，并记录 InvalidAudienceError 的 warning。"""
+        from app.mcp.keys import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+
+        token = manager.sign_jwt(
+            {
+                "sub": "user1",
+                "exp": int(time.time()) + 3600,
+                "aud": "wrong-aud",
+            }
+        )
+
+        with caplog.at_level(logging.WARNING, logger="app.mcp.keys"):
+            result = manager.verify_jwt(token, audience="bangumi-syncer")
+
+        assert result is None
+        warning_records = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert warning_records, "audience 不匹配必须记录 WARNING 级别日志"
+        assert any("InvalidAudienceError" in r.getMessage() for r in warning_records)
+        assert "验证失败" in caplog.text
+        # 严禁把 token 原文写进日志
+        assert token not in caplog.text
+
+    def test_verify_jwt_audience匹配_返回claims(self, tmp_path):
+        """verify_jwt 在 audience 匹配时应返回 claims 且 sub 正确。"""
+        from app.mcp.keys import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+
+        token = manager.sign_jwt(
+            {
+                "sub": "user1",
+                "exp": int(time.time()) + 3600,
+                "aud": "bangumi-syncer",
+            }
+        )
+
+        result = manager.verify_jwt(token, audience="bangumi-syncer")
+
+        assert result is not None
+        assert result["sub"] == "user1"
+        assert result["aud"] == "bangumi-syncer"
+
+    def test_verify_jwt_audience为None_跳过校验(self, tmp_path):
+        """verify_jwt 在 audience=None 时应跳过受众校验，携带任意 aud 也返回 claims。"""
+        from app.mcp.keys import RSAKeyManager
+
+        manager = RSAKeyManager(
+            private_key_path=str(tmp_path / "private.pem"),
+            public_key_path=str(tmp_path / "public.pem"),
+        )
+        manager.generate_keys()
+
+        token = manager.sign_jwt(
+            {
+                "sub": "user1",
+                "exp": int(time.time()) + 3600,
+                "aud": "some-other-audience",
+            }
+        )
+
+        result = manager.verify_jwt(token, audience=None)
+
+        assert result is not None
+        assert result["sub"] == "user1"
 
 
 # ---------------------------------------------------------------------------

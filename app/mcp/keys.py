@@ -167,6 +167,10 @@ class RSAKeyManager:
     ) -> dict[str, Any] | None:
         """用公钥验证 JWT，返回 claims；无效则返回 None。
 
+        ``audience=None`` 表示**跳过受众（aud）校验**，仅用于显式不需要校验
+        的调用场景；授权服务器的生产路径（``load_access_token``）始终传入
+        非空 audience 做严格校验。
+
         失败时按异常类型记 warning 便于线上定位；**只打印异常类型名**，
         绝不输出 token 原文或可能含敏感内容的异常消息。
         """
