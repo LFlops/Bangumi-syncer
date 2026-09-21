@@ -71,8 +71,6 @@ order: 15
 - **吊销名单清空 ⇒ 已吊销 access token 会"复活"到自然过期（≤1h）**；
 - 唯一落盘的 MCP 认证状态：RSA 密钥对（页面按 `MCP_RSA_PRIVATE_KEY` 路径）。
 
-持久化方案与触发条件见本地记录 `remain/mcp-oauth-state-persistence.md`（未纳入仓库）。
-
 ## 五、代码索引
 
 - `BangumiOAuthProvider`（provider.py）：`authorize` / `register_client` / `exchange_authorization_code` / `exchange_refresh_token` / `load_access_token` / `revoke_token` / `_cleanup_expired_state`

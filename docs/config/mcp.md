@@ -109,6 +109,8 @@ MCP 服务随 BS 主进程启动，下面几个变量通过**启动 BS 的进程
 `MCP_BASE_URL` 环境变量 > 配置项 `[dev] mcp_base_url` > 默认值 `http://localhost:8000`。
 
 不想改环境变量时，也可以在 Web 管理页的「开发与代理」段填写 `mcp_base_url`，效果相同（环境变量优先级更高，两者都设时以环境变量为准）。
+
+该配置与 `auth.enabled` 均在进程启动时读取一次，通过 Web 管理页修改 `mcp_base_url`（或 `auth.enabled`）后**需重启 BS 才生效**。
 :::
 
 ## 常见问题

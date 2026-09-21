@@ -40,10 +40,6 @@ order: 16
 
 更细粒度（`logs:read` / `config:read` / `config:write` / `secrets:write`）暂不考虑：OAuth scope 无继承语义、consent 页与客户端适配成本高。
 
-## 决策记录
-
-- 2026-09-12：暂缓分级，保留现状（write 可写敏感字段）。实施要点与恢复条件见本地记录 `remain/mcp-scope-tiering.md`（未纳入仓库）。
-
 ## 代码索引
 
 - `_require_read_scope()`（tools.py）：read 校验；`update_config` 内 write 校验（均为 defense-in-depth）

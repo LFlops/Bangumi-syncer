@@ -22,7 +22,9 @@ MCP Server 是 Bangumi-syncer 的**内置模块**，通过 MCP 协议（Model Co
 app/mcp/
 ├── __init__.py
 ├── server.py               # FastMCP 服务工厂 + 工具注册
-├── provider.py             # OAuth AS（authorize/token/register）+ RSA 密钥管理 + CIMD
+├── provider.py             # OAuth AS（authorize/token/register）+ CIMD
+├── keys.py                 # RSA 密钥管理（生成/加载/签名/验签）
+├── consent.py              # consent 授权页渲染与处理
 └── tools.py                # 工具实现（get_logs / get_current_config / update_config）
 
 tests/
@@ -31,6 +33,8 @@ tests/
 ├── test_mcp_cimd_real.py   # CIMD（Client ID Metadata Document）流程测试
 ├── test_mcp_embed.py       # FastMCP 嵌入 FastAPI 测试
 ├── test_mcp_integration.py # 端到端集成测试
+├── test_mcp_assembly.py    # 装配唯一性与 provider 同一性断言
+├── test_mcp_key_paths.py   # RSA 默认 data/ 路径、env 覆盖、父目录创建 + 0600
 └── test_main_mcp.py        # main.py MCP 集成测试
 ```
 
@@ -294,6 +298,10 @@ BS 单容器部署，内置 MCP 服务。
 | `MCP_RSA_PUBLIC_KEY` | `data/mcp_public.pem`（Docker 内 `/app/data/mcp_public.pem`） | RSA 公钥路径（相对 cwd；建议挂载 `data/` 持久化） |
 | `MCP_BASE_URL` | `http://localhost:8000` | 服务公共 URL，用作 OAuth issuer / metadata 端点；解析优先级：`create_mcp_server(base_url=...)` 参数 > `MCP_BASE_URL` > `dev.mcp_base_url` 配置 > 默认值 |
 | `MCP_REFRESH_TOKEN_TTL` | `2592000`（30 天） | Refresh Token 有效期，单位：秒；每次轮换后重新计时（滑动窗口） |
+
+::: tip 环境变量与相关配置在启动时读取一次
+`MCP_BASE_URL`、配置项 `dev.mcp_base_url` 与 `auth.enabled` 均在**进程启动时读取一次**：`mcp_app` 是模块导入时创建的单例（`app/mcp/server.py:176`），运行中修改不会热生效，需重启 BS。
+:::
 
 ::: warning 不可配置项
 以下值当前在 `app/mcp/server.py` 中硬编码，**没有对应环境变量**：

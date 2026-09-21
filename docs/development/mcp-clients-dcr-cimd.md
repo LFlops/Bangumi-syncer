@@ -21,15 +21,14 @@ order: 14
 ## 安全边界（关键结论）
 
 - **注册 ≠ 授权**：注册成功后仍需 BS 登录会话 + consent 页点 Allow 才能拿到 token；
-- `/register` 由 `app/main.py` 路由平铺暴露在根路径，未认证可达；
+- `/register` 随 MCP 子应用经 `app.mount("/", mcp_app)` 挂载暴露在根路径，未认证可达；
 - 现实风险：公网暴露时被批量注册（占用上限额度）、社工诱导授权；
 - 缓解：控制网络暴露面；兜底 = **重启进程清空 `_clients`**（连带清 pending/code/refresh/revoked；access token 在 1h 内仍有效）。
 
-## 重置/管理入口的定位（决策记录）
+## 重置/管理入口的定位
 
 - **不应做成 MCP 工具**：MCP 不应管理自身会话与授权；
-- 若未来实现，应挂 BS 会话鉴权的 Web API（列表/重置/计数展示）；
-- 详见本地记录 `remain/mcp-dcr-reset-web-api.md`（未纳入仓库）。
+- 若未来实现，应挂 BS 会话鉴权的 Web API（列表/重置/计数展示）。
 
 ## 关闭 DCR
 
