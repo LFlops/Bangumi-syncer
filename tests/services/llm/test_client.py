@@ -450,6 +450,28 @@ class TestAnthropicProviderFactory:
         assert isinstance(provider, AnthropicProvider)
         assert provider.thinking_level == "high"
 
+    def test_build_provider_reads_global_thinking_level(self, reset_llm_singleton):
+        """_build_provider() 构造的 provider 会读取全局 config 的 thinking_level。
+
+        config 中的 thinking_level 作为 provider 构造默认值；per-call kwargs
+        仍可覆盖（每任务思考强度优先于全局默认）。
+        """
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.anthropic import AnthropicProvider
+
+        # 配置字典中故意残留 thinking_level=high（模拟旧 config.ini）
+        cfg = _make_config("anthropic_compat", thinking_level="high")
+        with patch(
+            "app.services.llm.client.config_manager.get_llm_config",
+            return_value=cfg,
+        ):
+            client = LLMClient()
+
+        provider = client._provider
+        assert isinstance(provider, AnthropicProvider)
+        # provider 的 thinking_level 来自全局 config（测试 cfg 显式给 "high"）
+        assert provider.thinking_level == "high"
+
     def test_openai_provider_accepts_thinking_level(self, reset_llm_singleton):
         """Phase 2.2：双 provider 统一传 thinking_level（openai 侧映射 reasoning_effort）。"""
         from app.services.llm.client import LLMClient

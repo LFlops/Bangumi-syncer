@@ -2271,3 +2271,96 @@ class TestMemoryStatsEstimateM11:
         data = response.json()["data"]
         # related 独立生效：估算 = (min(1,0)=0 + 2) × 80 × 0.7 = 112
         assert data["injected_estimate_tokens"] == 112
+
+
+class TestSummaryThinkingLevelAPIFlow:
+    """任务级 thinking_level 的 API 链路（e2e「编辑弹窗回填」缺陷的单元防线）。
+
+    背景：e2e 场景 2 失败——POST 保存 thinking_level=low 后，编辑弹窗回填 off。
+    根因：API 模型（Create/Update/Response）缺 thinking_level 字段——Pydantic
+    丢弃请求值、响应也不返回，config 层白名单（_SUMMARY_FIELDS）存取因此不可达。
+    """
+
+    def test_create_model_accepts_thinking_level(self):
+        """SummaryJobCreate：默认 off，合法枚举接受，非法拒绝。"""
+        assert SummaryJobCreate().thinking_level == "off"
+        assert SummaryJobCreate(thinking_level="low").thinking_level == "low"
+        with pytest.raises(ValidationError):
+            SummaryJobCreate(thinking_level="ultra")
+
+    def test_update_model_accepts_thinking_level(self):
+        """SummaryJobUpdate：可选字段（None 表示不更新）。"""
+        assert SummaryJobUpdate().thinking_level is None
+        assert SummaryJobUpdate(thinking_level="high").thinking_level == "high"
+
+    def test_response_from_config_dict_carries_thinking_level(self):
+        """SummaryJobResponse.from_config_dict 携带 thinking_level（前端回填数据源）。"""
+        resp = SummaryJobResponse.from_config_dict(
+            {"name": "T", "thinking_level": "medium"}
+        )
+        assert resp.thinking_level == "medium"
+        # 缺省回落 off（兼容无该键的老配置）
+        assert (
+            SummaryJobResponse.from_config_dict({"name": "T"}).thinking_level == "off"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_persists_thinking_level(self):
+        """POST 带 thinking_level → save_summary_config 收到该字段。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                response = await client.post(
+                    "/api/summary/jobs",
+                    json={"name": "TLJob", "thinking_level": "low"},
+                )
+        assert response.status_code == 200
+        saved = mock_cm.save_summary_config.call_args[0][0]
+        assert saved["thinking_level"] == "low"
+
+    @pytest.mark.asyncio
+    async def test_update_persists_thinking_level(self):
+        """PUT 带 thinking_level → save_summary_config 收到该字段。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_scheduler") as mock_scheduler,
+            ):
+                mock_scheduler.apply_config_after_save = AsyncMock()
+                response = await client.put(
+                    "/api/summary/jobs/TLJob", json={"thinking_level": "high"}
+                )
+        assert response.status_code == 200
+        saved = mock_cm.save_summary_config.call_args[0][0]
+        assert saved["thinking_level"] == "high"
+
+    @pytest.mark.asyncio
+    async def test_list_returns_thinking_level(self):
+        """GET 列表响应含 thinking_level（前端回填值）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                mock_cm.get_summary_configs.return_value = [
+                    {"name": "TLJob", "thinking_level": "low"}
+                ]
+                response = await client.get("/api/summary/jobs")
+        assert response.status_code == 200
+        job = response.json()["data"][0]
+        assert job["thinking_level"] == "low"
