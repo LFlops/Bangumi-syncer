@@ -1603,3 +1603,28 @@ class TestEnqueueMatchRun:
             assert dbm.agent_runs.get_run("new-run") is None
         finally:
             dbm._connection._conn.close()
+
+
+# ---------------------------------------------------------------------------
+# P2-4：进程级 active 集合由 tests/conftest.py 的 autouse fixture 统一隔离
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _seed_scheduler_active_runs():
+    """S5：模块首条测试前预先污染进程级 active 集合。
+
+    conftest 的 autouse fixture 在每条测试 setup 阶段清理；模块级 fixture 的
+    setup 早于函数级 fixture，因此首条用例即可观测到 conftest 清理已生效。
+    """
+    import app.services.llm_match_scheduler as sched_module
+
+    sched_module._active_run_ids.add("s5-leftover")
+    yield
+
+
+def test_scheduler_active_runs_cleared_by_conftest_fixture():
+    """S5：预置的 active run 元素被 conftest 的 autouse fixture 清空。"""
+    import app.services.llm_match_scheduler as sched_module
+
+    assert sched_module._active_run_ids == set()
