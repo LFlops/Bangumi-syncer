@@ -54,12 +54,14 @@ _PARAM_REJECTION_PATTERNS = (
     "extra fields not permitted",
     "does not support thinking",
     "does not support reasoning",
+    # 强制 tool_choice 被 thinking 模式拒绝的实测文案（DeepSeek anthropic 兼容层）：
+    # "Thinking mode does not support this tool_choice"
+    "does not support this tool_choice",
 )
 
 # Anthropic invalid_request_error 覆盖过广（消息格式错误等无关 400 也用该 type），
 # 须与扩展参数关键字组合才判定为参数拒绝。
 _PARAM_KEYWORDS = ("thinking", "reasoning", "budget_tokens")
-
 _PARAM_REJECTION_STATUSES = (400, 422)
 
 
@@ -92,6 +94,19 @@ def _is_terminal_error(e: Exception) -> bool:
             # 参数类 400/422 由调用方先走降级路径，此处仅兜底其它确定性 4xx
             return not _is_param_rejection(e)
     return False
+
+
+class LLMCallError(Exception):
+    """LLM 调用失败（重试耗尽或确定性错误）。
+
+    ``retryable`` 指示调用方是否可以安全重试：
+    - ``True``：429/5xx/超时类故障，下个调度周期重试可能恢复。
+    - ``False``：401/403/400/参数类/refusal 等确定性错误，重试无意义。
+    """
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _retry_delay(e: Exception, fallback: int) -> int:
@@ -166,7 +181,11 @@ class LLMClient:
             **kwargs: provider 特定的覆盖参数（temperature、max_tokens 等）。
 
         Returns:
-            成功时返回 ChatResponse，所有重试耗尽时返回空的 ChatResponse。
+            成功时返回 ChatResponse。
+
+        Raises:
+            LLMCallError: 所有重试耗尽或遇到确定性错误（401/403/refusal 等）。
+                ``retryable`` 标志指示调用方是否可安全重试。
         """
         last_error: Exception | None = None
         # L8：latency 只计量成功那次请求（不含退避睡眠墙钟）
@@ -192,6 +211,19 @@ class LLMClient:
                 # 置位降级标记后立即重试（该 provider 实例生命周期内不再发送）
                 if not extras_degraded and _is_param_rejection(e):
                     extras_degraded = True
+                    resp_text = (
+                        getattr(getattr(e, "response", None), "text", "") or ""
+                    ).lower()
+                    if "tool_choice" in resp_text and hasattr(
+                        self._provider, "_force_tool_choice_degraded"
+                    ):
+                        # 专用降级：部分端点（thinking 模式）拒绝强制工具选择，
+                        # 仅降级 tool_choice，保留 thinking 等其它参数
+                        self._provider._force_tool_choice_degraded = True
+                        logger.warning(
+                            "LLM endpoint rejected forced tool_choice, "
+                            f"degraded to auto: {_format_error_detail(e)}"
+                        )
                     if hasattr(self._provider, "_extras_disabled"):
                         self._provider._extras_disabled = True
                     logger.warning(
@@ -201,6 +233,9 @@ class LLMClient:
                     # 顺手项 1：降级重试前重置计时，避免把首次失败请求的耗时计入 latency
                     t_attempt = time.time()
                     continue
+                # 已降级后再次命中参数类拒绝 → 该端点始终不支持该参数 → 终态
+                if extras_degraded and _is_param_rejection(e):
+                    break
                 # M7/M9：确定性错误（refusal/鉴权/参数类）不重试
                 if _is_terminal_error(e):
                     break
@@ -214,7 +249,7 @@ class LLMClient:
                 attempt += 1
                 t_attempt = time.time()  # L8：重试后重新计时
 
-        # 所有重试耗尽 —— 记录错误并返回空响应（latency 仅最后尝试耗时）
+        # 所有重试耗尽 —— 记录错误并抛 LLMCallError（不再返回空响应伪装成功）
         latency_ms = int((time.time() - t_attempt) * 1000)
         error_detail = _format_error_detail(last_error) if last_error else "unknown"
         logger.error(
@@ -226,7 +261,15 @@ class LLMClient:
             job_name=job_name,
             latency_ms=latency_ms,
         )
-        return ChatResponse(content="", model="", usage=None, latency=latency_ms)
+        retryable = not _is_terminal_error(last_error)
+        # 已降级后再次命中参数类拒绝 → 该端点始终不支持该参数，重试无意义 → 终态
+        if (
+            extras_degraded
+            and last_error is not None
+            and _is_param_rejection(last_error)
+        ):
+            retryable = False
+        raise LLMCallError(error_detail, retryable=retryable) from last_error
 
     def _log_success(
         self,
