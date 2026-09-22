@@ -517,6 +517,24 @@ def clean_proxy_env():
 
 
 @pytest.fixture(autouse=True)
+def _speed_up_bangumi_rate_limit():
+    """测试加速：把进程级 Bangumi API 令牌桶替换为高速率实例。
+
+    令牌桶默认 1 req/s、burst=3，多个测试连续发请求会触发真实 sleep 拖慢套件。
+    需要验证限速行为的测试（tests/utils/test_bangumi_rate_limit.py）会在用例内
+    显式 reset 为注入假时钟的实例，不受此 fixture 影响。
+    """
+    from app.utils.bangumi_api.rate_limit import (
+        RateLimiter,
+        reset_bgm_rate_limiter,
+    )
+
+    reset_bgm_rate_limiter(RateLimiter(rate=1_000_000.0, burst=1_000_000))
+    yield
+    reset_bgm_rate_limiter(RateLimiter(rate=1_000_000.0, burst=1_000_000))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_archive_shortcut(monkeypatch):
     """每个测试默认禁用全局 archive_shortcut，避免用户 config.ini 中
     bangumi-archive.enabled=True 通过 conftest 复制污染测试。
