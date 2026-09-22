@@ -86,6 +86,14 @@ from app.core.config import config_manager  # noqa: E402
 from app.core.database import database_manager  # noqa: E402
 from app.models.trakt import TraktConfig  # noqa: E402
 
+# ===== 场景装配（Composition Root）=====
+# 必须在任何测试运行前、且在 CONFIG_FILE / DB 重定向等环境准备完成后执行：
+# 静态装配 match 场景，使调度器等经 get_scenario("match") 取用运行时可用。
+# import llm_assist 会触发其依赖链加载，故置于环境准备之后。
+from app.services.scenarios import wire_scenarios  # noqa: E402
+
+wire_scenarios()
+
 
 @pytest.fixture
 def test_db():
