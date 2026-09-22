@@ -237,6 +237,7 @@ class SummaryService:
         response = await self.llm_client.chat(
             messages,
             job_name=job_config.name,
+            thinking_level=job_config.thinking_level,
         )
 
         return {
@@ -321,6 +322,7 @@ class SummaryService:
             response = await self.llm_client.chat(
                 messages,
                 job_name=job_config.name,
+                thinking_level=job_config.thinking_level,
             )
 
             # 3. 提取记忆（读写同开关：memory_limit=0 不注入也不写入）

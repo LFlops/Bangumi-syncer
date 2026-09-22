@@ -705,7 +705,22 @@ class ConfigManager:
         "max_records",
         "memory_limit",
         "related_limit",
+        "thinking_level",
     )
+
+    _VALID_THINKING_LEVELS = frozenset({"off", "low", "medium", "high"})
+
+    def _normalize_thinking_level(self, raw: Any, *, default: str) -> str:
+        """归一化 thinking_level：strip + 小写，非法值回落 ``default``。
+
+        合法值集合复用 ``_VALID_THINKING_LEVELS``（与 summary 配置同一来源）。
+        调用方显式传入 ``default``（llm_match 为 medium，summary 为 off），避免隐藏默认值。
+        """
+        normalized = str(raw or "").strip().lower()
+        if normalized not in self._VALID_THINKING_LEVELS:
+            logger.warning(f"thinking_level 非法值 {raw!r}，回落默认档 {default!r}")
+            return default
+        return normalized
 
     def get_summary_configs(self) -> list[dict[str, Any]]:
         """获取所有 summary 配置节，按名称排序。"""
@@ -715,6 +730,10 @@ class ConfigManager:
             if section_name.startswith("summary-"):
                 section_config = self.get_section(section_name)
                 section_config["name"] = section_name[len("summary-") :]
+                # 容错：先归一化（去空格+小写），非法才回落默认值
+                section_config["thinking_level"] = self._normalize_thinking_level(
+                    section_config.get("thinking_level", ""), default="off"
+                )
                 configs.append(section_config)
         configs.sort(key=lambda x: x.get("name", ""))
         return configs

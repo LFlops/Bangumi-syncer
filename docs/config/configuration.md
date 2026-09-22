@@ -331,6 +331,9 @@ LLM 连接是独立模块，追番总结和调试工具共用。在「配置管�
 
 </details>
 
+- **最大记录数（max_records）**：每次发送给 LLM 的最大观影记录条数，默认 -1（不限制）。季度/年度总结保持 -1 即可，日常总结可设为 200 控制上下文长度。
+- **思考强度（thinking_level）**：可选 `off` / `low` / `medium` / `high`，默认 `off` 不启用思考。每个总结任务可独立设置，执行时该值会透传到 LLM provider：`anthropic_compat` 映射为 Anthropic extended thinking 的 `budget_tokens`（依次为 2048 / 4096 / 8192），`low` 适合日常总结，高质量总结可试 `high`，不支持 extended thinking 的模型会自动降级为 `off`（日志有提示）；`openai_compat` 映射为 OpenAI `reasoning_effort`（`low` / `medium` / `high`），仅 o 系列推理模型（o1/o3/o4-mini 等）生效，其余模型自动忽略（debug 日志有提示）。
+
 ### 记忆与同剧关联
 
 追番总结可以「记住」之前总结过的内容，让每次总结有连贯性。这两个选项对应任务配置里的 `memory_limit` 与 `related_limit`，默认都是 `0`（关闭）。详见 [🧠 AI 追番总结 · 记忆功能](./summary-memory)。

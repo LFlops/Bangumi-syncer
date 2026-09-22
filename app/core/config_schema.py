@@ -396,6 +396,7 @@ SECTIONS: dict[str, SectionMeta] = {
         visible_in_ui=False,
         hidden_reason="在配置页「AI 追番总结」卡片中管理（经 /api/summary/jobs）",
         # summary 调度器为 instance 类型，配置联动由 summary_jobs API 直调
+        fields=(FieldMeta(name="thinking_level", default="off"),),
     ),
     "llm": SectionMeta(
         name="llm",
@@ -407,7 +408,6 @@ SECTIONS: dict[str, SectionMeta] = {
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),
             FieldMeta(name="timeout", default=60),
-            FieldMeta(name="thinking_level", default="off"),
         ),
     ),
     # ── 调度器全局（order 900）──
