@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import socket
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -14,6 +15,47 @@ import httpx
 from ...core.logging import logger
 from ..http_base import SyncHttpClient
 from ..retry import RETRY_EXCEPTIONS, RETRY_STATUS_CODES
+from .rate_limit import get_bgm_rate_limiter
+
+
+def _parse_retry_after(res: httpx.Response) -> float | None:
+    """解析响应头 ``Retry-After`` 为秒数
+
+    支持纯秒数与 HTTP-date；缺失或无法解析时返回 None（由令牌桶走默认冷却）。
+    """
+    headers = getattr(res, "headers", None) or {}
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+
+    # 纯秒数
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError) as e:
+        # 正常降级路径：Retry-After 也可能是 HTTP-date，继续按 date 解析
+        logger.warning(
+            f"⚠️  Retry-After 非纯秒数，尝试按 HTTP-date 解析: {text!r} ({e})"
+        )
+
+    # HTTP-date
+    try:
+        from email.utils import parsedate_to_datetime
+
+        dt = parsedate_to_datetime(text)
+        if dt is None:
+            logger.warning(f"⚠️  Retry-After 无法解析: {text!r}，使用默认冷却")
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = (dt - datetime.now(timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except (TypeError, ValueError, OverflowError) as e:
+        logger.warning(f"⚠️  Retry-After 无法解析: {text!r} ({e})，使用默认冷却")
+        return None
+
 
 # 上游网关以 2xx 返回错误页（HTML 等非 JSON）时，其语义等价于 502 Bad Gateway。
 # 据此构造等价状态码，让既有的服务端不可用降级链路（5xx 标记不可达并入队待补发）
@@ -23,6 +65,22 @@ _UPSTREAM_GATEWAY_ERROR_STATUS = 502
 
 class HttpLayerMixin:
     """HTTP 请求层相关方法（供 BangumiApi 组合）"""
+
+    def _apply_rate_limit_notification(self, res: httpx.Response) -> None:
+        """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）
+
+        仅 ``< 400``（成功）重置 429 升级计数；5xx 等服务端错误保持计数不变
+        （既不重置也不额外冻结），避免误重置弱化自适应冷却。
+        """
+        limiter = get_bgm_rate_limiter()
+        if res.status_code == 429:
+            limiter.notify_rate_limited(_parse_retry_after(res))
+        elif res.status_code < 400:
+            limiter.notify_success()
+        else:
+            logger.debug(
+                f"⏳ HTTP {res.status_code} 非成功响应：保留 429 升级计数（不重置）"
+            )
 
     def _try_direct_connection(
         self, method: str, url: str, **kwargs: Any
@@ -64,9 +122,11 @@ class HttpLayerMixin:
             kwargs_copy["timeout"] = 15
 
         try:
+            get_bgm_rate_limiter().acquire()
             res = temp_session.request(method, url, **kwargs_copy)
 
             # 检查响应状态
+            self._apply_rate_limit_notification(res)
             if res.status_code < 400:
                 return res
             else:
@@ -150,8 +210,12 @@ class HttpLayerMixin:
             return self._try_direct_connection(method, url, **kwargs)
 
         try:
+            get_bgm_rate_limiter().acquire()
             res = session.request(method, url, **kwargs)
         except RETRY_EXCEPTIONS as e:
+            # 网络异常分支刻意不调用 notify_success、也不冻结令牌桶：
+            # 连接层错误既不能证明请求成功（不应重置 429 升级计数），
+            # 也不代表服务端限流（不应额外冻结）；升级计数保留到下次成功请求重置。
             # SyncHttpClient 重试耗尽后仍抛出异常
             dns_error = "Failed to resolve" in str(
                 e
@@ -181,6 +245,9 @@ class HttpLayerMixin:
             self.mark_api_unreachable()
 
             raise e
+
+        # 429 冻结令牌桶 / 成功重置升级计数（须在重试状态码分支前处理）
+        self._apply_rate_limit_notification(res)
 
         # 重试耗尽后仍返回重试状态码（429/500/502/503/504）
         if res.status_code in RETRY_STATUS_CODES:
