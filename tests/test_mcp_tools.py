@@ -5,6 +5,7 @@ MCP 工具函数测试（app/mcp/tools.py）
 覆盖 BDD 场景：
 1. get_logs：参数透传、时间过滤、文件缺失返回空
 2. get_current_config：脱敏生效
+3. update_config：正常写入、非法段名拒绝、auth 段拒绝
 """
 
 from pathlib import Path
@@ -633,3 +634,288 @@ class TestGetCurrentConfig:
         assert data["notify_email_1"]["url"] == "https://example.com"
         assert data["notify_wecom_1"]["url"] == "https://qyapi.weixin.qq.com/hook"
         assert data["notify_dingtalk_1"]["url"] == "https://oapi.dingtalk.com/hook"
+
+
+# ===========================================================================
+# update_config 测试
+# ===========================================================================
+
+
+class TestUpdateConfig:
+    """update_config 工具：正常写入、非法段名拒绝、auth 段拒绝。"""
+
+    @staticmethod
+    def _make_write_token():
+        """创建含 write scope 的 mock token。"""
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    @pytest.mark.asyncio
+    async def test_update_config_合法段_返回成功(self):
+        """合法段修改 → 返回成功。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section="sync",
+                    key="match_confidence_threshold",
+                    value=0.7,
+                )
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_with("sync", "match_confidence_threshold", 0.7)
+
+    @pytest.mark.asyncio
+    async def test_update_config_下划线段名_自动转连字符(self):
+        """下划线段名（如 bangumi_data）应归一化为连字符。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section="bangumi_data",
+                    key="cache_ttl_days",
+                    value=14,
+                )
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_with("bangumi-data", "cache_ttl_days", 14)
+
+    @pytest.mark.asyncio
+    async def test_update_config_非法段名_抛出ToolError(self):
+        """不存在的段名 → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(
+                        section="nonexistent_section",
+                        key="key",
+                        value="value",
+                    )
+
+        assert "nonexistent_section" in str(exc_info.value)
+        assert "未知配置段" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_auth段_拒绝(self):
+        """auth 段禁止通过 MCP 修改 → ToolError。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(
+                        section="auth",
+                        key="enabled",
+                        value=False,
+                    )
+
+        assert "auth" in str(exc_info.value).lower()
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_auth变体段名_拒绝(self):
+        """auth 的大小写/空白/下划线变体均应被拒绝，且不调用 set_config。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        for section in ("Auth", " auth ", "auth_"):
+            mock_cm = MagicMock()
+
+            with patch("app.mcp.tools.config_manager", mock_cm):
+                with patch(
+                    "app.mcp.tools.get_access_token",
+                    return_value=self._make_write_token(),
+                ):
+                    with pytest.raises(ToolError):
+                        await tools.update_config(
+                            section=section,
+                            key="enabled",
+                            value=False,
+                        )
+
+            mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_多实例段_正常写入(self):
+        """多实例段（如 notify-webhook-1）应正常写入。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section="notify-webhook-1",
+                    key="url",
+                    value="https://example.com/hook",
+                )
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_with(
+            "notify-webhook-1", "url", "https://example.com/hook"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_config_read_scope_token_拒绝写入(self):
+        """read scope token 调 update_config 应被拒绝（ToolError）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        # 模拟 get_access_token 返回仅含 read scope 的 token
+        mock_token = MagicMock()
+        mock_token.scopes = ["read"]
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch("app.mcp.tools.get_access_token", return_value=mock_token):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(
+                        section="sync",
+                        key="match_confidence_threshold",
+                        value=0.7,
+                    )
+
+        assert "需要 write scope" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_no_token_拒绝写入(self):
+        """无 access token（None）时 update_config 应被拒绝。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch("app.mcp.tools.get_access_token", return_value=None):
+                with pytest.raises(ToolError):
+                    await tools.update_config(
+                        section="sync",
+                        key="match_confidence_threshold",
+                        value=0.7,
+                    )
+
+        mock_cm.set_config.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# update_config key/value 合法性校验（P1-4）
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateConfigKeyValueValidation:
+    """验证 update_config 的 key/value 合法性校验。"""
+
+    def _make_write_token(self):
+        """创建含 write scope 的 mock token。"""
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    @pytest.mark.asyncio
+    async def test_update_config_非法key_拒绝(self):
+        """不在 schema 中的 key 应被拒绝。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(
+                        section="sync",
+                        key="nonexistent_key_xyz",
+                        value="anything",
+                    )
+
+        assert "非法配置键" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_超长value_拒绝(self):
+        """超过长度上限的 value 应被拒绝。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(
+                        section="sync",
+                        key="match_confidence_threshold",
+                        value="x" * 10001,
+                    )
+
+        assert "长度" in str(exc_info.value) or "long" in str(exc_info.value).lower()
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_value恰好上限_通过(self):
+        """value 长度恰好等于上限（10000）时应正常写入。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section="sync",
+                    key="match_confidence_threshold",
+                    value="x" * 10000,
+                )
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_once_with(
+            "sync", "match_confidence_threshold", "x" * 10000
+        )

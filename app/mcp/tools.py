@@ -2,7 +2,7 @@
 MCP 工具函数（FastMCP 4 async tools）
 
 直接调用 BS 业务层（同进程），不再走 HTTP。
-提供 2 个只读工具：get_logs / get_current_config。
+提供 3 个工具：get_logs / get_current_config / update_config。
 """
 
 import asyncio
@@ -16,7 +16,11 @@ from fastmcp.server.dependencies import get_access_token
 
 from app.api.logs import _read_log_file
 from app.core.config import config_manager
-from app.core.config_schema import is_sensitive_field
+from app.core.config_schema import (
+    SECTIONS,
+    is_sensitive_field,
+    multi_instance_prefixes,
+)
 from app.core.logging import resolved_dev_log_file_path
 
 # 日志级别白名单（get_logs 参数校验）
@@ -102,6 +106,23 @@ def _filter_by_time_range(
             continue
         filtered.append(line)
     return "".join(filtered)
+
+
+def _valid_section_names() -> set[str]:
+    """返回所有合法段名集合（含多实例段前缀）。"""
+    names: set[str] = set(SECTIONS.keys())
+    names.update(multi_instance_prefixes())
+    return names
+
+
+def _is_valid_section(normalized: str) -> bool:
+    """判断归一化后的段名是否合法（支持多实例段前缀匹配）。"""
+    if normalized in _valid_section_names():
+        return True
+    for prefix in multi_instance_prefixes():
+        if normalized.startswith(f"{prefix}-"):
+            return True
+    return False
 
 
 def _mask_sensitive(config_data: dict[str, Any]) -> dict[str, Any]:
@@ -233,3 +254,78 @@ async def get_current_config() -> dict[str, Any]:
     data = config_manager.get_all_config()
     _mask_sensitive(data)
     return {"status": "success", "data": data}
+
+
+async def update_config(
+    section: str,
+    key: str,
+    value: Any,
+) -> dict[str, Any]:
+    """修改配置项，直接生效；auth 段不可修改。
+
+    Args:
+        section: 配置段名（支持下划线，自动归一化为连字符）。
+        key: 配置键名。
+        value: 配置值。
+
+    Returns:
+        {"status": "success", "message": "...", "data": {"section": ..., "key": ...}}
+
+    Raises:
+        ToolError: 非法段名或 auth 段拒绝。
+    """
+    # scope 校验：update_config 要求 write 权限
+    token = get_access_token()
+    if token is None:
+        raise ToolError(
+            "未找到访问令牌，无法修改配置。请提供含 write 权限的 access token。"
+        )
+    scopes = getattr(token, "scopes", [])
+    if "write" not in scopes:
+        raise ToolError(
+            f"权限不足：update_config 需要 write scope，当前 scope: {scopes}"
+        )
+
+    # 归一化段名：下划线 → 连字符
+    normalized = section.replace("_", "-")
+
+    # auth 段黑名单
+    if normalized == "auth":
+        raise ToolError("auth 段不可通过 MCP 修改，请使用 Web 界面修改认证配置")
+
+    # 校验段名合法性
+    if not _is_valid_section(normalized):
+        valid_names = _valid_section_names()
+        raise ToolError(
+            f"未知配置段: {section}。合法段包括: {', '.join(sorted(valid_names))}"
+        )
+
+    # 校验 key 合法性：非多实例段必须在 schema 字段列表中
+    _section_meta = SECTIONS.get(normalized)
+    if _section_meta is None:
+        # 多实例段（notify-webhook-1 等）：前缀匹配父段
+        for prefix in multi_instance_prefixes():
+            if normalized.startswith(f"{prefix}-"):
+                _section_meta = SECTIONS.get(prefix)
+                break
+
+    if _section_meta is not None and _section_meta.fields:
+        valid_keys = {f.name for f in _section_meta.fields}
+        if key not in valid_keys:
+            raise ToolError(
+                f"非法配置键: {key}。段 {normalized} 的合法键包括: "
+                f"{', '.join(sorted(valid_keys))}"
+            )
+
+    # 校验 value 长度上限（防止 INI 膨胀）：按 str(value) 长度计算
+    _MAX_VALUE_LENGTH = 10000
+    if len(str(value)) > _MAX_VALUE_LENGTH:
+        raise ToolError(f"配置值长度超限: {len(str(value))} > {_MAX_VALUE_LENGTH}")
+
+    config_manager.set_config(normalized, key, value)
+
+    return {
+        "status": "success",
+        "message": f"已更新配置: {normalized}.{key}",
+        "data": {"section": normalized, "key": key},
+    }

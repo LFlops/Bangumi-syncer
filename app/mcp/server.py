@@ -16,7 +16,7 @@ from app.core.security import security_manager
 from .consent import handle_consent
 from .keys import RSAKeyManager
 from .provider import REFRESH_TOKEN_TTL, BangumiOAuthProvider
-from .tools import get_current_config, get_logs
+from .tools import get_current_config, get_logs, update_config
 
 # RSA 密钥默认存放目录（相对 cwd 的项目数据目录）：Docker 镜像 WORKDIR=/app
 # 且已预建 /app/data，故容器内即 /app/data；该目录已加入 .gitignore。
@@ -104,6 +104,7 @@ def _register_tools(mcp: FastMCP) -> None:
     """
     mcp.add_tool(get_logs)
     mcp.add_tool(get_current_config)
+    mcp.add_tool(update_config)
 
 
 def create_mcp_server(
