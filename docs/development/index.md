@@ -13,6 +13,7 @@ order: 100
 | --------------------------------------- | ------------------------------------------------------------- |
 | [🔄 同步服务](./sync-service)           | `CustomItem` 统一模型、`SyncService` 主流程、三段式匹配数据流 |
 | [⏰ 调度器框架](./scheduler)            | `BaseScheduler` 继承、`SchedulerRegistry` 注册、cron 与时区   |
+| [🤖 Agent 运行时与场景协议](./agent-runtime) | 通用运行时、`ScenarioHooks` 协议、扩展新 Agent 场景步骤 |
 | [⚙️ 配置系统](./config)                 | `ConfigManager`、`SectionMeta` 注册表、`FieldMeta` 布尔语义   |
 | [🗄️ 数据库仓储层](./database)           | SQLite 表结构、Repository 模式、迁移机制                      |
 | [🔐 OAuth 集成](./oauth)                | `OAuthProvider` 注册表、`OAuthService` 通用流程、如何接入新提供方 |
