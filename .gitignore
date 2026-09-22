@@ -186,5 +186,18 @@ sync_records.db-shm
 # Claude Code
 .claude/
 
+
 # 本地嵌套的第三方仓库（如 jellyfin-plugin-bangumi），仅本地开发用，不纳入分发
 rrr/
+
+# Pi Agent
+.pi
+
+# 本地待办与内部任务稿（不随仓库提交）
+/remain/
+/specs/
+/scripts/memory_selfcheck.py
+/log.txt.*
+
+# eval 运行产物（本地生成，不入库）
+/eval-out/
