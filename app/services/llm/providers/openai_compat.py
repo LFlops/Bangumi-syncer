@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.core.logging import logger
@@ -21,6 +22,7 @@ from app.services.llm.models import (
     ChatResponse,
     ContentBlock,
     Message,
+    StreamChunk,
     TextBlock,
     ThinkingLevel,
     ToolResultBlock,
@@ -28,6 +30,7 @@ from app.services.llm.models import (
     Usage,
 )
 from app.services.llm.providers.base import BaseProvider
+from app.services.llm.sse import iter_sse_events
 from app.utils.http_client import create_async_client
 
 
@@ -132,6 +135,165 @@ class OpenAICompatProvider(BaseProvider):
             data = response.json()
 
         return self._parse_response(data)
+
+    async def stream(
+        self, messages: list[Message], **kwargs: Any
+    ) -> AsyncIterator[StreamChunk]:
+        """以 SSE 流式方式发送聊天补全请求。
+
+        请求构造复用 chat() 的 _build_request（reasoning_effort 映射、
+        _extras_disabled / _force_tool_choice_degraded 降级、tools 规范化
+        全部沿用），仅追加 stream / stream_options 以启用增量与 usage 上报。
+
+        provider 层不重试、不吞异常：httpx 异常/状态错误直接向上抛，
+        由 client 层（T7）负责重试与降级；已产出部分事件后发生的异常在
+        迭代中自然抛出。
+
+        Args:
+            messages: 对话消息列表。
+            **kwargs: 覆盖默认的 model、max_tokens、temperature、tools 等。
+
+        Yields:
+            provider 无关的归一化流式事件 StreamChunk。
+
+        Raises:
+            httpx.HTTPStatusError: HTTP 错误响应（非 2xx）。
+            httpx.TimeoutException: 请求超时。
+        """
+        url = f"{self.api_base}/chat/completions"
+        model = kwargs.get("model", self.model)
+        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
+        logger.debug(
+            f"LLM stream request: url={url}, model={model}, "
+            f"timeout={self.timeout}s{proxy_label}"
+        )
+
+        body = self._build_request(messages, **kwargs)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # index → (id, name)：OpenAI 仅在首个 tool_call 分片给出 id/name，
+        # 后续 arguments 增量需据此还原归属。
+        tool_index: dict[int, tuple[str, str]] = {}
+
+        async with create_async_client(
+            proxy=self.proxy,
+            timeout=self.timeout,
+            follow_redirects=True,
+        ) as client:
+            async with client.stream(
+                "POST",
+                url,
+                json=body,
+                headers=headers,
+                timeout=self.timeout,
+            ) as response:
+                if not response.is_success:
+                    # 读取错误体并记录，便于上游日志/重试判断；再抛状态错误（与 chat() 一致）
+                    error_body = (await response.aread()).decode("utf-8", "replace")
+                    logger.warning(
+                        f"LLM 流式请求失败: status={response.status_code}, "
+                        f"body={error_body[:500]}"
+                    )
+                    response.raise_for_status()
+                async for event in iter_sse_events(response.aiter_lines()):
+                    if event.data == "[DONE]":
+                        logger.debug("LLM 流式收到 [DONE]，结束迭代")
+                        return
+                    for chunk in self._map_stream_event(event.data, tool_index):
+                        yield chunk
+
+    def _map_stream_event(
+        self, raw: str, tool_index: dict[int, tuple[str, str]]
+    ) -> list[StreamChunk]:
+        """单个 OpenAI chat.completion.chunk → 零或多个 StreamChunk。
+
+        tool_index 为跨事件维护的 index → (id, name) 映射（原地更新）。
+        """
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # 坏事件不中断流：记录后跳过
+            logger.warning("LLM 流式事件 JSON 解析失败，已忽略：%r", raw)
+            return []
+        if not isinstance(data, dict):
+            logger.warning("LLM 流式事件非对象，已忽略：%r", data)
+            return []
+
+        chunks: list[StreamChunk] = []
+        choices = data.get("choices") or []
+        if choices:
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                chunks.append(StreamChunk(type="text_delta", text=content))
+            chunks.extend(
+                self._map_tool_call_deltas(delta.get("tool_calls") or [], tool_index)
+            )
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                # 与 _parse_response 一致：tool_calls → tool_use，其余透传
+                stop_reason = (
+                    "tool_use" if finish_reason == "tool_calls" else finish_reason
+                )
+                chunks.append(StreamChunk(type="stop", stop_reason=stop_reason))
+
+        usage = data.get("usage")
+        if usage:
+            chunks.append(
+                StreamChunk(
+                    type="usage",
+                    usage=Usage(
+                        prompt_tokens=usage.get("prompt_tokens", 0),
+                        completion_tokens=usage.get("completion_tokens", 0),
+                        total_tokens=usage.get("total_tokens", 0),
+                    ),
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _map_tool_call_deltas(
+        tool_calls: list, tool_index: dict[int, tuple[str, str]]
+    ) -> list[StreamChunk]:
+        """tool_calls 分片数组 → tool_use_start / tool_use_delta 事件。"""
+        chunks: list[StreamChunk] = []
+        for tc in tool_calls:
+            index = tc.get("index", 0)
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+
+            if index not in tool_index and name:
+                # 首次出现且带 name → 新建工具调用槽（id 仅首个分片提供）
+                call_id = tc.get("id") or f"call_{index}"
+                tool_index[index] = (call_id, name)
+                chunks.append(
+                    StreamChunk(
+                        type="tool_use_start",
+                        tool_use_id=call_id,
+                        tool_name=name,
+                    )
+                )
+
+            arguments = fn.get("arguments")
+            if arguments:
+                call_id = tool_index.get(index, (tc.get("id") or f"call_{index}", ""))[
+                    0
+                ]
+                chunks.append(
+                    StreamChunk(
+                        type="tool_use_delta",
+                        tool_use_id=call_id,
+                        partial_json=arguments,
+                    )
+                )
+        return chunks
 
     def _build_request(self, messages: list[Message], **kwargs: Any) -> dict:
         """内部模型 → OpenAI wire 格式（请求体）。"""
