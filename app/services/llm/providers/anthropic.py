@@ -12,6 +12,8 @@ _parse_response 两个方法内：
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.core.logging import logger
@@ -20,6 +22,7 @@ from app.services.llm.models import (
     ContentBlock,
     Message,
     RedactedThinkingBlock,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
     ThinkingLevel,
@@ -28,6 +31,7 @@ from app.services.llm.models import (
     Usage,
 )
 from app.services.llm.providers.base import BaseProvider
+from app.services.llm.sse import SSEEvent, iter_sse_events
 from app.utils.http_client import create_async_client
 
 
@@ -106,14 +110,7 @@ class AnthropicProvider(BaseProvider):
         )
 
         body = self._build_request(messages, **kwargs)
-        # x-api-key 为 Anthropic 官方文档标准认证头，Authorization: Bearer 兼容
-        # OpenAI 风格网关——双发对两类端点都兼容且无害。
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-            "anthropic-version": "2023-06-01",
-        }
+        headers = self._auth_headers()
 
         async with create_async_client(
             proxy=self.proxy,
@@ -130,6 +127,199 @@ class AnthropicProvider(BaseProvider):
             data = response.json()
 
         return self._parse_response(data)
+
+    async def stream(
+        self, messages: list[Message], **kwargs: Any
+    ) -> AsyncIterator[StreamChunk]:
+        """以 SSE 流式方式向 API 发送请求，逐条产出归一化事件。
+
+        请求体复用 :meth:`_build_request`（thinking budget 映射、max_tokens
+        抬升、temperature、tool_choice 降级等逻辑与 chat() 完全一致），并追加
+        ``stream: true``。响应逐行交给 :func:`iter_sse_events` 解析后映射为
+        provider 无关的 :class:`StreamChunk`。
+
+        Args:
+            messages: 对话消息列表。
+            **kwargs: 覆盖默认的 model、max_tokens、temperature 或 thinking_level。
+
+        Yields:
+            归一化流式事件（text/thinking/tool_use/usage/stop）。
+
+        Raises:
+            httpx.HTTPStatusError: 非 2xx 响应（不重试、不吞异常）。
+            httpx.TimeoutException: 请求超时。
+        """
+        url = f"{self.api_base}/messages"
+        model = kwargs.get("model", self.model)
+        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
+        logger.debug(
+            f"LLM stream request: url={url}, model={model}, "
+            f"timeout={self.timeout}s{proxy_label}"
+        )
+
+        body = self._build_request(messages, **kwargs)
+        body["stream"] = True
+        headers = self._auth_headers()
+
+        async with create_async_client(
+            proxy=self.proxy,
+            timeout=self.timeout,
+            follow_redirects=True,
+        ) as client:
+            async with client.stream(
+                "POST",
+                url,
+                json=body,
+                headers=headers,
+                timeout=self.timeout,
+            ) as response:
+                response.raise_for_status()
+                async for chunk in self._iter_stream_chunks(response.aiter_lines()):
+                    yield chunk
+
+    def _auth_headers(self) -> dict[str, str]:
+        """构造认证/内容头。
+
+        x-api-key 为 Anthropic 官方文档标准认证头，Authorization: Bearer 兼容
+        OpenAI 风格网关——双发对两类端点都兼容且无害。
+        """
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "x-api-key": self.api_key,
+            "Content-Type": "application/json",
+            "anthropic-version": "2023-06-01",
+        }
+
+    async def _iter_stream_chunks(
+        self, lines: AsyncIterator[str]
+    ) -> AsyncIterator[StreamChunk]:
+        """消费 SSE 文本行，按 Anthropic 事件语义产出 StreamChunk。
+
+        跨事件状态：``tool_index`` 维护 content block index → (tool_use_id,
+        tool_name)（input_json_delta 只带 index，需据此回填 tool_use_id）；
+        ``input_tokens`` 暂存 message_start 的输入用量，待 message_delta 合并。
+        """
+        tool_index: dict[int, tuple[str, str]] = {}
+        input_tokens = 0
+
+        async for event in iter_sse_events(lines):
+            payload = self._decode_sse_payload(event)
+            if payload is None:
+                continue
+            etype = event.event or payload.get("type")
+
+            if etype == "message_start":
+                input_tokens = self._extract_input_tokens(payload)
+            elif etype == "content_block_start":
+                chunk = self._map_content_block_start(payload, tool_index)
+                if chunk is not None:
+                    yield chunk
+            elif etype == "content_block_delta":
+                chunk = self._map_content_block_delta(payload, tool_index)
+                if chunk is not None:
+                    yield chunk
+            elif etype == "message_delta":
+                usage_chunk, stop_chunk = self._map_message_delta(payload, input_tokens)
+                yield usage_chunk
+                yield stop_chunk
+            elif etype == "message_stop":
+                return
+            else:
+                # 宽容处理：SSE 规范允许未知事件类型，忽略并记录
+                logger.debug("忽略未知 SSE 事件类型：%r", etype)
+
+    @staticmethod
+    def _decode_sse_payload(event: SSEEvent) -> dict | None:
+        """解析 SSE 事件的 data 为 dict；空 data 或非法 JSON 返回 None。"""
+        if not event.data:
+            logger.debug("SSE 事件无 data，忽略：event=%r", event.event)
+            return None
+        try:
+            return json.loads(event.data)
+        except json.JSONDecodeError:
+            logger.warning("SSE data 非合法 JSON，忽略：%r", event.data)
+            return None
+
+    @staticmethod
+    def _extract_input_tokens(payload: dict) -> int:
+        """从 message_start 事件提取输入 token 数。"""
+        message = payload.get("message") or {}
+        usage = message.get("usage") or {}
+        return int(usage.get("input_tokens", 0) or 0)
+
+    @staticmethod
+    def _map_content_block_start(
+        payload: dict, tool_index: dict[int, tuple[str, str]]
+    ) -> StreamChunk | None:
+        """content_block_start → tool_use_start；text/thinking 无需立即产出。"""
+        block = payload.get("content_block") or {}
+        if block.get("type") != "tool_use":
+            return None
+        index = payload.get("index", 0)
+        tool_use_id = block.get("id", "")
+        tool_name = block.get("name", "")
+        tool_index[index] = (tool_use_id, tool_name)
+        return StreamChunk(
+            type="tool_use_start",
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+        )
+
+    @staticmethod
+    def _map_content_block_delta(
+        payload: dict, tool_index: dict[int, tuple[str, str]]
+    ) -> StreamChunk | None:
+        """content_block_delta → 对应增量事件；未知 delta 类型返回 None。"""
+        delta = payload.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "text_delta":
+            return StreamChunk(type="text_delta", text=delta.get("text", ""))
+        if dtype == "thinking_delta":
+            return StreamChunk(
+                type="thinking_delta", thinking=delta.get("thinking", "")
+            )
+        if dtype == "signature_delta":
+            # thinking signature 增量：映射为 thinking_delta，仅填 signature 字段。
+            # 签名需完整拼接后随 thinking block 回传，否则多轮对话被端点拒绝。
+            return StreamChunk(
+                type="thinking_delta", signature=delta.get("signature", "")
+            )
+        if dtype == "input_json_delta":
+            index = payload.get("index", 0)
+            tool_use_id = tool_index.get(index, ("", ""))[0]
+            if not tool_use_id:
+                logger.warning(
+                    "input_json_delta 缺少 content_block_start 映射，index=%r", index
+                )
+            return StreamChunk(
+                type="tool_use_delta",
+                tool_use_id=tool_use_id,
+                partial_json=delta.get("partial_json", ""),
+            )
+        logger.debug("忽略未知 content_block_delta 类型：%r", dtype)
+        return None
+
+    @staticmethod
+    def _map_message_delta(
+        payload: dict, input_tokens: int
+    ) -> tuple[StreamChunk, StreamChunk]:
+        """message_delta → (usage 事件, stop 事件)。
+
+        Anthropic usage 字段映射：input_tokens → prompt_tokens、
+        output_tokens → completion_tokens；stop_reason 原样透传。
+        """
+        usage_data = payload.get("usage") or {}
+        output_tokens = int(usage_data.get("output_tokens", 0) or 0)
+        usage = Usage(
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            total_tokens=input_tokens + output_tokens,
+        )
+        stop_reason = (payload.get("delta") or {}).get("stop_reason")
+        return (
+            StreamChunk(type="usage", usage=usage),
+            StreamChunk(type="stop", stop_reason=stop_reason),
+        )
 
     def _build_request(self, messages: list[Message], **kwargs: Any) -> dict:
         """内部模型 → Anthropic wire 格式（请求体）。"""
