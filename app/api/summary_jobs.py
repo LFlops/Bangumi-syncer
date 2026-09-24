@@ -2,9 +2,11 @@
 Summary AI 观影报告任务管理 API。
 """
 
+import json
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException
+from sse_starlette.sse import EventSourceResponse
 
 from ..core.config import config_manager
 from ..core.database import database_manager
@@ -16,8 +18,10 @@ from ..models.summary import (
     SummaryJobTestResponse,
     SummaryJobUpdate,
 )
+from ..services.llm.models import StreamChunk
 from ..services.memory.service import MemoryService
 from ..services.summary import SummaryJobConfig, summary_scheduler, summary_service
+from ..services.summary.service import SummaryStreamResult
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/summary/jobs", tags=["summary_jobs"])
@@ -176,6 +180,61 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
         latency_ms=result.get("latency_ms", 0),
         record_count=result["record_count"],
     )
+
+
+def _chunk_to_stream_event(chunk: StreamChunk) -> dict | None:
+    """把 LLM 归一化事件映射为前端可消费的 SSE 事件体。
+
+    仅透传正文/思考增量；usage/stop/tool_use 等由服务层聚合为 done 事件，
+    不在增量阶段重复推送（返回 None 表示该事件不产生 SSE 输出）。
+    """
+    if chunk.type == "text_delta":
+        return {"type": "delta", "text": chunk.text}
+    if chunk.type == "thinking_delta":
+        return {"type": "thinking", "text": chunk.thinking}
+    return None
+
+
+async def _summary_test_stream_generator(job_config: SummaryJobConfig):
+    """试生成 SSE 事件生成器：delta/thinking 增量 → done（聚合）→ 或 error。"""
+    result = SummaryStreamResult()
+    try:
+        async for chunk in summary_service.generate_summary_stream(job_config, result):
+            event = _chunk_to_stream_event(chunk)
+            if event is not None:
+                yield {"data": json.dumps(event, ensure_ascii=False)}
+
+        usage = result.usage
+        done = {
+            "type": "done",
+            "model": result.model,
+            "prompt_tokens": usage.prompt_tokens if usage else 0,
+            "completion_tokens": usage.completion_tokens if usage else 0,
+            "total_tokens": usage.total_tokens if usage else 0,
+            "latency_ms": result.latency_ms,
+            "record_count": result.record_count,
+        }
+        yield {"data": json.dumps(done, ensure_ascii=False)}
+    except Exception as e:
+        # 异常统一转 error 事件（不 500）：前端据 type=error 展示失败。
+        # CancelledError（客户端断开）不属 Exception，会向上传播终止生成器。
+        logger.error(f"Summary job '{job_config.name}' 流式试生成失败: {e}")
+        yield {
+            "data": json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+        }
+
+
+@router.get("/{name:path}/test/stream")
+async def test_summary_job_stream(name: str, _=Depends(get_current_user_flexible)):
+    """流式试生成摘要（SSE）——逐 token 推送，末尾 done 携带用量/延迟。
+
+    与 POST /test 的区别：不等待全量结果，正文增量渲染；预览语义一致
+    （不含记忆注入、不写记忆、不发通知）。任务不存在时在建立流之前返回 404。
+    """
+    decoded = unquote(name)
+    target = _find_config(decoded)
+    job_config = SummaryJobConfig.from_config_dict(target)
+    return EventSourceResponse(_summary_test_stream_generator(job_config))
 
 
 @router.post("/{name:path}/trigger")

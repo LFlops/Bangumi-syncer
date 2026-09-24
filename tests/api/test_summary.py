@@ -2396,3 +2396,207 @@ class TestSummaryThinkingLevelAPIFlow:
         assert response.status_code == 200
         job = response.json()["data"][0]
         assert job["thinking_level"] == "low"
+
+
+# ========== 试生成流式 SSE 端点（T9） ==========
+
+
+def _parse_sse_data_events(body: str) -> list[dict]:
+    """解析 SSE 响应体中的 ``data:`` 行（忽略注释/心跳/ping）。"""
+    import json
+
+    events: list[dict] = []
+    for line in body.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:") :].strip()
+        if payload:
+            events.append(json.loads(payload))
+    return events
+
+
+def _job_config_dict(name: str = "Test Job") -> dict:
+    return {
+        "id": 1,
+        "name": name,
+        "cron": "0 21 * * *",
+        "lookback_days": 1,
+        "user_name": "",
+        "system_prompt": "",
+        "max_records": 200,
+        "enabled": True,
+    }
+
+
+class TestTestSummaryJobStream:
+    """GET /api/summary/jobs/{id}/test/stream SSE 端点测试。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_delta_sequence_and_done(self):
+        """正常流：delta 事件逐条推送，末尾 done 携带 usage/latency/model。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.llm.models import StreamChunk, Usage
+
+        app = _make_summary_app()
+
+        async def _fake_stream(job_config, result=None):
+            for text in ("你", "好"):
+                yield StreamChunk(type="text_delta", text=text)
+            if result is not None:
+                result.model = "gpt-4o-mini"
+                result.usage = Usage(
+                    prompt_tokens=100, completion_tokens=50, total_tokens=150
+                )
+                result.latency_ms = 123
+                result.record_count = 3
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_service") as mock_service,
+            ):
+                mock_cm.get_summary_configs.return_value = [_job_config_dict()]
+                mock_service.generate_summary_stream = _fake_stream
+
+                response = await client.get("/api/summary/jobs/Test%20Job/test/stream")
+
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+
+        events = _parse_sse_data_events(response.text)
+        deltas = [e for e in events if e.get("type") == "delta"]
+        assert [d["text"] for d in deltas] == ["你", "好"]
+
+        done = next(e for e in events if e.get("type") == "done")
+        assert done["model"] == "gpt-4o-mini"
+        assert done["prompt_tokens"] == 100
+        assert done["completion_tokens"] == 50
+        assert done["total_tokens"] == 150
+        assert done["latency_ms"] == 123
+        assert done["record_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_stream_emits_thinking_event(self):
+        """thinking_delta 作为 thinking 事件推送（可选展示，不阻断主文本）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.llm.models import StreamChunk
+
+        app = _make_summary_app()
+
+        async def _fake_stream(job_config, result=None):
+            yield StreamChunk(type="thinking_delta", thinking="思考中")
+            yield StreamChunk(type="text_delta", text="正文")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_service") as mock_service,
+            ):
+                mock_cm.get_summary_configs.return_value = [_job_config_dict()]
+                mock_service.generate_summary_stream = _fake_stream
+
+                response = await client.get("/api/summary/jobs/Test%20Job/test/stream")
+
+        events = _parse_sse_data_events(response.text)
+        thinking = next(e for e in events if e.get("type") == "thinking")
+        assert thinking["text"] == "思考中"
+        assert any(e.get("type") == "delta" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_stream_error_event_without_500(self):
+        """流中异常 → 200 + error 事件（不 500，不伪装成功）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.llm.models import StreamChunk
+
+        app = _make_summary_app()
+
+        async def _fake_stream(job_config, result=None):
+            yield StreamChunk(type="text_delta", text="开头")
+            raise RuntimeError("LLM down")
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://test",
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_service") as mock_service,
+            ):
+                mock_cm.get_summary_configs.return_value = [_job_config_dict()]
+                mock_service.generate_summary_stream = _fake_stream
+
+                response = await client.get("/api/summary/jobs/Test%20Job/test/stream")
+
+        assert response.status_code == 200
+        events = _parse_sse_data_events(response.text)
+        assert any(e.get("type") == "delta" for e in events)
+        error = next(e for e in events if e.get("type") == "error")
+        assert "LLM down" in error["message"]
+        # 出错后不再补 done（避免前端误判成功）
+        assert not any(e.get("type") == "done" for e in events)
+
+    @pytest.mark.asyncio
+    async def test_stream_404_for_nonexistent_job(self):
+        """任务不存在 → 404（在返回 SSE 响应前抛出）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with patch("app.api.summary_jobs.config_manager") as mock_cm:
+                mock_cm.get_summary_configs.return_value = [
+                    _job_config_dict("Other Job")
+                ]
+                response = await client.get("/api/summary/jobs/Nonexistent/test/stream")
+
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_post_test_endpoint_still_aggregates(self):
+        """回归：POST /test 仍走聚合 generate_summary（行为不变）。"""
+        from httpx import ASGITransport, AsyncClient
+
+        from app.services.llm.models import Usage
+
+        app = _make_summary_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            with (
+                patch("app.api.summary_jobs.config_manager") as mock_cm,
+                patch("app.api.summary_jobs.summary_service") as mock_service,
+            ):
+                mock_cm.get_summary_configs.return_value = [_job_config_dict()]
+                mock_service.generate_summary = AsyncMock(
+                    return_value={
+                        "summary_text": "聚合结果",
+                        "model": "gpt-4o-mini",
+                        "usage": Usage(
+                            prompt_tokens=10, completion_tokens=5, total_tokens=15
+                        ),
+                        "record_count": 3,
+                        "date_from": "2024-01-01",
+                        "date_to": "2024-01-02",
+                    }
+                )
+
+                response = await client.post("/api/summary/jobs/Test%20Job/test")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["summary_text"] == "聚合结果"
+        assert data["total_tokens"] == 15
+        mock_service.generate_summary.assert_awaited_once()
+        mock_service.generate_summary_stream.assert_not_called()

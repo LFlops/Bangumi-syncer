@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from uuid import uuid4
 
@@ -10,6 +12,7 @@ from app.core.logging import logger
 from app.models.memory import MemoryEntry
 
 from ..llm import Message, get_llm_client
+from ..llm.models import StreamAggregator, StreamChunk, Usage
 from ..memory.service import MemoryService
 from ..notification_service import notification_service
 from .models import SummaryJobConfig, SummaryRecord
@@ -70,6 +73,22 @@ _STAGE_FAILURE_META = {
         "summary_prefix": "追番总结任务异常（记忆写入阶段）",
     },
 }
+
+
+@dataclass
+class SummaryStreamResult:
+    """流式试生成的终态元数据（生成器耗尽后由调用方读取）。
+
+    同时作为 ``LLMClient.stream_chat(_state=...)`` 的鸭子类型容器：该参数要求
+    容器具备 ``model`` / ``latency_ms`` / ``used_fallback`` 属性，``stream_chat``
+    会在流式过程中回填（与 ``LLMClient.chat()`` 内部用法一致）。
+    """
+
+    model: str = ""
+    latency_ms: int = 0
+    used_fallback: bool = False
+    usage: Usage | None = None
+    record_count: int = 0
 
 
 class SummaryService:
@@ -222,17 +241,31 @@ class SummaryService:
     # 对外入口
     # ------------------------------------------------------------------
 
-    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
-        """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
+    def _build_preview_context(
+        self, job_config: SummaryJobConfig
+    ) -> tuple[list[Message], int, str, str]:
+        """试生成共用路径：查询记录 → 解析 system prompt → 构建消息。
 
-        返回字典，包含以下键：summary_text、model、usage、record_count、
-        date_from、date_to。
+        返回 ``(messages, record_count, date_from, date_to)``。聚合路径
+        （``generate_summary``）与流式路径（``generate_summary_stream``）共用，
+        保证两条预览路径的消息与统计口径一致。
         """
         records, date_from, date_to = self._query_records(job_config)
         system_prompt = job_config.system_prompt.strip()
         if not system_prompt:
             system_prompt = SummaryJobConfig.system_prompt
         messages = self._build_messages(records, system_prompt, date_from, date_to)
+        return messages, len(records), date_from, date_to
+
+    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
+        """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
+
+        返回字典，包含以下键：summary_text、model、usage、record_count、
+        date_from、date_to。
+        """
+        messages, record_count, date_from, date_to = self._build_preview_context(
+            job_config
+        )
 
         response = await self.llm_client.chat(
             messages,
@@ -245,10 +278,41 @@ class SummaryService:
             "model": response.model,
             "usage": response.usage,
             "latency_ms": response.latency,
-            "record_count": len(records),
+            "record_count": record_count,
             "date_from": date_from,
             "date_to": date_to,
         }
+
+    async def generate_summary_stream(
+        self,
+        job_config: SummaryJobConfig,
+        result: SummaryStreamResult | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """流式试生成：逐条透传 ``stream_chat`` 事件，终态元数据回填到 result。
+
+        与 ``generate_summary`` 共用消息构造与配置解析（``_build_preview_context``），
+        差别仅在底层走流式；预览语义（不含记忆注入、不写记忆、不发通知）保持一致。
+
+        ``result`` 传入时承载 ``model`` / ``usage`` / ``latency_ms`` / ``record_count``；
+        该对象同时作为 ``stream_chat(_state=...)`` 的鸭子类型容器被回填 model/latency。
+        异常（如 ``LLMCallError``）向上透传，由调用方（SSE 端点）转 error 事件。
+        """
+        holder = result if result is not None else SummaryStreamResult()
+        messages, record_count, _date_from, _date_to = self._build_preview_context(
+            job_config
+        )
+        aggregator = StreamAggregator()
+        async for chunk in self.llm_client.stream_chat(
+            messages,
+            job_name=job_config.name,
+            thinking_level=job_config.thinking_level,
+            _state=holder,
+        ):
+            aggregator.feed(chunk)
+            yield chunk
+        # 生成器耗尽：聚合 usage（stream_chat 已回填 model/latency 到 holder）
+        holder.usage = aggregator.finalize().usage
+        holder.record_count = record_count
 
     async def execute_job(self, job_config: SummaryJobConfig) -> bool:
         """完整执行入口：任务级互斥守卫 + 实际执行。
