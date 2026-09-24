@@ -32,7 +32,7 @@ from app.services.llm.client import LLMCallError
 from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 from app.services.llm.tools import ToolRegistry, serialize_tool_result
 
-# 非 read（write/terminal/未注册）缺失工具的占位 tool_result 文案
+# 非只读（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
 _SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
 
@@ -377,7 +377,7 @@ async def _replay_missing_tool(
     span_recorder=None,
     sequence: int = 0,
 ) -> None:
-    """补执行单条缺失的只读工具调用（readonly 校验）。
+    """补执行单条缺失的无副作用工具调用（readonly 门控）。
 
     F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
     追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
@@ -386,6 +386,9 @@ async def _replay_missing_tool(
     G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
     tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
     真实调用留给续跑 loop 自然触发。
+
+    门控判据是 ``readonly``（无副作用语义），**不是** ``idempotent``：幂等 ≠ 无副作用，
+    幂等的 write 工具重复执行仍会留下副作用记录，故仍走占位不补执行。
 
     当 ``span_recorder`` 不为 None 时，为每条缺失工具写 ``tool_execute`` span
     （iteration 由调用方通过 ``begin_replayed_round`` 锚定），保证二次 replay
@@ -404,7 +407,7 @@ async def _replay_missing_tool(
         tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
         span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
 
-    if defn is None or defn.access != "read":
+    if defn is None or not defn.readonly:
         logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
         _append_tool_result(
             messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False

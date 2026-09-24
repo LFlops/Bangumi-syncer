@@ -1,8 +1,8 @@
 """通用工具注册表与执行器。
 
 提供：
-- ``ToolDefinition``：工具元信息（含 access 枚举与 readonly 推导）
-- ``ToolRegistry``：注册 / 执行 / JSON Schema 轻量校验 / 分段并行批量执行
+- ``ToolDefinition``：工具元信息（含 access 枚举、readonly 与 idempotent 推导）
+- ``ToolRegistry``：注册 / 执行 / JSON Schema 轻量校验 / 分段并行批量执行（按幂等分段）
 
 零新增依赖：JSON Schema 校验使用手写轻量实现（必填字段、类型、pattern、maxLength），
 不引入 ``jsonschema``。
@@ -72,9 +72,14 @@ class TerminalCapture:
 class ToolDefinition:
     """单一工具定义。
 
-    - ``access``：read（只读）/ write（写，执行前审计）/ terminal（终止性，仅捕获参数）
-    - ``readonly``：仅代码层面属性，决定循环的分段并行策略；不序列化进 tools schema
+    - ``access``：read（只读）/ write（写，执行前审计）/ terminal（终止性，仅捕获参数）。
+      表示**副作用语义**，用于 write 审计、terminal 捕获、补执行门控。
+    - ``readonly``：仅代码层面属性，表示**无副作用**语义；不序列化进 tools schema。
       默认由 ``access`` 推导（read→True；write/terminal→False），注册时可显式覆盖。
+      补执行门控（``runtime._replay_missing_tool``）以此为准。
+    - ``idempotent``：表示**重复执行安全性**，决定 ``execute_batch`` 的并行调度判据；
+      与 ``access`` 正交（幂等 write 重复执行仍有副作用记录）。默认由 ``access``
+      推导（read→True；write/terminal→False），工具开发者可显式标注覆盖。
     - ``parameters``：OpenAI function calling 标准的 JSON Schema
     """
 
@@ -84,15 +89,19 @@ class ToolDefinition:
     handler: Callable[[dict], Any]
     access: ToolAccess
     readonly: bool | None = None
+    idempotent: bool | None = None
 
     def __post_init__(self) -> None:
         if self.readonly is None:
             self.readonly = self.access == "read"
+        # 显式标注优先；未标注时以 access 作便捷推导（幂等维度独立于 readonly）
+        if self.idempotent is None:
+            self.idempotent = self.access == "read"
 
     def to_schema(self) -> dict:
         """供 provider ``tools`` 参数的 schema：仅 name/description/parameters。
 
-        readonly / access 不序列化（LLM 不可见，天然防诱导）。
+        readonly / idempotent / access 不序列化（LLM 不可见，天然防诱导）。
         """
         return {
             "name": self.name,
@@ -181,9 +190,14 @@ class ToolRegistry:
         return self._tools.get(name)
 
     def is_readonly(self, name: str) -> bool:
-        """工具是否可并行执行（连续 readonly 段）。"""
+        """工具是否无副作用（补执行门控判据）。"""
         defn = self._tools.get(name)
         return defn is not None and bool(defn.readonly)
+
+    def is_idempotent(self, name: str) -> bool:
+        """工具是否幂等（连续幂等段可并行执行的判据）。"""
+        defn = self._tools.get(name)
+        return defn is not None and bool(defn.idempotent)
 
     # -- 校验 ---------------------------------------------------------------
 
@@ -277,8 +291,8 @@ class ToolRegistry:
     ) -> "BatchResults":
         """分段并行批量执行。
 
-        - 按原始顺序扫描：连续 readonly 段 ``asyncio.gather`` 并行（保序返回）
-        - 非 readonly（write / terminal）单独串行，相对顺序保持
+        - 按原始顺序扫描：连续**幂等**（idempotent）段 ``asyncio.gather`` 并行（保序返回）
+        - 非幂等（含 write / terminal / 显式标注非幂等的 read）单独串行，相对顺序保持
         - 返回 ``BatchResults``：``ordered`` 与 ``tool_calls`` **一一对应的独立槽位**，
           同时兼容 ``{tool_use_id: result}`` 的 dict 视图（按 id 取首个结果）：
            - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
@@ -304,11 +318,11 @@ class ToolRegistry:
                 self._record_duplicate(tc, slots[i], recorder=recorder, sequence=i)
                 i += 1
                 continue
-            if self.is_readonly(tc.name):
-                # 收集连续 readonly 段，段内同样跳过重复 id（不进入 gather）
+            if self.is_idempotent(tc.name):
+                # 收集连续幂等段，段内同样跳过重复 id（不进入 gather）
                 j = i
                 seg: list[tuple[int, ToolUseBlock]] = []
-                while j < n and self.is_readonly(tool_calls[j].name):
+                while j < n and self.is_idempotent(tool_calls[j].name):
                     cur = tool_calls[j]
                     if cur.id in seen_ids:
                         slots[j] = self._duplicate_block(cur.id)

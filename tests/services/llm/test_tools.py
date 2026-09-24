@@ -1045,3 +1045,331 @@ async def test_recorder_重复id_占位错误块同样有span且is_error():
     # 首个保留真实结果
     assert results["same"].is_error is False
     assert results["same"].content == '"ran"'
+
+
+# ---------------------------------------------------------------------------
+# T3：幂等（idempotent）维度 —— 默认推导 + 显式覆盖
+#   幂等 ≠ 无副作用：access 是副作用语义，idempotent 是重复执行安全性，二者正交
+# ---------------------------------------------------------------------------
+
+
+def test_tool_definition_idempotent_derives_true_for_read_access():
+    """默认推导：access=read → idempotent=True。"""
+    d = ToolDefinition(
+        name="t", description="d", parameters={}, handler=_noop_handler, access="read"
+    )
+    assert d.idempotent is True
+
+
+def test_tool_definition_idempotent_derives_false_for_write_access():
+    """默认推导：access=write → idempotent=False。"""
+    d = ToolDefinition(
+        name="t", description="d", parameters={}, handler=_noop_handler, access="write"
+    )
+    assert d.idempotent is False
+
+
+def test_tool_definition_idempotent_derives_false_for_terminal_access():
+    """默认推导：access=terminal → idempotent=False。"""
+    d = ToolDefinition(
+        name="t",
+        description="d",
+        parameters={},
+        handler=_noop_handler,
+        access="terminal",
+    )
+    assert d.idempotent is False
+
+
+def test_tool_definition_idempotent_explicit_override_write_true():
+    """显式覆盖：access=write 但幂等（如幂等写接口）→ idempotent=True。"""
+    d = ToolDefinition(
+        name="t",
+        description="d",
+        parameters={},
+        handler=_noop_handler,
+        access="write",
+        idempotent=True,
+    )
+    assert d.idempotent is True
+    # access 副作用语义不受 idempotent 影响（正交）
+    assert d.access == "write"
+
+
+def test_tool_definition_idempotent_explicit_override_read_false():
+    """显式覆盖：access=read 但非幂等（读操作含非幂等副作用）→ idempotent=False。"""
+    d = ToolDefinition(
+        name="t",
+        description="d",
+        parameters={},
+        handler=_noop_handler,
+        access="read",
+        idempotent=False,
+    )
+    assert d.idempotent is False
+    # readonly 仍按 access 推导（read→True），不被 idempotent 覆盖
+    assert d.readonly is True
+
+
+def test_tool_definition_idempotent_and_readonly_are_independent():
+    """两个维度正交：readonly 只看 access，idempotent 独立推导/覆盖。"""
+    d = ToolDefinition(
+        name="t",
+        description="d",
+        parameters={},
+        handler=_noop_handler,
+        access="write",
+        readonly=True,
+        idempotent=False,
+    )
+    assert d.readonly is True
+    assert d.idempotent is False
+
+
+# ---------------------------------------------------------------------------
+# T3：ToolRegistry.is_idempotent 查询（与 is_readonly 并存、未注册口径一致）
+# ---------------------------------------------------------------------------
+
+
+def test_is_idempotent_true_for_read_default_and_explicit_write():
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="r",
+            description="d",
+            parameters={},
+            handler=_noop_handler,
+            access="read",
+        )
+    )
+    reg.register(
+        ToolDefinition(
+            name="w",
+            description="d",
+            parameters={},
+            handler=_noop_handler,
+            access="write",
+            idempotent=True,
+        )
+    )
+    assert reg.is_idempotent("r") is True
+    assert reg.is_idempotent("w") is True
+
+
+def test_is_idempotent_false_for_write_default_and_explicit_read():
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name="w",
+            description="d",
+            parameters={},
+            handler=_noop_handler,
+            access="write",
+        )
+    )
+    reg.register(
+        ToolDefinition(
+            name="r",
+            description="d",
+            parameters={},
+            handler=_noop_handler,
+            access="read",
+            idempotent=False,
+        )
+    )
+    assert reg.is_idempotent("w") is False
+    assert reg.is_idempotent("r") is False
+
+
+def test_is_idempotent_unregistered_returns_false_like_is_readonly():
+    """未注册工具与 is_readonly 口径一致：返回 False（不抛错）。"""
+    reg = ToolRegistry()
+    assert reg.is_idempotent("ghost") is False
+    assert reg.is_readonly("ghost") is False
+
+
+# ---------------------------------------------------------------------------
+# T3：execute_batch 分段判据改为幂等（连续幂等段并行 / 非幂等串行）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_idempotent_segment_runs_in_parallel():
+    """3 个幂等工具（默认 read）连续段并行执行。"""
+    reg = ToolRegistry()
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+
+    async def make_handler(key):
+        async def handler(args):
+            starts[key] = asyncio.get_event_loop().time()
+            await asyncio.sleep(0.05)
+            ends[key] = asyncio.get_event_loop().time()
+            return key
+
+        return handler
+
+    for k in ("a", "b", "c"):
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(k),
+                access="read",
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b", "c")]
+    t0 = asyncio.get_event_loop().time()
+    results = await reg.execute_batch(calls)
+    elapsed = asyncio.get_event_loop().time() - t0
+    # 三条幂等工具并行，总耗时约等于单条（< 3 倍）
+    assert elapsed < 0.13
+    # 起始时间彼此接近（并发启动）
+    assert max(starts.values()) - min(starts.values()) < 0.04
+    # 结果保序
+    assert list(results.keys()) == ["a", "b", "c"]
+    for k in ("a", "b", "c"):
+        assert results[k].is_error is False
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_non_idempotent_tools_run_serially():
+    """2 个非幂等工具（默认 write）严格串行：后者在前者结束后才开始。"""
+    reg = ToolRegistry()
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+
+    async def make_handler(key):
+        async def handler(args):
+            starts[key] = asyncio.get_event_loop().time()
+            await asyncio.sleep(0.05)
+            ends[key] = asyncio.get_event_loop().time()
+            return key
+
+        return handler
+
+    for k in ("a", "b"):
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(k),
+                access="write",  # 默认非幂等
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b")]
+    t0 = asyncio.get_event_loop().time()
+    await reg.execute_batch(calls)
+    elapsed = asyncio.get_event_loop().time() - t0
+    # 串行：总耗时约 2 倍单条
+    assert elapsed >= 0.09
+    # b 在 a 结束之后才启动
+    assert starts["b"] >= ends["a"] - 0.005
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_mixed_segments_preserve_order():
+    """[幂等, 非幂等, 幂等]：段一并行、中间串行、段三并行，结果顺序与输入一致。"""
+    reg = ToolRegistry()
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+
+    async def make_handler(key):
+        async def handler(args):
+            starts[key] = asyncio.get_event_loop().time()
+            await asyncio.sleep(0.03)
+            ends[key] = asyncio.get_event_loop().time()
+            return key
+
+        return handler
+
+    # a/c 幂等（默认 read），b 非幂等（write）
+    for k, access in (("a", "read"), ("b", "write"), ("c", "read")):
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(k),
+                access=access,  # type: ignore[arg-type]
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b", "c")]
+    results = await reg.execute_batch(calls)
+    # 结果保序
+    assert list(results.keys()) == ["a", "b", "c"]
+    # 段边界不重叠：a 段结束后 b 才启动，b 结束后 c 段才启动
+    assert starts["b"] >= ends["a"] - 0.005
+    assert starts["c"] >= ends["b"] - 0.005
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_non_idempotent_read_tool_runs_serially():
+    """新语义：access=read + idempotent=False 的读工具按非幂等处理，串行执行。"""
+    reg = ToolRegistry()
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+
+    async def make_handler(key):
+        async def handler(args):
+            starts[key] = asyncio.get_event_loop().time()
+            await asyncio.sleep(0.05)
+            ends[key] = asyncio.get_event_loop().time()
+            return key
+
+        return handler
+
+    for k in ("a", "b"):
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(k),
+                access="read",
+                idempotent=False,
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b")]
+    t0 = asyncio.get_event_loop().time()
+    await reg.execute_batch(calls)
+    elapsed = asyncio.get_event_loop().time() - t0
+    # 串行：总耗时约 2 倍单条（若仍按 readonly 并行则 < 0.09）
+    assert elapsed >= 0.09
+    assert starts["b"] >= ends["a"] - 0.005
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_idempotent_write_tool_runs_in_parallel():
+    """新语义：access=write + idempotent=True 的写工具按幂等处理，并行执行。"""
+    reg = ToolRegistry()
+    starts: dict[str, float] = {}
+
+    async def make_handler(key):
+        async def handler(args):
+            starts[key] = asyncio.get_event_loop().time()
+            await asyncio.sleep(0.05)
+            return key
+
+        return handler
+
+    for k in ("a", "b"):
+        reg.register(
+            ToolDefinition(
+                name=k,
+                description="d",
+                parameters={"type": "object", "properties": {}},
+                handler=await make_handler(k),
+                access="write",
+                idempotent=True,
+            )
+        )
+    calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b")]
+    t0 = asyncio.get_event_loop().time()
+    await reg.execute_batch(calls)
+    elapsed = asyncio.get_event_loop().time() - t0
+    # 并行：总耗时约等于单条（若串行则 >= 0.09）
+    assert elapsed < 0.09
+    assert max(starts.values()) - min(starts.values()) < 0.04

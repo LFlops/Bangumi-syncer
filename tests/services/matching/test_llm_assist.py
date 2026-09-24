@@ -3669,6 +3669,70 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
     assert json.loads(blk.content) == {"id": 2, "name": "花咲くいろは"}
 
 
+# T3：补执行门控仍以 readonly（无副作用语义）为准，与 idempotent 正交 ---------
+
+
+def test_replay_missing_non_idempotent_read_tool_still_replayed():
+    """access=read 但 idempotent=False：补执行门控看 readonly，仍会补执行（不重放副作用语义）。"""
+    called: list = []
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read_non_idem",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda args: called.append("read_non_idem") or "R",
+            access="read",
+            idempotent=False,
+        )
+    )
+    messages: list = []
+
+    asyncio.run(
+        agent_runtime._replay_missing_tool(
+            {"id": "r1", "name": "read_non_idem", "input": {}}, registry, messages
+        )
+    )
+
+    # readonly 门控放行：handler 被补执行
+    assert called == ["read_non_idem"]
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.tool_use_id == "r1"
+    assert blk.content == '"R"'
+
+
+def test_replay_missing_idempotent_write_tool_appends_placeholder():
+    """access=write 但 idempotent=True：幂等 ≠ 无副作用，补执行门控仍回填占位不重放。"""
+    called: list = []
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="write_idem",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=lambda args: called.append("write_idem") or "W",
+            access="write",
+            idempotent=True,
+        )
+    )
+    messages: list = []
+
+    asyncio.run(
+        agent_runtime._replay_missing_tool(
+            {"id": "w1", "name": "write_idem", "input": {}}, registry, messages
+        )
+    )
+
+    # 副作用语义门控：不补执行，仅回填占位闭合协议
+    assert called == []
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.tool_use_id == "w1"
+    assert blk.content == _SKIP_PLACEHOLDER
+    assert blk.is_error is False
+
+
 # P1-c：补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
 
 
