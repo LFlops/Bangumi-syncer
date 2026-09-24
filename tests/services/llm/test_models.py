@@ -7,10 +7,14 @@ from app.services.llm.models import (
     ChatResponse,
     Message,
     RedactedThinkingBlock,
+    StreamAggregator,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
+    ToolUseBlock,
     Usage,
 )
+from app.services.llm.providers.base import BaseProvider
 
 
 class TestContentBlock:
@@ -214,3 +218,128 @@ class TestChatResponse:
             {"content": "Hi", "model": "m", "extra": "should-be-ignored"}
         )
         assert resp.content == "Hi"
+
+
+class TestStreamAggregator:
+    """StreamChunk 序列聚合为等价 ChatResponse。"""
+
+    def test_aggregate_text_deltas_concatenates_content(self):
+        """多个 text_delta → content 拼接、blocks 含单个 TextBlock。"""
+        agg = StreamAggregator()
+        for part in ("你", "好", "世界"):
+            agg.feed(StreamChunk(type="text_delta", text=part))
+
+        resp = agg.finalize()
+
+        assert resp.content == "你好世界"
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, TextBlock)
+        assert block.text == "你好世界"
+
+    def test_aggregate_thinking_and_signature_deltas(self):
+        """thinking_delta 与 signature 均按增量拼接。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="thinking_delta", thinking="思", signature="sig-1"))
+        agg.feed(StreamChunk(type="thinking_delta", thinking="考", signature="sig-2"))
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "思考"
+        assert block.signature == "sig-1sig-2"
+
+    def test_aggregate_tool_use_deltas_builds_input_dict(self):
+        """tool_use_start + 多段 tool_use_delta → 完整 input dict。"""
+        agg = StreamAggregator()
+        agg.feed(
+            StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="search")
+        )
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json='{"q":')
+        )
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json='"hi"}')
+        )
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.id == "t1"
+        assert block.name == "search"
+        assert block.input == {"q": "hi"}
+
+    def test_malformed_tool_json_falls_back_to_raw(self):
+        """partial_json 非法 → input 兜底 {"raw": <原字符串>}。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="x"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{bad")
+        )
+
+        resp = agg.finalize()
+
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.input == {"raw": "{bad"}
+
+    def test_usage_and_stop_propagated(self):
+        """usage / stop 事件传递到 ChatResponse。"""
+        agg = StreamAggregator()
+        usage = Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+        agg.feed(StreamChunk(type="usage", usage=usage))
+        agg.feed(StreamChunk(type="stop", stop_reason="tool_use"))
+
+        resp = agg.finalize()
+
+        assert resp.usage is not None
+        assert resp.usage.prompt_tokens == 1
+        assert resp.usage.total_tokens == 3
+        assert resp.stop_reason == "tool_use"
+
+    def test_blocks_order_follows_first_appearance(self):
+        """blocks 顺序 = 各块首次出现的事件顺序。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="thinking_delta", thinking="t"))
+        agg.feed(StreamChunk(type="text_delta", text="a"))
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="f"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{}")
+        )
+
+        resp = agg.finalize()
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "ThinkingBlock",
+            "TextBlock",
+            "ToolUseBlock",
+        ]
+
+    def test_empty_stream_finalize(self):
+        """无事件 finalize → 空 blocks、content 为空字符串。"""
+        resp = StreamAggregator().finalize()
+
+        assert resp.blocks == []
+        assert resp.content == ""
+        assert resp.usage is None
+
+
+class TestBaseProviderStream:
+    """BaseProvider.stream 默认实现契约。"""
+
+    @pytest.mark.asyncio
+    async def test_stream_default_raises_not_implemented(self):
+        """子类未实现 stream → 迭代时抛 NotImplementedError。"""
+
+        class ChatOnlyProvider(BaseProvider):
+            async def chat(self, messages, **kwargs):
+                return ChatResponse(content="mocked")
+
+        provider = ChatOnlyProvider()
+        with pytest.raises(NotImplementedError):
+            async for _ in provider.stream([Message(role="user", content="hi")]):
+                pass

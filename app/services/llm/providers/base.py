@@ -4,9 +4,10 @@
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from typing import Any
 
-from app.services.llm.models import ChatResponse, Message
+from app.services.llm.models import ChatResponse, Message, StreamChunk
 
 
 class BaseProvider(ABC):
@@ -40,3 +41,18 @@ class BaseProvider(ABC):
             包含助手回复和可选用量统计的 ChatResponse。
         """
         ...
+
+    async def stream(
+        self, messages: list[Message], **kwargs: Any
+    ) -> AsyncIterator[StreamChunk]:
+        """流式调用（SSE 增量事件）。子类应实现；默认未实现。
+
+        Args:
+            messages: 表示对话历史的 Message 对象列表。
+            **kwargs: provider 特定的额外参数。
+
+        Yields:
+            provider 无关的归一化流式事件 StreamChunk。
+        """
+        raise NotImplementedError("provider 未实现流式")
+        yield  # 使函数成为 async generator
