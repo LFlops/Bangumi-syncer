@@ -1525,6 +1525,91 @@ def test_register_match_tools_overwrite_no_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
+# T13：match 场景 5 个工具显式标注幂等属性（契约语义，不再依赖缺省推导）
+
+
+def test_register_match_tools_idempotent_flags():
+    """4 个查询工具幂等（True）+ submit_suggestion 非幂等（False）。"""
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, _make_bgm())
+
+    assert registry.is_idempotent("search_bangumi") is True
+    assert registry.is_idempotent("get_subject_detail") is True
+    assert registry.is_idempotent("check_subject") is True
+    assert registry.is_idempotent("get_related_subjects") is True
+    assert registry.is_idempotent("submit_suggestion") is False
+
+
+def test_register_match_tools_idempotent_consistent_with_readonly():
+    """显式标注与缺省推导一致：4 个 read 工具 readonly=True；terminal readonly=False。"""
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, _make_bgm())
+
+    for name in (
+        "search_bangumi",
+        "get_subject_detail",
+        "check_subject",
+        "get_related_subjects",
+    ):
+        defn = registry.get(name)
+        assert defn is not None
+        assert defn.readonly is True, name
+        assert defn.idempotent is True, name
+
+    submit = registry.get("submit_suggestion")
+    assert submit is not None
+    assert submit.readonly is False
+    assert submit.idempotent is False
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture():
+    """match 5 工具批量：4 幂等查询并行成段，submit_suggestion 捕获为 terminal。"""
+    import asyncio as _asyncio
+
+    from app.services.llm.tools import TerminalCapture
+
+    class _SlowBgm:
+        def search(self, **kwargs):
+            time.sleep(0.05)
+            return [{"id": 1}]
+
+        def get_subject(self, sid):
+            time.sleep(0.05)
+            return {"name": f"subject-{sid}"}
+
+        def get_related_subjects(self, sid):
+            time.sleep(0.05)
+            return []
+
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, _SlowBgm())
+
+    calls = [
+        ToolUseBlock(id="s", name="search_bangumi", input={"title": "x"}),
+        ToolUseBlock(id="g", name="get_subject_detail", input={"subject_id": "1"}),
+        ToolUseBlock(id="c", name="check_subject", input={"subject_id": "1"}),
+        ToolUseBlock(id="r", name="get_related_subjects", input={"subject_id": "1"}),
+        ToolUseBlock(id="sub", name="submit_suggestion", input={"reason": "done"}),
+    ]
+    t0 = _asyncio.get_event_loop().time()
+    results = await registry.execute_batch(calls)
+    elapsed = _asyncio.get_event_loop().time() - t0
+
+    # 4 个幂等查询并行（串行则约 3×0.05=0.15s）
+    assert elapsed < 0.13
+    # 槽位一一对应：4 个查询成功 + 1 个 terminal 捕获
+    for key in ("s", "g", "c", "r"):
+        block = results[key]
+        assert isinstance(block, ToolResultBlock)
+        assert block.is_error is False
+    terminal = results["sub"]
+    assert isinstance(terminal, TerminalCapture)
+    assert terminal.name == "submit_suggestion"
+    assert terminal.args == {"reason": "done"}
+
+
+# ---------------------------------------------------------------------------
 # G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
 # 否则多用户跨 run 复用首次注册的错误 token
 # ---------------------------------------------------------------------------

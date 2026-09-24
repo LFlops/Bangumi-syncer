@@ -172,6 +172,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             },
             handler=_search,
             access="read",
+            idempotent=True,  # 幂等：纯查询，重复执行无副作用
         ),
         ToolDefinition(
             name="get_subject_detail",
@@ -189,6 +190,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             },
             handler=_get_detail,
             access="read",
+            idempotent=True,  # 幂等：纯查询，重复执行无副作用
         ),
         ToolDefinition(
             name="check_subject",
@@ -206,6 +208,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             },
             handler=_check,
             access="read",
+            idempotent=True,  # 幂等：纯查询，重复执行无副作用
         ),
         ToolDefinition(
             name="get_related_subjects",
@@ -223,6 +226,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             },
             handler=_related,
             access="read",
+            idempotent=True,  # 幂等：纯查询，重复执行无副作用
         ),
         ToolDefinition(
             name="submit_suggestion",
@@ -253,6 +257,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             },
             handler=_noop,
             access="terminal",
+            idempotent=False,  # 非幂等：terminal 状态提交（提交/放弃），不可重复执行
         ),
     ]
     for d in defns:
