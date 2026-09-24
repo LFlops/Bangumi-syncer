@@ -29,10 +29,12 @@ from .models import (
 from .providers.anthropic import AnthropicProvider
 from .providers.base import BaseProvider
 from .providers.openai_compat import OpenAICompatProvider
+from .providers.openai_responses import OpenAIResponsesProvider
 
 _PROVIDER_MAP: dict[str, type] = {
     "openai_compat": OpenAICompatProvider,
     "anthropic_compat": AnthropicProvider,
+    "openai_responses": OpenAIResponsesProvider,
 }
 
 
@@ -188,7 +190,8 @@ def _build_provider(
         "temperature": cfg["temperature"],
         "timeout": cfg["timeout"],
         "proxy": proxy,
-        # 双 provider 构造函数均接受 thinking_level（openai 侧映射 reasoning_effort）
+        # 各 provider 构造函数均接受 thinking_level
+        # （openai_compat / openai_responses 映射 reasoning_effort）
         "thinking_level": cfg.get("thinking_level", "off"),
     }
     return cls(**kwargs)

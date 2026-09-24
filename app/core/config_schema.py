@@ -414,6 +414,8 @@ SECTIONS: dict[str, SectionMeta] = {
         order=610,
         sensitive_fields=frozenset({"api_key"}),
         fields=(
+            # provider 受控取值（与 _PROVIDER_MAP / LLMConfigUpdate.provider 一致）：
+            # openai_compat / anthropic_compat / openai_responses
             FieldMeta(name="provider", default="openai_compat"),
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),

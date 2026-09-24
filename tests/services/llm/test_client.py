@@ -1449,3 +1449,94 @@ class TestStreamChat:
         assert chat_resp.blocks == stream_resp.blocks
         assert chat_resp.stop_reason == stream_resp.stop_reason
         assert chat_resp.usage == stream_resp.usage
+
+
+# ===================================================================
+# openai_responses 工厂分支与枚举收口（T8）
+# ===================================================================
+
+
+class TestOpenAIResponsesProviderFactory:
+    """openai_responses 注册与枚举收口（T8）。
+
+    覆盖：_build_provider 构建并透传参数、LLMClient 集成路径、
+    枚举三处一致（_PROVIDER_MAP / Literal / 非法值拒绝）。
+    """
+
+    def test_build_provider_openai_responses_passes_params(self):
+        """_build_provider('openai_responses', cfg, proxy) 返回实例且参数透传正确。"""
+        from app.services.llm.client import _build_provider
+        from app.services.llm.providers.openai_responses import (
+            OpenAIResponsesProvider,
+        )
+
+        cfg = _make_config("openai_responses", thinking_level="medium")
+        provider = _build_provider("openai_responses", cfg, "http://proxy.local:7890")
+
+        assert isinstance(provider, OpenAIResponsesProvider)
+        assert provider.api_base == "https://test.api.com/v1"
+        assert provider.api_key == "sk-test-key"
+        assert provider.model == "gpt-4o-mini"
+        assert provider.max_tokens == 2000
+        assert provider.temperature == 0.7
+        assert provider.timeout == 60
+        assert provider.thinking_level == "medium"
+        assert provider.proxy == "http://proxy.local:7890"
+
+    def test_build_provider_defaults_thinking_level_off(self):
+        """cfg 未提供 thinking_level 时，构建出的 provider 默认为 off。"""
+        from app.services.llm.client import _build_provider
+        from app.services.llm.providers.openai_responses import (
+            OpenAIResponsesProvider,
+        )
+
+        cfg = _make_config("openai_responses")
+        provider = _build_provider("openai_responses", cfg, None)
+
+        assert isinstance(provider, OpenAIResponsesProvider)
+        assert provider.thinking_level == "off"
+        assert provider.proxy is None
+
+    def test_llm_client_uses_openai_responses(self, reset_llm_singleton):
+        """LLMClient 依据配置 provider=openai_responses 实例化对应 provider。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_responses import (
+            OpenAIResponsesProvider,
+        )
+
+        cfg = _make_config("openai_responses")
+        with patch(
+            "app.services.llm.client.config_manager.get_llm_config",
+            return_value=cfg,
+        ):
+            client = LLMClient()
+
+        assert isinstance(client._provider, OpenAIResponsesProvider)
+        assert client._provider_name == "openai_responses"
+
+    def test_provider_map_contains_all_supported(self):
+        """枚举一致性：_PROVIDER_MAP 同时含三类 provider（回归旧两类）。"""
+        from app.services.llm.client import _PROVIDER_MAP
+
+        assert set(_PROVIDER_MAP) == {
+            "openai_compat",
+            "anthropic_compat",
+            "openai_responses",
+        }
+
+    def test_llm_config_update_accepts_openai_responses(self):
+        """LLMConfigUpdate 接受 provider='openai_responses'。"""
+        from app.models.summary import LLMConfigUpdate
+
+        model = LLMConfigUpdate(provider="openai_responses")
+
+        assert model.provider == "openai_responses"
+
+    def test_llm_config_update_rejects_unknown_provider(self):
+        """非法 provider 仍被 Literal 拒绝（422 边界）。"""
+        from pydantic import ValidationError
+
+        from app.models.summary import LLMConfigUpdate
+
+        with pytest.raises(ValidationError):
+            LLMConfigUpdate(provider="banana")
