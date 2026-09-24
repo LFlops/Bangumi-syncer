@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 ToolAccess = Literal["read", "write", "terminal"]
 
+# 幂等段并行执行的并发上限（S3）：避免一次性发起过多工具调用压垮下游。
+_MAX_PARALLEL_TOOLS = 10
+
 # JSON Schema type → Python 类型（用于轻量校验）
 _TYPE_MAP: dict[str, tuple[type, ...]] = {
     "string": (str,),
@@ -333,9 +336,11 @@ class ToolRegistry:
                         seen_ids.add(cur.id)
                         seg.append((j, cur))
                     j += 1
+                # S3：幂等段并行受 _MAX_PARALLEL_TOOLS 上限约束（保序返回不变）
+                sem = asyncio.Semaphore(_MAX_PARALLEL_TOOLS)
                 seg_results = await asyncio.gather(
                     *[
-                        self._exec_one(t, recorder=recorder, sequence=idx)
+                        self._exec_one_limited(idx, t, recorder=recorder, sem=sem)
                         for idx, t in seg
                     ]
                 )
@@ -371,6 +376,18 @@ class ToolRegistry:
             content="duplicate tool_use_id",
             is_error=True,
         )
+
+    async def _exec_one_limited(
+        self,
+        idx: int,
+        t: ToolUseBlock,
+        *,
+        recorder: ToolSpanRecorder | None,
+        sem: asyncio.Semaphore,
+    ) -> Any:
+        """在并发信号量约束下执行单条工具（S3：幂等段并发上限）。"""
+        async with sem:
+            return await self._exec_one(t, recorder=recorder, sequence=idx)
 
     async def _exec_one(
         self,

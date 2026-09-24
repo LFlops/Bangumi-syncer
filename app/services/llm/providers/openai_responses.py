@@ -489,7 +489,9 @@ class OpenAIResponsesProvider(BaseProvider):
                         yield StreamChunk(
                             type="thinking_delta", thinking=payload.get("delta", "")
                         )
-                    elif name == "response.completed":
+                    elif name in ("response.completed", "response.incomplete"):
+                        # M2：incomplete（截断）与 completed 同路径产出 usage + stop，
+                        # stop_reason 由 _stop_reason_of 依 status 判定
                         response_data = payload.get("response") or {}
                         usage = self._usage_from(response_data.get("usage"))
                         if usage is not None:
@@ -520,12 +522,20 @@ class OpenAIResponsesProvider(BaseProvider):
 
     @staticmethod
     def _stop_reason_of(response_data: dict) -> str:
-        """从 response.completed 的 response 对象推导 stop_reason。"""
+        """从 response.completed / response.incomplete 的 response 对象推导 stop_reason。
+
+        优先级：有 function_call → ``tool_use``；``status == "incomplete"``（截断）
+        → ``max_tokens``；否则 ``end_turn``。与非流式 ``_parse_response`` 口径一致（M2）。
+        """
         has_function_call = any(
             item.get("type") == "function_call"
             for item in (response_data.get("output") or [])
         )
-        return "tool_use" if has_function_call else "end_turn"
+        if has_function_call:
+            return "tool_use"
+        if response_data.get("status") == "incomplete":
+            return "max_tokens"
+        return "end_turn"
 
     @staticmethod
     def _error_message(name: str, payload: dict) -> str:

@@ -948,12 +948,24 @@ class TestStreamRejectionDetection:
             "unsupported parameter: stream",
             "unknown parameter: stream",
             "stream: not supported",
+            # M1：网关文案 "unrecognized parameter 'stream' is not supported"
+            "unrecognized parameter 'stream' is not supported",
+            'unrecognized parameter "stream" is not supported',
         ],
     )
     def test_stream_rejection_patterns_match(self, text):
         from app.services.llm.client import _is_stream_rejection
 
         assert _is_stream_rejection(_httpx_status(400, text)) is True
+
+    def test_stream_options_not_mistaken_as_stream_rejection(self):
+        """M1：'unrecognized parameter stream_options' 不应误判为 stream 拒绝。"""
+        from app.services.llm.client import _is_stream_rejection
+
+        e = _httpx_status(
+            400, "unrecognized parameter 'stream_options' is not supported"
+        )
+        assert _is_stream_rejection(e) is False
 
     def test_non_stream_rejection_does_not_match(self):
         from app.services.llm.client import _is_stream_rejection
@@ -1319,6 +1331,83 @@ class TestStreamChat:
         assert mock_log_usage.call_count == 2  # 每次 fallback 落库一次
 
     @pytest.mark.asyncio
+    async def test_stream_rejection_unrecognized_parameter_stream_falls_back(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """M1：网关文案 "unrecognized parameter 'stream' is not supported"
+        必须走 fallback（而非普通参数降级）。"""
+        from app.services.llm.client import LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        stream_calls: list[dict] = []
+        fallback = ChatResponse(
+            content="fallback",
+            model="gpt-4o-mini",
+            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.stream = _stream_fn(
+            [
+                _httpx_status(
+                    400,
+                    '{"error": "unrecognized parameter \'stream\' is not supported"}',
+                )
+            ],
+            stream_calls,
+        )
+        provider.chat = AsyncMock(return_value=fallback)
+
+        client = LLMClient()
+        client._provider = provider
+
+        resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == "fallback"
+        assert provider._stream_unsupported is True  # 标记流式不支持
+        assert provider.chat.await_count == 1  # fallback 触发
+        assert len(stream_calls) == 1  # 不重试 stream
+        # 关键：不得走普通参数降级（否则会带 stream 重试直至耗尽）
+        assert provider._extras_disabled is False
+        mock_log_usage.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_fallback_llm_call_error_not_retried(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """S1：fallback 抛出确定性 LLMCallError → 不套用重试策略，原样透传。
+
+        评审定位为 stream except；实证放大点实际在 ``_call_with_retry``
+        对冒泡的 ``LLMCallError`` 再次重试（provider.chat 被调 3 次且
+        retryable 被改写为 True）。两处均须直接透传。
+        """
+        from app.services.llm.client import LLMCallError, LLMClient
+        from app.services.llm.providers.openai_compat import OpenAICompatProvider
+
+        stream_calls: list[dict] = []
+        mock_sleep = AsyncMock()
+        provider = OpenAICompatProvider(
+            api_base="https://test.api.com/v1", api_key="sk"
+        )
+        provider.stream = _stream_fn(
+            [_httpx_status(400, "stream is not supported")], stream_calls
+        )
+        provider.chat = AsyncMock(side_effect=LLMCallError("det fail", retryable=False))
+
+        client = LLMClient()
+        client._provider = provider
+
+        with patch(_sleep_patch_path(), mock_sleep):
+            with pytest.raises(LLMCallError) as exc_info:
+                await client.chat([Message(role="user", content="Q")])
+
+        assert exc_info.value.retryable is False  # 原样透传，未被改写
+        assert provider.chat.await_count == 1  # fallback 只调用一次
+        assert len(stream_calls) == 1  # stream 只尝试一次
+        assert mock_sleep.await_count == 0  # 不重试
+
+    @pytest.mark.asyncio
     async def test_stream_error_after_first_chunk_no_retry(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
@@ -1449,6 +1538,44 @@ class TestStreamChat:
         assert chat_resp.blocks == stream_resp.blocks
         assert chat_resp.stop_reason == stream_resp.stop_reason
         assert chat_resp.usage == stream_resp.usage
+
+    @pytest.mark.asyncio
+    async def test_chat_reuses_stream_chat_aggregation_single_pass(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """S4：chat() 复用 stream_chat() 的聚合结果，不对同一响应二次聚合。
+
+        用 feed 计数证明：chat() 路径下聚合器只被 feed 一次（若双重聚合则翻倍）。
+        """
+        from app.services.llm.models import StreamAggregator as _Agg
+
+        feed_count = {"n": 0}
+        original_feed = _Agg.feed
+
+        def counting_feed(self, chunk):
+            feed_count["n"] += 1
+            return original_feed(self, chunk)
+
+        chunks = [
+            StreamChunk(type="text_delta", text="Hello"),
+            StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+            ),
+            StreamChunk(type="stop", stop_reason="end_turn"),
+        ]
+
+        with (
+            patch(_sleep_patch_path(), AsyncMock()),
+            patch.object(_Agg, "feed", counting_feed),
+        ):
+            client = _build_client()
+            client._provider.stream = _stream_fn([chunks])
+            resp = await client.chat([Message(role="user", content="Q")])
+
+        assert resp.content == "Hello"
+        # 3 个 chunk 只被聚合一次（修复前 chat()+stream_chat() 双重聚合 → 6）
+        assert feed_count["n"] == len(chunks)
 
 
 # ===================================================================

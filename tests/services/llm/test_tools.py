@@ -1373,3 +1373,74 @@ async def test_execute_batch_idempotent_write_tool_runs_in_parallel():
     # 并行：总耗时约等于单条（若串行则 >= 0.09）
     assert elapsed < 0.09
     assert max(starts.values()) - min(starts.values()) < 0.04
+
+
+# ---------------------------------------------------------------------------
+# S3：幂等段并发上限（_MAX_PARALLEL_TOOLS）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_idempotent_segment_caps_parallelism():
+    """超过上限的幂等工具并发数不超过 _MAX_PARALLEL_TOOLS。"""
+    from app.services.llm.tools import _MAX_PARALLEL_TOOLS
+
+    reg = ToolRegistry()
+    active = 0
+    max_active = 0
+
+    async def handler(args):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return "ok"
+
+    reg.register(
+        ToolDefinition(
+            name="h",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    n = _MAX_PARALLEL_TOOLS * 2 + 5
+    calls = [ToolUseBlock(id=f"t{i}", name="h", input={}) for i in range(n)]
+    results = await reg.execute_batch(calls)
+
+    assert max_active <= _MAX_PARALLEL_TOOLS
+    assert max_active >= 2  # 仍存在并行
+    assert all(not results[c.id].is_error for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_execute_batch_under_cap_still_parallel():
+    """不超过上限时行为不变：全部并发启动。"""
+    reg = ToolRegistry()
+    active = 0
+    max_active = 0
+
+    async def handler(args):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.02)
+        active -= 1
+        return "ok"
+
+    reg.register(
+        ToolDefinition(
+            name="h",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=handler,
+            access="read",
+        )
+    )
+    calls = [ToolUseBlock(id=f"t{i}", name="h", input={}) for i in range(5)]
+    results = await reg.execute_batch(calls)
+
+    assert max_active == 5
+    assert all(not results[c.id].is_error for c in calls)

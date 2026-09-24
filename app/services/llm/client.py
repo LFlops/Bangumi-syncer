@@ -109,6 +109,10 @@ _STREAM_REJECTION_PATTERNS = (
     "unsupported parameter: stream",
     "unknown parameter: stream",
     "stream: not supported",
+    # M1：网关文案 "unrecognized parameter 'stream' is not supported"
+    # 注意保留闭合引号，避免误伤 stream_options 等同前缀参数
+    "unrecognized parameter 'stream'",
+    'unrecognized parameter "stream"',
 )
 
 
@@ -257,19 +261,29 @@ class LLMClient:
                 ``retryable`` 标志指示调用方是否可安全重试。
         """
         state = _StreamRunState()
-        aggregator = StreamAggregator()
-        async for chunk in self.stream_chat(
+        # S4：chat() 复用 stream_chat() 内部已聚合的结果，避免同一响应聚合两次。
+        # 不污染 _StreamRunState 契约（其可为外部 SummaryStreamResult 鸭子类型），
+        # 故聚合结果经独立私有容器回传。
+        holder: dict[str, ChatResponse | None] = {"response": None}
+        async for _ in self.stream_chat(
             messages,
             job_id=job_id,
             job_name=job_name,
             _state=state,
+            _result=holder,
             **kwargs,
         ):
-            aggregator.feed(chunk)
-        response = aggregator.finalize()
-        response.model = state.model
-        response.latency = state.latency_ms
-        return response
+            # 事件流的聚合与落库均由 stream_chat() 内部完成，此处仅驱动至耗尽。
+            pass
+        response = holder["response"]
+        if response is not None:
+            return response
+        # 防御兜底：正常耗尽/兜底路径均应回填聚合结果；走到此处说明内部契约被破坏
+        # （重跑会二次发起 API 调用），故显式报错暴露该悬垂分支。
+        logger.error("chat() 未取得聚合响应：stream_chat 未按契约回填聚合结果")
+        raise LLMCallError(
+            "stream_chat 未回填聚合响应（内部契约异常）", retryable=False
+        )
 
     async def stream_chat(
         self,
@@ -278,6 +292,7 @@ class LLMClient:
         job_id: int | None = None,
         job_name: str | None = None,
         _state: _StreamRunState | None = None,
+        _result: dict[str, ChatResponse | None] | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
         """流式聊天入口：逐条产出归一化事件，正常耗尽后落库一次。
@@ -287,6 +302,8 @@ class LLMClient:
             job_id: 可选的 job 标识符，用于用量追踪。
             job_name: 可选的 job 名称，用于用量追踪。
             _state: 内部使用——供 ``chat()`` 回读 model/latency 与 fallback 标记。
+            _result: 内部使用——单元素容器，正常耗尽/兜底成功时回填聚合后的
+                ``ChatResponse``，供 ``chat()`` 复用（S4：避免重复聚合）。
             **kwargs: provider 特定的覆盖参数。
 
         Yields:
@@ -300,7 +317,12 @@ class LLMClient:
         aggregator = StreamAggregator()
         completed = False
         inner = self._stream_with_retry(
-            messages, job_id=job_id, job_name=job_name, state=state, **kwargs
+            messages,
+            job_id=job_id,
+            job_name=job_name,
+            state=state,
+            result=_result,
+            **kwargs,
         )
         try:
             async for chunk in inner:
@@ -322,6 +344,7 @@ class LLMClient:
                 response = aggregator.finalize()
                 response.model = state.model
                 response.latency = state.latency_ms
+                self._publish_result(_result, response)  # S4：供 chat() 复用聚合结果
                 self._log_success(response, job_id=job_id, job_name=job_name)
                 logger.debug(
                     f"LLM stream call: model={response.model} "
@@ -336,6 +359,7 @@ class LLMClient:
         job_id: int | None = None,
         job_name: str | None = None,
         state: _StreamRunState,
+        result: dict[str, ChatResponse | None] | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
         """流式调用的重试/降级/兜底包装（唯一底层实现 = provider.stream）。
@@ -349,6 +373,8 @@ class LLMClient:
           确定性 4xx/refusal → 终态。
         - 首 chunk 后失败：一律不重试（已产出内容不回滚），包装为
           ``LLMCallError(retryable=True)`` 抛出。
+
+        ``result`` 为可选的单元素容器，兜底成功时回填聚合结果供 ``chat()`` 复用。
         """
         provider = self._provider
         if getattr(provider, "_stream_unsupported", False):
@@ -356,7 +382,12 @@ class LLMClient:
             logger.debug("LLM 端点已标记不支持流式，直接走非流式兜底")
             state.used_fallback = True
             async for chunk in self._fallback_stream(
-                messages, job_id=job_id, job_name=job_name, state=state, **kwargs
+                messages,
+                job_id=job_id,
+                job_name=job_name,
+                state=state,
+                result=result,
+                **kwargs,
             ):
                 yield chunk
             return
@@ -377,6 +408,14 @@ class LLMClient:
                 return
             except Exception as e:  # noqa: BLE001 - 统一按重试/终态策略处理
                 last_error = e
+                if isinstance(e, LLMCallError):
+                    # S1：确定性 LLMCallError（如 fallback 透传）不套用重试策略，
+                    # 保留其 retryable 原样抛出，避免确定性失败被放大
+                    logger.debug(
+                        "LLM stream 收到 LLMCallError，直接透传（不重试）: "
+                        f"{_format_error_detail(e)}"
+                    )
+                    raise
                 if started:
                     # 已产出内容：不回滚、不重试，包装为可重试错误抛出
                     latency_ms = int((time.time() - t_attempt) * 1000)
@@ -405,6 +444,7 @@ class LLMClient:
                         job_id=job_id,
                         job_name=job_name,
                         state=state,
+                        result=result,
                         **kwargs,
                     ):
                         yield chunk
@@ -430,8 +470,16 @@ class LLMClient:
                 attempt += 1
                 t_attempt = time.time()
             finally:
-                # 显式关闭上游生成器，避免 GeneratorExit/中断时 httpx 流泄漏
-                await source.aclose()
+                # 显式关闭上游生成器，避免 GeneratorExit/中断时 httpx 流泄漏。
+                # S2：防御 source 非 async generator（无 aclose）时 AttributeError。
+                aclose = getattr(source, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+                else:
+                    logger.debug(
+                        "LLM stream source 无 aclose 方法，跳过显式关闭: %s",
+                        type(source).__name__,
+                    )
 
         # 所有重试耗尽 —— 记录错误并抛 LLMCallError
         latency_ms = int((time.time() - t_attempt) * 1000)
@@ -461,13 +509,15 @@ class LLMClient:
         job_id: int | None = None,
         job_name: str | None = None,
         state: _StreamRunState | None = None,
+        result: dict[str, ChatResponse | None] | None = None,
         **kwargs,
     ) -> AsyncIterator[StreamChunk]:
         """非流式兜底：调用 ``_call_with_retry``（含其重试/降级/落库）后，
         把 ChatResponse.blocks 按顺序包装为等价事件序列。
 
         落库由 ``_call_with_retry`` 负责；调用方据 ``state.used_fallback``
-        跳过自身落库，避免重复计费。
+        跳过自身落库，避免重复计费。``result`` 非空时回填聚合响应供 ``chat()``
+        复用（S4）。
         """
         response = await self._call_with_retry(
             messages, job_id=job_id, job_name=job_name, **kwargs
@@ -476,8 +526,19 @@ class LLMClient:
             # 回填实际 model/latency，供 chat() 组装响应
             state.model = response.model or state.model
             state.latency_ms = response.latency
+        self._publish_result(result, response)
         for chunk in self._response_to_chunks(response):
             yield chunk
+
+    @staticmethod
+    def _publish_result(
+        result: dict[str, ChatResponse | None] | None, response: ChatResponse
+    ) -> None:
+        """把聚合后的 ChatResponse 写入单元素容器（S4：供 chat() 复用）。"""
+        if result is None:
+            logger.debug("stream_chat 未提供 result 容器，跳过聚合结果回填")
+            return
+        result["response"] = response
 
     @staticmethod
     def _response_to_chunks(response: ChatResponse) -> list[StreamChunk]:
@@ -573,6 +634,13 @@ class LLMClient:
                 return response
             except Exception as e:
                 last_error = e
+                if isinstance(e, LLMCallError):
+                    # S1：冒泡的确定性 LLMCallError 不重试，原样透传（保留 retryable）
+                    logger.debug(
+                        "LLM 非流式兜底收到 LLMCallError，直接透传（不重试）: "
+                        f"{_format_error_detail(e)}"
+                    )
+                    raise
                 # 双重保险第二道：端点拒绝扩展参数（thinking/reasoning 等）→
                 # 置位降级标记后立即重试（该 provider 实例生命周期内不再发送）
                 if not extras_degraded and _is_param_rejection(e):

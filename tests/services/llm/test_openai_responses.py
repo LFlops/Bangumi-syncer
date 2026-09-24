@@ -713,6 +713,86 @@ class TestStreamCompleted:
 
 
 # --------------------------------------------------------------------------- #
+# M2：流式 incomplete（截断）与 _stop_reason_of 一致性
+# --------------------------------------------------------------------------- #
+class TestStreamIncomplete:
+    """response.incomplete → usage + max_tokens stop；与 _parse_response 一致。"""
+
+    def test_stop_reason_of_incomplete_maps_max_tokens(self):
+        assert (
+            OpenAIResponsesProvider._stop_reason_of(
+                {"status": "incomplete", "output": []}
+            )
+            == "max_tokens"
+        )
+
+    def test_stop_reason_of_incomplete_with_function_call_prefers_tool_use(self):
+        assert (
+            OpenAIResponsesProvider._stop_reason_of(
+                {
+                    "status": "incomplete",
+                    "output": [{"type": "function_call", "call_id": "c", "name": "f"}],
+                }
+            )
+            == "tool_use"
+        )
+
+    def test_stop_reason_of_completed_maps_end_turn(self):
+        assert (
+            OpenAIResponsesProvider._stop_reason_of(
+                {"status": "completed", "output": []}
+            )
+            == "end_turn"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incomplete_event_emits_usage_and_max_tokens(self):
+        lines = _sse(
+            "response.incomplete",
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 7,
+                        "output_tokens": 8,
+                        "total_tokens": 15,
+                    },
+                },
+            },
+        )
+        mock_client = _make_stream_client(lines)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            chunks = await _collect(_provider(), [Message(role="user", content="q")])
+
+        usage_chunks = [c for c in chunks if c.type == "usage"]
+        assert len(usage_chunks) == 1
+        assert usage_chunks[0].usage is not None
+        assert usage_chunks[0].usage.total_tokens == 15
+        assert chunks[-1].type == "stop"
+        assert chunks[-1].stop_reason == "max_tokens"
+
+    @pytest.mark.asyncio
+    async def test_incomplete_event_with_function_call_stop_tool_use(self):
+        lines = _sse(
+            "response.incomplete",
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "output": [{"type": "function_call", "call_id": "c1", "name": "f"}],
+                },
+            },
+        )
+        mock_client = _make_stream_client(lines)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            chunks = await _collect(_provider(), [Message(role="user", content="q")])
+
+        assert chunks[-1].stop_reason == "tool_use"
+
+
+# --------------------------------------------------------------------------- #
 # 场景 11：流式失败事件
 # --------------------------------------------------------------------------- #
 class TestStreamFailure:
