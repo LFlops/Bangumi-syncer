@@ -765,18 +765,44 @@ class TestUpdateLLMConfig:
                 mock_cm.set_config.assert_not_called()
 
 
+class _FakeLLMStream:
+    """可控的异步流对象，模拟 ``client.stream_chat()`` 返回值。
+
+    支持 ``async for``（``__aiter__``/``__anext__``）与显式 ``aclose()``，
+    并记录 ``aclose`` 是否被调用——用于断言端点在收到首个内容事件后主动关闭流。
+    """
+
+    def __init__(self, chunks, *, error=None):
+        self._chunks = list(chunks)
+        self._error = error
+        self.aclose_called = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._error is not None:
+            raise self._error
+        if not self._chunks:
+            raise StopAsyncIteration
+        return self._chunks.pop(0)
+
+    async def aclose(self):
+        self.aclose_called = True
+
+
 class TestTestLLMConnection:
-    """POST /api/llm/test 端点测试。"""
+    """POST /api/llm/test 端点测试（T10：改走流式 stream_chat）。"""
 
     @pytest.mark.asyncio
     async def test_successful_llm_connection(self):
-        """POST /api/llm/test 在 LLM 有效时应返回成功。"""
+        """POST /api/llm/test 收到首个内容事件即返回成功（流式连通，不等待全量）。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
         from app.api.deps import get_current_user_flexible
         from app.api.llm import router
-        from app.services.llm.models import ChatResponse, Usage
+        from app.services.llm.models import StreamChunk
 
         app = FastAPI()
         app.include_router(router)
@@ -786,16 +812,22 @@ class TestTestLLMConnection:
 
         app.dependency_overrides[get_current_user_flexible] = mock_auth
 
-        mock_client = MagicMock()
-        mock_client.chat = AsyncMock(
-            return_value=ChatResponse(
-                content="Hello! How can I help you?",
-                model="gpt-4o-mini",
-                usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-            )
+        fake_stream = _FakeLLMStream(
+            [
+                StreamChunk(type="text_delta", text="H"),
+                StreamChunk(type="text_delta", text="i"),
+            ]
         )
+        mock_client = MagicMock()
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
 
-        with patch("app.api.llm.get_llm_client", return_value=mock_client):
+        with (
+            patch("app.api.llm.get_llm_client", return_value=mock_client),
+            patch(
+                "app.api.llm.config_manager.get_llm_config",
+                return_value={"model": "gpt-4o-mini"},
+            ),
+        ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as client:
@@ -803,27 +835,29 @@ class TestTestLLMConnection:
                 assert response.status_code == 200
                 data = response.json()
                 assert data["success"] is True
-                # 响应不含回复正文（S12：message 为固定文案，短回复截停无展示价值）
+                # 响应不含回复正文（固定文案，短回复截停无展示价值）
                 assert data["message"] == "连接成功"
-                assert "Hello! How can I help you?" not in data["message"]
                 assert data["model"] == "gpt-4o-mini"
                 assert data["latency_ms"] is not None
                 # 连通性 ping 应限制生成长度（max_tokens=8）且 prompt 极简
-                call_kwargs = mock_client.chat.await_args.kwargs
+                call_kwargs = mock_client.stream_chat.call_args.kwargs
                 assert call_kwargs["max_tokens"] == 8
-                assert call_kwargs["job_name"] == "llm_test"
-                msgs = mock_client.chat.await_args.args[0]
+                assert call_kwargs["job_name"] == "连接测试"
+                msgs = mock_client.stream_chat.call_args.args[0]
                 assert len(msgs) == 1
                 assert msgs[0].content == "ping"
+                # 首个内容事件后主动 aclose（不等待全量；未耗尽 → 不落成功计数）
+                assert fake_stream.aclose_called is True
 
     @pytest.mark.asyncio
     async def test_llm_connection_failure(self):
-        """POST /api/llm/test 在 LLM 出错时应返回失败。"""
+        """POST /api/llm/test 流中抛 LLMCallError → 返回失败（现有格式）。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
         from app.api.deps import get_current_user_flexible
         from app.api.llm import router
+        from app.services.llm.client import LLMCallError
 
         app = FastAPI()
         app.include_router(router)
@@ -833,8 +867,11 @@ class TestTestLLMConnection:
 
         app.dependency_overrides[get_current_user_flexible] = mock_auth
 
+        fake_stream = _FakeLLMStream(
+            [], error=LLMCallError("Connection refused", retryable=True)
+        )
         mock_client = MagicMock()
-        mock_client.chat = AsyncMock(side_effect=Exception("Connection refused"))
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
 
         with patch("app.api.llm.get_llm_client", return_value=mock_client):
             async with AsyncClient(
@@ -845,20 +882,17 @@ class TestTestLLMConnection:
                 data = response.json()
                 assert data["success"] is False
                 assert "Connection refused" in data["message"]
+                assert fake_stream.aclose_called is True
 
     @pytest.mark.asyncio
     async def test_llm_connection_empty_content_with_model_fails(self):
-        """F2（H1 同步）：content 为空但 model 存在 → 仍视为失败（仅判 not content）。
-
-        旧逻辑 `not response.model and not response.content` 在 model 存在时会误判为
-        成功；修复后与 summary 侧一致，仅 `not content` 即失败。
-        """
+        """流中无 text_delta（如仅 stop）→ 仍视为失败（与旧 not content 语义一致）。"""
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
 
         from app.api.deps import get_current_user_flexible
         from app.api.llm import router
-        from app.services.llm.models import ChatResponse, Usage
+        from app.services.llm.models import StreamChunk
 
         app = FastAPI()
         app.include_router(router)
@@ -868,14 +902,11 @@ class TestTestLLMConnection:
 
         app.dependency_overrides[get_current_user_flexible] = mock_auth
 
-        mock_client = MagicMock()
-        mock_client.chat = AsyncMock(
-            return_value=ChatResponse(
-                content="",
-                model="gpt-4o-mini",
-                usage=Usage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
-            )
+        fake_stream = _FakeLLMStream(
+            [StreamChunk(type="stop", stop_reason="max_tokens")]
         )
+        mock_client = MagicMock()
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
 
         with patch("app.api.llm.get_llm_client", return_value=mock_client):
             async with AsyncClient(
@@ -885,6 +916,7 @@ class TestTestLLMConnection:
                 assert response.status_code == 200
                 data = response.json()
                 assert data["success"] is False
+                assert fake_stream.aclose_called is True
 
 
 class TestGetLLMStats:
