@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timedelta, timezone
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.models.memory import MemoryEntry
 from app.services.llm.models import ChatResponse, Usage
-from app.services.memory.models import MemoryEntry
 from app.services.memory.service import MemoryService
 from app.services.summary.models import SummaryJobConfig, SummaryRecord
-from app.services.summary.service import SummaryService
+from app.services.summary.service import SummaryService, _utc_to_local_date
 
 # ── helpers ────────────────────────────────────────────────────────────
 
@@ -197,6 +199,56 @@ class TestGenerateSummary:
 
         call_kwargs = mock_db.get_records_in_date_range.call_args.kwargs
         assert call_kwargs["user_name"] is None
+
+    @pytest.mark.asyncio
+    async def test_include_consumed_true_when_memory_on(self):
+        """P1：memory_limit>0 时传 include_consumed=True（消费排除所需）。"""
+        from app.services.summary.service import SummaryService
+
+        svc = SummaryService()
+        config = _make_config(user_name="dad", memory_limit=5)
+
+        mock_llm_client = MagicMock()
+        mock_llm_client.chat = AsyncMock(return_value=_mock_chat_response())
+
+        with (
+            patch("app.services.summary.service.database_manager") as mock_db,
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=mock_llm_client,
+            ),
+        ):
+            mock_db.get_records_in_date_range.return_value = []
+
+            await svc.generate_summary(config)
+
+        call_kwargs = mock_db.get_records_in_date_range.call_args.kwargs
+        assert call_kwargs["include_consumed"] is True
+
+    @pytest.mark.asyncio
+    async def test_include_consumed_false_when_memory_off(self):
+        """P1：memory_limit=0（默认）时传 include_consumed=False（轻量查询）。"""
+        from app.services.summary.service import SummaryService
+
+        svc = SummaryService()
+        config = _make_config(user_name="dad")  # memory_limit 默认 0
+
+        mock_llm_client = MagicMock()
+        mock_llm_client.chat = AsyncMock(return_value=_mock_chat_response())
+
+        with (
+            patch("app.services.summary.service.database_manager") as mock_db,
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=mock_llm_client,
+            ),
+        ):
+            mock_db.get_records_in_date_range.return_value = []
+
+            await svc.generate_summary(config)
+
+        call_kwargs = mock_db.get_records_in_date_range.call_args.kwargs
+        assert call_kwargs["include_consumed"] is False
 
     @pytest.mark.asyncio
     async def test_system_prompt_in_messages(self):
@@ -964,6 +1016,89 @@ class TestExecuteJob:
         assert "（无记录）" in user_content
 
     @pytest.mark.asyncio
+    async def test_placeholder_row_prevents_rerun_of_consumed_records(
+        self, temp_dir, reset_singletons
+    ):
+        """T2 端到端防重跑：第一次执行摘要提取失败 → 写占位行 + 消费标记；
+        第二次执行同窗口 → 这批记录被消费排除（不再进 LLM prompt）。"""
+        db = _temp_db(temp_dir)
+        svc = SummaryService()
+        svc.memory = MemoryService(
+            db.memory
+        )  # 真实 extractor（不 mock extract_and_store）
+        config = _make_config(memory_limit=5, lookback_days=7)
+
+        # 真实记录入库（第二次执行走真实 _query_records → 回填消费标记）
+        db.log_sync_record(
+            user_name="dad",
+            title="葬送的芙莉莲",
+            ori_title=None,
+            season=1,
+            episode=10,
+            bgm_title="葬送的芙莉莲",
+        )
+        db.log_sync_record(
+            user_name="dad",
+            title="鬼灭之刃",
+            ori_title=None,
+            season=3,
+            episode=5,
+            bgm_title="",
+        )
+
+        # 主总结成功；摘要提取 LLM 失败 → 触发占位行
+        failing_summary_client = MagicMock()
+        failing_summary_client.chat = AsyncMock(
+            side_effect=RuntimeError("summary llm down")
+        )
+        _llm_patch, _mock_client = self._patch_llm(_mock_chat_response("主总结正文"))
+
+        with (
+            patch("app.services.summary.service.database_manager", db),
+            _llm_patch,
+            patch(
+                "app.services.memory.extractor.get_llm_client",
+                return_value=failing_summary_client,
+            ),
+            patch("app.services.summary.service.notification_service"),
+        ):
+            await svc.execute_job(config)
+
+        # 占位行已写入（summary 空、outcome 标记失败来源）
+        entries = db.memory.get_recent("summary", "summary-test_job", limit=10)
+        assert len(entries) == 1
+        assert entries[0].summary == ""
+        assert entries[0].outcome == "summary_failed"
+        run_id = entries[0].run_id
+
+        # 消费标记已写入（真实查询回填 consumed_run_ids）
+        rows = db.get_records_in_date_range(
+            date_from=(datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),
+            date_to=datetime.now().strftime("%Y-%m-%d"),
+            include_consumed=True,
+        )
+        assert rows
+        assert all(r["consumed_run_ids"] == {run_id} for r in rows)
+
+        # 第二次执行：真实 _query_records（含消费回填）→ 这批记录被排除
+        _llm_patch2, mock_client2 = self._patch_llm(_mock_chat_response("第二次总结"))
+        with (
+            patch("app.services.summary.service.database_manager", db),
+            _llm_patch2,
+            patch(
+                "app.services.memory.extractor.get_llm_client",
+                return_value=failing_summary_client,
+            ),
+            patch("app.services.summary.service.notification_service"),
+        ):
+            await svc.execute_job(config)
+
+        user_content = mock_client2.chat.call_args.args[0][1].content
+        assert "葬送的芙莉莲" not in user_content
+        assert "鬼灭之刃" not in user_content
+        assert "（无记录）" in user_content
+
+    @pytest.mark.asyncio
     async def test_related_titles_from_today_records(self, temp_dir, reset_singletons):
         """related_limit>0：titles = 今日明细 bgm_title 去重（空值过滤，全量不截前 5）。"""
         svc, _ = self._svc_with_real_memory(temp_dir)
@@ -1050,7 +1185,7 @@ class TestRelatedInjection:
     @pytest.mark.asyncio
     async def test_related_prefix_and_dedup(self, temp_dir, reset_singletons):
         """recent 与 related 共享 run_id 时去重（recent 优先无前缀）；纯 related 冠前缀。"""
-        from app.services.memory.models import MemoryEntry
+        from app.models.memory import MemoryEntry
 
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         records = [_summary_record(id=1, title="番剧A", bgm_title="番剧A")]
@@ -1088,6 +1223,108 @@ class TestRelatedInjection:
         mock_memory.related.assert_called_once()
 
 
+class TestMemoryContextSkipsPlaceholder:
+    """T2：摘要失败占位行（summary=""）不得进入提示词注入（recent 与 related 两路径）。"""
+
+    def test_placeholder_skipped_in_recent(self):
+        """recent 返回 [正常行, 占位行] → 注入文本只含正常摘要，无空条目。"""
+        svc = SummaryService()
+        mock_memory = MagicMock()
+        mock_memory.recent.return_value = [
+            MemoryEntry(
+                run_id="r-ok",
+                summary="昨日看了芙莉莲",
+                task_type="summary",
+                task_id="summary-test_job",
+            ),
+            MemoryEntry(
+                run_id="r-placeholder",
+                summary="",
+                outcome="summary_failed",
+                task_type="summary",
+                task_id="summary-test_job",
+            ),
+        ]
+        svc.memory = mock_memory
+
+        ctx = svc._build_memory_context(
+            _make_config(memory_limit=5), "summary-test_job", [_summary_record()]
+        )
+
+        assert ctx == "- 昨日看了芙莉莲"  # 占位行被完全跳过（无裸 "- " 条目）
+        mock_memory.recent.assert_called_once_with(
+            "summary", "summary-test_job", limit=5
+        )
+
+    def test_placeholder_skipped_in_related(self):
+        """related 返回占位行 → 跳过；正常同剧历史冠 [同剧历史] 前缀保留。"""
+        svc = SummaryService()
+        mock_memory = MagicMock()
+        mock_memory.recent.return_value = []
+        mock_memory.related.return_value = [
+            MemoryEntry(
+                run_id="r-old",
+                summary="上一季芙莉莲",
+                task_type="summary",
+                task_id="summary-test_job",
+            ),
+            MemoryEntry(
+                run_id="r-placeholder",
+                summary="",
+                outcome="summary_failed",
+                task_type="summary",
+                task_id="summary-test_job",
+            ),
+        ]
+        svc.memory = mock_memory
+
+        ctx = svc._build_memory_context(
+            _make_config(memory_limit=5, related_limit=3),
+            "summary-test_job",
+            [_summary_record(bgm_title="葬送的芙莉莲")],
+        )
+
+        assert ctx == "- [同剧历史] 上一季芙莉莲"
+        mock_memory.related.assert_called_once()
+
+
+class TestUTCToLocalDate:
+    """`_utc_to_local_date`：SQLite datetime('now') 的 UTC 时间串 → 指定时区日期。
+
+    显式注入 tz，避免断言随运行环境系统时区（CI=UTC、开发机可能 UTC+8）漂移。
+    """
+
+    def test_utc_to_local_date_utc_plus8_crosses_day(self):
+        """UTC 16:30 + UTC+8 → 次日（跨日）。"""
+        result = _utc_to_local_date(
+            "2026-07-10 16:30:00", tz=timezone(timedelta(hours=8))
+        )
+        assert result == "2026-07-11"
+
+    def test_utc_to_local_date_utc_plus8_same_day(self):
+        """UTC 02:00 + UTC+8 → 同日。"""
+        result = _utc_to_local_date(
+            "2026-07-10 02:00:00", tz=timezone(timedelta(hours=8))
+        )
+        assert result == "2026-07-10"
+
+    def test_utc_to_local_date_utc_minus8_no_inversion(self):
+        """UTC 2026-07-11 04:00 + UTC-8 → 2026-07-10（西半球不产生未来日期）。"""
+        result = _utc_to_local_date(
+            "2026-07-11 04:00:00", tz=timezone(timedelta(hours=-8))
+        )
+        assert result == "2026-07-10"
+
+    def test_utc_to_local_date_empty_returns_none(self):
+        """空字符串 → None（调用方据此回退 lookback）。"""
+        assert _utc_to_local_date("", tz=timezone.utc) is None
+
+    def test_utc_to_local_date_invalid_format_returns_none(self):
+        """非法格式 → None 且不抛异常。"""
+        assert _utc_to_local_date("not-a-date", tz=timezone.utc) is None
+        assert _utc_to_local_date("2026-07-10", tz=timezone.utc) is None
+
+
 class TestIncrementalWindow:
     """T3 增量窗口：记忆开启时 date_from = 上次总结点（本任务最后一条记忆的
     created_at 日期）；无历史记忆时回退 lookback_days。"""
@@ -1099,10 +1336,168 @@ class TestIncrementalWindow:
         return svc, db
 
     def test_memory_enabled_uses_last_summary_date(self, temp_dir, reset_singletons):
-        """记忆开启 + 有历史记忆 → date_from = 最后一条记忆的日期（非 lookback）。"""
+        """记忆开启 + 有历史记忆 → date_from = 最后一条记忆的日期（非 lookback）。
+
+        显式注入 UTC 时区，使 created_at（UTC）→ 日期断言与运行环境系统时区无关。
+        """
         svc, db = self._svc(temp_dir)
-        # store_and_mark 的 INSERT 不含 created_at（DB 默认当前时间），
+        # store_and_mark 的 INSERT 不含 created_at（DB 默认 UTC 当前时间），
         # 故用 patch memory.recent 模拟"上次总结点在 2026-07-10"
+        with (
+            patch.object(
+                svc.memory,
+                "recent",
+                return_value=[
+                    MemoryEntry(
+                        task_type="summary",
+                        task_id="summary-test_job",
+                        run_id="run-1",
+                        summary="昨日总结",
+                        created_at="2026-07-10 21:00:00",
+                    )
+                ],
+            ),
+            patch(
+                "app.services.summary.service._utc_to_local_date",
+                partial(_utc_to_local_date, tz=timezone.utc),
+            ),
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        # 窗口起点 = 上次总结日期（UTC 下即 created_at 日期），而非 now-7
+        assert date_from == "2026-07-10"
+        mock_db.get_records_in_date_range.assert_called_once()
+        assert (
+            mock_db.get_records_in_date_range.call_args.kwargs["date_from"]
+            == "2026-07-10"
+        )
+
+    def test_memory_enabled_utc_plus8_crosses_day(self, temp_dir, reset_singletons):
+        """集成：注入 UTC+8 → created_at 16:30 转出次日，date_from 用转换结果。"""
+        svc, db = self._svc(temp_dir)
+        with (
+            patch.object(
+                svc.memory,
+                "recent",
+                return_value=[
+                    MemoryEntry(
+                        task_type="summary",
+                        task_id="summary-test_job",
+                        run_id="run-1",
+                        summary="昨日总结",
+                        created_at="2026-07-10 16:30:00",
+                    )
+                ],
+            ),
+            patch(
+                "app.services.summary.service._utc_to_local_date",
+                partial(_utc_to_local_date, tz=timezone(timedelta(hours=8))),
+            ),
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        assert date_from == "2026-07-11"
+        assert (
+            mock_db.get_records_in_date_range.call_args.kwargs["date_from"]
+            == "2026-07-11"
+        )
+
+    def test_future_created_at_clamps_window_to_single_day(
+        self, temp_dir, reset_singletons, capsys
+    ):
+        """防御：时钟回拨等异常使记忆 created_at 落在未来 → 增量起点晚于终点。
+
+        夹紧为单日窗口（date_from = date_to），查询仍正常调用且不抛异常，
+        并留下 warning 日志可观测（正常时钟下该分支不触发）。
+
+        注：项目 logger 为自定义实现（print 输出，非 stdlib logging），
+        故用 capsys 捕获，而非 caplog。
+        """
+        svc, db = self._svc(temp_dir)
+        with (
+            patch.object(
+                svc.memory,
+                "recent",
+                return_value=[
+                    MemoryEntry(
+                        task_type="summary",
+                        task_id="summary-test_job",
+                        run_id="run-future",
+                        summary="未来记忆",
+                        created_at="2099-12-31 12:00:00",
+                    )
+                ],
+            ),
+            patch(
+                "app.services.summary.service._utc_to_local_date",
+                partial(_utc_to_local_date, tz=timezone.utc),
+            ),
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        # 倒置区间被夹紧为单日：查询正常调用（非倒置）且不抛异常
+        assert date_from == date_to
+        mock_db.get_records_in_date_range.assert_called_once()
+        call_kwargs = mock_db.get_records_in_date_range.call_args.kwargs
+        assert call_kwargs["date_from"] == call_kwargs["date_to"]
+        assert "window inverted" in capsys.readouterr().out
+
+    def test_placeholder_row_serves_as_incremental_start(
+        self, temp_dir, reset_singletons
+    ):
+        """T2：最近一条是摘要失败占位行（summary=""）时，增量窗口起点仍取它的
+        created_at 日期——占位行是有效的"上次总结点"，不得因空摘要被跳过导致窗口回退。"""
+        svc, db = self._svc(temp_dir)
+        with (
+            patch.object(
+                svc.memory,
+                "recent",
+                return_value=[
+                    MemoryEntry(
+                        task_type="summary",
+                        task_id="summary-test_job",
+                        run_id="run-placeholder",
+                        summary="",
+                        outcome="summary_failed",
+                        created_at="2026-07-10 21:00:00",
+                    )
+                ],
+            ) as mock_recent,
+            patch(
+                "app.services.summary.service._utc_to_local_date",
+                partial(_utc_to_local_date, tz=timezone.utc),
+            ),
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        assert date_from == "2026-07-10"  # 占位行起点生效，非 lookback
+        mock_recent.assert_called_once_with("summary", "summary-test_job", limit=1)
+
+    def test_invalid_created_at_falls_back_to_lookback(
+        self, temp_dir, reset_singletons
+    ):
+        """created_at 非法 → 转换返回 None，回退 lookback_days 且不抛异常。"""
+        svc, db = self._svc(temp_dir)
         with patch.object(
             svc.memory,
             "recent",
@@ -1111,8 +1506,8 @@ class TestIncrementalWindow:
                     task_type="summary",
                     task_id="summary-test_job",
                     run_id="run-1",
-                    summary="昨日总结",
-                    created_at="2026-07-10 21:00:00",
+                    summary="脏数据",
+                    created_at="not-a-date",
                 )
             ],
         ):
@@ -1123,13 +1518,34 @@ class TestIncrementalWindow:
                     config, incremental=True
                 )
 
-        # 窗口起点 = 上次总结日期，而非 now-7
-        assert date_from == "2026-07-10"
-        mock_db.get_records_in_date_range.assert_called_once()
-        assert (
-            mock_db.get_records_in_date_range.call_args.kwargs["date_from"]
-            == "2026-07-10"
-        )
+        expected = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        assert date_from == expected
+
+    def test_empty_created_at_falls_back_to_lookback(self, temp_dir, reset_singletons):
+        """created_at 为空 → 回退 lookback_days，不抛异常。"""
+        svc, db = self._svc(temp_dir)
+        with patch.object(
+            svc.memory,
+            "recent",
+            return_value=[
+                MemoryEntry(
+                    task_type="summary",
+                    task_id="summary-test_job",
+                    run_id="run-1",
+                    summary="空时间",
+                    created_at="",
+                )
+            ],
+        ):
+            config = _make_config(memory_limit=5, lookback_days=7)
+            with patch("app.services.summary.service.database_manager") as mock_db:
+                mock_db.get_records_in_date_range.return_value = []
+                records, date_from, date_to = svc._query_records(
+                    config, incremental=True
+                )
+
+        expected = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+        assert date_from == expected
 
     def test_no_memory_falls_back_to_lookback(self, temp_dir, reset_singletons):
         """记忆开启但无历史 → date_from 回退 lookback_days（incremental 分支）。"""
@@ -1263,3 +1679,212 @@ class TestRelatedIndependentOfMemoryLimit:
         )
         # 不写入记忆（memory_limit=0）
         assert not mock_memory.extract_and_store.called
+
+
+# ── 并发执行保护（同一任务运行中登记）────────────────────────────
+
+
+class TestConcurrentExecutionGuard:
+    """execute_job 的任务级进程内互斥：同任务并发只执行一次，其余跳过返回 False。"""
+
+    @staticmethod
+    def _gated_llm(release: asyncio.Event, started=None, block_name=None):
+        """构造 chat 受 release 控制的 mock client。
+
+        block_name=None 时阻塞所有调用；否则仅阻塞 job_name==block_name 的调用。
+        ``started`` 在进入被阻塞调用时 set，供测试等待"已持锁"。
+        返回 (client, 已调用的 job_name 列表)。
+        """
+        client = MagicMock()
+        called_jobs: list[str | None] = []
+
+        async def _chat(messages, **kwargs):
+            job_name = kwargs.get("job_name")
+            called_jobs.append(job_name)
+            if block_name is None or job_name == block_name:
+                if started is not None:
+                    started.set()
+                await release.wait()
+            return _mock_chat_response()
+
+        client.chat = AsyncMock(side_effect=_chat)
+        return client, called_jobs
+
+    @pytest.mark.asyncio
+    async def test_same_job_concurrent_only_one_executes(self):
+        """同一任务并发触发：恰好一个 True、一个 False；LLM 与通知各一次。"""
+        svc = SummaryService()
+        config = _make_config(name="concurrent_job")
+        started, release = asyncio.Event(), asyncio.Event()
+        client, called_jobs = self._gated_llm(release, started)
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=client,
+            ),
+            patch("app.services.summary.service.notification_service") as mock_ns,
+        ):
+            first = asyncio.create_task(svc.execute_job(config))
+            await started.wait()  # 第一个已进入 chat（登记已持有）
+            try:
+                # 第二个若未被守卫拦截会阻塞在 chat（timeout 保证红阶段不挂起）
+                second = await asyncio.wait_for(svc.execute_job(config), timeout=2)
+            finally:
+                release.set()
+            first_result = await first
+
+        assert first_result is True
+        assert second is False
+        assert called_jobs == ["concurrent_job"]
+        assert client.chat.await_count == 1
+        mock_ns.notify.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_skipped_call_has_no_side_effects(self):
+        """被跳过的调用不查库、不调 LLM、不写记忆、不发通知。"""
+        svc = SummaryService()
+        config = _make_config(name="side_effect_job", memory_limit=5)
+        started, release = asyncio.Event(), asyncio.Event()
+        client, _ = self._gated_llm(release, started)
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ) as mock_query,
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=client,
+            ),
+            patch("app.services.summary.service.notification_service") as mock_ns,
+            patch.object(svc, "memory") as mock_memory,
+        ):
+            mock_memory.recent.return_value = []
+            mock_memory.related.return_value = []
+            mock_memory.get_task_run_ids.return_value = set()
+            mock_memory.extract_and_store = AsyncMock()
+
+            first = asyncio.create_task(svc.execute_job(config))
+            await started.wait()
+            try:
+                second = await asyncio.wait_for(svc.execute_job(config), timeout=2)
+            finally:
+                release.set()
+            first_result = await first
+
+        assert first_result is True
+        assert second is False
+        # 跳过的调用零副作用：查询/LLM/记忆/通知都只发生第一次
+        assert mock_query.call_count == 1
+        assert client.chat.await_count == 1
+        assert mock_memory.extract_and_store.await_count == 1
+        mock_ns.notify.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_guard_released_after_error(self):
+        """一次执行内部出错（消化为失败通知）后登记释放，同任务可再次执行。"""
+        svc = SummaryService()
+        config = _make_config(name="release_job")
+
+        with (
+            patch.object(svc, "_query_records", side_effect=RuntimeError("boom")),
+            patch("app.services.summary.service.notification_service"),
+        ):
+            first = await svc.execute_job(config)
+
+        assert first is True  # 异常被消化为失败通知，本次视为已执行
+        assert config.name not in svc._running
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            patch("app.services.summary.service.notification_service"),
+        ):
+            second = await svc.execute_job(config)
+
+        assert second is True
+
+    @pytest.mark.asyncio
+    async def test_guard_released_after_cancellation(self):
+        """执行被取消（超时）后登记释放，后续同任务可正常执行。"""
+        svc = SummaryService()
+        config = _make_config(name="cancel_job")
+        started, release = asyncio.Event(), asyncio.Event()
+        client, _ = self._gated_llm(release, started)
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=client,
+            ),
+            patch("app.services.summary.service.notification_service"),
+        ):
+            task = asyncio.create_task(svc.execute_job(config))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        assert config.name not in svc._running
+
+        # 释放后可再次正常执行
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            patch("app.services.summary.service.notification_service"),
+        ):
+            assert await svc.execute_job(config) is True
+
+    @pytest.mark.asyncio
+    async def test_different_jobs_run_concurrently(self):
+        """不同 name 的任务互不影响，可并发执行且都返回 True。"""
+        svc = SummaryService()
+        config_a = _make_config(name="job_a")
+        config_b = _make_config(name="job_b")
+        started_a, release_a = asyncio.Event(), asyncio.Event()
+        client, called_jobs = self._gated_llm(release_a, started_a, block_name="job_a")
+
+        with (
+            patch.object(
+                svc,
+                "_query_records",
+                return_value=(_records(), "2026-07-14", "2026-07-15"),
+            ),
+            patch(
+                "app.services.summary.service.get_llm_client",
+                return_value=client,
+            ),
+            patch("app.services.summary.service.notification_service"),
+        ):
+            task_a = asyncio.create_task(svc.execute_job(config_a))
+            await started_a.wait()  # job_a 持登记并阻塞
+            try:
+                # 不同任务不应被 job_a 阻塞；timeout 保证实现错误时不挂起
+                result_b = await asyncio.wait_for(svc.execute_job(config_b), timeout=2)
+            finally:
+                release_a.set()
+            result_a = await task_a
+
+        assert result_a is True
+        assert result_b is True
+        assert set(called_jobs) == {"job_a", "job_b"}

@@ -8,11 +8,12 @@ import json
 import time
 import traceback
 from collections.abc import AsyncGenerator
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sse_starlette.sse import EventSourceResponse
 
+from ..core.database import database_manager
 from ..core.logging import logger, new_retry_sync_run_id, sync_log_context
 from ..core.security import security_manager
 from ..models.sync import CustomItem
@@ -257,12 +258,12 @@ async def get_sync_records(
     request: Request,
     limit: int = Query(10, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    status: Optional[str] = None,
-    user_name: Optional[str] = None,
-    source: Optional[str] = None,
-    source_prefix: Optional[str] = None,
-    match_method: Optional[str] = None,
-    match_platform: Optional[str] = None,
+    status: str | None = None,
+    user_name: str | None = None,
+    source: str | None = None,
+    source_prefix: str | None = None,
+    match_method: str | None = None,
+    match_platform: str | None = None,
     skip_count: bool = Query(False),
     include_poster: bool = Query(False),
     current_user: dict = Depends(get_current_user_flexible),
@@ -303,9 +304,9 @@ async def get_match_records(
     request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=200),
-    status: Optional[str] = None,
-    match_method: Optional[str] = None,
-    match_platform: Optional[str] = None,
+    status: str | None = None,
+    match_method: str | None = None,
+    match_platform: str | None = None,
     current_user: dict = Depends(get_current_user_flexible),
 ):
     """获取匹配记录列表（含匹配追踪字段）"""
@@ -356,12 +357,48 @@ async def get_match_trace(
 # ===== 待确认候选（候选沉淀 + 确认 UI） =====
 
 
+def _enrich_candidate_with_agent_run(record: dict | None) -> dict | None:
+    """为候选记录附加关联 agent run 信息（前端徽标 / AI 评估过程折叠区用）。
+
+    - 经 sync_record_id 查最新 agent_runs（任意状态），取其 status 与 run_id；
+      无关联 run → agent_run_status / agent_run_id 均为 None（null）。
+    - 同时保证 llm 两列始终存在（老记录缺列时补空串），
+      供「AI 推荐区块」与「徽标」判据使用。
+    """
+    if record is None:
+        return record
+    record.setdefault("llm_subject_id", "")
+    record.setdefault("llm_reason", "")
+    sync_record_id = record.get("sync_record_id")
+    agent_run_status = None
+    agent_run_id = None
+    if sync_record_id:
+        run = database_manager.agent_runs.find_latest_by_sync_record(
+            int(sync_record_id)
+        )
+        if run:
+            agent_run_status = run.get("status")
+            agent_run_id = run.get("run_id")
+    record["agent_run_status"] = agent_run_status
+    record["agent_run_id"] = agent_run_id
+    return record
+
+
+def _enrich_candidate_list(result: dict) -> dict:
+    """批量附加 agent run 信息到候选列表。"""
+    if result and isinstance(result.get("records"), list):
+        result["records"] = [
+            _enrich_candidate_with_agent_run(r) for r in result["records"]
+        ]
+    return result
+
+
 @router.get("/pending-candidates")
 async def get_pending_candidates(
     request: Request,
     page: int = Query(1, ge=1),
     limit: int = Query(10, ge=1, le=200),
-    status: Optional[str] = None,
+    status: str | None = None,
     current_user: dict = Depends(get_current_user_flexible),
 ):
     """获取待确认候选列表"""
@@ -370,6 +407,7 @@ async def get_pending_candidates(
         result = sync_service.get_pending_candidates(
             limit=limit, offset=offset, status=status
         )
+        _enrich_candidate_list(result)
         return {"status": "success", "data": result}
     except Exception as e:
         logger.error(f"获取待确认候选失败: {e}")
@@ -401,6 +439,8 @@ async def get_pending_candidate_detail(
             trace = json.loads(trace_str) if trace_str else None
         except (json.JSONDecodeError, TypeError):
             trace = None
+
+        _enrich_candidate_with_agent_run(record)
 
         return {
             "status": "success",
@@ -439,6 +479,8 @@ async def get_pending_candidate_by_sync_record(
         except (json.JSONDecodeError, TypeError):
             trace = None
 
+        _enrich_candidate_with_agent_run(record)
+
         return {
             "status": "success",
             "data": {"record": record, "candidates": candidates, "trace": trace},
@@ -459,7 +501,13 @@ async def confirm_pending_candidate(
     """确认待确认候选：写入自定义映射并标记为已确认"""
     try:
         body = await request.json()
-        subject_id = str(body.get("subject_id", "")).strip()
+        # 兼容：body 含 llm_subject_id（AI 推荐场景，允许不在候选列表内）时优先用之，
+        # 否则沿用候选列表内选择的 subject_id（向后兼容既有前端）
+        llm_subject_id = body.get("llm_subject_id")
+        if llm_subject_id is not None:
+            subject_id = str(llm_subject_id).strip()
+        else:
+            subject_id = str(body.get("subject_id", "")).strip()
         if not subject_id:
             raise HTTPException(status_code=400, detail="subject_id 不能为空")
 

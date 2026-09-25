@@ -31,6 +31,12 @@ _LIST_TEMPLATE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 方块列表：`{\n[a]\n[b]\n}` —— Archive dump 中「别名」字段的主流写法
+# （98.9% 的条目用此格式，见 alias_format_census.txt）
+_BRACE_LIST_RE = re.compile(r"^\s*\{(.*)\}\s*$", re.DOTALL)
+# 方块列表内的整行项：外层 `[...]`，内部允许 wiki 链接 `[[target|显示]]`
+_BRACKET_LINE_RE = re.compile(r"^\s*(\[.*\])\s*$", re.MULTILINE)
+
 # <br> / <br/> / <br /> 分隔
 _BR_SPLIT_RE = re.compile(r"<\s*br\s*/?\s*>", re.IGNORECASE)
 
@@ -127,6 +133,14 @@ def _split_top_level_params(s: str) -> list[str]:
 
     输入: `"key1=v1|key2={{list|a|b}}|key3=[[link|display]]"`
     输出: `["key1=v1", "key2={{list|a|b}}", "key3=[[link|display]]"]`
+
+    括号深度不滞留：值中出现未配对的括号时，深度不能永久停在非 0，否则此后的顶层
+    `|` 判断会失效、把剩余参数并进同一个值。两种失衡各有对策：
+
+    - 未配对的 `]]`（如 `TOKKO 特公` 的 `别名` 含 `[TOKKÔ[特公]]`）：深度不小于 0，
+      避免计数转负。
+    - 未闭合的 `[[`（如 `我推的孩子 第三季` 的 `别名` 写作 `[[Oshi no Ko] 3rd Season]`）：
+      换行处重置方括号深度。`[[...]]` 链接不跨行书写，换行即其语法边界。
     """
     parts: list[str] = []
     brace_depth = 0  # {{...}}
@@ -141,7 +155,8 @@ def _split_top_level_params(s: str) -> list[str]:
             current.append(two)
             i += 2
         elif two == "}}":
-            brace_depth -= 1
+            if brace_depth > 0:
+                brace_depth -= 1
             current.append(two)
             i += 2
         elif two == "[[":
@@ -149,9 +164,14 @@ def _split_top_level_params(s: str) -> list[str]:
             current.append(two)
             i += 2
         elif two == "]]":
-            bracket_depth -= 1
+            if bracket_depth > 0:
+                bracket_depth -= 1
             current.append(two)
             i += 2
+        elif s[i] == "\n":
+            bracket_depth = 0
+            current.append(s[i])
+            i += 1
         elif s[i] == "|" and brace_depth == 0 and bracket_depth == 0:
             parts.append("".join(current))
             current = []
@@ -170,8 +190,10 @@ def _parse_value(value: str) -> str | list[dict[str, str]]:
     识别规则（按优先级）：
     1. bullet list (`* a\\n* b`) → `[{"v": "a"}, {"v": "b"}]`
     2. `{{list|a|b}}` / `{{ll|a|b}}` 模板 → `[{"v": "a"}, {"v": "b"}]`
-    3. `<br>` 分隔（至少 2 个非空项）→ `[{"v": "a"}, {"v": "b"}]`
-    4. 其他 → 清理 wiki 标记后的字符串
+    3. 方块列表 `{\\n[a]\\n[b]\\n}` → `[{"v": "a"}, {"v": "b"}]`
+       （Archive dump 别名主流格式，未识别时整块字符串会导致别名失效）
+    4. `<br>` 分隔（至少 2 个非空项）→ `[{"v": "a"}, {"v": "b"}]`
+    5. 其他 → 清理 wiki 标记后的字符串
 
     单个 bullet 项也视为列表（保持与 API 列表字段一致的返回结构）。
     """
@@ -195,7 +217,22 @@ def _parse_value(value: str) -> str | list[dict[str, str]]:
         if cleaned:
             return [{"v": x} for x in cleaned]
 
-    # 3. <br> 分隔（至少 2 个非空项才视为列表）
+    # 3. 方块列表：`{\n[a]\n[b]\n}`（Archive dump 别名主流格式）
+    mb = _BRACE_LIST_RE.match(value)
+    if mb:
+        cleaned: list[str] = []
+        # 先清 wiki 标记（`[[target|显示]]` → `显示`），再去掉外层 [ ]
+        for raw_item in _BRACKET_LINE_RE.findall(mb.group(1)):
+            text = _clean_wiki_markup(raw_item.strip()).strip()
+            if text.startswith("[") and text.endswith("]") and len(text) >= 2:
+                text = text[1:-1].strip()
+            if text:
+                cleaned.append(text)
+        if cleaned:
+            return [{"v": c} for c in cleaned]
+        # 大括号内无整行方括号项（如 `{链接}`）→ fallthrough 到普通字符串
+
+    # 4. <br> 分隔（至少 2 个非空项才视为列表）
     if _BR_SPLIT_RE.search(value):
         parts = _BR_SPLIT_RE.split(value)
         cleaned = [_clean_wiki_markup(p.strip()) for p in parts if p.strip()]
@@ -203,7 +240,7 @@ def _parse_value(value: str) -> str | list[dict[str, str]]:
             return [{"v": x} for x in cleaned]
         # 单项时 fallthrough 到普通字符串，但需先去除 <br> 标记
 
-    # 4. 普通字符串（清理 wiki 标记 + 残留 <br> 标签）
+    # 5. 普通字符串（清理 wiki 标记 + 残留 <br> 标签）
     cleaned = _clean_wiki_markup(value)
     if "<br" in cleaned.lower():
         cleaned = _BR_SPLIT_RE.sub("", cleaned).strip()

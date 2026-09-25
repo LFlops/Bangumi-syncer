@@ -6,6 +6,7 @@ from __future__ import annotations
 
 # time/asyncio 重新导出以兼容测试 patch（app.services.sync_service.time.sleep 等）
 import asyncio  # noqa: F401
+import dataclasses
 import json
 import threading
 import time  # noqa: F401
@@ -38,6 +39,7 @@ from ...utils.bangumi_constants import (
 from ...utils.bangumi_data import BangumiData, bangumi_data
 from ...utils.media_type_detector import detect_media_type as detect_media_type
 from ..mapping_service import mapping_service
+from ..matching.identity import build_match_business_key
 from ..notification_service import notification_service
 from .match_trace import MatchCandidate as MatchCandidate, MatchTrace
 from .retry import MARK_QUEUED, RetryMixin
@@ -247,7 +249,15 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         database_manager.update_pending_candidate_status(
             candidate_id, "confirmed", confirmed_subject_id=str(subject_id)
         )
-        # 批量更新同 key 的其它 pending 行，避免残留（去重后通常无额外行）
+        # 用户处理结果由 pending_candidates（status + resolved_at）承载，
+        # agent_runs 回归通用框架，确认候选不再改写 run 状态。
+        # 批量更新同业务身份的其它 pending 行，避免残留（去重后通常无额外行）。
+        # 使用 business_key 对齐 agent_runs 去重语义（去 source / 归一化标题）。
+        resolve_bk = build_match_business_key(
+            record.get("user_name", ""),
+            record.get("request_title", ""),
+            int(record.get("request_season") or 1),
+        )
         database_manager.resolve_similar_pending_candidates(
             request_title=title,
             request_season=season,
@@ -256,6 +266,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             status="confirmed",
             confirmed_subject_id=str(subject_id),
             exclude_id=candidate_id,
+            business_key=resolve_bk,
         )
 
         # 候选确认即补发：若有关联的 sync_record_id，自动触发重试
@@ -470,10 +481,10 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 return False, f"条目类型为 {stype}，仅支持动画/三次元"
             # archive 未命中或不完整：降级到 API
 
-        # 降级到 API：DB 为唯一真相源，取激活账号；无激活则取首个可用账号
+        # 降级到 API：DB 为唯一真相源，取首选账号；无首选则取首个可用账号
         from app.core import accounts as _accounts
 
-        cfg = _accounts.get_active_bangumi_config() or None
+        cfg = _accounts.get_primary_bangumi_config() or None
         if cfg is None:
             configs = _accounts.list_bangumi_configs()
             if not configs:
@@ -511,11 +522,47 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         return True, ""
 
     def reject_pending_candidate(self, candidate_id: int) -> tuple[bool, str]:
-        """拒绝待确认候选"""
+        """拒绝待确认候选，并将其候选 subject_id 记入该标题的负样本黑名单。
+
+        黑名单用于「学习」用户的拒绝：下次自动匹配命中相同 subject_id 时直接排除，
+        避免重复推送已被否决的条目。用户显式自定义映射（custom_mapping）不受黑名单约束。
+        """
         if not database_manager.update_pending_candidate_status(
             candidate_id, "rejected"
         ):
             return False, "候选记录不存在或已处理"
+        # 用户处理结果由 pending_candidates 承载，忽略候选不再改写 run 状态
+
+        # 将被拒候选项的 subject_id 写入标题黑名单（容错：失败不影响 reject 主流程）
+        try:
+            record = database_manager.get_pending_candidate_by_id(candidate_id)
+            if record:
+                title = record.get("request_title", "")
+                candidates_json = record.get("candidates_json") or "[]"
+                try:
+                    candidates = json.loads(candidates_json)
+                except (ValueError, TypeError):
+                    candidates = []
+                subject_ids = [
+                    str(c.get("subject_id"))
+                    for c in candidates
+                    if isinstance(c, dict) and c.get("subject_id")
+                ]
+                if title and subject_ids:
+                    added = database_manager.bulk_add_title_blacklist(
+                        request_title=title,
+                        subject_ids=subject_ids,
+                        user_name=record.get("user_name", ""),
+                        source=record.get("source", ""),
+                    )
+                    if added:
+                        logger.info(
+                            f"候选拒绝已记入黑名单: title={title!r}, "
+                            f"subjects={subject_ids}"
+                        )
+        except Exception as e:
+            logger.warning(f"写入负样本黑名单失败（不影响 reject）: {e}")
+
         return True, "已忽略"
 
     def delete_pending_candidate(self, candidate_id: int) -> tuple[bool, str]:
@@ -525,13 +572,36 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         return True, "已删除"
 
     @staticmethod
-    def _collect_candidates_from_trace(trace: MatchTrace) -> list[dict[str, Any]]:
-        """从 MatchTrace 各步骤中收集候选，去重并按 score 降序"""
+    def _safe_request_title(item: Any) -> str:
+        """安全读取条目标题（取不到时按空标题处理）
+
+        黑名单查询是旁路能力，不应因条目对象缺少 title 而中断主流程
+        （例如测试替身对象）；非字符串一律视为空标题。
+        """
+        title = getattr(item, "title", "")
+        return title if isinstance(title, str) else ""
+
+    @staticmethod
+    def _get_blocked_for_title(title: str) -> set[str]:
+        """读取某标题的负样本黑名单（容错，失败返回空集）。"""
+        return database_manager.get_title_blacklist(title) or set()
+
+    @staticmethod
+    def _collect_candidates_from_trace(
+        trace: MatchTrace, exclude_subject_ids: set[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """从 MatchTrace 各步骤中收集候选，去重并按 score 降序。
+
+        exclude_subject_ids：若提供，命中其中的 subject_id 会被剔除
+        （用于负样本黑名单，避免已被否决的候选项重复出现）。
+        """
         seen: set[str] = set()
         merged: list[dict[str, Any]] = []
         for step in trace.steps:
             for cand in step.candidates:
                 if not cand.subject_id or cand.subject_id in seen:
+                    continue
+                if exclude_subject_ids and cand.subject_id in exclude_subject_ids:
                     continue
                 seen.add(cand.subject_id)
                 merged.append(cand.to_dict())
@@ -551,10 +621,19 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         并触发 pending_candidate 通知提醒用户前往 WebUI 确认。
 
         sync_record_id：关联的 sync_records 行 id，用于候选确认后回写原记录状态。
+        business_key：按 (user_name, normalize(title), season) 构造，对齐 agent_runs
+        业务身份去重，跨 source 共享同一 pending 行。
         """
-        candidates = self._collect_candidates_from_trace(trace)
+        candidates = self._collect_candidates_from_trace(
+            trace,
+            exclude_subject_ids=self._get_blocked_for_title(
+                self._safe_request_title(item)
+            ),
+        )
         if not candidates:
             return
+        # 计算业务键：对齐 agent_runs 去重语义（去 source / 归一化标题）
+        bk = build_match_business_key(item.user_name, item.title, item.season)
         try:
             database_manager.log_pending_candidate(
                 request_title=item.title,
@@ -566,6 +645,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 candidates=candidates,
                 trace=trace.to_dict(),
                 sync_record_id=sync_record_id,
+                business_key=bk,
             )
         except Exception as e:
             logger.warning(f"沉淀待确认候选失败（不影响主流程）: {e}")
@@ -605,7 +685,12 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         try:
             if not trace or not trace.is_ambiguous:
                 return
-            candidates = self._collect_candidates_from_trace(trace)
+            candidates = self._collect_candidates_from_trace(
+                trace,
+                exclude_subject_ids=self._get_blocked_for_title(
+                    self._safe_request_title(item)
+                ),
+            )
             if len(candidates) < 2:
                 return
             top1_score = float(candidates[0].get("score", 0.0))
@@ -828,10 +913,18 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     return SyncResponse(status="error", message=str(ve))
                 raise ve
 
+            # 其余 Bangumi 账号共享本次匹配结果，不再重复解析条目
+            other_results = self._mark_movie_watching_for_other_accounts(
+                item, bgm, str(subject_id)
+            )
+
             if mark_st == 0:
                 result_message = "条目已在看或已看过，无需变更"
             else:
                 result_message = "播放开始：条目标记为在看"
+            account_outcomes = self._build_account_outcomes(
+                item, bgm, other_results, "success", result_message
+            )
 
             logger.debug(
                 f"bgm: {item.title} {result_message} https://bgm.tv/subject/{subject_id}"
@@ -855,6 +948,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 if trace
                 else "",
                 match_trace=trace.to_dict() if trace else None,
+                account_results=account_outcomes,
             )
 
             return SyncResponse(
@@ -865,6 +959,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     "season": item.season,
                     "episode": item.episode,
                     "subject_id": str(subject_id),
+                    "account_results": account_outcomes,
                 },
             )
         except Exception as e:
@@ -983,8 +1078,13 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         优先级（从高到低）：
         1. 标题与请求标题精确相等（最直接的主线条目）
         2. 标题含"第N季"声明（明确是季番条目）
-        3. eps/total_episodes 最大的候选（主线剧集集数多）
-        4. 兜底取第一个候选
+        3. 兜底取第一个候选
+
+        历史变更：删除了原 step 3「eps/total_episodes 最大的候选」（2026-09-08）。
+        根因：跨季场景下该规则不安全。`凡人修仙传`（81 集）会盖过
+        `凡人修仙传 新年番`（48 集）——实际查询带「新年番」字样时本意是后者。
+        实测 240 条 L2 黄金集 NFKC 修复后此类误判占新增错配 7 条。
+        决策：宁可取第一个（季番候选中按 API 返回顺序），不再按集数取最大。
 
         Args:
             candidates: detect_media_type 为 episode 的候选列表（已排除剧场版/电影）
@@ -1008,7 +1108,8 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 if name == request_title or name_cn == request_title:
                     return cand
 
-        # 2) 标题含"第N季"声明（明确是季番条目，优先于衍生短番）
+        # 2) 标题含"第N季"声明（明确是季番条目，优先于衍生短番）。
+        #    季番候选内部按 API 返回顺序取首条（不再按 eps 排序，见上方说明）。
         season_candidates = []
         for cand in candidates:
             name = cand.get("name") or ""
@@ -1017,20 +1118,10 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             if "季" in combined or "期" in combined or "Season" in combined:
                 season_candidates.append(cand)
         if season_candidates:
-            # 在季番候选中再按 eps 排序
-            season_candidates.sort(
-                key=lambda c: int(c.get("eps") or c.get("total_episodes") or 0),
-                reverse=True,
-            )
             return season_candidates[0]
 
-        # 3) eps/total_episodes 最大的候选
-        sorted_by_eps = sorted(
-            candidates,
-            key=lambda c: int(c.get("eps") or c.get("total_episodes") or 0),
-            reverse=True,
-        )
-        return sorted_by_eps[0]
+        # 3) 兜底：取第一个候选
+        return candidates[0]
 
     def _resolve_season_episode(
         self,
@@ -1065,6 +1156,16 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             return "已标记为看过"
         return "已添加到收藏并标记为看过"
 
+    def _format_watching_status_message(self, watching_status: int) -> str:
+        """根据剧场版收藏结果构建结果消息（供其余账号结果展示复用）
+
+        剧场版链路只置条目收藏状态、不点单集，故取值与剧集不同：
+        0 为无需变更（已在看或已看过），1 为新增收藏或设为在看。
+        """
+        if watching_status == 0:
+            return "已在看或已看过，不再重复标记"
+        return "已标记为在看"
+
     def _apply_sync_status(
         self,
         item: CustomItem,
@@ -1073,8 +1174,13 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         bgm_ep_id: str,
         bgm_title: str,
         mark_status: int,
+        bgm_username: str = "",
     ) -> str:
-        """根据标记结果构建结果消息并发送通知。返回 result_message。"""
+        """根据标记结果构建结果消息并发送通知。返回 result_message。
+
+        ``bgm_username`` 为执行标记的 Bangumi 账号用户名，作为通知变量供
+        模板区分多账号场景下各账号的结果。
+        """
         result_message = self._format_mark_status_message(mark_status)
         if mark_status == 0:
             logger.debug(
@@ -1088,6 +1194,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 subject_id=bgm_se_id,
                 episode_id=bgm_ep_id,
                 bgm_title=bgm_title,
+                bgm_username=bgm_username,
             )
 
         elif mark_status == 1:
@@ -1102,6 +1209,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 subject_id=bgm_se_id,
                 episode_id=bgm_ep_id,
                 bgm_title=bgm_title,
+                bgm_username=bgm_username,
             )
 
         else:
@@ -1119,9 +1227,52 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 subject_id=bgm_se_id,
                 episode_id=bgm_ep_id,
                 bgm_title=bgm_title,
+                bgm_username=bgm_username,
             )
 
         return result_message
+
+    def _notify_account_outcomes(
+        self,
+        item: CustomItem,
+        actual_source: str,
+        bgm_se_id: str,
+        bgm_ep_id: str,
+        bgm_title: str,
+        account_results: list[dict] | None,
+    ) -> None:
+        """按 Bangumi 账号发送各自的标记结果通知
+
+        多账号场景下各账号结果可能不同（如 A 账号已看过跳过、B 账号标记失败），
+        单条汇总通知无法按账号精确订阅，故为每个账号单独发送一条，并给出
+        ``bgm_username`` 变量供模板引用账号用户名。
+
+        首选账号的通知由 ``_apply_sync_status`` 随本次同步结果一并发出，
+        此处只处理其余账号，避免重复通知。
+        """
+        for outcome in account_results or []:
+            if outcome.get("primary"):
+                continue
+            if outcome.get("status") == "success":
+                notification_type = (
+                    "mark_skipped"
+                    if outcome.get("mark_status") == 0
+                    else "mark_success"
+                )
+                extra = {"message": outcome.get("message", "")}
+            else:
+                notification_type = "mark_failed"
+                extra = {"error_message": outcome.get("message", "")}
+            notification_service.notify(
+                notification_type,
+                item,
+                actual_source,
+                subject_id=bgm_se_id,
+                episode_id=bgm_ep_id,
+                bgm_title=bgm_title,
+                bgm_username=outcome.get("username", ""),
+                **extra,
+            )
 
     def _mark_subject_completed_if_needed(
         self,
@@ -1142,7 +1293,9 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                         f"subject_id={bgm_se_id}"
                     )
                 else:
-                    bgm.change_collection_state(subject_id=str(bgm_se_id), state=2)
+                    bgm.change_collection_state(
+                        subject_id=str(bgm_se_id), state=COLLECTION_TYPE_DONE
+                    )
             except Exception as e:
                 logger.warning(
                     f"剧场版条目标记为看过失败（单集已处理）: subject_id={bgm_se_id} {e}"
@@ -1169,7 +1322,8 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     if total_eps > 0:
                         if watched_eps >= total_eps:
                             bgm.change_collection_state(
-                                subject_id=str(bgm_se_id), state=2
+                                subject_id=str(bgm_se_id),
+                                state=COLLECTION_TYPE_DONE,
                             )
                             logger.debug(
                                 f"bgm: {bgm_title or item.title} 所有剧集已看完（已看 {watched_eps}/{total_eps} 集），已自动归档为「看过」"
@@ -1178,6 +1332,151 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 logger.warning(
                     f"TV番剧自动归档为「看过」失败（单集已处理）: subject_id={bgm_se_id} {e}"
                 )
+
+    def _mark_episode_for_other_accounts(
+        self,
+        item: CustomItem,
+        primary_bgm: BangumiApi,
+        bgm_se_id: str,
+        bgm_ep_id: str,
+        bgm_title: str,
+    ) -> None:
+        """把已解析的单集标记到首选账号之外的其余 Bangumi 账号
+
+        同一媒体服务器用户名可被多个 Bangumi 账号声明（一人多号、与亲友共享
+        观看记录）。首选账号由执行阶段管线完成标记，其余账号共享同一次集数
+        解析结果，在此逐个补标记，不重复解析集数。
+
+        其余账号不传入队 payload：待同步队列按媒体服务器用户名补发，入队会
+        与首选账号产生重复条目，故其余账号遇 API 不可达只记录日志。
+
+        单个其余账号标记失败只记录日志，不改变本次同步结果（结果由首选账号
+        的标记状态决定）。
+
+        Returns:
+            每个其余账号一条标记结果（配置段名、Bangumi 用户名、成功/失败、
+            失败原因），供同步记录详情按账号展示。
+        """
+        results: list[dict] = []
+        for section, bgm in self._get_bangumi_account_targets_for_user(item.user_name):
+            if bgm is primary_bgm:
+                continue
+            username = str(getattr(bgm, "username", "") or "")
+            try:
+                mark_status = self._retry_mark_episode(
+                    bgm, str(bgm_se_id), str(bgm_ep_id)
+                )
+                self._mark_subject_completed_if_needed(item, bgm, bgm_se_id, bgm_title)
+            except Exception as e:
+                logger.warning(
+                    f"其余 Bangumi 账号标记或归档失败（首选账号已标记）: "
+                    f"subject_id={bgm_se_id} ep={bgm_ep_id} {e}"
+                )
+                results.append(
+                    {
+                        "section": section,
+                        "username": username,
+                        "status": "failed",
+                        "message": str(e),
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "section": section,
+                        "username": username,
+                        "status": "success",
+                        "mark_status": mark_status,
+                        "message": self._format_mark_status_message(mark_status),
+                    }
+                )
+        return results
+
+    def _build_account_outcomes(
+        self,
+        item: CustomItem,
+        primary_bgm: BangumiApi,
+        other_results: list[dict],
+        status: str,
+        primary_message: str = "",
+        primary_mark_status: int | None = None,
+    ) -> list[dict]:
+        """组装本次同步各 Bangumi 账号的结果，按登记顺序、首选在前。
+
+        首选账号的标记由执行阶段管线完成，其结果即本次同步结果，故状态直接
+        取 ``status``、结果说明取 ``primary_message``；剧场版链路无单集
+        ``mark_status``（只置条目在看），传 ``None`` 由展示层回退到 ``message``。
+        其余账号结果由 ``_mark_episode_for_other_accounts`` 收集后原样拼接在后面。
+
+        首选账号也携带 ``mark_status``（剧集链路），与其余账号结构对齐，
+        便于前端在「同步动作/同步结果」中按账号统一展示标记状态。
+        """
+        primary_section = ""
+        for section, api in self._get_bangumi_account_targets_for_user(item.user_name):
+            if api is primary_bgm:
+                primary_section = section
+                break
+        primary_outcome = {
+            "section": primary_section,
+            "username": str(getattr(primary_bgm, "username", "") or ""),
+            "status": status,
+            "message": primary_message,
+            "primary": True,
+        }
+        if primary_mark_status is not None:
+            primary_outcome["mark_status"] = primary_mark_status
+        return [
+            primary_outcome,
+            *({**r, "primary": False} for r in other_results),
+        ]
+
+    def _mark_movie_watching_for_other_accounts(
+        self,
+        item: CustomItem,
+        primary_bgm: BangumiApi,
+        subject_id: str,
+    ) -> list[dict]:
+        """把已匹配的剧场版条目置为「在看」到首选账号之外的其余 Bangumi 账号
+
+        与 ``_mark_episode_for_other_accounts`` 对称，沿用剧场版链路只置条目
+        收藏状态、不点单集。失败只记录日志，不改变本次同步结果。
+
+        Returns:
+            每个其余账号一条标记结果（配置段名、Bangumi 用户名、成功/失败、
+            失败原因），供同步记录详情按账号展示。
+        """
+        results: list[dict] = []
+        for section, bgm in self._get_bangumi_account_targets_for_user(item.user_name):
+            if bgm is primary_bgm:
+                continue
+            username = str(getattr(bgm, "username", "") or "")
+            try:
+                watching_status = bgm.ensure_subject_watching(str(subject_id))
+                results.append(
+                    {
+                        "section": section,
+                        "username": username,
+                        "status": "success",
+                        "mark_status": watching_status,
+                        "message": self._format_watching_status_message(
+                            watching_status
+                        ),
+                    }
+                )
+            except Exception as e:
+                logger.warning(
+                    f"其余 Bangumi 账号标记剧场版在看失败（首选账号已标记）: "
+                    f"subject_id={subject_id} {e}"
+                )
+                results.append(
+                    {
+                        "section": section,
+                        "username": username,
+                        "status": "failed",
+                        "message": str(e),
+                    }
+                )
+        return results
 
     def _allocate_inline_run_id(self) -> str:
         """直调 sync_custom_item 时分配 run_id。"""
@@ -1235,6 +1534,12 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     f"用户 {user_name} 不在允许同步的媒体服务器用户名列表中"
                     f"（当前配置: {', '.join(allowed)}）"
                 )
+            # 账号已停用：与多用户模式一致地短路，避免继续执行匹配流程
+            if accounts_list and not accounts_list[0].get("enabled", True):
+                logger.debug(f"账号已停用，跳过同步：{user_name}")
+                return False, (
+                    f"用户 {user_name} 对应的 Bangumi 账号已停用，不参与同步"
+                )
         else:
             # 多用户语义：检查用户是否在映射中
             user_mappings = _accounts.get_user_mappings()
@@ -1245,12 +1550,16 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     "需在 Bangumi 账号中填写 media_server_username）"
                 )
 
-            # 检查对应的bangumi配置是否存在且有效
+            # 检查对应的bangumi配置是否存在且有效（账号已停用或缺少 username/令牌时缺失）
             bangumi_config = self._get_bangumi_config_for_user(user_name)
             if not bangumi_config:
-                logger.error(f"多用户模式下用户 {user_name} 的bangumi配置无效")
+                logger.error(
+                    f"多用户模式下用户 {user_name} 无可用 Bangumi 账号"
+                    "（已停用或配置无效），跳过同步"
+                )
                 return False, (
-                    f"用户 {user_name} 对应的 Bangumi 账号配置无效或缺少 access_token"
+                    f"用户 {user_name} 对应的 Bangumi 账号已停用，"
+                    "或配置无效（缺少 username / access_token）"
                 )
 
         return True, ""
@@ -1369,6 +1678,29 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         # 传播 ctx.is_ambiguous 到 trace，编排器据此发 match_ambiguous 通知
         actual_trace.is_ambiguous = ctx.is_ambiguous
 
+        # 负样本黑名单：若自动匹配命中的 subject 曾被用户拒绝，则降级为漏标
+        # （custom_mapping 为显式用户映射，代表明确意图，不受黑名单约束）
+        blocked = self._get_blocked_for_title(self._safe_request_title(item))
+        if (
+            blocked
+            and result.subject_id
+            and result.subject_id in blocked
+            and actual_trace.final_match_method != "custom_mapping"
+        ):
+            logger.info(
+                f"命中 {result.subject_id} 已被用户拒绝（标题 {item.title!r}），"
+                f"按黑名单排除，转为漏标"
+            )
+            result = dataclasses.replace(
+                result,
+                subject_id=None,
+                bgm_se_id=None,
+                bgm_ep_id=None,
+                bgm_title="",
+                is_season_matched_id=False,
+                failure_detail="已排除：该条目曾被手动拒绝（可在待确认中重新确认）",
+            )
+
         # 匹配歧义检测已前移到 APISearchStep（设置 ctx.is_ambiguous），
         # 通知职责由编排器统一发送，_find_subject_id 不再直接发通知。
 
@@ -1384,25 +1716,21 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
         return _accounts.get_bangumi_config_for_user(user_name)
 
-    def _get_bangumi_api_for_user(self, user_name: str) -> BangumiApi | None:
-        """根据用户名获取对应的BangumiApi实例
+    def _get_or_create_bangumi_api(
+        self, cache_key: str, bangumi_config: dict[str, Any]
+    ) -> BangumiApi:
+        """按缓存键复用已有的 BangumiApi 实例，配置变更时失效重建
 
-        按用户缓存实例，配置变更时自动失效重建。
         复用实例可避免每次同步都重新构造 httpx.Client（含连接池建立），
         同时让 BangumiApi 内部的 OrderedDict 实例缓存跨调用点生效，
         显著降低单次同步耗时（特别是跨季遍历场景）。
 
+        缓存键由调用方加命名空间前缀：按用户名取用 ``u:`` 前缀、按配置段取用
+        ``s:`` 前缀，避免两个命名空间共用同一扁平 dict 键时互相覆盖。
+
         线程安全说明：dict get/set 在 GIL 下原子，最坏情况是两个线程
         同时 miss 各创建一个实例，最终 dict 被覆盖，可接受（比加锁性能好）。
         """
-        bangumi_config = self._get_bangumi_config_for_user(user_name)
-        if not bangumi_config:
-            return None
-
-        if not bangumi_config["username"] or not bangumi_config["access_token"]:
-            logger.error(f"用户 {user_name} 的bangumi配置不完整")
-            return None
-
         # 组装配置快照：bangumi section + dev section 中影响 API 行为的字段
         dev_snapshot = config_manager.get_dev_http_snapshot()
         config_snapshot = {
@@ -1417,7 +1745,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         }
 
         # 缓存命中：实例存在且配置快照未变化
-        cached = self._bangumi_api_cache.get(user_name)
+        cached = self._bangumi_api_cache.get(cache_key)
         if cached is not None and cached[1] == config_snapshot:
             return cached[0]
 
@@ -1432,8 +1760,81 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             bgm_next_proxy=config_snapshot["bgm_next_proxy"],
             ech_mode=config_snapshot["ech_mode"],
         )
-        self._bangumi_api_cache[user_name] = (api, config_snapshot)
+        self._bangumi_api_cache[cache_key] = (api, config_snapshot)
         return api
+
+    def _get_bangumi_api_by_section(self, section_name: str) -> BangumiApi | None:
+        """根据配置段名获取对应的BangumiApi实例
+
+        按配置段缓存实例，让同一媒体服务器用户名下的多个 Bangumi 账号各自
+        持有实例，互不覆盖。
+        """
+        from app.core import accounts as _accounts
+
+        bangumi_config = _accounts.get_bangumi_config_by_section(section_name)
+        if not bangumi_config:
+            return None
+
+        if not bangumi_config["username"] or not bangumi_config["access_token"]:
+            logger.error(f"配置段 {section_name} 的bangumi配置不完整")
+            return None
+
+        return self._get_or_create_bangumi_api("s:" + section_name, bangumi_config)
+
+    def _get_bangumi_api_for_user(self, user_name: str) -> BangumiApi | None:
+        """根据用户名获取对应的BangumiApi实例（首选账号）
+
+        同一媒体服务器用户名绑定多个 Bangumi 账号时返回首选（首个配置完整的）
+        账号实例；需要对全部账号各执行一次标记时使用
+        ``_get_bangumi_account_targets_for_user``。
+
+        按用户缓存实例，配置变更时自动失效重建。
+        """
+        bangumi_config = self._get_bangumi_config_for_user(user_name)
+        if not bangumi_config:
+            return None
+
+        if not bangumi_config["username"] or not bangumi_config["access_token"]:
+            logger.error(f"用户 {user_name} 的bangumi配置不完整")
+            return None
+
+        return self._get_or_create_bangumi_api("u:" + user_name, bangumi_config)
+
+    def _get_bangumi_account_targets_for_user(
+        self, user_name: str
+    ) -> list[tuple[str, BangumiApi]]:
+        """返回该用户名下全部 Bangumi 账号的（配置段名, 实例），按登记顺序。
+
+        同一媒体服务器用户名可被多个 Bangumi 账号声明时返回全部账号（按账号
+        登记顺序），供一人多号或与亲友共享观看记录的场景对每个账号各执行一次
+        标记，并按配置段名区分各账号的标记结果。未绑定任何账号时返回空列表。
+
+        首选（首个配置完整的）账号沿用 ``_get_bangumi_api_for_user`` 的实例，
+        与主流程持有同一对象；其余账号按配置段缓存，互不覆盖。
+        """
+        from app.core import accounts as _accounts
+
+        sections = _accounts.get_bangumi_sections_for_user(user_name)
+        primary_index = next(
+            (
+                index
+                for index, section in enumerate(sections)
+                if _accounts.get_bangumi_config_by_section(section) is not None
+            ),
+            None,
+        )
+        if primary_index is None:
+            return []
+
+        targets: list[tuple[str, BangumiApi]] = []
+        for index, section in enumerate(sections):
+            if index == primary_index:
+                api = self._get_bangumi_api_for_user(user_name)
+            else:
+                api = self._get_bangumi_api_by_section(section)
+            if api is not None:
+                targets.append((section, api))
+        return targets
 
     def _get_bangumi_data(self) -> BangumiData:
         """获取BangumiData实例（使用实例缓存避免内存泄漏）"""
@@ -1445,15 +1846,16 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         """批量复位所有缓存 BangumiApi 实例的不可达标记，返回复位数量。
 
         补发调度器批量探测成功（_probe_api）后调用：一次探测通过即统一恢复
-        全部用户实例，避免每个实例各自等 TTL 到期、每条同步任务各探一次的
-        「无用重试」堆积。探测失败时不调用，维持不可达状态。
+        全部账号实例（含其余 Bangumi 账号），避免每个实例各自等 TTL 到期、
+        每条同步任务各探一次的「无用重试」堆积。探测失败时不调用，
+        维持不可达状态。
         """
         count = 0
-        # 快照遍历：_get_bangumi_api_for_user（sync worker 线程）会并发写入
-        # _bangumi_api_cache，直接遍历 dict 在写入时触发
-        # "dictionary changed size during iteration"。GIL 下 list() 原子拷贝
-        # 引用，与既有"不加锁、接受偶发覆盖"的设计一致。
-        for _user_name, (api, _snapshot) in list(self._bangumi_api_cache.items()):
+        # 快照遍历：_get_bangumi_api_for_user / _get_bangumi_api_by_section
+        # （sync worker 线程）会并发写入 _bangumi_api_cache，直接遍历 dict
+        # 在写入时触发 "dictionary changed size during iteration"。GIL 下
+        # list() 原子拷贝引用，与既有"不加锁、接受偶发覆盖"的设计一致。
+        for _cache_key, (api, _snapshot) in list(self._bangumi_api_cache.items()):
             if api.is_api_unreachable():
                 api.mark_api_reachable()
                 count += 1
@@ -1584,6 +1986,12 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 "should_mark_synced": False,
                 "sync_record_id": sync_record_id,
             }
+
+        # 补发成功：其余 Bangumi 账号共享本次补发结果（入队只记首选账号）
+        if is_movie:
+            self._mark_movie_watching_for_other_accounts(item, bgm, bgm_se_id)
+        else:
+            self._mark_episode_for_other_accounts(item, bgm, bgm_se_id, bgm_ep_id, "")
 
         # 补发成功，发通知（可选）
         try:
