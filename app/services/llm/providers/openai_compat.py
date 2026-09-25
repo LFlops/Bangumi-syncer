@@ -12,18 +12,25 @@ _parse_response 两个方法内（与 AnthropicProvider 结构对称）：
 
 from __future__ import annotations
 
+import json
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import (
     ChatResponse,
+    ContentBlock,
     Message,
+    StreamChunk,
     TextBlock,
     ThinkingLevel,
+    ToolResultBlock,
+    ToolUseBlock,
     Usage,
 )
 from app.services.llm.providers.base import BaseProvider
+from app.services.llm.sse import iter_sse_events
 from app.utils.http_client import create_async_client
 
 
@@ -129,11 +136,170 @@ class OpenAICompatProvider(BaseProvider):
 
         return self._parse_response(data)
 
+    async def stream(
+        self, messages: list[Message], **kwargs: Any
+    ) -> AsyncIterator[StreamChunk]:
+        """以 SSE 流式方式发送聊天补全请求。
+
+        请求构造复用 chat() 的 _build_request（reasoning_effort 映射、
+        _extras_disabled / _force_tool_choice_degraded 降级、tools 规范化
+        全部沿用），仅追加 stream / stream_options 以启用增量与 usage 上报。
+
+        provider 层不重试、不吞异常：httpx 异常/状态错误直接向上抛，
+        由 client 层（T7）负责重试与降级；已产出部分事件后发生的异常在
+        迭代中自然抛出。
+
+        Args:
+            messages: 对话消息列表。
+            **kwargs: 覆盖默认的 model、max_tokens、temperature、tools 等。
+
+        Yields:
+            provider 无关的归一化流式事件 StreamChunk。
+
+        Raises:
+            httpx.HTTPStatusError: HTTP 错误响应（非 2xx）。
+            httpx.TimeoutException: 请求超时。
+        """
+        url = f"{self.api_base}/chat/completions"
+        model = kwargs.get("model", self.model)
+        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
+        logger.debug(
+            f"LLM stream request: url={url}, model={model}, "
+            f"timeout={self.timeout}s{proxy_label}"
+        )
+
+        body = self._build_request(messages, **kwargs)
+        body["stream"] = True
+        body["stream_options"] = {"include_usage": True}
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        # index → (id, name)：OpenAI 仅在首个 tool_call 分片给出 id/name，
+        # 后续 arguments 增量需据此还原归属。
+        tool_index: dict[int, tuple[str, str]] = {}
+
+        async with create_async_client(
+            proxy=self.proxy,
+            timeout=self.timeout,
+            follow_redirects=True,
+        ) as client:
+            async with client.stream(
+                "POST",
+                url,
+                json=body,
+                headers=headers,
+                timeout=self.timeout,
+            ) as response:
+                if not response.is_success:
+                    # 读取错误体并记录，便于上游日志/重试判断；再抛状态错误（与 chat() 一致）
+                    error_body = (await response.aread()).decode("utf-8", "replace")
+                    logger.warning(
+                        f"LLM 流式请求失败: status={response.status_code}, "
+                        f"body={error_body[:500]}"
+                    )
+                    response.raise_for_status()
+                async for event in iter_sse_events(response.aiter_lines()):
+                    if event.data == "[DONE]":
+                        logger.debug("LLM 流式收到 [DONE]，结束迭代")
+                        return
+                    for chunk in self._map_stream_event(event.data, tool_index):
+                        yield chunk
+
+    def _map_stream_event(
+        self, raw: str, tool_index: dict[int, tuple[str, str]]
+    ) -> list[StreamChunk]:
+        """单个 OpenAI chat.completion.chunk → 零或多个 StreamChunk。
+
+        tool_index 为跨事件维护的 index → (id, name) 映射（原地更新）。
+        """
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            # 坏事件不中断流：记录后跳过
+            logger.warning("LLM 流式事件 JSON 解析失败，已忽略：%r", raw)
+            return []
+        if not isinstance(data, dict):
+            logger.warning("LLM 流式事件非对象，已忽略：%r", data)
+            return []
+
+        chunks: list[StreamChunk] = []
+        choices = data.get("choices") or []
+        if choices:
+            choice = choices[0]
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                chunks.append(StreamChunk(type="text_delta", text=content))
+            chunks.extend(
+                self._map_tool_call_deltas(delta.get("tool_calls") or [], tool_index)
+            )
+            finish_reason = choice.get("finish_reason")
+            if finish_reason:
+                # 与 _parse_response 一致：tool_calls → tool_use，其余透传
+                stop_reason = (
+                    "tool_use" if finish_reason == "tool_calls" else finish_reason
+                )
+                chunks.append(StreamChunk(type="stop", stop_reason=stop_reason))
+
+        usage = data.get("usage")
+        if usage:
+            chunks.append(
+                StreamChunk(
+                    type="usage",
+                    usage=Usage(
+                        prompt_tokens=usage.get("prompt_tokens", 0),
+                        completion_tokens=usage.get("completion_tokens", 0),
+                        total_tokens=usage.get("total_tokens", 0),
+                    ),
+                )
+            )
+        return chunks
+
+    @staticmethod
+    def _map_tool_call_deltas(
+        tool_calls: list, tool_index: dict[int, tuple[str, str]]
+    ) -> list[StreamChunk]:
+        """tool_calls 分片数组 → tool_use_start / tool_use_delta 事件。"""
+        chunks: list[StreamChunk] = []
+        for tc in tool_calls:
+            index = tc.get("index", 0)
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+
+            if index not in tool_index and name:
+                # 首次出现且带 name → 新建工具调用槽（id 仅首个分片提供）
+                call_id = tc.get("id") or f"call_{index}"
+                tool_index[index] = (call_id, name)
+                chunks.append(
+                    StreamChunk(
+                        type="tool_use_start",
+                        tool_use_id=call_id,
+                        tool_name=name,
+                    )
+                )
+
+            arguments = fn.get("arguments")
+            if arguments:
+                call_id = tool_index.get(index, (tc.get("id") or f"call_{index}", ""))[
+                    0
+                ]
+                chunks.append(
+                    StreamChunk(
+                        type="tool_use_delta",
+                        tool_use_id=call_id,
+                        partial_json=arguments,
+                    )
+                )
+        return chunks
+
     def _build_request(self, messages: list[Message], **kwargs: Any) -> dict:
         """内部模型 → OpenAI wire 格式（请求体）。"""
         body: dict[str, Any] = {
             "model": kwargs.get("model", self.model),
-            "messages": [self._to_wire_message(m) for m in messages],
+            "messages": [wm for m in messages for wm in self._to_wire_messages(m)],
             "max_tokens": kwargs.get("max_tokens", self.max_tokens),
             "temperature": kwargs.get("temperature", self.temperature),
         }
@@ -148,17 +314,48 @@ class OpenAICompatProvider(BaseProvider):
         )
         if effort is not None:
             body["reasoning_effort"] = effort
-            # H3：o 系列推理模型拒绝非 1 的 temperature（硬 400），
+            # o 系列推理模型拒绝非 1 的 temperature（硬 400），
             # 与 Anthropic thinking 开启时的处理对齐（anthropic.py 强制 1）
             body["temperature"] = 1
+
+        # 工具协议 wire 规范化（provider 拥有 wire 格式，agent/场景层保持 provider 无关）。
+        # - tools 元素已是 {"type":"function","function":{...}} → 透传；否则（内部
+        #   flat 形态 name/description/parameters）→ 包装为 function 形式。
+        # - tool_choice "none"/"auto"/"required" 原样透传；其它字符串（工具名）
+        #   → {"type":"function","function":{"name":<str>}}；dict 透传；
+        #   None → 不发送该键（避免序列化为 null）。
+        if "tools" in kwargs:
+            tools = kwargs["tools"]
+            if tools is not None:
+                body["tools"] = [self._normalize_openai_tool(t) for t in tools]
+        if "tool_choice" in kwargs:
+            tc = kwargs["tool_choice"]
+            if tc is not None:
+                normalized_tc = self._normalize_openai_tool_choice(tc)
+                if (
+                    self._force_tool_choice_degraded
+                    and isinstance(normalized_tc, dict)
+                    and normalized_tc.get("type") == "function"
+                ):
+                    # 端点级降级（client 依据服务端拒绝置位）：该端点不支持
+                    # 强制工具选择（如 thinking 模式约束），改为 auto。
+                    logger.warning(
+                        "已按端点约束将强制 tool_choice 降级为 auto"
+                        "（该端点不支持强制工具选择）"
+                    )
+                    normalized_tc = "auto"
+                body["tool_choice"] = normalized_tc
+        # cache_control 是 Anthropic 专属参数，OpenAI 无此字段——忽略不发送，
+        # 即便调用方误传也不得进入请求体（否则部分端点报错）
+        body.pop("cache_control", None)
         return body
 
     def _to_wire_message(self, m: Message) -> dict:
-        """内部消息 → OpenAI wire 消息（content 为字符串）。
+        """单条内部消息 → 单条 OpenAI wire 消息（无 tool 拆分的简单路径）。
 
         content 为 list[ContentBlock] 时取 text block 拼接（与 Anthropic 侧
         _system_text 同一分隔语义）；thinking/tool 等 block 不适用于当前端点，
-        跳过（正式工具协议见 Phase 4）。
+        跳过（工具协议见 _to_wire_messages）。
         """
         if isinstance(m.content, str):
             return {"role": m.role, "content": m.content}
@@ -170,6 +367,95 @@ class OpenAICompatProvider(BaseProvider):
             )
         return {"role": m.role, "content": "\n\n".join(parts)}
 
+    def _to_wire_messages(self, m: Message) -> list[dict]:
+        """内部消息 → 一条或多条 OpenAI wire 消息（工具协议拆并）。
+
+        - str 内容：单条 {role, content}
+        - assistant 消息含 ToolUseBlock：聚合为单条 assistant 消息
+          （content 与 tool_calls 共存；无文本时 content=null）
+        - user 消息含 ToolResultBlock：文本先输出为独立 user 消息，
+          再逐条拆为 role=tool 消息（is_error 加 [ERROR] 前缀）
+        """
+        if isinstance(m.content, str):
+            return [{"role": m.role, "content": m.content}]
+
+        text_parts: list[str] = []
+        tool_calls: list[dict] = []
+        tool_results: list[ToolResultBlock] = []
+        for block in m.content:
+            if isinstance(block, TextBlock):
+                text_parts.append(block.text)
+            elif isinstance(block, ToolUseBlock):
+                tool_calls.append(
+                    {
+                        "id": block.id,
+                        "type": "function",
+                        "function": {
+                            "name": block.name,
+                            # arguments 必须为 JSON 字符串（OpenAI wire 约定）
+                            "arguments": json.dumps(block.input, ensure_ascii=False),
+                        },
+                    }
+                )
+            elif isinstance(block, ToolResultBlock):
+                tool_results.append(block)
+
+        if m.role == "assistant" and tool_calls:
+            content = "\n\n".join(text_parts) if text_parts else None
+            return [{"role": "assistant", "content": content, "tool_calls": tool_calls}]
+
+        if m.role == "user" and tool_results:
+            result: list[dict] = []
+            if text_parts:
+                result.append({"role": "user", "content": "\n\n".join(text_parts)})
+            for tr in tool_results:
+                prefix = "[ERROR] " if tr.is_error else ""
+                result.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.tool_use_id,
+                        "content": prefix + tr.content,
+                    }
+                )
+            return result
+
+        # 默认：纯文本（或未知组合）→ 单条文本消息
+        return [{"role": m.role, "content": "\n\n".join(text_parts)}]
+
+    @staticmethod
+    def _normalize_openai_tool(tool: dict) -> dict:
+        """将工具 schema 规范化为 OpenAI wire 形态。
+
+        - 已是 {"type":"function","function":{...}} → 透传；
+        - 否则（内部 flat 形态 name/description/parameters）→ 包装为 function 形式。
+        """
+        if tool.get("type") == "function" and "function" in tool:
+            return tool
+        return {
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool["description"],
+                "parameters": tool.get("parameters", {}),
+            },
+        }
+
+    _OPENAI_TOOL_CHOICE_LITERALS = frozenset({"none", "auto", "required"})
+
+    @classmethod
+    def _normalize_openai_tool_choice(cls, tool_choice: Any) -> Any:
+        """规范化 tool_choice：
+
+        - "none"/"auto"/"required" 原样透传；
+        - 其它字符串（工具名）→ {"type":"function","function":{"name":<str>}}；
+        - dict 透传。
+        """
+        if isinstance(tool_choice, str):
+            if tool_choice in cls._OPENAI_TOOL_CHOICE_LITERALS:
+                return tool_choice
+            return {"type": "function", "function": {"name": tool_choice}}
+        return tool_choice
+
     def _reasoning_effort(self, level: str, model: str) -> str | None:
         """thinking_level → reasoning_effort；off/不支持时返回 None（不传字段）。"""
         if level == "off":
@@ -179,7 +465,7 @@ class OpenAICompatProvider(BaseProvider):
         # 误中导致向不支持的端点发送未知参数。OpenAI 对未知参数的行为因 API 版本
         # 而异，不冒险传给非 o 系列。
         if not re.match(r"^o\d", model):
-            # L6：配置/模型不匹配是静态事实，warning 刷屏无益——降为 debug
+            # 配置/模型不匹配是静态事实，warning 刷屏无益——降为 debug
             # （用户可通过 stats/日志在调优期定位）
             logger.debug(
                 f"model {model} 非 o 系列不支持 reasoning_effort，"
@@ -194,13 +480,39 @@ class OpenAICompatProvider(BaseProvider):
         message = choice.get("message", {})
         content = message.get("content")
         refusal = message.get("refusal")
-        # M10：finish_reason → stop_reason（与 Anthropic 对齐，P4 判断 max_tokens 截断用）
-        stop_reason = choice.get("finish_reason") or ""
+        # finish_reason → stop_reason（与 Anthropic 对齐，供 max_tokens 截断判断用）；
+        # "tool_calls" 统一映射为内部 "tool_use"
+        finish_reason = choice.get("finish_reason") or ""
+        stop_reason = "tool_use" if finish_reason == "tool_calls" else finish_reason
 
         if content is None:
             if refusal:
                 raise ValueError(f"模型拒绝响应: {refusal}")
             content = ""
+
+        blocks: list[ContentBlock] = []
+        text_parts: list[str] = []
+        if content:
+            text_parts.append(content)
+            blocks.append(TextBlock(text=content))
+
+        # wire tool_calls → ToolUseBlock 列表（arguments JSON 字符串解析，
+        # 解析失败兜底 {"raw": "<原字符串>"}）
+        for tc in message.get("tool_calls", []) or []:
+            fn = tc.get("function", {})
+            raw_args = fn.get("arguments", "{}")
+            try:
+                parsed = json.loads(raw_args) if raw_args else {}
+            except (json.JSONDecodeError, TypeError):
+                parsed = {"raw": raw_args}
+            blocks.append(
+                ToolUseBlock(
+                    id=tc.get("id", ""),
+                    name=fn.get("name", ""),
+                    input=parsed,
+                )
+            )
+
         model = data.get("model", "")
 
         usage: Usage | None = None
@@ -213,5 +525,59 @@ class OpenAICompatProvider(BaseProvider):
             )
 
         return ChatResponse(
-            content=content, model=model, usage=usage, stop_reason=stop_reason
+            content="".join(text_parts),
+            blocks=blocks,
+            model=model,
+            usage=usage,
+            stop_reason=stop_reason,
         )
+
+    def _wire_to_messages(self, wire_messages: list[dict]) -> list[Message]:
+        """OpenAI wire 消息列表 → 内部消息列表（历史合并）。
+
+        连续的 role=tool 消息合并回一条 user 消息的多个 ToolResultBlock
+        （与 _to_wire_messages 的拆分方向互逆）；普通消息按文本/TextBlock 还原。
+        """
+        result: list[Message] = []
+        i = 0
+        n = len(wire_messages)
+        while i < n:
+            msg = wire_messages[i]
+            role = msg.get("role")
+            if role == "tool":
+                # 收集连续 role=tool 块，合并为单条 user 消息
+                tool_blocks: list[ToolResultBlock] = []
+                while i < n and wire_messages[i].get("role") == "tool":
+                    tm = wire_messages[i]
+                    raw = tm.get("content", "")
+                    is_error = False
+                    if isinstance(raw, str) and raw.startswith("[ERROR] "):
+                        is_error = True
+                        raw = raw[len("[ERROR] ") :]
+                    tool_blocks.append(
+                        ToolResultBlock(
+                            tool_use_id=tm.get("tool_call_id", ""),
+                            content=raw,
+                            is_error=is_error,
+                        )
+                    )
+                    i += 1
+                result.append(Message(role="user", content=tool_blocks))
+                continue
+
+            content = msg.get("content")
+            if isinstance(content, str):
+                result.append(Message(role=role, content=content))
+            elif isinstance(content, list):
+                # 多模态/列表内容：仅取 text 部分还原为 TextBlock
+                blocks: list[ContentBlock] = [
+                    TextBlock(text=part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                result.append(Message(role=role, content=blocks))
+            else:
+                # content 为 None（如纯 tool_call 的 assistant 消息）→ 空文本
+                result.append(Message(role=role, content=""))
+            i += 1
+        return result
