@@ -18,7 +18,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.services.agent.loop import ChatFn
+from app.services.agent.loop import StreamFn
 from app.services.llm.models import Message
 from app.services.llm.tools import ToolDefinition, ToolRegistry
 
@@ -35,8 +35,9 @@ class ScenarioHooks:
     register_tools: Callable[[ToolRegistry, Any], list[ToolDefinition]]
     #: 构建种子消息（``ctx`` → ``[system, user, ...]``）
     build_seed: Callable[[Any], list[Message]]
-    #: 构建默认 chat 函数（``thinking_level`` → ``ChatFn``；场景决定 job 归属与思考强度透传）
-    build_chat_fn: Callable[[str], ChatFn]
+    #: 构建默认**流式** LLM 函数（``thinking_level`` → ``StreamFn``；场景决定 job 归属
+    #: 与思考强度透传）。返回 async iterator（``StreamChunk``），由 runtime 经 recorder 包装。
+    build_stream_fn: Callable[[str], StreamFn]
     #: 解析思考强度（从场景集中配置读取；恢复续跑路径使用）
     resolve_thinking_level: Callable[[], str]
     #: 解析轮次预算（``thinking_level`` → ``max_iterations``；含场景配置覆盖）

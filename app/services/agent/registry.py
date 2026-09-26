@@ -38,16 +38,22 @@ class ScenarioRuntime:
         sync_record: dict,
         bgm: Any,
         thinking_level: str,
+        stream_fn: Callable | None = None,
         chat_fn: Callable | None = None,
         notification_service: Any | None = None,
         span_recorder: Any | None = None,
     ) -> str:
-        """执行一次场景任务（转发通用运行时）。"""
+        """执行一次场景任务（转发通用运行时）。
+
+        ``stream_fn`` 为**主路径**流式注入；``chat_fn`` 为旧契约兼容（返回 ChatResponse），
+        两者都为空时由场景默认 ``build_stream_fn`` 构造。
+        """
         return await agent_runtime.run(
             run_id,
             hooks=self.hooks,
             ctx=self.make_ctx(sync_record, bgm),
             thinking_level=thinking_level,
+            stream_fn=stream_fn,
             chat_fn=chat_fn,
             notification_service=notification_service,
             span_recorder=span_recorder,

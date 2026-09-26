@@ -20,13 +20,18 @@ from dataclasses import asdict
 from datetime import datetime
 
 from app.core.logging import logger
-from app.services.agent.loop import ChatFn
+from app.services.agent.loop import ChatFn, StreamFn
 from app.services.agent.trace import (
     end_span as trace_end_span,
     record_budget_message as trace_record_budget_message,
     start_span as trace_start_span,
 )
-from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
+from app.services.llm.models import (
+    Message,
+    StreamAggregator,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 
 def _default_clock() -> float:
@@ -73,7 +78,7 @@ class TraceRecorder:
     # -- chat span 包装 -----------------------------------------------------
 
     def wrap_chat_fn(self, chat_fn: ChatFn) -> ChatFn:
-        """包装 chat_fn：每轮 start_span → await → end_span。
+        """包装旧契约 chat_fn：每轮 start_span → await → end_span。
 
         iteration 状态机：
         - 每轮开始时设定 ``_current_iteration`` 为 ``_next_iteration`` 的当前值，
@@ -87,63 +92,111 @@ class TraceRecorder:
 
         async def wrapped(messages, *, tools=None, tool_choice=None):
             # 设定当前轮并推进单调计数（仅在新一轮 chat 开始时推进）
-            recorder._current_iteration = recorder._next_iteration
-            recorder._next_iteration += 1
+            span_id = recorder._begin_chat_span()
             iteration = recorder._current_iteration
-            span_id = trace_start_span(
-                recorder.run_id, name="llm_chat", iteration=iteration, sequence=0
-            )
-            recorder._chat_span_id = span_id
-            recorder._last_tool_span_id = None  # 新轮重置
             t0 = recorder._clock()
             resp = None
             try:
                 resp = await chat_fn(messages, tools=tools, tool_choice=tool_choice)
                 return resp
             finally:
-                latency_ms = int((recorder._clock() - t0) * 1000)
-                if resp is not None:
-                    tokens = resp.usage.total_tokens if resp.usage is not None else 0
-                    # 全轮累计：终态落库取累计值而非仅末轮
-                    recorder.total_tokens += tokens
-                    tool_calls = [
-                        b.model_dump() if hasattr(b, "model_dump") else asdict(b)
-                        for b in resp.blocks
-                        if isinstance(b, ToolUseBlock)
-                    ]
-                    # 全量 blocks（含 thinking/text）：思考模型的 thinking 块必须随
-                    # tool_use 回传，恢复路径 replay 据此重建 assistant 消息，否则
-                    # 断点续跑的下一轮请求会 400（与 live loop 的 list(resp.blocks) 对齐）。
-                    # 仅追加字段、不升级 schema：旧数据无 blocks 时读取方走 tool_calls 回退。
-                    blocks = [b.model_dump() for b in resp.blocks]
-                    trace_end_span(
-                        span_id,
-                        status="ok",
-                        model=resp.model,
-                        tokens=tokens,
-                        latency_ms=latency_ms,
-                        replay_delta={
-                            "response": {
-                                "stop_reason": resp.stop_reason,
-                                "content": resp.content,
-                                "tool_calls": tool_calls,
-                                "blocks": blocks,
-                            }
-                        },
-                    )
-                else:
-                    # chat_fn 抛异常：写 error span 但不遮掩原始异常
-                    logger.warning(
-                        f"[agent] chat_fn 异常（iteration={iteration}），写 error span"
-                    )
-                    trace_end_span(
-                        span_id,
-                        status="error",
-                        latency_ms=latency_ms,
-                        error="chat_fn raised before response",
-                    )
+                recorder._finish_chat_span(
+                    span_id, iteration=iteration, t0=t0, resp=resp
+                )
 
         return wrapped
+
+    # -- stream span 包装 ---------------------------------------------------
+
+    def wrap_stream_fn(self, stream_fn: StreamFn) -> StreamFn:
+        """包装流式 LLM 调用：每轮 start_span → 透传事件（内部 fold）→ end_span。
+
+        流式唯一入口的观测包装：
+
+        - 每轮开始时（首次 ``__anext__``）设定 ``_current_iteration`` 并 start chat span，
+          使**流进行中**提前执行的工具 span 与本轮 chat span 同 iteration。
+        - 逐事件透传给调用方，同时在内部用 :class:`StreamAggregator` fold 出等价
+          ``ChatResponse``；**流正常耗尽后**以 fold 结果写 span（schema 与
+          ``wrap_chat_fn`` 完全一致：blocks/stop_reason/content/model/usage）。
+        - 流异常（LLMCallError 等）或消费方提前关闭 → resp 为空 → 写 error span，
+          不落成功、不遮掩原始异常。
+        """
+        recorder = self
+
+        async def wrapped(messages, *, tools=None, tool_choice=None):
+            span_id = recorder._begin_chat_span()
+            iteration = recorder._current_iteration
+            t0 = recorder._clock()
+            aggregator = StreamAggregator()
+            resp = None
+            try:
+                async for chunk in stream_fn(
+                    messages, tools=tools, tool_choice=tool_choice
+                ):
+                    aggregator.feed(chunk)
+                    yield chunk
+                resp = aggregator.finalize()
+            finally:
+                recorder._finish_chat_span(
+                    span_id, iteration=iteration, t0=t0, resp=resp
+                )
+
+        return wrapped
+
+    def _begin_chat_span(self) -> str:
+        """开启新一轮 chat span：推进 iteration 并重置本轮 tool 追踪。"""
+        self._current_iteration = self._next_iteration
+        self._next_iteration += 1
+        span_id = trace_start_span(
+            self.run_id, name="llm_chat", iteration=self._current_iteration, sequence=0
+        )
+        self._chat_span_id = span_id
+        self._last_tool_span_id = None  # 新轮重置
+        return span_id
+
+    def _finish_chat_span(self, span_id, *, iteration: int, t0: float, resp) -> None:
+        """写 chat span 终态（成功写 response delta；失败写 error span）。"""
+        latency_ms = int((self._clock() - t0) * 1000)
+        if resp is not None:
+            tokens = resp.usage.total_tokens if resp.usage is not None else 0
+            # 全轮累计：终态落库取累计值而非仅末轮
+            self.total_tokens += tokens
+            tool_calls = [
+                b.model_dump() if hasattr(b, "model_dump") else asdict(b)
+                for b in resp.blocks
+                if isinstance(b, ToolUseBlock)
+            ]
+            # 全量 blocks（含 thinking/text）：思考模型的 thinking 块必须随
+            # tool_use 回传，恢复路径 replay 据此重建 assistant 消息，否则
+            # 断点续跑的下一轮请求会 400（与 live loop 的 list(resp.blocks) 对齐）。
+            # 仅追加字段、不升级 schema：旧数据无 blocks 时读取方走 tool_calls 回退。
+            blocks = [b.model_dump() for b in resp.blocks]
+            trace_end_span(
+                span_id,
+                status="ok",
+                model=resp.model,
+                tokens=tokens,
+                latency_ms=latency_ms,
+                replay_delta={
+                    "response": {
+                        "stop_reason": resp.stop_reason,
+                        "content": resp.content,
+                        "tool_calls": tool_calls,
+                        "blocks": blocks,
+                    }
+                },
+            )
+        else:
+            # LLM 调用异常 / 流中断：写 error span 但不遮掩原始异常
+            logger.warning(
+                f"[agent] LLM 调用异常（iteration={iteration}），写 error span"
+            )
+            trace_end_span(
+                span_id,
+                status="error",
+                latency_ms=latency_ms,
+                error="llm call raised before response",
+            )
 
     # -- ToolSpanRecorder 协议 ----------------------------------------------
 

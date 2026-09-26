@@ -20,9 +20,13 @@ from typing import Any
 from unittest.mock import patch
 
 from app.core.database import DatabaseManager, set_database_manager
+from app.core.logging import logger
 from app.services.llm.models import (
     ChatResponse,
+    StreamAggregator,
+    StreamChunk,
     TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     Usage,
@@ -93,6 +97,57 @@ def response_from_wire(wire: dict) -> ChatResponse:
     )
 
 
+def response_to_chunks(response: ChatResponse) -> list[StreamChunk]:
+    """ChatResponse.blocks → 等价 ``StreamChunk`` 事件序列（回放展开）。
+
+    与生产 provider 的**无停点协议**等价：只产出 text/thinking/tool_use(start+delta)/
+    usage/stop，**不产出 ``tool_use_stop``**。因此 eval 回放/录制天然退化为
+    Agent 循环的**轮级执行**（工具统一经 ``execute_batch``），既保证 cassette 的
+    轮级结构自洽，也让回放完全离线（不会因提前执行触发真实工具调用）。
+    """
+    chunks: list[StreamChunk] = []
+    blocks = list(response.blocks)
+    if not blocks and response.content:
+        # 防御兜底：provider 仅填 content 未填 blocks 时，仍还原文本
+        blocks = [TextBlock(text=response.content)]
+    for block in blocks:
+        if isinstance(block, TextBlock):
+            chunks.append(StreamChunk(type="text_delta", text=block.text))
+        elif isinstance(block, ThinkingBlock):
+            chunks.append(
+                StreamChunk(
+                    type="thinking_delta",
+                    thinking=block.thinking,
+                    signature=block.signature or "",
+                )
+            )
+        elif isinstance(block, ToolUseBlock):
+            chunks.append(
+                StreamChunk(
+                    type="tool_use_start",
+                    tool_use_id=block.id,
+                    tool_name=block.name,
+                )
+            )
+            chunks.append(
+                StreamChunk(
+                    type="tool_use_delta",
+                    tool_use_id=block.id,
+                    partial_json=json.dumps(block.input, ensure_ascii=False),
+                )
+            )
+        else:
+            # 防御兜底：未知 block 类型（如 RedactedThinkingBlock）跳过并记录
+            logger.warning(
+                "response_to_chunks 遇到未知 block 类型，已跳过: %r",
+                type(block).__name__,
+            )
+    if response.usage is not None:
+        chunks.append(StreamChunk(type="usage", usage=response.usage))
+    chunks.append(StreamChunk(type="stop", stop_reason=response.stop_reason))
+    return chunks
+
+
 # ---------------------------------------------------------------------------
 # Golden / cassette IO
 # ---------------------------------------------------------------------------
@@ -147,7 +202,12 @@ class FixtureDriver:
     def rounds_consumed(self) -> int:
         return self._idx + 1
 
-    async def chat(self, messages, *, tools=None, tool_choice=None):
+    async def stream(self, messages, *, tools=None, tool_choice=None):
+        """回放一轮：指纹比对（不变）→ cassette 取 ChatResponse → 展开为事件序列。
+
+        展开**不含 ``tool_use_stop``**，故循环走轮级执行（工具经 ``execute_batch``），
+        完全离线且与 cassette 的轮级结构对齐（见 :func:`response_to_chunks`）。
+        """
         self._idx += 1
         if self._idx >= len(self._rounds):
             raise FingerprintMismatch(
@@ -161,7 +221,16 @@ class FixtureDriver:
                 f"第 {self._idx} 轮请求与录制不一致（prompt/消息序列/工具协议已变化）——"
                 f"请用 --mode record 重新录制"
             )
-        return response_from_wire(rnd.get("response") or {})
+        resp = response_from_wire(rnd.get("response") or {})
+        for chunk in response_to_chunks(resp):
+            yield chunk
+
+    async def chat(self, messages, *, tools=None, tool_choice=None):
+        """旧契约兼容：把流式回放聚合回 ``ChatResponse``（测试/迁移期使用）。"""
+        aggregator = StreamAggregator()
+        async for chunk in self.stream(messages, tools=tools, tool_choice=tool_choice):
+            aggregator.feed(chunk)
+        return aggregator.finalize()
 
     async def execute_batch(self, tool_calls, *, recorder=None):
         if not (0 <= self._idx < len(self._rounds)):
@@ -197,8 +266,13 @@ class FixtureDriver:
 # ---------------------------------------------------------------------------
 
 
-class RecordingChatFn:
-    """录制包装：透传真实调用，记录请求指纹与响应。"""
+class RecordingStreamFn:
+    """录制包装：透传真实流（滤除停点）并记录请求指纹与 fold 后的响应。
+
+    滤除 ``tool_use_stop`` 使循环走**轮级执行**（工具经 ``execute_batch``），保证
+    cassette 的工具结果由 ``recording_execute_batch_factory`` 完整录制；否则停点触发
+    的提前执行会绕过 execute_batch，导致 cassette 缺失工具结果、回放无法复现。
+    """
 
     def __init__(self, inner, model: str, sink: list):
         self._inner = inner
@@ -207,7 +281,13 @@ class RecordingChatFn:
 
     async def __call__(self, messages, *, tools=None, tool_choice=None):
         fp = fingerprint(messages, tools, tool_choice, self._model)
-        resp = await self._inner(messages, tools=tools, tool_choice=tool_choice)
+        aggregator = StreamAggregator()
+        async for chunk in self._inner(messages, tools=tools, tool_choice=tool_choice):
+            aggregator.feed(chunk)
+            if chunk.type == "tool_use_stop":
+                continue
+            yield chunk
+        resp = aggregator.finalize()
         self._sink.append(
             {
                 "request_fingerprint": fp,
@@ -215,7 +295,6 @@ class RecordingChatFn:
                 "tool_results": [],
             }
         )
-        return resp
 
 
 def recording_execute_batch_factory(orig, sink):
@@ -292,8 +371,8 @@ def build_sync_record(case: dict, sync_record_id: int = 1) -> dict:
     }
 
 
-def build_real_chat_fn(llm_cfg: dict):
-    """构造真实 chat_fn（record/live）。
+def build_real_stream_fn(llm_cfg: dict):
+    """构造真实**流式** LLM 函数（record/live）。
 
     注意：不向 provider 传 ``thinking_level``——兼容端点（如 DeepSeek 的
     Anthropic 兼容层）未必支持 thinking 字段；多轮预算由场景的 thinking_level
@@ -305,12 +384,12 @@ def build_real_chat_fn(llm_cfg: dict):
     with patch.object(config_manager, "get_llm_config", return_value=llm_cfg):
         client = LLMClient()
 
-    async def chat_fn(messages, *, tools=None, tool_choice=None):
-        return await client.chat(
+    def stream_fn(messages, *, tools=None, tool_choice=None):
+        return client.stream_chat(
             messages, tools=tools, tool_choice=tool_choice, job_name="eval"
         )
 
-    return chat_fn
+    return stream_fn
 
 
 def _maybe_patch_legacy_search(bgm) -> None:
@@ -449,14 +528,16 @@ async def run_case(
         async def _fixture_execute_batch(self, tool_calls, *, recorder=None):
             return await driver.execute_batch(tool_calls, recorder=recorder)
 
-        chat_fn = driver.chat
+        stream_fn = driver.stream
         tools_cm = patch.object(ToolRegistry, "execute_batch", _fixture_execute_batch)
         bgm = None  # 回放完全离线；_prefetch_bgm_name(None) → ""
     else:
         if llm_cfg is None:
             raise RuntimeError("record/live 模式需要 LLM 配置（环境变量）")
-        real_chat = build_real_chat_fn(llm_cfg)
-        chat_fn = RecordingChatFn(real_chat, model=llm_cfg.get("model", ""), sink=sink)
+        real_stream = build_real_stream_fn(llm_cfg)
+        stream_fn = RecordingStreamFn(
+            real_stream, model=llm_cfg.get("model", ""), sink=sink
+        )
         orig_execute_batch = ToolRegistry.execute_batch
         tools_cm = patch.object(
             ToolRegistry,
@@ -474,7 +555,7 @@ async def run_case(
             sync_record=sync_record,
             bgm=bgm,
             thinking_level=thinking_level,
-            chat_fn=chat_fn,
+            stream_fn=stream_fn,
             notification_service=notifier,
         )
 

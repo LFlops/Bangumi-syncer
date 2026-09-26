@@ -1,0 +1,295 @@
+"""流式工具执行器：停点驱动提前执行 + 提交闸门 + 受控兜底。
+
+业界模式（流式解析 + 提交闸门 + 受控执行）在 Agent 循环中的落地：
+
+- **提前执行**：幂等工具在其参数**停点**（``StreamChunk.type == "tool_use_stop"``）
+  到达时立即启动 ``asyncio.create_task``，与后续 tool_call 的生成**重叠**，缩短端到端时延。
+- **提交闸门**：停点到达时对累积的 ``partial_json`` 做 ``json.loads`` 校验——非法 JSON
+  记 error result 且**绝不执行**（不把畸形参数喂给 handler）。
+- **能力分级**：无 per-tool 停点信号的协议（如退化到轮末补发的 OpenAI chat）自然
+  不触发提前执行，全部工具留到 :meth:`finalize` 按 ``execute_batch`` 语义执行，
+  行为与改造前**等价**。
+- **terminal 抑制**：终止工具（``is_terminal`` 为真）不执行 handler，由 loop 在流结束后
+  走既有捕获逻辑；且一旦出现 terminal，后续停点不再启动新任务（同轮其他工具不执行，
+  与改造前「终止工具优先」语义一致）。已提前启动的幂等任务 await 完成，其结果无害但被忽略。
+
+依赖注入（不耦合具体 ``ToolRegistry`` 内部）：
+
+- ``execute_fn``：``tool_use: ToolUseBlock -> Awaitable[Any]``，单工具执行（返回原始结果），
+  异常自行抛出，由本组件统一包装为 ``ToolResultBlock(is_error=True)``。
+- ``is_idempotent`` / ``is_terminal``：``name -> bool``，用于调度决策。
+- ``on_recorder``：可选 ``ToolSpanRecorder``，为**提前执行**的工具落 span（延迟执行走
+  ``batch_execute_fn`` 自带的 span 包裹）。
+- ``batch_execute_fn``：``list[ToolUseBlock] -> Awaitable[BatchResults]``，延迟执行的批量
+  路径（复用 ``ToolRegistry.execute_batch`` 的分段并行/保序语义）。为 ``None`` 时退化为
+  经 ``execute_fn`` 串行执行。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from app.core.logging import logger
+from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
+from app.services.llm.tools import serialize_tool_result
+
+# 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。
+# 正常业务路径不会消费它（terminal 轮 loop 直接走终止分支），仅作协议闭合兜底。
+_NOT_EXECUTED_CONTENT = "skipped: not executed in this round"
+
+
+@dataclass
+class _ToolState:
+    """单个工具调用的流式累积状态。"""
+
+    tool_use_id: str
+    name: str
+    seq: int
+    json_parts: list[str] = field(default_factory=list)
+    args: dict | None = None
+    parse_ok: bool = False
+    stop_seen: bool = False
+    task: asyncio.Task | None = None
+    result: ToolResultBlock | None = None
+
+
+class StreamingToolExecutor:
+    """停点驱动的工具执行器（见模块 docstring 的调度决策树）。"""
+
+    def __init__(
+        self,
+        *,
+        execute_fn: Callable[[ToolUseBlock], Awaitable[Any]],
+        is_idempotent: Callable[[str], bool],
+        is_terminal: Callable[[str], bool],
+        on_recorder: Any | None = None,
+        batch_execute_fn: Callable[[list[ToolUseBlock]], Awaitable[Any]] | None = None,
+    ) -> None:
+        self._execute_fn = execute_fn
+        self._is_idempotent = is_idempotent
+        self._is_terminal = is_terminal
+        self._on_recorder = on_recorder
+        self._batch_execute_fn = batch_execute_fn
+        # tool_use_id 首次出现顺序（重复 id first-wins，与 StreamAggregator 对齐）
+        self._order: list[str] = []
+        self._states: dict[str, _ToolState] = {}
+        self._tasks: list[asyncio.Task] = []
+        self._terminal_seen = False
+
+    # -- 流式喂入 -----------------------------------------------------------
+
+    def feed(self, chunk: StreamChunk) -> None:
+        """喂入一条流式事件（非工具事件忽略）。"""
+        if chunk.type == "tool_use_start":
+            self._on_start(chunk)
+        elif chunk.type == "tool_use_delta":
+            self._on_delta(chunk)
+        elif chunk.type == "tool_use_stop":
+            self._on_stop(chunk)
+
+    def _on_start(self, chunk: StreamChunk) -> None:
+        tid = chunk.tool_use_id
+        if tid in self._states:
+            logger.warning(
+                "StreamingToolExecutor 收到重复 tool_use_start（first-wins）: %s", tid
+            )
+            return
+        self._states[tid] = _ToolState(
+            tool_use_id=tid, name=chunk.tool_name, seq=len(self._order)
+        )
+        self._order.append(tid)
+
+    def _on_delta(self, chunk: StreamChunk) -> None:
+        st = self._states.get(chunk.tool_use_id)
+        if st is None:
+            # 防御兜底：缺 start 的增量（与 StreamAggregator 的宽容行为对齐）
+            logger.warning(
+                "StreamingToolExecutor 收到无 start 的 tool_use_delta: %s",
+                chunk.tool_use_id,
+            )
+            st = _ToolState(
+                tool_use_id=chunk.tool_use_id, name="", seq=len(self._order)
+            )
+            self._states[chunk.tool_use_id] = st
+            self._order.append(chunk.tool_use_id)
+        st.json_parts.append(chunk.partial_json)
+
+    def _on_stop(self, chunk: StreamChunk) -> None:
+        """停点 = 提交闸门：校验参数 → 幂等提前启动 / 非幂等延迟 / terminal 抑制。"""
+        st = self._states.get(chunk.tool_use_id)
+        if st is None:
+            logger.warning(
+                "StreamingToolExecutor 收到无 start 的 tool_use_stop: %s",
+                chunk.tool_use_id,
+            )
+            return
+        st.stop_seen = True
+        if self._terminal_seen:
+            logger.debug(
+                "StreamingToolExecutor terminal 已出现，抑制停点启动: %s", st.name
+            )
+            return
+        if self._is_terminal(st.name):
+            self._terminal_seen = True
+            return
+        if not self._parse_args(st):
+            return
+        if self._is_idempotent(st.name):
+            st.task = asyncio.create_task(self._run_early(st))
+            self._tasks.append(st.task)
+            return
+        logger.debug(
+            "StreamingToolExecutor 非幂等工具 %s 延迟到 finalize 执行", st.name
+        )
+
+    def _parse_args(self, st: _ToolState) -> bool:
+        """闸门：解析累积 JSON；失败记 error result 且不执行，返回 False。"""
+        raw = "".join(st.json_parts)
+        try:
+            st.args = json.loads(raw) if raw else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            st.result = ToolResultBlock(
+                tool_use_id=st.tool_use_id,
+                content=f"工具参数不是合法 JSON: {type(e).__name__}",
+                is_error=True,
+            )
+            logger.warning(
+                "StreamingToolExecutor 工具 %s 参数非法 JSON，已拦截不执行: %s",
+                st.name,
+                e,
+            )
+            return False
+        st.parse_ok = True
+        return True
+
+    # -- 提前执行 -----------------------------------------------------------
+
+    async def _run_early(self, st: _ToolState) -> None:
+        """提前执行单个幂等工具，结果/异常统一包装为 ToolResultBlock。"""
+        st.result = await self._exec_single(st, record_span=True)
+
+    async def _exec_single(
+        self, st: _ToolState, *, record_span: bool
+    ) -> ToolResultBlock:
+        tool_use = ToolUseBlock(id=st.tool_use_id, name=st.name, input=st.args or {})
+        span_id: str | None = None
+        if record_span and self._on_recorder is not None:
+            span_id = self._on_recorder.start_tool(tool_use, sequence=st.seq)
+        result: ToolResultBlock | None = None
+        error_name = ""
+        try:
+            raw = await self._execute_fn(tool_use)
+            result = ToolResultBlock(
+                tool_use_id=st.tool_use_id,
+                content=serialize_tool_result(raw),
+                is_error=False,
+            )
+        except Exception as e:  # ToolError / handler 异常 / 超时 统一转为错误块
+            error_name = type(e).__name__
+            result = ToolResultBlock(
+                tool_use_id=st.tool_use_id,
+                content=f"工具执行失败: {error_name}",
+                is_error=True,
+            )
+        finally:
+            if span_id is not None:
+                self._on_recorder.end_tool(span_id, result=result, error=error_name)
+        return result
+
+    # -- 收尾：await 提前任务 + 延迟执行 + 保序对齐 --------------------------
+
+    async def finalize(self) -> list[ToolResultBlock]:
+        """流结束后收尾，返回按 tool_use 首次出现顺序对齐的完整结果列表。"""
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+
+        deferred = self._collect_deferred()
+        if deferred:
+            await self._execute_deferred(deferred)
+
+        return [self._result_for(tid) for tid in self._order]
+
+    def _collect_deferred(self) -> list[_ToolState]:
+        """收集留到 finalize 执行的工具（非幂等 / 无停点降级的轮级执行）。
+
+        terminal 工具不执行（由 loop 处理）；terminal 轮的其他工具也不执行
+        （保持「终止工具优先，同轮其他工具不执行」的既有语义）。
+        """
+        deferred: list[_ToolState] = []
+        for tid in self._order:
+            st = self._states[tid]
+            if st.result is not None or st.task is not None:
+                continue  # 已提前执行 / 已闸门拦截
+            if self._is_terminal(st.name):
+                continue
+            if self._terminal_seen:
+                logger.debug(
+                    "StreamingToolExecutor terminal 轮跳过延迟执行: %s", st.name
+                )
+                continue
+            if not st.stop_seen:
+                # 无停点协议的轮级降级：仍按原 execute_batch 语义执行
+                logger.debug(
+                    "StreamingToolExecutor 无停点工具 %s 走轮级降级执行", st.name
+                )
+            if not st.parse_ok and not self._parse_args(st):
+                # 未收到停点且累积 JSON 非法：error result 已就位，不执行
+                logger.debug(
+                    "StreamingToolExecutor 延迟工具 %s 参数非法，已拦截", st.name
+                )
+                continue
+            deferred.append(st)
+        return deferred
+
+    async def _execute_deferred(self, states: list[_ToolState]) -> None:
+        if self._batch_execute_fn is not None:
+            tool_calls = [
+                ToolUseBlock(id=st.tool_use_id, name=st.name, input=st.args or {})
+                for st in states
+            ]
+            results = await self._batch_execute_fn(tool_calls)
+            by_id = self._index_batch_results(results)
+            for st in states:
+                st.result = by_id.get(st.tool_use_id) or self._not_executed(st)
+            return
+        # 无批量执行器注入：串行兜底（保序）
+        for st in states:
+            st.result = await self._exec_single(st, record_span=True)
+
+    @staticmethod
+    def _index_batch_results(results: Any) -> dict[str, ToolResultBlock]:
+        """把 execute_batch 的返回值按 tool_use_id 建索引（兼容 ordered / dict 视图）。"""
+        out: dict[str, ToolResultBlock] = {}
+        ordered = getattr(results, "ordered", None)
+        if isinstance(ordered, list):
+            for oid, item in ordered:
+                if isinstance(item, ToolResultBlock):
+                    out.setdefault(oid, item)
+        getter = getattr(results, "get", None)
+        if getter is None:
+            return out
+        if not out:
+            logger.debug(
+                "StreamingToolExecutor 批量结果无 ordered 槽位，回退 dict 取值"
+            )
+        return out
+
+    def _result_for(self, tid: str) -> ToolResultBlock:
+        st = self._states[tid]
+        if st.result is not None:
+            return st.result
+        # 防御兜底：无结果（terminal 轮被抑制 / 异常路径）→ 协议闭合占位块
+        logger.debug("StreamingToolExecutor 工具 %s 无执行结果，回填占位块", st.name)
+        return self._not_executed(st)
+
+    @staticmethod
+    def _not_executed(st: _ToolState) -> ToolResultBlock:
+        return ToolResultBlock(
+            tool_use_id=st.tool_use_id,
+            content=_NOT_EXECUTED_CONTENT,
+            is_error=True,
+        )

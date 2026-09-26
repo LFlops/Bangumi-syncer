@@ -686,27 +686,31 @@ def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None
     return value
 
 
-def _build_default_chat_fn(thinking_level: str):
-    """构造默认 chat_fn：包装 LLMClient.chat（job_name='llm_match' 归属用量）。
+def _build_default_stream_fn(thinking_level: str):
+    """构造默认**流式** LLM 函数：包装 ``LLMClient.stream_chat``（job_name='llm_match'）。
 
     ``thinking_level`` 由调用方（run）传入，透传到 provider 层，使 match 的 LLM
     请求按自身思考强度工作（而非使用全局 [llm] thinking_level 默认值）。
 
     ``get_llm_client`` 在模块头部导入（无导入环）：每次调用现取单例，
     使测试可 ``patch("app.services.matching.llm_assist.get_llm_client")``。
+
+    返回 async generator（``AsyncIterator[StreamChunk]``），交由 runtime 经 recorder
+    包装后喂给通用循环（流式解析 + 提交闸门 + 受控执行）。
     """
     client = get_llm_client()
 
-    async def chat_fn(messages, *, tools=None, tool_choice=None):
-        return await client.chat(
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        async for chunk in client.stream_chat(
             messages,
             tools=tools,
             tool_choice=tool_choice,
             job_name="llm_match",
             thinking_level=thinking_level,
-        )
+        ):
+            yield chunk
 
-    return chat_fn
+    return stream_fn
 
 
 # ---------------------------------------------------------------------------
@@ -732,8 +736,8 @@ def _match_build_seed(ctx: _MatchContext) -> list:
     return build_seed_messages(ctx.sync_record, candidates, DEFAULT_SYSTEM_TEMPLATE)
 
 
-def _match_build_chat_fn(thinking_level: str):
-    return _build_default_chat_fn(thinking_level)
+def _match_build_stream_fn(thinking_level: str):
+    return _build_default_stream_fn(thinking_level)
 
 
 def _match_resolve_thinking_level() -> str:
@@ -813,7 +817,7 @@ _MATCH_HOOKS = ScenarioHooks(
     terminal_tool="submit_suggestion",
     register_tools=_match_register_tools,
     build_seed=_match_build_seed,
-    build_chat_fn=_match_build_chat_fn,
+    build_stream_fn=_match_build_stream_fn,
     resolve_thinking_level=_match_resolve_thinking_level,
     resolve_max_iterations=_match_resolve_max_iterations,
     handle_terminal=_match_handle_terminal,

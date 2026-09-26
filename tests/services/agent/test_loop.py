@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock
 
 from app.services.agent import loop as loop_module
@@ -23,6 +24,7 @@ from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
@@ -1243,3 +1245,242 @@ async def test_veto_records_injected_tool_result_span_for_replay():
     assert ended_result.tool_use_id == "ts1"
     assert ended_result.content == "请再核对"
     assert ended_result.is_error is False
+
+
+# ---------------------------------------------------------------------------
+# 17. 流式路径（stream_fn + executor_factory）：提前执行 / 保序回填 / 终止语义
+# ---------------------------------------------------------------------------
+
+
+def _stream_start(tid: str, name: str) -> StreamChunk:
+    return StreamChunk(type="tool_use_start", tool_use_id=tid, tool_name=name)
+
+
+def _stream_delta(tid: str, partial: str) -> StreamChunk:
+    return StreamChunk(type="tool_use_delta", tool_use_id=tid, partial_json=partial)
+
+
+def _stream_stop(tid: str) -> StreamChunk:
+    return StreamChunk(type="tool_use_stop", tool_use_id=tid)
+
+
+def _stream_end_turn() -> StreamChunk:
+    return StreamChunk(type="stop", stop_reason="end_turn")
+
+
+def _streaming_executor(events: list, *, gate: asyncio.Event | None = None):
+    """构造 StreamingToolExecutor：read_* 幂等（提前），submit_suggestion terminal。"""
+    from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+
+    async def execute_fn(tool_use):
+        events.append(("exec", tool_use.id))
+        if gate is not None:
+            await gate.wait()
+        return {"echo": tool_use.name}
+
+    return StreamingToolExecutor(
+        execute_fn=execute_fn,
+        is_idempotent=lambda name: name.startswith("read"),
+        is_terminal=lambda name: name == "submit_suggestion",
+    )
+
+
+async def test_stream_path_starts_idempotent_tool_before_stream_ends():
+    """幂等工具在停点到达即执行（与后续事件生成重叠）：exec 早于后续生成标记。"""
+    import asyncio
+
+    events: list = []
+
+    async def _round1():
+        yield _stream_start("a", "read_a")
+        yield _stream_delta("a", '{"title": "x"}')
+        yield _stream_stop("a")
+        await asyncio.sleep(0)  # 让提前任务获得调度
+        events.append(("stream", "after_a_stop"))
+        yield _stream_start("b", "read_b")
+        yield _stream_delta("b", "{}")
+        yield _stream_stop("b")
+        yield StreamChunk(type="stop", stop_reason="tool_use")
+
+    state = {"round": 0}
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        state["round"] += 1
+        if state["round"] == 1:
+            async for c in _round1():
+                yield c
+        else:
+            yield _stream_end_turn()
+
+    def factory():
+        return _streaming_executor(events)
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=factory,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    # a 的提前执行发生在 b 事件生成之前
+    assert events.index(("exec", "a")) < events.index(("stream", "after_a_stop"))
+    assert ("exec", "b") in events
+
+
+async def test_stream_path_backfills_ordered_tool_results_and_blocks():
+    """流式路径：tool_result 保序回填；assistant 消息保留 thinking/tool_use blocks。"""
+    calls: list[list[Message]] = []
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            yield StreamChunk(type="thinking_delta", thinking="先搜索", signature="s1")
+            yield StreamChunk(type="text_delta", text="检索中")
+            yield _stream_start("a", "read_a")
+            yield _stream_delta("a", "{}")
+            yield _stream_stop("a")
+            yield _stream_start("b", "read_b")
+            yield _stream_delta("b", "{}")
+            yield _stream_stop("b")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+        else:
+            yield _stream_end_turn()
+
+    def factory():
+        return _streaming_executor([])
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=factory,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    assistant = next(m for m in calls[1] if m.role == "assistant")
+    assert [b.type for b in assistant.content] == [
+        "thinking",
+        "text",
+        "tool_use",
+        "tool_use",
+    ]
+
+    blocks = _collect_tool_results(calls[1])
+    assert [b.tool_use_id for b in blocks] == ["a", "b"], "tool_result 应按原始顺序回填"
+    assert all(not b.is_error for b in blocks)
+
+
+async def test_stream_path_terminal_captured_and_other_tools_not_executed():
+    """终止工具捕获即 break；terminal 不执行 handler，同轮其他工具不执行。"""
+    events: list = []
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield _stream_start("s", "submit_suggestion")
+        yield _stream_delta("s", '{"subject_id": "1", "reason": "ok"}')
+        yield _stream_stop("s")
+        yield _stream_start("r", "read_r")
+        yield _stream_delta("r", "{}")
+        yield _stream_stop("r")
+        yield StreamChunk(type="stop", stop_reason="tool_use")
+
+    def factory():
+        return _streaming_executor(events)
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=factory,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "1", "reason": "ok"}
+    assert events == [], "terminal 轮不得执行任何工具（含后续 read）"
+
+
+async def test_stream_path_malformed_json_error_and_loop_continues():
+    """畸形参数 → error result 回填，循环继续（不崩溃）到下一轮 end_turn。"""
+    calls: list[list[Message]] = []
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            yield _stream_start("bad", "read_bad")
+            yield _stream_delta("bad", "{not json")
+            yield _stream_stop("bad")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+        else:
+            yield _stream_end_turn()
+
+    def factory():
+        return _streaming_executor([])
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=factory,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    blocks = _collect_tool_results(calls[1])
+    assert len(blocks) == 1 and blocks[0].is_error is True
+    assert "JSON" in blocks[0].content
+
+
+async def test_stream_path_budget_and_recovery_use_stream():
+    """耗尽后收尾也走流式：收尾返回 terminal → submit_suggestion。"""
+    state = {"round": 0}
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        state["round"] += 1
+        if state["round"] <= 2:
+            # 循环内两轮均返回非终止工具（迫使耗尽）
+            yield _stream_start("a", "read_a")
+            yield _stream_delta("a", "{}")
+            yield _stream_stop("a")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+        else:
+            # 收尾轮：submit
+            yield _stream_start("s", "submit_suggestion")
+            yield _stream_delta("s", '{"subject_id": "9", "reason": "收尾"}')
+            yield _stream_stop("s")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+
+    def factory():
+        return _streaming_executor([])
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=factory,
+        tools_schemas=[],
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "9", "reason": "收尾"}
+
+
+async def test_run_requires_stream_fn_or_chat_fn():
+    """二者都不提供 → ValueError（显式契约）。"""
+    import pytest
+
+    with pytest.raises(ValueError):
+        await run(
+            tools_schemas=[],
+            tool_calls_fn=AsyncMock(),
+            max_iterations=1,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )

@@ -381,3 +381,95 @@ class TestRecordBudgetMessage:
         ).fetchone()[0]
         # 原值未被覆盖
         assert raw_after == "this-is-not-valid-json-or-ciphertext"
+
+
+class TestRecorderWrapStreamFn:
+    """R4：``wrap_stream_fn`` 透传事件 + 内部 fold，流结束后写 span（schema 不变）。"""
+
+    def test_wrap_stream_fn_forwards_chunks_and_persists_folded_response(self, dbm):
+        import asyncio
+
+        from app.services.llm.models import StreamChunk, Usage
+
+        _ensure_run(dbm, "run-stream-rec")
+        recorder = TraceRecorder("run-stream-rec", start_iteration=0)
+
+        async def stream_fn(messages, *, tools=None, tool_choice=None):
+            yield StreamChunk(type="thinking_delta", thinking="想", signature="s")
+            yield StreamChunk(type="text_delta", text="搜")
+            yield StreamChunk(
+                type="tool_use_start", tool_use_id="t1", tool_name="search_bangumi"
+            )
+            yield StreamChunk(
+                type="tool_use_delta", tool_use_id="t1", partial_json='{"title": "x"}'
+            )
+            yield StreamChunk(type="tool_use_stop", tool_use_id="t1")
+            yield StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3),
+            )
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+
+        async def _consume():
+            wrapped = recorder.wrap_stream_fn(stream_fn)
+            seen = []
+            async for chunk in wrapped([Message(role="user", content="hi")], tools=[]):
+                seen.append(chunk.type)
+            return seen
+
+        seen = asyncio.run(_consume())
+
+        # 事件透传（含停点）
+        assert seen == [
+            "thinking_delta",
+            "text_delta",
+            "tool_use_start",
+            "tool_use_delta",
+            "tool_use_stop",
+            "usage",
+            "stop",
+        ]
+        step = next(
+            s
+            for s in dbm.agent_runs.get_steps("run-stream-rec")
+            if s["name"] == "llm_chat"
+        )
+        assert step["tokens"] == 3
+        response = json.loads(step["replay_delta"])["response"]
+        assert response["stop_reason"] == "tool_use"
+        assert response["content"] == "搜"
+        assert response["tool_calls"][0]["id"] == "t1"
+        assert [b["type"] for b in response["blocks"]] == [
+            "thinking",
+            "text",
+            "tool_use",
+        ]
+
+    def test_wrap_stream_fn_exception_writes_error_span(self, dbm):
+        import asyncio
+
+        from app.services.llm.models import StreamChunk
+
+        _ensure_run(dbm, "run-stream-err")
+        recorder = TraceRecorder("run-stream-err", start_iteration=0)
+
+        async def stream_fn(messages, *, tools=None, tool_choice=None):
+            yield StreamChunk(type="text_delta", text="partial")
+            raise RuntimeError("stream boom")
+
+        async def _consume():
+            wrapped = recorder.wrap_stream_fn(stream_fn)
+            async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
+                pass
+
+        import pytest
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(_consume())
+
+        step = next(
+            s
+            for s in dbm.agent_runs.get_steps("run-stream-err")
+            if s["name"] == "llm_chat"
+        )
+        assert step["status"] == "error"

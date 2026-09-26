@@ -234,3 +234,82 @@ async def test_replay_case_performs_no_network_access(monkeypatch, fixtures_dir:
         assert result["replay_verified"] is True
 
     assert attempts == [], f"replay 期间发生真实网络访问: {attempts}"
+
+
+# ---------------------------------------------------------------------------
+# 5. R4：ChatResponse → StreamChunk 展开（无停点 → 轮级降级）
+# ---------------------------------------------------------------------------
+
+
+def test_response_to_chunks_expands_without_stop_signal():
+    """展开事件序列不含 tool_use_stop（能力分级：回放走轮级执行）。"""
+    from app.services.llm.models import StreamAggregator
+    from eval.lib import response_from_wire, response_to_chunks
+
+    wire = {
+        "stop_reason": "tool_use",
+        "content": "hi",
+        "tool_calls": [{"id": "t1", "name": "search_bangumi", "input": {"title": "x"}}],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+    }
+    resp = response_from_wire(wire)
+    chunks = response_to_chunks(resp)
+    types = [c.type for c in chunks]
+
+    assert "tool_use_stop" not in types, "回放展开不得含停点信号"
+    assert types == ["text_delta", "tool_use_start", "tool_use_delta", "usage", "stop"]
+
+    # 往返：聚合回 ChatResponse 与原始一致（cassette 格式不变）
+    agg = StreamAggregator()
+    for c in chunks:
+        agg.feed(c)
+    back = agg.finalize()
+    assert back.stop_reason == "tool_use"
+    assert back.content == "hi"
+    assert [(b.type, getattr(b, "id", None)) for b in back.blocks] == [
+        ("text", None),
+        ("tool_use", "t1"),
+    ]
+
+
+async def test_fixture_driver_stream_yields_expanded_events():
+    """``FixtureDriver.stream`` 指纹不变、产出可聚合的事件流。"""
+    from eval.lib import FixtureDriver, fingerprint
+
+    messages = [{"role": "user", "content": "hi"}]
+    model = "test-model"
+    rounds = [
+        {
+            "request_fingerprint": fingerprint(messages, None, None, model),
+            "response": {
+                "stop_reason": "end_turn",
+                "content": "recorded",
+                "usage": None,
+            },
+            "tool_results": [],
+        }
+    ]
+    driver = FixtureDriver(rounds, model=model)
+
+    chunks = [c async for c in driver.stream(messages)]
+
+    assert chunks[-1].type == "stop"
+    assert chunks[-1].stop_reason == "end_turn"
+
+
+async def test_fixture_driver_stream_tampered_fingerprint_raises():
+    """流式回放同样受指纹守卫保护。"""
+    from eval.lib import FixtureDriver
+
+    rounds = [
+        {
+            "request_fingerprint": "sha256:deadbeef",
+            "response": {"stop_reason": "end_turn", "content": "x"},
+            "tool_results": [],
+        }
+    ]
+    driver = FixtureDriver(rounds, model="m")
+
+    with pytest.raises(FingerprintMismatch):
+        async for _c in driver.stream([{"role": "user", "content": "hi"}]):
+            pass

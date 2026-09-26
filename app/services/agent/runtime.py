@@ -28,6 +28,7 @@ from app.services.agent import trace
 from app.services.agent.loop import RunResult, run as loop_run
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
+from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
 from app.services.llm.tools import ToolRegistry, serialize_tool_result
@@ -43,6 +44,7 @@ async def run(
     hooks: ScenarioHooks,
     ctx: Any,
     thinking_level: str,
+    stream_fn: Callable | None = None,
     chat_fn: Callable | None = None,
     notification_service: Any | None = None,
     span_recorder: Any | None = None,
@@ -51,6 +53,9 @@ async def run(
 
     status 取值：``succeeded`` / ``no_suggestion`` / ``failed`` / ``processing``
     （调度轮次重试中）/ ``skipped``（并发抢占失败，由调用方忽略）。
+
+    LLM 调用注入：``stream_fn`` 为**主路径**（流式，默认由 hooks.build_stream_fn
+    构造）；``chat_fn`` 为旧契约兼容（返回 ``ChatResponse``，仅测试/迁移期使用）。
     """
     dbm = get_database_manager()
 
@@ -73,27 +78,23 @@ async def run(
     # 由场景保证单一来源。
     max_iterations = hooks.resolve_max_iterations(thinking_level)
 
-    if chat_fn is None:
-        chat_fn = hooks.build_chat_fn(thinking_level)
+    if stream_fn is None and chat_fn is None:
+        stream_fn = hooks.build_stream_fn(thinking_level)
 
-    # 包装 chat_fn（chat span）并写 seed 行
-    wrapped_chat_fn = span_recorder.wrap_chat_fn(chat_fn)
+    # 写 seed 行（供 replay 显式提取种子消息）
     span_recorder.write_seed_row(seed)
 
-    # LLM 调用异常（chat_fn 抛错）→ 按可重试性分流
+    # LLM 调用异常（stream_fn/chat_fn 抛错）→ 按可重试性分流
     try:
-        result = await loop_run(
-            chat_fn=wrapped_chat_fn,
+        result = await _invoke_loop(
+            stream_fn=stream_fn,
+            chat_fn=chat_fn,
+            registry=registry,
+            span_recorder=span_recorder,
             tools_schemas=tools_schemas,
-            tool_calls_fn=functools.partial(
-                registry.execute_batch, recorder=span_recorder
-            ),
             max_iterations=max_iterations,
-            tool_choice_terminal=hooks.terminal_tool,
+            hooks=hooks,
             seed_messages=seed,
-            recorder=span_recorder,
-            # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
-            veto_terminal=getattr(hooks, "veto_terminal", None),
         )
     except LLMCallError as e:
         # LLMCallError 携带 retryable 标志区分可重试/确定性失败
@@ -124,6 +125,76 @@ async def run(
         ctx,
         total_tokens=span_recorder.total_tokens,
         notification_service=notification_service,
+    )
+
+
+def _is_terminal_tool(registry: ToolRegistry, name: str) -> bool:
+    """工具是否终止性（access=terminal）：决定执行器是否抑制其提前执行。"""
+    defn = registry.get(name)
+    return defn is not None and defn.access == "terminal"
+
+
+def _make_executor_factory(
+    registry: ToolRegistry, span_recorder: Any
+) -> Callable[[], StreamingToolExecutor]:
+    """构造按轮新建 ``StreamingToolExecutor`` 的工厂（流式主路径）。
+
+    - ``execute_fn``：单工具执行（``registry.execute``，异常由执行器包装为错误块）
+    - ``batch_execute_fn``：延迟执行复用 ``execute_batch``（分段并行/保序 + span 包裹）
+    - ``is_idempotent``：停点是否提前启动的判据
+    - ``is_terminal``：access=terminal 判定（terminal 不执行、且抑制后续停点启动）
+    - ``on_recorder``：为提前执行的工具落 tool span（延迟执行由 execute_batch 自带）
+    """
+
+    def factory() -> StreamingToolExecutor:
+        async def execute_fn(tool_use: ToolUseBlock):
+            return await registry.execute(tool_use.name, tool_use.input)
+
+        return StreamingToolExecutor(
+            execute_fn=execute_fn,
+            is_idempotent=registry.is_idempotent,
+            is_terminal=lambda name: _is_terminal_tool(registry, name),
+            on_recorder=span_recorder,
+            batch_execute_fn=functools.partial(
+                registry.execute_batch, recorder=span_recorder
+            ),
+        )
+
+    return factory
+
+
+async def _invoke_loop(
+    *,
+    stream_fn: Callable | None,
+    chat_fn: Callable | None,
+    registry: ToolRegistry,
+    span_recorder: Any,
+    tools_schemas: list[dict],
+    max_iterations: int,
+    hooks: ScenarioHooks,
+    seed_messages: list[Message],
+) -> RunResult:
+    """按注入形态选择主路径（流式）或旧路径（chat_fn）运行通用循环。"""
+    common: dict[str, Any] = dict(
+        tools_schemas=tools_schemas,
+        max_iterations=max_iterations,
+        tool_choice_terminal=hooks.terminal_tool,
+        seed_messages=seed_messages,
+        recorder=span_recorder,
+        # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
+        veto_terminal=getattr(hooks, "veto_terminal", None),
+    )
+    if stream_fn is not None:
+        return await loop_run(
+            stream_fn=span_recorder.wrap_stream_fn(stream_fn),
+            executor_factory=_make_executor_factory(registry, span_recorder),
+            **common,
+        )
+    # 旧契约兼容路径：chat_fn + execute_batch（行为与改造前完全一致）
+    return await loop_run(
+        chat_fn=span_recorder.wrap_chat_fn(chat_fn),
+        tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),
+        **common,
     )
 
 
@@ -345,17 +416,15 @@ async def _execute_continuation(
         )
         seq += 1
 
-    wrapped_chat_fn = span_recorder.wrap_chat_fn(hooks.build_chat_fn(thinking_level))
-    result = await loop_run(
-        chat_fn=wrapped_chat_fn,
+    result = await _invoke_loop(
+        stream_fn=hooks.build_stream_fn(thinking_level),
+        chat_fn=None,
+        registry=registry,
+        span_recorder=span_recorder,
         tools_schemas=tools_schemas,
-        tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),
         max_iterations=remaining,
-        tool_choice_terminal=hooks.terminal_tool,
+        hooks=hooks,
         seed_messages=replay_result.messages,
-        recorder=span_recorder,
-        # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
-        veto_terminal=getattr(hooks, "veto_terminal", None),
     )
     await hooks.handle_terminal(
         dbm,

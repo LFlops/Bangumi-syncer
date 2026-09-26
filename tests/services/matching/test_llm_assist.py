@@ -22,6 +22,9 @@ from app.services.agent.trace import ReplayResult
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    StreamChunk,
+    TextBlock,
+    ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
     Usage,
@@ -1494,6 +1497,47 @@ def _make_notify():
     return ns
 
 
+def _wire_stream_client(client, chat_callable=None):
+    """把 mock client 的 ``stream_chat`` 适配为从 ``client.chat`` 展开的事件流。
+
+    默认路径已切换为 ``client.stream_chat``（流式唯一入口）。测试沿用
+    ``client.chat = AsyncMock(...)`` 定义响应，本辅助函数据其展开为**无停点**事件流
+    （与 eval 回放同款），使循环走轮级执行、行为与改造前等价；``client.chat`` 仍被
+    真实调用（便于断言 thinking_level 等参数透传）。
+    """
+    inner = chat_callable if chat_callable is not None else client.chat
+
+    async def _stream(messages, *, tools=None, tool_choice=None, **kwargs):
+        resp = await inner(messages, tools=tools, tool_choice=tool_choice, **kwargs)
+        blocks = list(resp.blocks)
+        if not blocks and resp.content:
+            blocks = [TextBlock(text=resp.content)]
+        for b in blocks:
+            if isinstance(b, TextBlock):
+                yield StreamChunk(type="text_delta", text=b.text)
+            elif isinstance(b, ThinkingBlock):
+                yield StreamChunk(
+                    type="thinking_delta",
+                    thinking=b.thinking,
+                    signature=b.signature or "",
+                )
+            elif isinstance(b, ToolUseBlock):
+                yield StreamChunk(
+                    type="tool_use_start", tool_use_id=b.id, tool_name=b.name
+                )
+                yield StreamChunk(
+                    type="tool_use_delta",
+                    tool_use_id=b.id,
+                    partial_json=json.dumps(b.input, ensure_ascii=False),
+                )
+        if resp.usage is not None:
+            yield StreamChunk(type="usage", usage=resp.usage)
+        yield StreamChunk(type="stop", stop_reason=resp.stop_reason)
+
+    client.stream_chat = _stream
+    return client
+
+
 # ---------------------------------------------------------------------------
 # G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
 #     且覆盖时不得产生“重复注册”warning（quiet=True）
@@ -1921,17 +1965,18 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
-    """场景1：run(thinking_level="medium") 使用默认 chat_fn 时，client.chat 收到 thinking_level='medium'。"""
+    """场景1：run(thinking_level="medium") 使用默认 stream_fn 时，client 收到 thinking_level='medium'。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    # Mock LLMClient：chat 返回 end_turn 使循环立即结束
+    # Mock LLMClient：chat 返回 end_turn 使循环立即结束；stream_chat 由其展开
     mock_client = MagicMock()
     mock_client.chat = AsyncMock(
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
+    _wire_stream_client(mock_client)
 
     # get_llm_client 由 llm_assist 模块头部导入，patch 其模块命名空间
-    # 不 mock loop_run：让真实循环执行，验证默认 chat_fn 确实调用 client.chat
+    # 不 mock loop_run：让真实循环执行，验证默认 stream_fn 确实调用 client
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
     ):
@@ -1945,8 +1990,8 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
             thinking_level="medium",
         )
 
-    # client.chat 应被调用，且收到 thinking_level="medium"
-    assert mock_client.chat.called, "默认 chat_fn 应调用 client.chat"
+    # client.chat 应经 stream_chat 被调用，且收到 thinking_level="medium"
+    assert mock_client.chat.called, "默认 stream_fn 应调用 client.chat"
     _, kwargs = mock_client.chat.call_args
     assert kwargs.get("thinking_level") == "medium", (
         f"client.chat 应收到 thinking_level='medium'，实际 kwargs={kwargs}"
@@ -2002,6 +2047,7 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
     mock_client.chat = AsyncMock(
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
+    _wire_stream_client(mock_client)
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
@@ -2016,7 +2062,7 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
             thinking_level="off",
         )
 
-    assert mock_client.chat.called, "默认 chat_fn 应调用 client.chat"
+    assert mock_client.chat.called, "默认 stream_fn 应调用 client.chat"
     _, kwargs = mock_client.chat.call_args
     assert kwargs.get("thinking_level") == "off", (
         f"client.chat 应收到 thinking_level='off'，实际 kwargs={kwargs}"
@@ -2434,9 +2480,9 @@ def test_wrap_chat_fn_exception_propagates_original():
 
 
 def test_build_default_chat_fn_requires_thinking_level():
-    """P1：_build_default_chat_fn 不传 thinking_level 应抛 TypeError。"""
+    """P1：_build_default_stream_fn 不传 thinking_level 应抛 TypeError。"""
     with pytest.raises(TypeError):
-        llm_assist._build_default_chat_fn()
+        llm_assist._build_default_stream_fn()
 
 
 # ---------------------------------------------------------------------------
@@ -3461,6 +3507,7 @@ def test_continue_run_llm_call_error_retryable_false_marks_failed():
 
     async def _boom(messages, *, tools=None, tool_choice=None):
         raise LLMCallError("401 Unauthorized", retryable=False)
+        yield  # pragma: no cover - 使其成为 async generator，供流式消费
 
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -3470,7 +3517,7 @@ def test_continue_run_llm_call_error_retryable_false_marks_failed():
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
-            "app.services.matching.llm_assist._build_default_chat_fn",
+            "app.services.matching.llm_assist._build_default_stream_fn",
             return_value=_boom,
         ),
     ):
@@ -3497,6 +3544,7 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
 
     async def _boom(messages, *, tools=None, tool_choice=None):
         raise LLMCallError("500 Internal Server Error", retryable=True)
+        yield  # pragma: no cover - 使其成为 async generator，供流式消费
 
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -3506,7 +3554,7 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
-            "app.services.matching.llm_assist._build_default_chat_fn",
+            "app.services.matching.llm_assist._build_default_stream_fn",
             return_value=_boom,
         ),
     ):
@@ -3542,7 +3590,7 @@ def test_continue_run_outer_exception_logs_current_run_status():
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
-            "app.services.matching.llm_assist._build_default_chat_fn",
+            "app.services.matching.llm_assist._build_default_stream_fn",
             return_value=_chat_fn,
         ),
         patch("app.services.agent.runtime.loop_run", boom_loop),
@@ -3848,6 +3896,7 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -3930,6 +3979,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     chat = AsyncMock(side_effect=_chat)
     client = MagicMock()
     client.chat = chat
+    _wire_stream_client(client)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -3991,6 +4041,7 @@ def test_continue_run_writes_chat_span(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -4027,10 +4078,10 @@ def test_continue_run_respects_thinking_level(monkeypatch):
     def _fake_build(thinking_level):
         captured["thinking_level"] = thinking_level
 
-        async def chat_fn(messages, *, tools=None, tool_choice=None):
-            return ChatResponse(content="done", stop_reason="end_turn")
+        async def stream_fn(messages, *, tools=None, tool_choice=None):
+            yield StreamChunk(type="stop", stop_reason="end_turn")
 
-        return chat_fn
+        return stream_fn
 
     rr = _make_replay_result(executed=0, missing=[], last_response=None)
 
@@ -4042,7 +4093,7 @@ def test_continue_run_respects_thinking_level(monkeypatch):
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
-            "app.services.matching.llm_assist._build_default_chat_fn",
+            "app.services.matching.llm_assist._build_default_stream_fn",
             side_effect=_fake_build,
         ),
     ):
@@ -4090,10 +4141,10 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
     def _fake_build(thinking_level):
         captured["thinking_level"] = thinking_level
 
-        async def chat_fn(messages, *, tools=None, tool_choice=None):
-            return ChatResponse(content="done", stop_reason="end_turn")
+        async def stream_fn(messages, *, tools=None, tool_choice=None):
+            yield StreamChunk(type="stop", stop_reason="end_turn")
 
-        return chat_fn
+        return stream_fn
 
     rr = _make_replay_result(executed=0, missing=[], last_response=None)
 
@@ -4105,7 +4156,7 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
             return_value=_make_continuation_dbm(repo),
         ),
         patch(
-            "app.services.matching.llm_assist._build_default_chat_fn",
+            "app.services.matching.llm_assist._build_default_stream_fn",
             side_effect=_fake_build,
         ),
     ):
@@ -4137,6 +4188,7 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -4199,6 +4251,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
 
     client = MagicMock()
     client.chat = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -5076,3 +5129,61 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
     assert run_row["stop_reason"] == "give_up"
     ns.notify.assert_not_called()
     assert _read_candidate(sr_id) is None, "give_up 不应落库任何候选"
+
+
+# ---------------------------------------------------------------------------
+# R4：流式注入端到端（mock 事件流）——停点提前执行 search + submit 捕获落库
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_stream_fn_end_to_end_early_execution_and_submit(monkeypatch):
+    """注入 stream_fn（事件流）：幂等 search 停点提前执行，submit 捕获落库。"""
+    run_id = "run-stream-e2e"
+    sr_id = 9001
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+    monkeypatch.setattr(llm_assist, "_validate_subject_id", lambda sid: (True, ""))
+    bgm = _make_bgm()
+    ns = _make_notify()
+    calls = {"n": 0}
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            yield StreamChunk(
+                type="tool_use_start", tool_use_id="t1", tool_name="search_bangumi"
+            )
+            yield StreamChunk(
+                type="tool_use_delta",
+                tool_use_id="t1",
+                partial_json='{"title": "花开伊吕波"}',
+            )
+            yield StreamChunk(type="tool_use_stop", tool_use_id="t1")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+        else:
+            yield StreamChunk(
+                type="tool_use_start",
+                tool_use_id="s1",
+                tool_name="submit_suggestion",
+            )
+            yield StreamChunk(
+                type="tool_use_delta",
+                tool_use_id="s1",
+                partial_json='{"subject_id": "123", "reason": "跨季匹配"}',
+            )
+            yield StreamChunk(type="tool_use_stop", tool_use_id="s1")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+
+    status = await llm_assist.get_scenario_runtime().run(
+        run_id,
+        sync_record=sr,
+        bgm=bgm,
+        thinking_level="medium",
+        stream_fn=stream_fn,
+        notification_service=ns,
+    )
+
+    assert status == "succeeded"
+    _assert_candidate_written(sr_id, subject_id="123", reason="跨季匹配")
+    assert calls["n"] == 2
