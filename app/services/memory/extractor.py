@@ -9,7 +9,7 @@ from __future__ import annotations
 from app.core.database.agent_memory import AgentMemoryRepository
 from app.core.logging import logger
 from app.models.memory import MemoryEntry
-from app.services.llm import Message, get_llm_client
+from app.services.llm import Message, collect, get_llm_client
 from app.services.llm.models import ChatResponse
 
 _SUMMARY_PROMPT = (
@@ -94,7 +94,7 @@ class MemoryExtractor:
             summary_messages.append(Message(role="assistant", content=response.content))
             summary_messages.append(Message(role="user", content=_SUMMARY_PROMPT))
             llm = self._llm or get_llm_client()
-            resp = await llm.chat(summary_messages, job_name=job_name)
+            resp = await collect(llm.stream_chat(summary_messages, job_name=job_name))
             if resp.content:
                 return resp.content.strip()
         except Exception as e:
