@@ -196,10 +196,10 @@ class TestOpenAICompatRawSSE:
         assert resp.usage.total_tokens == 15
 
     @pytest.mark.asyncio
-    async def test_chat_aggregates_raw_sse(
+    async def test_collect_aggregates_raw_sse(
         self, reset_llm_singleton, mock_log_usage, mock_sleep
     ):
-        """client.chat() 对同一原始字节流聚合出等价 ChatResponse。"""
+        """collect(stream_chat()) 对同一原始字节流聚合出等价 ChatResponse。"""
         provider = OpenAICompatProvider(
             api_base="https://test.api.com/v1",
             api_key="sk-test",
@@ -211,7 +211,9 @@ class TestOpenAICompatRawSSE:
             "app.services.llm.providers.openai_compat.create_async_client",
             _mock_transport_client(lambda request: _sse_response(self._BODY)),
         ):
-            resp = await client.chat([Message(role="user", content="hi")])
+            resp = _aggregate(
+                await _collect(client, [Message(role="user", content="hi")])
+            )
 
         assert resp.content == "Hello, world"
         assert resp.stop_reason == "stop"
@@ -519,7 +521,9 @@ class TestRawSSEErrorRetry:
             "app.services.llm.providers.openai_compat.create_async_client",
             _mock_transport_client(handler),
         ):
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = _aggregate(
+                await _collect(client, [Message(role="user", content="Q")])
+            )
 
         assert resp.content == "ok"
         assert calls["n"] == 2  # 降级后立即重试，无退避
@@ -549,7 +553,7 @@ class TestRawSSEErrorRetry:
             _mock_transport_client(handler),
         ):
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await _collect(client, [Message(role="user", content="Q")])
 
         assert calls["n"] == 2
         assert exc_info.value.retryable is False
@@ -576,10 +580,9 @@ class TestRawSSEErrorRetry:
             _mock_transport_client(handler),
         ):
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await _collect(client, [Message(role="user", content="Q")])
 
         assert exc_info.value.retryable is False
         assert "端点不支持流式调用" in str(exc_info.value)
         assert calls["n"] == 1  # 只发一次，不重试
         mock_sleep.assert_not_awaited()
-        assert not hasattr(provider, "_stream_unsupported")

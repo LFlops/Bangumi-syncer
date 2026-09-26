@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from app.services.llm.models import collect
 from eval.lib import (
     FingerprintMismatch,
     FixtureDriver,
@@ -70,7 +71,7 @@ async def test_replay_matches_recorded_outcome(case, fixtures_dir: Path):
 # ---------------------------------------------------------------------------
 
 
-async def test_fixture_driver_chat_tampered_fingerprint_raises_with_rerecord_hint():
+async def test_fixture_driver_stream_tampered_fingerprint_raises_with_rerecord_hint():
     """篡改 request_fingerprint 后回放：抛 FingerprintMismatch 且提示重新录制。"""
     rounds = [
         {
@@ -82,12 +83,12 @@ async def test_fixture_driver_chat_tampered_fingerprint_raises_with_rerecord_hin
     driver = FixtureDriver(rounds, model="test-model")
 
     with pytest.raises(FingerprintMismatch) as excinfo:
-        await driver.chat([{"role": "user", "content": "hi"}])
+        await collect(driver.stream([{"role": "user", "content": "hi"}]))
 
     assert "重新录制" in str(excinfo.value), "错配信息应提示用 --mode record 重录"
 
 
-async def test_fixture_driver_chat_matching_fingerprint_returns_recorded_response():
+async def test_fixture_driver_stream_matching_fingerprint_returns_recorded_response():
     """指纹一致时正常回放（守卫不会误伤合法 cassette）。"""
     messages = [{"role": "user", "content": "hi"}]
     model = "test-model"
@@ -104,18 +105,18 @@ async def test_fixture_driver_chat_matching_fingerprint_returns_recorded_respons
     ]
     driver = FixtureDriver(rounds, model=model)
 
-    resp = await driver.chat(messages)
+    resp = await collect(driver.stream(messages))
 
     assert resp.content == "recorded"
     assert resp.stop_reason == "end_turn"
 
 
-async def test_fixture_driver_chat_beyond_recorded_rounds_raises_mismatch():
+async def test_fixture_driver_stream_beyond_recorded_rounds_raises_mismatch():
     """请求超出录制轮数：同样以 FingerprintMismatch 显式失败。"""
     driver = FixtureDriver([], model="")
 
     with pytest.raises(FingerprintMismatch):
-        await driver.chat([{"role": "user", "content": "hi"}])
+        await collect(driver.stream([{"role": "user", "content": "hi"}]))
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +242,7 @@ async def test_replay_case_performs_no_network_access(monkeypatch, fixtures_dir:
 # ---------------------------------------------------------------------------
 
 
-def test_response_to_chunks_expands_without_stop_signal():
+def test_expand_wire_response_without_stop_signal():
     """展开事件序列不含 tool_use_stop（能力分级：回放走轮级执行）。"""
     from app.services.llm.models import StreamAggregator
     from eval.lib import response_from_wire, response_to_chunks

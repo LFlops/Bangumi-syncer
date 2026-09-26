@@ -252,6 +252,7 @@ LLM 连接是独立模块，追番总结和调试工具共用。在「配置管�
 
 - **提供商（provider）**：LLM 服务提供商。可选值：`openai_compat`（默认，兼容 OpenAI / DeepSeek / Ollama 等 OpenAI 接口格式的服务）、`anthropic_compat`（兼容 Anthropic Messages API，官方 API 或遵循 `/v1/messages` 规范的代理/网关均可）、`openai_responses`（OpenAI Responses API，遵循 `/v1/responses` 规范，支持推理摘要，适用于官方 OpenAI 及支持该 API 的服务）。
 - **API 地址（api_base）**：LLM 服务商的 API 端点，需兼容所选 provider 的接口格式。`openai_compat` 默认 `https://api.openai.com/v1`，OpenAI 兼容接口请以 `/v1` 结尾填写完整地址；`anthropic_compat` 默认 `https://api.anthropic.com/v1`，使用第三方兼容网关时按其文档填写；`openai_responses` 同样填写 OpenAI 风格的 `/v1` 地址。
+- **端点需支持流式（SSE）**：LLM 调用一律走流式接口（请求体带 `stream: true`，或 Responses API 的流式模式），请确认所选服务/网关支持 SSE 流式返回。**不支持流式的端点会在首次调用时直接报错并提示更换端点或升级网关**，不会退化为非流式请求；`anthropic_compat` 网关还需支持 `/v1/messages` 流式返回。
 - **API 密钥（api_key）**：服务商提供的 API Key。**加密存储**，页面回显为掩码。
 - **模型（model）**：要调用的模型名称，默认 `gpt-4o-mini`。`openai_compat` 请确认模型支持 Chat Completions 接口；`anthropic_compat` 请填写 Claude 模型（如 `claude-sonnet-4-6`、`claude-opus-4-6` 等）；`openai_responses` 请填写支持 Responses API 的模型（如 `gpt-4o`、`o3` 等）。
 - **最大 Token（max_tokens）**：单次请求最大输出 token 数，默认 2000。根据模型上下文窗口和总结长度调整。Anthropic Messages API 的 max_tokens 为必填字段，请保持不小于所需输出长度。开启思考强度时该值会被自动抬升到不低于 `budget_tokens + 1024`（Anthropic 约束：思考 token 计入 max_tokens 上限，`budget_tokens` 必须小于 `max_tokens`），无需手动调大。

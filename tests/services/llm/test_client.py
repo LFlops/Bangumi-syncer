@@ -1,8 +1,8 @@
 """app.services.llm.client 测试。
 
-T7：LLMClient 统一走流式底层（provider.stream），chat() 变为
-"消费流 + 聚合" 的封装；非流式仅作端点不支持 stream 时的兜底。
-本文件同时覆盖：重试/降级/终态语义、流式透传、fallback 包装、落库防双计。
+LLMClient 以 ``stream_chat`` 为唯一调用入口（流式形态唯一）；聚合消费
+一律由调用方 ``collect(stream_chat(...))`` 完成，不再保留 ``chat()`` 别名。
+本文件覆盖：重试/降级/终态语义、流式透传、流拒绝终态、落库防双计。
 """
 
 import json
@@ -14,10 +14,10 @@ import pytest
 from app.services.llm.models import (
     ChatResponse,
     Message,
-    StreamAggregator,
     StreamChunk,
     TextBlock,
     Usage,
+    collect,
 )
 
 # ---------------------------------------------------------------------------
@@ -187,12 +187,12 @@ def _stream_partial_then_error(chunks, exc, calls=None):
 
 
 # ===================================================================
-# LLMClient.chat（流式聚合 + 重试/降级）
+# LLMClient 聚合消费（collect(stream_chat) + 重试/降级/落库）
 # ===================================================================
 
 
-class TestLLMClientChat:
-    """LLMClient.chat() 测试（底层统一为 provider.stream）。"""
+class TestLLMClientAggregateConsume:
+    """``collect(LLMClient.stream_chat(...))`` 聚合消费测试（重试/降级/落库）。"""
 
     @pytest.mark.asyncio
     async def test_chat_success(
@@ -209,7 +209,9 @@ class TestLLMClientChat:
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
             messages = [Message(role="user", content="Hello")]
-            result = await client.chat(messages, job_id=1, job_name="test")
+            result = await collect(
+                client.stream_chat(messages, job_id=1, job_name="test")
+            )
 
         assert isinstance(result, ChatResponse)
         assert result.content == "Hello!"
@@ -256,7 +258,7 @@ class TestLLMClientChat:
                 [Exception("Connection error"), ok_chunks], calls
             )
             messages = [Message(role="user", content="Retry test")]
-            response = await client.chat(messages)
+            response = await collect(client.stream_chat(messages))
 
         assert response.content == "Retry OK"
         assert response.usage is not None
@@ -289,7 +291,7 @@ class TestLLMClientChat:
             )
             messages = [Message(role="user", content="Always fail")]
             with pytest.raises(LLMCallError):
-                await client.chat(messages)
+                await collect(client.stream_chat(messages))
 
         assert len(calls) == 3
 
@@ -317,7 +319,9 @@ class TestLLMClientChat:
                 ]
             )
             with pytest.raises(LLMCallError):
-                await client.chat([Message(role="user", content="Test")])
+                await collect(
+                    client.stream_chat([Message(role="user", content="Test")])
+                )
 
         assert mock_sleep.await_count == 2
         mock_sleep.assert_any_await(1)
@@ -337,8 +341,10 @@ class TestLLMClientChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
-            result = await client.chat(
-                [Message(role="user", content="Count tokens")], model="claude-3"
+            result = await collect(
+                client.stream_chat(
+                    [Message(role="user", content="Count tokens")], model="claude-3"
+                )
             )
 
         assert result.model == "claude-3"
@@ -371,7 +377,9 @@ class TestLLMClientChat:
                 ]
             )
             with pytest.raises(LLMCallError):
-                await client.chat([Message(role="user", content="Error test")])
+                await collect(
+                    client.stream_chat([Message(role="user", content="Error test")])
+                )
 
         mock_log_usage.assert_called_once()
         kwargs = mock_log_usage.call_args[1]
@@ -393,8 +401,10 @@ class TestLLMClientChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
-            await client.chat(
-                [Message(role="user", content="Log test")], model="test-model-v1"
+            await collect(
+                client.stream_chat(
+                    [Message(role="user", content="Log test")], model="test-model-v1"
+                )
             )
 
         mock_logger.debug.assert_called_once()
@@ -422,7 +432,7 @@ class TestLLMClientChat:
                 client = _build_client()
                 client._provider.stream = _stream_fn([_response_chunks(response)])
                 messages = [Message(role="user", content="test")]
-                result = await client.chat(messages)
+                result = await collect(client.stream_chat(messages))
 
         assert result.content == "Hello!"
         assert result.model == "gpt-4o-mini"
@@ -442,7 +452,9 @@ class TestLLMClientChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
-            result = await client.chat([Message(role="user", content="Q")])
+            result = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert result.content == "OK"
         mock_log_usage.assert_called_once()
@@ -461,7 +473,7 @@ class TestLLMClientChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         mock_log_usage.assert_called_once()
         kwargs = mock_log_usage.call_args[1]
@@ -484,10 +496,12 @@ class TestLLMClientChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)], calls)
-            await client.chat(
-                [Message(role="user", content="Q")],
-                temperature=0.1,
-                max_tokens=100,
+            await collect(
+                client.stream_chat(
+                    [Message(role="user", content="Q")],
+                    temperature=0.1,
+                    max_tokens=100,
+                )
             )
 
         assert len(calls) == 1
@@ -601,9 +615,11 @@ class TestAnthropicProviderFactory:
                 client._provider.stream = _stream_fn(
                     [_response_chunks(response)], calls
                 )
-                await client.chat(
-                    [Message(role="user", content="Q")],
-                    thinking_level="high",
+                await collect(
+                    client.stream_chat(
+                        [Message(role="user", content="Q")],
+                        thinking_level="high",
+                    )
                 )
 
         assert calls[0].get("thinking_level") == "high"
@@ -678,7 +694,7 @@ class TestParamRejectionDegradation:
 
         client = LLMClient()
         client._provider = provider
-        resp = await client.chat([Message(role="user", content="Q")])
+        resp = await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert resp.content == "ok"
         assert len(calls) == 2  # 降级后立即重试，无退避
@@ -716,10 +732,14 @@ class TestParamRejectionDegradation:
 
         client = LLMClient()
         client._provider = provider
-        resp = await client.chat(
-            [Message(role="user", content="Q")],
-            tools=[{"name": "t", "description": "d", "parameters": {"type": "object"}}],
-            tool_choice="t",
+        resp = await collect(
+            client.stream_chat(
+                [Message(role="user", content="Q")],
+                tools=[
+                    {"name": "t", "description": "d", "parameters": {"type": "object"}}
+                ],
+                tool_choice="t",
+            )
         )
 
         assert resp.content == "ok"
@@ -733,8 +753,9 @@ class TestParamRejectionDegradation:
     ):
         """降级重试：成功落库的 latency 由 stream_chat 全程墙钟测量。
 
-        调用顺序（time.time）：chat.t0 → stream_chat.t0 → retry.t_attempt
-        → 降级重置 t_attempt → stream_chat 成功时刻 → chat 收尾时刻。
+        调用顺序（time.time）：stream_chat.t0 → retry.t_attempt
+        → 降级重置 t_attempt → stream_chat 成功时刻。降级时重置 t_attempt，
+        使失败尝试的耗时不计入 latency。
         """
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
@@ -757,15 +778,14 @@ class TestParamRejectionDegradation:
             calls,
         )
 
-        times = [1000.0, 2000.0, 2000.5, 2000.5, 2000.5, 2000.5]
+        times = [2000.0, 2000.5, 2000.5, 2000.5]
         with patch("app.services.llm.client.time.time", side_effect=times):
             client = LLMClient()
             client._provider = provider
-            resp = await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
-        # stream_chat 墙钟 = 2000.5 - 2000.0 = 500ms；chat 别名 latency = 全程墙钟
+        # 降级重置 t_attempt：成功落库 latency = 2000.5 - 2000.0 = 500ms
         assert mock_log_usage.call_args[1]["latency_ms"] == 500
-        assert resp.latency == int((2000.5 - 1000.0) * 1000)
 
     @pytest.mark.asyncio
     async def test_non_param_400_terminal_no_degradation(
@@ -789,7 +809,7 @@ class TestParamRejectionDegradation:
             client = LLMClient()
             client._provider = provider
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert len(calls) == 1  # 确定性 400 → 终态，不重试
         assert exc_info.value.retryable is False
@@ -820,7 +840,7 @@ class TestTerminalErrorsNoRetry:
             client = LLMClient()
             client._provider = provider
             with pytest.raises(LLMCallError):
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert len(calls) == 1  # 不重试
         assert mock_sleep.await_count == 0  # 无退避
@@ -845,7 +865,7 @@ class TestTerminalErrorsNoRetry:
             client = LLMClient()
             client._provider = provider
             with pytest.raises(LLMCallError):
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert len(calls) == 1
         assert mock_sleep.await_count == 0
@@ -876,7 +896,9 @@ class TestTerminalErrorsNoRetry:
         with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
             client = LLMClient()
             client._provider = provider
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert resp.content == "ok"
         assert len(calls) == 2
@@ -908,7 +930,9 @@ class TestTerminalErrorsNoRetry:
         with patch("app.services.llm.client.asyncio.sleep", mock_sleep):
             client = LLMClient()
             client._provider = provider
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert resp.content == "ok"
         assert len(calls) == 2
@@ -1019,7 +1043,9 @@ class TestLLMCallError:
                 ]
             )
             with pytest.raises(LLMCallError):
-                await client.chat([Message(role="user", content="Always fail")])
+                await collect(
+                    client.stream_chat([Message(role="user", content="Always fail")])
+                )
 
         mock_log_usage.assert_called_once()
         kwargs = mock_log_usage.call_args[1]
@@ -1043,7 +1069,7 @@ class TestLLMCallError:
             client = LLMClient()
             client._provider = provider
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is True
 
@@ -1063,7 +1089,7 @@ class TestLLMCallError:
         client = LLMClient()
         client._provider = provider
         with pytest.raises(LLMCallError) as exc_info:
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
 
@@ -1083,7 +1109,7 @@ class TestLLMCallError:
         client = LLMClient()
         client._provider = provider
         with pytest.raises(LLMCallError) as exc_info:
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
 
@@ -1103,7 +1129,7 @@ class TestLLMCallError:
         client = LLMClient()
         client._provider = provider
         with pytest.raises(LLMCallError) as exc_info:
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
 
@@ -1127,7 +1153,7 @@ class TestLLMCallError:
         client = LLMClient()
         client._provider = provider
         with pytest.raises(LLMCallError) as exc_info:
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
 
@@ -1145,7 +1171,9 @@ class TestLLMCallError:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([_response_chunks(response)])
-            result = await client.chat([Message(role="user", content="Hello")])
+            result = await collect(
+                client.stream_chat([Message(role="user", content="Hello")])
+            )
 
         assert result.content == "Hello!"
         assert result.model == "gpt-4o-mini"
@@ -1160,10 +1188,10 @@ class TestStreamChat:
     """stream_chat() 增量消费、重试、降级与兜底（T7）。"""
 
     @pytest.mark.asyncio
-    async def test_chat_aggregates_stream_events(
+    async def test_collect_aggregates_stream_events(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """场景 1：chat() 聚合 provider.stream 事件为等价 ChatResponse。"""
+        """场景 1：collect(stream_chat()) 聚合 provider.stream 事件为等价 ChatResponse。"""
         chunks = [
             StreamChunk(type="thinking_delta", thinking="think", signature="sig"),
             StreamChunk(type="text_delta", text="Hello"),
@@ -1181,7 +1209,9 @@ class TestStreamChat:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([chunks])
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert resp.content == "Hello"
         assert resp.stop_reason == "tool_use"
@@ -1234,7 +1264,9 @@ class TestStreamChat:
             client._provider.stream = _stream_fn(
                 [httpx.ConnectError("boom"), ok], calls
             )
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert resp.content == "ok"
         assert len(calls) == 2
@@ -1258,7 +1290,9 @@ class TestStreamChat:
                 ],
                 calls,
             )
-            resp = await client.chat([Message(role="user", content="Q")])
+            resp = await collect(
+                client.stream_chat([Message(role="user", content="Q")])
+            )
 
         assert resp.content == "ok"
         assert len(calls) == 2
@@ -1292,7 +1326,7 @@ class TestStreamChat:
 
         client = LLMClient()
         client._provider = provider
-        resp = await client.chat([Message(role="user", content="Q")])
+        resp = await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert resp.content == "ok"
         assert len(calls) == 2
@@ -1321,14 +1355,13 @@ class TestStreamChat:
 
         with patch(_sleep_patch_path(), mock_sleep):
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
         assert "端点不支持流式调用" in str(exc_info.value)
         assert len(stream_calls) == 1  # 不重试
         assert mock_sleep.await_count == 0  # 无退避
         assert provider._extras_disabled is False  # 不降级
-        assert not hasattr(provider, "_stream_unsupported")  # 不再有伪装/兜底标记
         mock_log_usage.assert_called_once()
         assert mock_log_usage.call_args[1]["status"] == "error"
 
@@ -1358,7 +1391,7 @@ class TestStreamChat:
         client._provider = provider
 
         with pytest.raises(LLMCallError) as exc_info:
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
         assert len(stream_calls) == 1  # 不重试 stream
@@ -1385,7 +1418,7 @@ class TestStreamChat:
                 calls,
             )
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is True
         assert len(calls) == 1  # 不重试
@@ -1436,79 +1469,11 @@ class TestStreamChat:
             client = LLMClient()
             client._provider = provider
             with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
+                await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         assert exc_info.value.retryable is False
         assert len(calls) == 1
         assert mock_sleep.await_count == 0
-
-    @pytest.mark.asyncio
-    async def test_chat_and_stream_chat_equivalent(
-        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
-    ):
-        """场景 11：chat() 与 stream_chat() 聚合等价（同一 mock 流）。"""
-        chunks = [
-            StreamChunk(type="text_delta", text="Hello "),
-            StreamChunk(type="text_delta", text="world"),
-            StreamChunk(
-                type="usage",
-                usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
-            ),
-            StreamChunk(type="stop", stop_reason="end_turn"),
-        ]
-
-        with patch(_sleep_patch_path(), AsyncMock()):
-            client = _build_client()
-            client._provider.stream = _stream_fn([chunks])
-            chat_resp = await client.chat([Message(role="user", content="Q")])
-
-            agg = StreamAggregator()
-            async for chunk in client.stream_chat([Message(role="user", content="Q")]):
-                agg.feed(chunk)
-            stream_resp = agg.finalize()
-
-        assert chat_resp.content == stream_resp.content
-        assert chat_resp.blocks == stream_resp.blocks
-        assert chat_resp.stop_reason == stream_resp.stop_reason
-        assert chat_resp.usage == stream_resp.usage
-
-    @pytest.mark.asyncio
-    async def test_chat_reuses_stream_chat_aggregation_single_pass(
-        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
-    ):
-        """S4：chat() 复用 stream_chat() 的聚合结果，不对同一响应二次聚合。
-
-        用 feed 计数证明：chat() 路径下聚合器只被 feed 一次（若双重聚合则翻倍）。
-        """
-        from app.services.llm.models import StreamAggregator as _Agg
-
-        feed_count = {"n": 0}
-        original_feed = _Agg.feed
-
-        def counting_feed(self, chunk):
-            feed_count["n"] += 1
-            return original_feed(self, chunk)
-
-        chunks = [
-            StreamChunk(type="text_delta", text="Hello"),
-            StreamChunk(
-                type="usage",
-                usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-            ),
-            StreamChunk(type="stop", stop_reason="end_turn"),
-        ]
-
-        with (
-            patch(_sleep_patch_path(), AsyncMock()),
-            patch.object(_Agg, "feed", counting_feed),
-        ):
-            client = _build_client()
-            client._provider.stream = _stream_fn([chunks])
-            resp = await client.chat([Message(role="user", content="Q")])
-
-        assert resp.content == "Hello"
-        # 3 个 chunk 只被聚合一次（修复前 chat()+stream_chat() 双重聚合 → 6）
-        assert feed_count["n"] == len(chunks)
 
 
 # ===================================================================
@@ -1518,6 +1483,14 @@ class TestStreamChat:
 
 class TestStreamChatContract:
     """stream_chat 纯公开契约（无下划线参数）与轻量元数据跟踪。"""
+
+    def test_client_has_no_chat_alias(self):
+        """chat() 过渡别名已删除：LLMClient 仅以 stream_chat 为唯一调用入口。"""
+        from app.services.llm.client import LLMClient
+
+        assert not hasattr(LLMClient, "chat"), (
+            "LLMClient.chat() 过渡别名应已删除；消费方一律 collect(stream_chat(...))"
+        )
 
     def test_stream_chat_signature_has_no_private_params(self):
         """stream_chat 不再暴露 _state / _result 下划线参数。"""
@@ -1541,7 +1514,7 @@ class TestStreamChatContract:
         with patch(_sleep_patch_path(), AsyncMock()):
             client = _build_client()
             client._provider.stream = _stream_fn([chunks])
-            await client.chat([Message(role="user", content="Q")])
+            await collect(client.stream_chat([Message(role="user", content="Q")]))
 
         kwargs = mock_log_usage.call_args[1]
         assert kwargs["status"] == "success"
@@ -1550,49 +1523,6 @@ class TestStreamChatContract:
         assert kwargs["total_tokens"] == 0
         warning_messages = [c.args[0] for c in mock_logger.warning.call_args_list]
         assert any("usage" in msg for msg in warning_messages)
-
-    @pytest.mark.asyncio
-    async def test_chat_alias_equivalent_to_collect_and_latency_nonzero(
-        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
-    ):
-        """chat() 别名等价 collect(stream_chat)，且 latency 由别名填入（非零）。"""
-        from app.services.llm.models import collect
-
-        chunks = [
-            StreamChunk(type="text_delta", text="Hello", model="gpt-4o"),
-            StreamChunk(
-                type="usage",
-                usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
-            ),
-            StreamChunk(type="stop", stop_reason="end_turn"),
-        ]
-        # time.time 调用顺序：chat.t0 → stream_chat.t0 → retry.t_attempt
-        #   → stream_chat 成功时刻 → chat 收尾时刻
-        times = [
-            1000.0,
-            1000.0,
-            1000.0,
-            1000.0,
-            1000.5,
-            1000.5,
-            1000.5,
-            1000.5,
-        ]
-        with (
-            patch(_sleep_patch_path(), AsyncMock()),
-            patch("app.services.llm.client.time.time", side_effect=times),
-        ):
-            client = _build_client()
-            client._provider.stream = _stream_fn([chunks])
-            resp = await client.chat([Message(role="user", content="Q")])
-            agg = await collect(client.stream_chat([Message(role="user", content="Q")]))
-
-        assert resp.content == agg.content == "Hello"
-        assert resp.blocks == agg.blocks
-        assert resp.stop_reason == agg.stop_reason
-        assert resp.usage == agg.usage
-        assert resp.model == agg.model == "gpt-4o"
-        assert resp.latency == 500  # 非零
 
 
 # ===================================================================

@@ -1106,10 +1106,14 @@ class TestExecuteJob:
         )
 
         # 主总结成功；摘要提取 LLM 失败 → 触发占位行
+        # （stream 唯一形态：摘要走 collect(stream_chat)，故 mock stream_chat 抛错）
         failing_summary_client = MagicMock()
-        failing_summary_client.chat = AsyncMock(
-            side_effect=RuntimeError("summary llm down")
-        )
+
+        async def _failing_stream_chat(messages, **kwargs):
+            raise RuntimeError("summary llm down")
+            yield  # pragma: no cover - 使函数成为 async generator
+
+        failing_summary_client.stream_chat = MagicMock(side_effect=_failing_stream_chat)
         _llm_patch, _mock_client = self._patch_llm(_mock_chat_response("主总结正文"))
 
         with (

@@ -16,11 +16,9 @@ from app.core.config import config_manager
 from app.core.logging import logger
 
 from .models import (
-    ChatResponse,
     Message,
     StreamChunk,
     Usage,
-    collect,
 )
 from .providers.anthropic import AnthropicProvider
 from .providers.base import BaseProvider
@@ -213,25 +211,6 @@ class LLMClient:
         proxy = config_manager.get("dev", "script_proxy", fallback="").strip() or None
         self._provider_name = cfg["provider"]
         self._provider = _build_provider(self._provider_name, cfg, proxy)
-
-    async def chat(
-        self,
-        messages: list[Message],
-        *,
-        job_id: int | None = None,
-        job_name: str | None = None,
-        **kwargs,
-    ) -> ChatResponse:
-        """过渡别名：等价于 collect(stream_chat(...))；下游迁移完成后删除（R3 批）。
-
-        流式为唯一调用形态；本方法仅为尚未迁移的调用方保留 ChatResponse 契约。
-        """
-        t0 = time.time()
-        response = await collect(
-            self.stream_chat(messages, job_id=job_id, job_name=job_name, **kwargs)
-        )
-        response.latency = int((time.time() - t0) * 1000)
-        return response
 
     async def stream_chat(
         self,

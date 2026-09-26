@@ -240,8 +240,8 @@ class TestGenerateSummaryStream:
                 _ = [c async for c in svc.generate_summary_stream(config)]
 
     @pytest.mark.asyncio
-    async def test_uses_only_stream_chat_alias_untouched(self):
-        """流式变体只走 stream_chat，不触发聚合 chat() 过渡别名（避免双份调用）。"""
+    async def test_uses_only_stream_chat(self):
+        """流式变体只走 stream_chat（无 chat() 别名，天然不会双份调用）。"""
         svc = SummaryService()
         config = _make_config()
         client = _mock_stream_client(_stream_chunks())
@@ -250,7 +250,6 @@ class TestGenerateSummaryStream:
             _ = [c async for c in svc.generate_summary_stream(config)]
 
         client.stream_chat.assert_called_once()
-        assert not client.chat.called
 
 
 class TestGenerateSummaryRegression:
@@ -258,7 +257,7 @@ class TestGenerateSummaryRegression:
 
     @pytest.mark.asyncio
     async def test_generate_summary_uses_stream_chat_collect(self):
-        """generate_summary 消费 stream_chat 聚合出完整字段（不再走 chat 别名）。"""
+        """generate_summary 消费 collect(stream_chat) 聚合出完整字段。"""
         svc = SummaryService()
         config = _make_config()
         usage = Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
@@ -277,4 +276,3 @@ class TestGenerateSummaryRegression:
         assert result["usage"] is usage
         assert result["record_count"] == 2
         client.stream_chat.assert_called_once()
-        assert not client.chat.called

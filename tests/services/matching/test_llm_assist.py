@@ -1497,15 +1497,15 @@ def _make_notify():
     return ns
 
 
-def _wire_stream_client(client, chat_callable=None):
-    """把 mock client 的 ``stream_chat`` 适配为从 ``client.chat`` 展开的事件流。
+def _wire_stream_client(client, response_fn):
+    """把 mock client 的 ``stream_chat`` 适配为 ``response_fn`` 展开的事件流。
 
-    默认路径已切换为 ``client.stream_chat``（流式唯一入口）。测试沿用
-    ``client.chat = AsyncMock(...)`` 定义响应，本辅助函数据其展开为**无停点**事件流
-    （与 eval 回放同款），使循环走轮级执行、行为与改造前等价；``client.chat`` 仍被
-    真实调用（便于断言 thinking_level 等参数透传）。
+    ``stream_chat`` 是 LLMClient 的唯一调用入口。测试用 ``response_fn``
+    （返回 ``ChatResponse`` 的 AsyncMock）定义每轮响应，本辅助函数据其展开为
+    **无停点**事件流（与 eval 回放同款），使循环走轮级执行；``response_fn``
+    仍被真实调用（便于断言 thinking_level 等参数透传）。
     """
-    inner = chat_callable if chat_callable is not None else client.chat
+    inner = response_fn
 
     async def _stream(messages, *, tools=None, tool_choice=None, **kwargs):
         resp = await inner(messages, tools=tools, tool_choice=tool_choice, **kwargs)
@@ -1959,7 +1959,7 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 思考开关透传：llm_match_thinking_level 应同时透传到 client.chat 调用
+# 思考开关透传：llm_match_thinking_level 应同时透传到 client.stream_chat 调用
 # ---------------------------------------------------------------------------
 
 
@@ -1968,12 +1968,12 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
     """场景1：run(thinking_level="medium") 使用默认 stream_fn 时，client 收到 thinking_level='medium'。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    # Mock LLMClient：chat 返回 end_turn 使循环立即结束；stream_chat 由其展开
+    # Mock LLMClient：response_fn 返回 end_turn 使循环立即结束；stream_chat 由其展开
     mock_client = MagicMock()
-    mock_client.chat = AsyncMock(
+    response_fn = AsyncMock(
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
-    _wire_stream_client(mock_client)
+    _wire_stream_client(mock_client, response_fn)
 
     # get_llm_client 由 llm_assist 模块头部导入，patch 其模块命名空间
     # 不 mock loop_run：让真实循环执行，验证默认 stream_fn 确实调用 client
@@ -1990,11 +1990,11 @@ async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
             thinking_level="medium",
         )
 
-    # client.chat 应经 stream_chat 被调用，且收到 thinking_level="medium"
-    assert mock_client.chat.called, "默认 stream_fn 应调用 client.chat"
-    _, kwargs = mock_client.chat.call_args
+    # response_fn 应经 stream_chat 被调用，且收到 thinking_level="medium"
+    assert response_fn.called, "默认 stream_fn 应调用 client.stream_chat"
+    _, kwargs = response_fn.call_args
     assert kwargs.get("thinking_level") == "medium", (
-        f"client.chat 应收到 thinking_level='medium'，实际 kwargs={kwargs}"
+        f"client.stream_chat 应收到 thinking_level='medium'，实际 kwargs={kwargs}"
     )
 
 
@@ -2006,7 +2006,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
     from app.services.agent.loop import RunResult
 
     mock_client = MagicMock()
-    mock_client.chat = AsyncMock(
+    mock_client.stream_chat = AsyncMock(
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
 
@@ -2040,14 +2040,14 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
-    """场景3：run(thinking_level="off") → client.chat 收到 thinking_level='off'。"""
+    """场景3：run(thinking_level="off") → client.stream_chat 收到 thinking_level='off'。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     mock_client = MagicMock()
-    mock_client.chat = AsyncMock(
+    response_fn = AsyncMock(
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
-    _wire_stream_client(mock_client)
+    _wire_stream_client(mock_client, response_fn)
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
@@ -2062,19 +2062,20 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
             thinking_level="off",
         )
 
-    assert mock_client.chat.called, "默认 stream_fn 应调用 client.chat"
-    _, kwargs = mock_client.chat.call_args
+    assert response_fn.called, "默认 stream_fn 应调用 client.stream_chat"
+    _, kwargs = response_fn.call_args
     assert kwargs.get("thinking_level") == "off", (
-        f"client.chat 应收到 thinking_level='off'，实际 kwargs={kwargs}"
+        f"client.stream_chat 应收到 thinking_level='off'，实际 kwargs={kwargs}"
     )
 
 
 @pytest.mark.asyncio
 async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
     """场景4：显式传入 chat_fn 时，不调用 get_llm_client，chat_fn 不被包装/改签名。"""
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import AsyncMock, MagicMock, patch
 
     mock_client = MagicMock()
+    mock_client.stream_chat = AsyncMock()
 
     custom_called = {}
 
@@ -2100,9 +2101,9 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
 
     # 自定义 chat_fn 应被直接调用
     assert custom_called.get("invoked") is True, "自定义 chat_fn 应被调用"
-    # get_llm_client 不应被触发（默认 chat_fn 未构建）
-    assert not mock_client.chat.called, (
-        "注入自定义 chat_fn 时不应调用 get_llm_client().chat"
+    # get_llm_client 不应被触发（默认 stream_fn 未构建）
+    assert not mock_client.stream_chat.called, (
+        "注入自定义 chat_fn 时不应触发 get_llm_client().stream_chat"
     )
     # 签名保持不变：tools / tool_choice 以关键字参数传入
     assert "tools" in custom_called
@@ -3895,8 +3896,8 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
         return ChatResponse(content="done", stop_reason="end_turn")
 
     client = MagicMock()
-    client.chat = AsyncMock(side_effect=_chat)
-    _wire_stream_client(client)
+    response_fn = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client, response_fn)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -3976,10 +3977,9 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
             )
         return ChatResponse(content="done", stop_reason="end_turn")
 
-    chat = AsyncMock(side_effect=_chat)
+    response_fn = AsyncMock(side_effect=_chat)
     client = MagicMock()
-    client.chat = chat
-    _wire_stream_client(client)
+    _wire_stream_client(client, response_fn)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -4019,7 +4019,9 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
 
     asyncio.run(_go())
 
-    assert chat.call_count == 2, f"期望累计 2 次 LLM 调用，实际 {chat.call_count}"
+    assert response_fn.call_count == 2, (
+        f"期望累计 2 次 LLM 调用，实际 {response_fn.call_count}"
+    )
     run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
 
@@ -4040,8 +4042,8 @@ def test_continue_run_writes_chat_span(monkeypatch):
         return ChatResponse(content="done", stop_reason="end_turn")
 
     client = MagicMock()
-    client.chat = AsyncMock(side_effect=_chat)
-    _wire_stream_client(client)
+    response_fn = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client, response_fn)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -4187,8 +4189,8 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
         return ChatResponse(content="done", stop_reason="end_turn")
 
     client = MagicMock()
-    client.chat = AsyncMock(side_effect=_chat)
-    _wire_stream_client(client)
+    response_fn = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client, response_fn)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )
@@ -4250,8 +4252,8 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
         return ChatResponse(content="done", stop_reason="end_turn")
 
     client = MagicMock()
-    client.chat = AsyncMock(side_effect=_chat)
-    _wire_stream_client(client)
+    response_fn = AsyncMock(side_effect=_chat)
+    _wire_stream_client(client, response_fn)
     monkeypatch.setattr(
         "app.services.matching.llm_assist.get_llm_client", lambda: client
     )

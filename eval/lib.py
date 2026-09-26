@@ -225,13 +225,6 @@ class FixtureDriver:
         for chunk in response_to_chunks(resp):
             yield chunk
 
-    async def chat(self, messages, *, tools=None, tool_choice=None):
-        """旧契约兼容：把流式回放聚合回 ``ChatResponse``（测试/迁移期使用）。"""
-        aggregator = StreamAggregator()
-        async for chunk in self.stream(messages, tools=tools, tool_choice=tool_choice):
-            aggregator.feed(chunk)
-        return aggregator.finalize()
-
     async def execute_batch(self, tool_calls, *, recorder=None):
         if not (0 <= self._idx < len(self._rounds)):
             raise FingerprintMismatch(

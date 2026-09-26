@@ -161,7 +161,7 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
 - **L1 进 CI**：将回放封装为 pytest 用例（`tests/eval/`），由现有 `ci-tests.yml`
   的 `pytest tests/` 收集——不需要新 workflow、不需要 secrets，fork PR 同样可跑。
 - **机制守卫**：`--mode record` 在 `CI=true` 下直接报错退出——"CI 绝不录音"由代码
-  保证，而非依赖纪律；回放路径完全不触网（chat/工具结果全部来自 cassette）。
+  保证，而非依赖纪律；回放路径完全不触网（LLM 响应/工具结果全部来自 cassette）。
 - **L2 不进 PR 门禁**：真实模型调用成本与结果非确定性不适合作为合并条件；
   由贡献者/维护者本地或 fork 运行，报告贴 PR 作为质量证据。
 
@@ -211,28 +211,29 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
 - 18 条正向**零误伤**（veto 词表预检 + 实测均未触发）；
 - 遗留：m013「剧场版 高达」（未识别歧义型——理由中无不确定表述，需更强的歧义检测，非本机制覆盖）。
 
-### 流式化兼容性验证（2026-09-24，T11）
+### 流式化兼容性验证（2026-09-24，T11；2026-09-26 收口）
 
-LLM 调用底层改为流式（`chat()` = 消费 `stream_chat()` 事件流后聚合，新增
-`stream_chat()`）后，对 eval 体系做兼容性核查，**结论：无需任何适配，cassette
-不必重录**。
+LLM 调用底层为**流式唯一形态**：`LLMClient.stream_chat()` 是唯一调用入口，
+聚合消费一律由调用方 `collect(stream_chat(...))` 完成（`chat()` 过渡别名已删除）。
+对 eval 体系做兼容性核查，**结论：无需任何适配，cassette 不必重录**。
 
 - **回放匹配键不含 HTTP 请求体**：指纹 =
   `sha256(模型 + tools schema + tool_choice + 规范化消息序列)`（见 `eval/lib.py`
   的 `fingerprint()`），与 `stream`/`stream_options` 等传输层字段无关。
-- **拦截层在 `chat_fn`（provider 之上）**：replay 用 `FixtureDriver.chat` 直接
-  顶替 `chat_fn`，工具结果由 `ToolRegistry.execute_batch` 的 patch 供给；
-  `build_real_chat_fn`（record/live）调用的 `LLMClient.chat()` 公共契约
-  （入参 `messages/tools/tool_choice`，返回 `ChatResponse`）在 T7 后保持不变。
+- **拦截层在 `stream_fn`（provider 之上）**：replay 用 `FixtureDriver.stream`
+  直接顶替 `stream_fn`，测试侧经 `collect(driver.stream(...))` 聚合为
+  `ChatResponse`；工具结果由 `ToolRegistry.execute_batch` 的 patch 供给；
+  `build_real_stream_fn`（record/live）包装 `LLMClient.stream_chat()`。
 - **`stream: true` 注入点在 provider 层**（`providers/anthropic.py`、
   `openai_compat.py`、`openai_responses.py` 组装请求体处），位于指纹计算边界
   之下，因此不会改变指纹，也不会影响 cassette 匹配。
-- **验证**：`uv run pytest tests/eval/ -q` → **28 passed**（21 条 golden 回放 +
-  指纹守卫 + 敏感信息扫描 + 零网络守卫，全绿）。
+- **端点须支持 SSE**：不接受流式请求的端点会确定性失败（提示更换端点/升级网关），
+  不再有非流式兜底；评测使用的服务与网关需支持 SSE。
+- **验证**：`uv run pytest tests/eval/ -q` 全绿（golden 回放 + 指纹守卫 +
+  敏感信息扫描 + 零网络守卫）。
 - **live 链路**：代码路径已就绪（`run_eval.py --mode live --case <id>`，经
-  `chat()` → `stream_chat()` 走真实流式端点），但本次环境未设置
-  `EVAL_LLM_API_KEY`/`DEEPSEEK_API_KEY` 等凭据，**live 端到端未执行**；恢复凭据后
-  可本地补跑。
+  `stream_chat()` 走真实流式端点），但需设置
+  `EVAL_LLM_API_KEY`/`DEEPSEEK_API_KEY` 等凭据后本地补跑。
 
 ## 演进方向
 
