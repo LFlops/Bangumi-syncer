@@ -3,19 +3,19 @@
 覆盖：
 - 事件透传（text_delta/usage/stop 原样产出，顺序不变）
 - 消息构造与 job_name / thinking_level 透传（复用 generate_summary 的公共路径）
-- 终态元数据回填（model / usage / latency_ms / record_count）
+- 终态元数据由业务自行收集（model / usage / latency / record_count；去鸭子容器契约）
 - 异常透传（不吞错，由上层转 SSE error 事件）
-- generate_summary（聚合路径）行为不变
+- generate_summary（聚合路径）走 collect(stream_chat)
 """
 
 from __future__ import annotations
 
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.services.llm.models import ChatResponse, StreamChunk, Usage
+from app.services.llm.models import StreamChunk, Usage
 from app.services.summary.models import SummaryJobConfig
 from app.services.summary.service import SummaryService, SummaryStreamResult
 
@@ -82,27 +82,24 @@ def _stream_chunks() -> list[StreamChunk]:
 def _mock_stream_client(
     chunks: list[StreamChunk],
     *,
-    model: str = "test-model",
-    latency_ms: int = 42,
     capture: dict | None = None,
 ) -> MagicMock:
-    """构造 mock LLM 客户端：stream_chat 为 async generator，按 _state 鸭子类型回填。"""
+    """构造 mock LLM 客户端：stream_chat 为 async generator，原样产出给定事件。"""
 
-    async def _stream(
-        messages, *, job_name=None, thinking_level=None, _state=None, **_
-    ):
+    def _stream_chat(messages, **kwargs):
         if capture is not None:
             capture["messages"] = messages
-            capture["job_name"] = job_name
-            capture["thinking_level"] = thinking_level
-        if _state is not None:
-            _state.model = model
-            _state.latency_ms = latency_ms
-        for chunk in chunks:
-            yield chunk
+            capture["job_name"] = kwargs.get("job_name")
+            capture["thinking_level"] = kwargs.get("thinking_level")
+
+        async def _gen():
+            for chunk in chunks:
+                yield chunk
+
+        return _gen()
 
     client = MagicMock()
-    client.stream_chat = _stream
+    client.stream_chat = MagicMock(side_effect=_stream_chat)
     return client
 
 
@@ -178,20 +175,52 @@ class TestGenerateSummaryStream:
 
     @pytest.mark.asyncio
     async def test_fills_result_meta(self):
-        """耗尽后 result 回填 model / usage / latency_ms / record_count。"""
+        """耗尽后 result 回填业务自采元数据：model / usage / latency / record_count。
+
+        R1 后 client 不再回填容器：model 取自事件 chunk.model，latency 由 service
+        自行计时（此处只断言非负，不依赖 client 传值）。
+        """
         svc = SummaryService()
         config = _make_config()
-        client = _mock_stream_client(_stream_chunks(), model="gpt-4o", latency_ms=123)
+        chunks = [
+            StreamChunk(type="text_delta", text="你", model="gpt-4o"),
+            StreamChunk(type="text_delta", text="好"),
+            StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+            ),
+            StreamChunk(type="stop", stop_reason="end_turn"),
+        ]
+        client = _mock_stream_client(chunks)
         result = SummaryStreamResult()
 
         with _patch_db_and_llm(client):
             _ = [c async for c in svc.generate_summary_stream(config, result)]
 
         assert result.model == "gpt-4o"
-        assert result.latency_ms == 123
+        assert result.latency_ms >= 0
         assert result.usage is not None
         assert result.usage.total_tokens == 15
         assert result.record_count == 2
+
+    @pytest.mark.asyncio
+    async def test_model_falls_back_to_config_when_absent(self):
+        """事件未携带 model → 回退当前 LLM 配置的 model（展示口径）。"""
+        svc = SummaryService()
+        config = _make_config()
+        client = _mock_stream_client(_stream_chunks())  # 事件均不带 model
+        result = SummaryStreamResult()
+
+        with (
+            _patch_db_and_llm(client),
+            patch(
+                "app.services.summary.service.config_manager.get_llm_config",
+                return_value={"model": "cfg-model"},
+            ),
+        ):
+            _ = [c async for c in svc.generate_summary_stream(config, result)]
+
+        assert result.model == "cfg-model"
 
     @pytest.mark.asyncio
     async def test_propagates_stream_error(self):
@@ -211,31 +240,33 @@ class TestGenerateSummaryStream:
                 _ = [c async for c in svc.generate_summary_stream(config)]
 
     @pytest.mark.asyncio
-    async def test_does_not_call_aggregate_chat(self):
-        """流式变体只走 stream_chat，不触发聚合 chat()（避免双份 LLM 调用）。"""
+    async def test_uses_only_stream_chat_alias_untouched(self):
+        """流式变体只走 stream_chat，不触发聚合 chat() 过渡别名（避免双份调用）。"""
         svc = SummaryService()
         config = _make_config()
         client = _mock_stream_client(_stream_chunks())
-        client.chat = AsyncMock()
 
         with _patch_db_and_llm(client):
             _ = [c async for c in svc.generate_summary_stream(config)]
 
-        client.chat.assert_not_called()
+        client.stream_chat.assert_called_once()
+        assert not client.chat.called
 
 
 class TestGenerateSummaryRegression:
-    """聚合路径 generate_summary 行为不变（回归）。"""
+    """聚合路径 generate_summary 走 collect(stream_chat)（回归）。"""
 
     @pytest.mark.asyncio
-    async def test_generate_summary_still_uses_chat(self):
-        """generate_summary 仍调用 chat() 并返回完整字段。"""
+    async def test_generate_summary_uses_stream_chat_collect(self):
+        """generate_summary 消费 stream_chat 聚合出完整字段（不再走 chat 别名）。"""
         svc = SummaryService()
         config = _make_config()
         usage = Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
-        client = MagicMock()
-        client.chat = AsyncMock(
-            return_value=ChatResponse(content="聚合正文", model="gpt-4", usage=usage)
+        client = _mock_stream_client(
+            [
+                StreamChunk(type="text_delta", text="聚合正文", model="gpt-4"),
+                StreamChunk(type="usage", usage=usage),
+            ]
         )
 
         with _patch_db_and_llm(client):
@@ -245,4 +276,5 @@ class TestGenerateSummaryRegression:
         assert result["model"] == "gpt-4"
         assert result["usage"] is usage
         assert result["record_count"] == 2
-        client.chat.assert_awaited_once()
+        client.stream_chat.assert_called_once()
+        assert not client.chat.called

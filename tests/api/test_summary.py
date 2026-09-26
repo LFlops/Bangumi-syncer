@@ -814,7 +814,7 @@ class TestTestLLMConnection:
 
         fake_stream = _FakeLLMStream(
             [
-                StreamChunk(type="text_delta", text="H"),
+                StreamChunk(type="text_delta", text="H", model="real-model-42"),
                 StreamChunk(type="text_delta", text="i"),
             ]
         )
@@ -837,7 +837,8 @@ class TestTestLLMConnection:
                 assert data["success"] is True
                 # 响应不含回复正文（固定文案，短回复截停无展示价值）
                 assert data["message"] == "连接成功"
-                assert data["model"] == "gpt-4o-mini"
+                # model 取首个事件真实值（优先于配置）
+                assert data["model"] == "real-model-42"
                 assert data["latency_ms"] is not None
                 # 连通性 ping 应限制生成长度（max_tokens=8）且 prompt 极简
                 call_kwargs = mock_client.stream_chat.call_args.kwargs
@@ -848,6 +849,45 @@ class TestTestLLMConnection:
                 assert msgs[0].content == "ping"
                 # 首个内容事件后主动 aclose（不等待全量；未耗尽 → 不落成功计数）
                 assert fake_stream.aclose_called is True
+
+    @pytest.mark.asyncio
+    async def test_connection_model_falls_back_to_config(self):
+        """首个事件未携带 model → 回退当前配置 model（展示口径）。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+        from app.services.llm.models import StreamChunk
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        fake_stream = _FakeLLMStream([StreamChunk(type="text_delta", text="Hi")])
+        mock_client = MagicMock()
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
+
+        with (
+            patch("app.api.llm.get_llm_client", return_value=mock_client),
+            patch(
+                "app.api.llm.config_manager.get_llm_config",
+                return_value={"model": "cfg-fallback"},
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/llm/test")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["model"] == "cfg-fallback"
 
     @pytest.mark.asyncio
     async def test_llm_connection_failure(self):

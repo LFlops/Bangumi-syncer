@@ -69,8 +69,8 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
     ``aclose()``，无需等待全量响应生成完毕，延迟显著低于 ``chat()``（后者需
     消费完整流才能聚合出 ChatResponse）。副作用：提前关闭走 client 的
     "未正常耗尽 → 跳过成功落库" 路径，连接测试 ping 不计入用量统计（合理：
-    这是探活而非真实业务调用）。model 取自当前 LLM 配置（流式事件不携带
-    model，与 chat() 回填的 configured model 语义一致）。
+    这是探活而非真实业务调用）。model 取首个事件携带的真实模型名
+    （``chunk.model``），事件缺失时回退当前 LLM 配置 model。
     """
     try:
         client = get_llm_client()
@@ -81,8 +81,11 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
             max_tokens=8,
         )
         connected = False
+        stream_model = ""
         try:
             async for chunk in stream:
+                if chunk.model and not stream_model:
+                    stream_model = chunk.model
                 if chunk.type == "text_delta" and chunk.text:
                     connected = True
                     break
@@ -96,7 +99,8 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
         return LLMTestResponse(
             success=True,
             message="连接成功",  # 不含回复正文（短回复截停无展示价值）
-            model=config_manager.get_llm_config()["model"],
+            # 真实值优先，事件未携带时回退配置（与流式业务展示口径一致）
+            model=stream_model or config_manager.get_llm_config()["model"],
             latency_ms=latency,
         )
     except LLMCallError as e:

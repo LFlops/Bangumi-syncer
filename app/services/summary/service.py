@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from uuid import uuid4
 
+from app.core.config import config_manager
 from app.core.database import database_manager
 from app.core.logging import logger
 from app.models.memory import MemoryEntry
 
-from ..llm import Message, get_llm_client
+from ..llm import ChatResponse, Message, collect, get_llm_client
 from ..llm.models import StreamAggregator, StreamChunk, Usage
 from ..memory.service import MemoryService
 from ..notification_service import notification_service
@@ -79,16 +81,26 @@ _STAGE_FAILURE_META = {
 class SummaryStreamResult:
     """流式试生成的终态元数据（生成器耗尽后由调用方读取）。
 
-    同时作为 ``LLMClient.stream_chat(_state=...)`` 的鸭子类型容器：该参数要求
-    容器具备 ``model`` / ``latency_ms`` / ``used_fallback`` 属性，``stream_chat``
-    会在流式过程中回填（与 ``LLMClient.chat()`` 内部用法一致）。
+    纯业务 DTO：全部字段由 SummaryService 在消费事件流过程中自行收集
+    （model 取事件真实值/回退配置、usage 取 usage 事件、latency 业务计时），
+    任何 LLM client 侧代码都不得引用或回填本类型（R1 后 client 已无
+    私有状态容器协议）。
     """
 
     model: str = ""
     latency_ms: int = 0
-    used_fallback: bool = False
     usage: Usage | None = None
     record_count: int = 0
+
+
+def _configured_model() -> str:
+    """当前 LLM 配置的 model（流式事件未携带真实模型名时的展示回退）。"""
+    try:
+        return config_manager.get_llm_config().get("model", "")
+    except Exception as e:  # noqa: BLE001 - 配置不可读仅影响展示，不阻断业务
+        # 防御分支：配置异常时回退空串并留日志，避免静默
+        logger.warning(f"读取 LLM 配置 model 失败，回退空串: {e}")
+        return ""
 
 
 class SummaryService:
@@ -257,6 +269,26 @@ class SummaryService:
         messages = self._build_messages(records, system_prompt, date_from, date_to)
         return messages, len(records), date_from, date_to
 
+    async def _call_llm(
+        self, messages: list[Message], job_config: SummaryJobConfig
+    ) -> ChatResponse:
+        """流式为唯一形态：消费 ``stream_chat`` 聚合为 ``ChatResponse``。
+
+        与 ``generate_summary_stream`` 同源（均直连 ``stream_chat``），差别只是
+        此处一次性聚合；latency 由业务侧墙钟计时（client 不再回填容器）。
+        ``job_name`` 经参数显式传入，保证 LLM 用量归属正确落库。
+        """
+        t0 = time.monotonic()
+        response = await collect(
+            self.llm_client.stream_chat(
+                messages,
+                job_name=job_config.name,
+                thinking_level=job_config.thinking_level,
+            )
+        )
+        response.latency = int((time.monotonic() - t0) * 1000)
+        return response
+
     async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
         """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
 
@@ -267,11 +299,7 @@ class SummaryService:
             job_config
         )
 
-        response = await self.llm_client.chat(
-            messages,
-            job_name=job_config.name,
-            thinking_level=job_config.thinking_level,
-        )
+        response = await self._call_llm(messages, job_config)
 
         return {
             "summary_text": response.content,
@@ -288,30 +316,37 @@ class SummaryService:
         job_config: SummaryJobConfig,
         result: SummaryStreamResult | None = None,
     ) -> AsyncIterator[StreamChunk]:
-        """流式试生成：逐条透传 ``stream_chat`` 事件，终态元数据回填到 result。
+        """流式试生成：逐条透传 ``stream_chat`` 事件，终态元数据由业务收集。
 
         与 ``generate_summary`` 共用消息构造与配置解析（``_build_preview_context``），
         差别仅在底层走流式；预览语义（不含记忆注入、不写记忆、不发通知）保持一致。
 
-        ``result`` 传入时承载 ``model`` / ``usage`` / ``latency_ms`` / ``record_count``；
-        该对象同时作为 ``stream_chat(_state=...)`` 的鸭子类型容器被回填 model/latency。
-        异常（如 ``LLMCallError``）向上透传，由调用方（SSE 端点）转 error 事件。
+        元数据来源（不依赖任何 client 私有协议）：
+        - ``model``：事件 ``chunk.model`` 非空即取，全程缺失时回退配置 model；
+        - ``usage``：``usage`` 事件聚合；
+        - ``latency_ms``：业务侧 ``time.monotonic()`` 包住整个消费过程。
+
+        ``result`` 传入时承载上述元数据；异常（如 ``LLMCallError``）向上透传，
+        由调用方（SSE 端点）转 error 事件。
         """
         holder = result if result is not None else SummaryStreamResult()
         messages, record_count, _date_from, _date_to = self._build_preview_context(
             job_config
         )
         aggregator = StreamAggregator()
+        t0 = time.monotonic()
         async for chunk in self.llm_client.stream_chat(
             messages,
             job_name=job_config.name,
             thinking_level=job_config.thinking_level,
-            _state=holder,
         ):
             aggregator.feed(chunk)
             yield chunk
-        # 生成器耗尽：聚合 usage（stream_chat 已回填 model/latency 到 holder）
-        holder.usage = aggregator.finalize().usage
+        # 生成器耗尽：聚合终态元数据回填到业务 DTO
+        aggregated = aggregator.finalize()
+        holder.model = aggregated.model or _configured_model()
+        holder.usage = aggregated.usage
+        holder.latency_ms = int((time.monotonic() - t0) * 1000)
         holder.record_count = record_count
 
     async def execute_job(self, job_config: SummaryJobConfig) -> bool:
@@ -381,13 +416,9 @@ class SummaryService:
                 )
             messages = self._build_messages(records, system_prompt, date_from, date_to)
 
-            # 2. 调 LLM 生成总结
+            # 2. 调 LLM 生成总结（流式唯一形态：collect(stream_chat)）
             stage = _STAGE_CHAT
-            response = await self.llm_client.chat(
-                messages,
-                job_name=job_config.name,
-                thinking_level=job_config.thinking_level,
-            )
+            response = await self._call_llm(messages, job_config)
 
             # 3. 提取记忆（读写同开关：memory_limit=0 不注入也不写入）
             if memory_enabled:

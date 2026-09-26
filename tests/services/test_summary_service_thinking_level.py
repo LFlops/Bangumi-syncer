@@ -1,26 +1,42 @@
 """SummaryService thinking_level 透传测试。
 
 覆盖场景：
-1. execute_job 执行 thinking_level="high" 的 job → chat 收到 thinking_level="high"
-2. execute_job 执行 thinking_level="off" 的 job → chat 收到 thinking_level="off"
+1. execute_job 执行 thinking_level="high" 的 job → stream_chat 收到 thinking_level="high"
+2. execute_job 执行 thinking_level="off" 的 job → stream_chat 收到 thinking_level="off"
 3. generate_summary 未配置时回退默认 → 透传 "off"
 """
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from app.services.llm.models import ChatResponse, Usage
+from app.services.llm.models import StreamChunk, Usage
 from app.services.summary.models import SummaryJobConfig
 
 
-def _make_response():
-    """构造一个非空的 ChatResponse（走成功通知路径）。"""
-    return ChatResponse(
-        content="测试总结",
-        model="test-model",
-        usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-    )
+def _make_stream_client() -> MagicMock:
+    """构造非空流响应的 mock client（走成功通知路径）。
+
+    R2 后 summary 服务统一走 ``stream_chat``（流式唯一形态），故 mock 该入口。
+    """
+    chunks = [
+        StreamChunk(type="text_delta", text="测试总结", model="test-model"),
+        StreamChunk(
+            type="usage",
+            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+        ),
+    ]
+    client = MagicMock()
+
+    def _stream_chat(messages, **kwargs):
+        async def _gen():
+            for chunk in chunks:
+                yield chunk
+
+        return _gen()
+
+    client.stream_chat = MagicMock(side_effect=_stream_chat)
+    return client
 
 
 class TestSummaryServiceThinkingLevel:
@@ -28,10 +44,8 @@ class TestSummaryServiceThinkingLevel:
 
     @pytest.fixture
     def mock_llm_client(self):
-        """模拟 llm_client，返回固定响应。"""
-        client = MagicMock()
-        client.chat = AsyncMock(return_value=_make_response())
-        return client
+        """模拟 llm_client，返回固定流式响应。"""
+        return _make_stream_client()
 
     @pytest.fixture
     def mock_db(self):
@@ -44,7 +58,7 @@ class TestSummaryServiceThinkingLevel:
     async def test_execute_job_thinking_level_high_passed_to_chat(
         self, mock_llm_client, mock_db
     ):
-        """场景：执行 thinking_level="high" 的 job → chat 收到 thinking_level="high"。"""
+        """场景：执行 thinking_level="high" 的 job → stream_chat 收到 "high"。"""
         with (
             patch(
                 "app.services.summary.service.get_llm_client",
@@ -59,14 +73,14 @@ class TestSummaryServiceThinkingLevel:
 
             await service.execute_job(config)
 
-            call_kwargs = mock_llm_client.chat.await_args.kwargs
+            call_kwargs = mock_llm_client.stream_chat.call_args.kwargs
             assert call_kwargs["thinking_level"] == "high"
 
     @pytest.mark.asyncio
     async def test_execute_job_thinking_level_off_passed_to_chat(
         self, mock_llm_client, mock_db
     ):
-        """场景：执行 thinking_level="off" 的 job → chat 收到 thinking_level="off"。"""
+        """场景：执行 thinking_level="off" 的 job → stream_chat 收到 "off"。"""
         with (
             patch(
                 "app.services.summary.service.get_llm_client",
@@ -81,7 +95,7 @@ class TestSummaryServiceThinkingLevel:
 
             await service.execute_job(config)
 
-            call_kwargs = mock_llm_client.chat.await_args.kwargs
+            call_kwargs = mock_llm_client.stream_chat.call_args.kwargs
             assert call_kwargs["thinking_level"] == "off"
 
     @pytest.mark.asyncio
@@ -100,5 +114,5 @@ class TestSummaryServiceThinkingLevel:
 
             await service.generate_summary(config)
 
-            call_kwargs = mock_llm_client.chat.await_args.kwargs
+            call_kwargs = mock_llm_client.stream_chat.call_args.kwargs
             assert call_kwargs["thinking_level"] == "off"
