@@ -360,3 +360,110 @@ async def test_no_stop_malformed_json_is_gated_at_finalize():
 
     assert called == []
     assert results[0].is_error is True
+
+
+# ---------------------------------------------------------------------------
+# R2. 提前执行路径受并发上限约束（对齐 _MAX_PARALLEL_TOOLS）
+# ---------------------------------------------------------------------------
+
+
+async def test_early_execution_caps_parallelism_at_max_parallel():
+    """注入超过上限的幂等停点 → 提前执行峰值并发不超过 max_parallel。"""
+    active = 0
+    max_active = 0
+    gate = asyncio.Event()
+
+    async def execute_fn(tool_use):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await gate.wait()
+        active -= 1
+        return tool_use.id
+
+    ex = _make_executor(execute_fn=execute_fn, max_parallel=10)
+    for i in range(15):
+        tid = f"t{i}"
+        ex.feed(_start(tid, "read_x"))
+        ex.feed(_delta(tid, "{}"))
+        ex.feed(_stop(tid))
+    # 让全部已 create_task 的协程都有机会被调度
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+    assert max_active <= 10, f"提前执行并发应受上限约束，峰值 {max_active}"
+
+    gate.set()
+    results = await ex.finalize()
+    assert len(results) == 15
+    assert all(not r.is_error for r in results)
+
+
+async def test_early_execution_default_cap_matches_max_parallel_tools():
+    """默认 max_parallel 与 tools._MAX_PARALLEL_TOOLS 一致（单一来源）。"""
+    from app.services.llm.tools import _MAX_PARALLEL_TOOLS
+
+    ex = _make_executor()
+    assert ex._max_parallel == _MAX_PARALLEL_TOOLS
+
+
+# ---------------------------------------------------------------------------
+# R3. BatchResults.ordered 缺失时的回退取值（非契约批量执行器）
+# ---------------------------------------------------------------------------
+
+
+async def test_batch_results_without_ordered_falls_back_to_get():
+    """非契约批量结果（无 ordered、仅 get 视图）→ 逐槽回退取值，不丢结果。"""
+
+    async def batch_execute_fn(tool_calls):
+        return {
+            tc.id: ToolResultBlock(
+                tool_use_id=tc.id, content=f"fallback:{tc.id}", is_error=False
+            )
+            for tc in tool_calls
+        }
+
+    ex = _make_executor(
+        batch_execute_fn=batch_execute_fn,
+        is_idempotent=lambda name: False,  # 全部延迟到 finalize
+    )
+    for tid in ("a", "b"):
+        ex.feed(_start(tid, f"write_{tid}"))
+        ex.feed(_delta(tid, "{}"))
+        ex.feed(_stop(tid))
+
+    results = await ex.finalize()
+
+    assert [r.content for r in results] == ["fallback:a", "fallback:b"]
+    assert all(not r.is_error for r in results)
+
+
+async def test_batch_results_ordered_contract_preferred_over_get():
+    """同时具备 ordered 与 get 时，以 ordered 槽位为准（生产契约优先）。"""
+
+    class _Results:
+        def __init__(self):
+            self.ordered = [
+                (
+                    "a",
+                    ToolResultBlock(tool_use_id="a", content="ordered", is_error=False),
+                )
+            ]
+
+        def get(self, key, default=None):  # pragma: no cover - 不应被走到
+            raise AssertionError("ordered 存在时不应回退 get 取值")
+
+    async def batch_execute_fn(tool_calls):
+        return _Results()
+
+    ex = _make_executor(
+        batch_execute_fn=batch_execute_fn,
+        is_idempotent=lambda name: False,
+    )
+    ex.feed(_start("a", "write_a"))
+    ex.feed(_delta("a", "{}"))
+    ex.feed(_stop("a"))
+
+    results = await ex.finalize()
+
+    assert [r.content for r in results] == ["ordered"]

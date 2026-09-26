@@ -1484,3 +1484,94 @@ async def test_run_requires_stream_fn_or_chat_fn():
             tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
+
+
+# ---------------------------------------------------------------------------
+# R1. 流中途异常：提前执行任务必须收敛，异常向上传播
+# ---------------------------------------------------------------------------
+
+
+async def test_stream_exception_converges_early_tasks_and_propagates():
+    """stream_fn 在幂等停点后抛异常 → 异常传播；提前任务被 finalize 收敛、无泄漏。"""
+    import pytest
+
+    from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+
+    events: list = []
+    created: list[StreamingToolExecutor] = []
+    finalized = {"called": False}
+
+    async def execute_fn(tool_use):
+        events.append(("exec", tool_use.id))
+        return tool_use.id
+
+    class _SpyExecutor(StreamingToolExecutor):
+        async def finalize(self):
+            finalized["called"] = True
+            return await super().finalize()
+
+    def factory():
+        ex = _SpyExecutor(
+            execute_fn=execute_fn,
+            is_idempotent=lambda name: name.startswith("read"),
+            is_terminal=lambda name: name == "submit_suggestion",
+        )
+        created.append(ex)
+        return ex
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield _stream_start("a", "read_a")
+        yield _stream_delta("a", "{}")
+        yield _stream_stop("a")  # 提前启动 a
+        await asyncio.sleep(0)  # 让提前任务获得调度
+        raise RuntimeError("stream boom")
+
+    with pytest.raises(RuntimeError, match="stream boom"):
+        await run(
+            stream_fn=stream_fn,
+            executor_factory=factory,
+            tools_schemas=[],
+            max_iterations=2,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )
+
+    # 异常路径必须 await finalize 收敛提前任务（而非让其在后台变孤儿）
+    assert finalized["called"] is True
+    assert ("exec", "a") in events, "提前任务应已执行"
+    ex = created[0]
+    assert all(t.done() for t in ex._tasks), "提前任务应已收敛，无 pending 泄漏"
+    assert ex._states["a"].result is not None, "提前任务结果应已回填"
+
+
+# ---------------------------------------------------------------------------
+# S3. 双注入：stream_fn + chat_fn → 告警且以流式路径为准
+# ---------------------------------------------------------------------------
+
+
+async def test_double_injection_warns_and_prefers_stream(caplog):
+    """同时注入 stream_fn 与 chat_fn → 告警 + 走流式路径（chat_fn 不被调用）。"""
+    import logging
+
+    stream_calls = {"n": 0}
+    chat_fn = AsyncMock()
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        stream_calls["n"] += 1
+        yield _stream_end_turn()
+
+    with caplog.at_level(logging.WARNING):
+        result = await run(
+            stream_fn=stream_fn,
+            chat_fn=chat_fn,
+            tools_schemas=[],
+            max_iterations=2,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )
+
+    assert result.stop_reason == "end_turn"
+    assert stream_calls["n"] == 1
+    chat_fn.assert_not_awaited()
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("同时收到 stream_fn 与 chat_fn" in r.message for r in warnings)

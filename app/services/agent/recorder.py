@@ -80,6 +80,9 @@ class TraceRecorder:
     def wrap_chat_fn(self, chat_fn: ChatFn) -> ChatFn:
         """包装旧契约 chat_fn：每轮 start_span → await → end_span。
 
+        .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；主路径请用
+           :meth:`wrap_stream_fn`。
+
         iteration 状态机：
         - 每轮开始时设定 ``_current_iteration`` 为 ``_next_iteration`` 的当前值，
           然后推进 ``_next_iteration``（供下一轮使用）。

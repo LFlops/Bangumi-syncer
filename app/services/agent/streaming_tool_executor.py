@@ -6,9 +6,15 @@
   到达时立即启动 ``asyncio.create_task``，与后续 tool_call 的生成**重叠**，缩短端到端时延。
 - **提交闸门**：停点到达时对累积的 ``partial_json`` 做 ``json.loads`` 校验——非法 JSON
   记 error result 且**绝不执行**（不把畸形参数喂给 handler）。
-- **能力分级**：无 per-tool 停点信号的协议（如退化到轮末补发的 OpenAI chat）自然
-  不触发提前执行，全部工具留到 :meth:`finalize` 按 ``execute_batch`` 语义执行，
-  行为与改造前**等价**。
+- **能力分级（按协议停点时序，三种）**：
+  - **anthropic / responses**：**逐工具停点**（每个 tool_use 参数生成完即发
+    ``tool_use_stop``）→ 真正提前执行，且与后续 tool_call 的生成**重叠**。
+  - **openai_compat**：``finish_reason`` 时**流末集中补发**全部 ``tool_use_stop``
+    → 仍会触发提前执行，但**无重叠收益**（停点已在流末）；其轮内并发模型为
+    「幂等工具全部并行（受 ``max_parallel`` 上限）→ deferred 再执行」，与旧
+    ``execute_batch`` 的分段交错（连续幂等段并行、非幂等串行）**不完全相同**。
+  - **eval replay**：真正**无 stop** → 纯轮级降级，全部工具留到 :meth:`finalize`
+    按 ``execute_batch`` 语义执行，行为与改造前**等价**。
 - **terminal 抑制**：终止工具（``is_terminal`` 为真）不执行 handler，由 loop 在流结束后
   走既有捕获逻辑；且一旦出现 terminal，后续停点不再启动新任务（同轮其他工具不执行，
   与改造前「终止工具优先」语义一致）。已提前启动的幂等任务 await 完成，其结果无害但被忽略。
@@ -23,6 +29,8 @@
 - ``batch_execute_fn``：``list[ToolUseBlock] -> Awaitable[BatchResults]``，延迟执行的批量
   路径（复用 ``ToolRegistry.execute_batch`` 的分段并行/保序语义）。为 ``None`` 时退化为
   经 ``execute_fn`` 串行执行。
+- ``max_parallel``：提前执行路径的并发上限（默认 ``tools._MAX_PARALLEL_TOOLS``，与
+  ``execute_batch`` 幂等段同源），防停点密集时无界并发打爆下游。
 """
 
 from __future__ import annotations
@@ -35,7 +43,7 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
-from app.services.llm.tools import serialize_tool_result
+from app.services.llm.tools import _MAX_PARALLEL_TOOLS, serialize_tool_result
 
 # 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。
 # 正常业务路径不会消费它（terminal 轮 loop 直接走终止分支），仅作协议闭合兜底。
@@ -68,12 +76,16 @@ class StreamingToolExecutor:
         is_terminal: Callable[[str], bool],
         on_recorder: Any | None = None,
         batch_execute_fn: Callable[[list[ToolUseBlock]], Awaitable[Any]] | None = None,
+        max_parallel: int = _MAX_PARALLEL_TOOLS,
     ) -> None:
         self._execute_fn = execute_fn
         self._is_idempotent = is_idempotent
         self._is_terminal = is_terminal
         self._on_recorder = on_recorder
         self._batch_execute_fn = batch_execute_fn
+        # 提前执行路径的并发上限（与 execute_batch 的幂等段上限同源，防停点风暴打爆下游）
+        self._max_parallel = max_parallel
+        self._sem = asyncio.Semaphore(max_parallel)
         # tool_use_id 首次出现顺序（重复 id first-wins，与 StreamAggregator 对齐）
         self._order: list[str] = []
         self._states: dict[str, _ToolState] = {}
@@ -169,8 +181,13 @@ class StreamingToolExecutor:
     # -- 提前执行 -----------------------------------------------------------
 
     async def _run_early(self, st: _ToolState) -> None:
-        """提前执行单个幂等工具，结果/异常统一包装为 ToolResultBlock。"""
-        st.result = await self._exec_single(st, record_span=True)
+        """提前执行单个幂等工具，结果/异常统一包装为 ToolResultBlock。
+
+        提前执行路径受 ``max_parallel`` 信号量约束（与 ``execute_batch`` 幂等段
+        同一上限），避免停点密集时无界并发打爆下游。
+        """
+        async with self._sem:
+            st.result = await self._exec_single(st, record_span=True)
 
     async def _exec_single(
         self, st: _ToolState, *, record_span: bool
@@ -252,7 +269,7 @@ class StreamingToolExecutor:
                 for st in states
             ]
             results = await self._batch_execute_fn(tool_calls)
-            by_id = self._index_batch_results(results)
+            by_id = self._index_batch_results(results, states)
             for st in states:
                 st.result = by_id.get(st.tool_use_id) or self._not_executed(st)
             return
@@ -261,21 +278,42 @@ class StreamingToolExecutor:
             st.result = await self._exec_single(st, record_span=True)
 
     @staticmethod
-    def _index_batch_results(results: Any) -> dict[str, ToolResultBlock]:
-        """把 execute_batch 的返回值按 tool_use_id 建索引（兼容 ordered / dict 视图）。"""
+    def _index_batch_results(
+        results: Any, states: list[_ToolState]
+    ) -> dict[str, ToolResultBlock]:
+        """把 ``execute_batch`` 返回值按 tool_use_id 建索引。
+
+        生产契约：``BatchResults.ordered``（``list[tuple[tool_use_id, result]]``）。
+        优先信任 ``ordered`` 槽位；若其缺失或未产出任何有效 ``ToolResultBlock``
+        （非契约实现 / 注入的简易执行器），回退用 ``results.get(tool_use_id)``
+        逐槽拉取（``isinstance`` 校验）——避免静默丢失全部 deferred 结果。
+        两者都不可用时返回已索引结果并告警（可观测，不静默）。
+        """
         out: dict[str, ToolResultBlock] = {}
         ordered = getattr(results, "ordered", None)
         if isinstance(ordered, list):
             for oid, item in ordered:
                 if isinstance(item, ToolResultBlock):
                     out.setdefault(oid, item)
+            if out:
+                return out
+
         getter = getattr(results, "get", None)
         if getter is None:
+            logger.warning(
+                "StreamingToolExecutor 批量结果既无 ordered 也无 get 视图，"
+                "本批 %d 个 deferred 工具将回填占位块",
+                len(states),
+            )
             return out
         if not out:
             logger.debug(
-                "StreamingToolExecutor 批量结果无 ordered 槽位，回退 dict 取值"
+                "StreamingToolExecutor 批量结果无 ordered 槽位，回退逐槽 get 取值"
             )
+        for st in states:
+            item = getter(st.tool_use_id)
+            if isinstance(item, ToolResultBlock):
+                out.setdefault(st.tool_use_id, item)
         return out
 
     def _result_for(self, tid: str) -> ToolResultBlock:

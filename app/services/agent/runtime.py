@@ -56,6 +56,9 @@ async def run(
 
     LLM 调用注入：``stream_fn`` 为**主路径**（流式，默认由 hooks.build_stream_fn
     构造）；``chat_fn`` 为旧契约兼容（返回 ``ChatResponse``，仅测试/迁移期使用）。
+
+    .. deprecated:: ``chat_fn`` 参数仅测试/迁移期兼容，后续清理时移除；
+       新代码请只传 ``stream_fn``（或两者都不传由 hooks 构造流式客户端）。
     """
     dbm = get_database_manager()
 
@@ -174,7 +177,11 @@ async def _invoke_loop(
     hooks: ScenarioHooks,
     seed_messages: list[Message],
 ) -> RunResult:
-    """按注入形态选择主路径（流式）或旧路径（chat_fn）运行通用循环。"""
+    """按注入形态选择主路径（流式）或旧路径（chat_fn）运行通用循环。
+
+    旧路径分支（``chat_fn``）为迁移期兼容：``.. deprecated::`` 仅测试/迁移期使用，
+    后续清理时移除（届时 ``chat_fn`` 置空、只保留 ``stream_fn`` 分支）。
+    """
     common: dict[str, Any] = dict(
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
@@ -190,7 +197,7 @@ async def _invoke_loop(
             executor_factory=_make_executor_factory(registry, span_recorder),
             **common,
         )
-    # 旧契约兼容路径：chat_fn + execute_batch（行为与改造前完全一致）
+    # 旧契约兼容路径（deprecated，仅测试/迁移期）：chat_fn + execute_batch
     return await loop_run(
         chat_fn=span_recorder.wrap_chat_fn(chat_fn),
         tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),

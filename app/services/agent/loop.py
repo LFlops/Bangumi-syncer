@@ -10,10 +10,12 @@
   客户端。``chat_fn``（返回 ``ChatResponse``）为旧契约兼容路径，行为与改造前等价。
 - **流式解析 + 提交闸门 + 受控执行**（``stream_fn`` 路径）：逐事件喂
   :class:`~app.services.llm.models.StreamAggregator` 聚合响应，同时喂
-  :class:`~app.services.agent.streaming_tool_executor.StreamingToolExecutor`——
-  幂等工具在参数停点（``tool_use_stop``）到达时**提前启动**并与生成重叠；非幂等工具
-  在流结束后按 ``execute_batch`` 语义（连续幂等段并行、非幂等串行、保序）执行；
-  无停点信号的协议自然退化为轮级执行。执行器由 ``executor_factory`` 按轮构造。
+  :class:`~app.services.agent.streaming_tool_executor.StreamingToolExecutor`。
+  停点时序因协议而异：anthropic/responses **逐工具停点** → 幂等工具在参数停点
+  （``tool_use_stop``）到达时**提前启动并与生成重叠**；openai_compat 在
+  ``finish_reason`` **流末集中补发**停点 → 仍提前执行但**无重叠收益**；eval replay
+  **无停点** → 纯轮级降级。非幂等工具在流结束后按 ``execute_batch`` 语义（连续幂等段
+  并行、非幂等串行、保序）执行。执行器由 ``executor_factory`` 按轮构造。
 - **旧路径兼容**：``chat_fn`` + ``tool_calls_fn`` 注入时行为与改造前**完全一致**
   （整批交给 ``execute_batch``，按独立结果槽位回填）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
@@ -84,8 +86,12 @@ class RunResult:
 
 
 # 注入的函数类型（仅做文档化提示，运行时不强制）
+#: .. deprecated:: 旧契约兼容。``ChatFn`` 仅测试/迁移期使用，后续清理时移除；
+#: 主路径请用 :data:`StreamFn`。
 ChatFn = Callable[..., Awaitable[ChatResponse]]
 StreamFn = Callable[..., AsyncIterator[StreamChunk]]
+#: .. deprecated:: 旧契约兼容。``ToolCallsFn`` 仅测试/迁移期使用，后续清理时移除；
+#: 主路径请用 ``executor_factory`` + ``StreamingToolExecutor``。
 ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable[dict[str, Any]]]
 #: 按轮构造流式工具执行器（返回值需实现 feed / finalize 鸭子类型）
 ExecutorFactory = Callable[[], Any]
@@ -103,13 +109,29 @@ async def _consume_stream(
 
     返回 ``(resp, executor)``；``executor_factory=None`` 时不构造执行器（纯聚合，
     用于收尾调用等不执行工具的场景）。
+
+    异常安全：执行器**先于消费构造**，流中途异常（httpx 超时/断连等）时先
+    ``await executor.finalize()`` 收敛已提前启动的任务（避免孤儿后台任务与
+    "exception never retrieved"、执行器引用丢失无法收敛），再向上抛出原异常。
+    收敛自身失败只记 warning，绝不掩盖原始异常。
     """
     aggregator = StreamAggregator()
     executor = executor_factory() if executor_factory is not None else None
-    async for chunk in stream_fn(messages, tools=tools, tool_choice=tool_choice):
-        aggregator.feed(chunk)
+    try:
+        async for chunk in stream_fn(messages, tools=tools, tool_choice=tool_choice):
+            aggregator.feed(chunk)
+            if executor is not None:
+                executor.feed(chunk)
+    except BaseException:
         if executor is not None:
-            executor.feed(chunk)
+            try:
+                # finalize 内部 gather(return_exceptions=True) 收敛提前任务
+                await executor.finalize()
+            except Exception as e:
+                logger.warning(
+                    "流异常后收敛提前执行任务失败（已忽略，保留原始异常）: %s", e
+                )
+        raise
     return aggregator.finalize(), executor
 
 
@@ -209,10 +231,15 @@ async def run(
       为 ``None`` 时主路径退化为纯聚合（不执行工具，供不使用工具的调用方）。
     - ``chat_fn``：**旧契约兼容路径**，``(messages, tools=, tool_choice=) -> ChatResponse``。
       与 ``tool_calls_fn`` 搭配时行为与改造前完全一致。
+
+      .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；新代码请用 ``stream_fn``。
     - ``tools_schemas``：传给 provider 的 tools 参数（schema 列表）
     - ``tool_calls_fn``：旧路径批量执行器，返回 ``BatchResults``（``ordered`` 与 tool_calls
       一一对应的结果槽位；同时兼容 ``{tool_use_id: ToolResultBlock | TerminalCapture}`` 的
       dict 视图）
+
+      .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；新代码请用
+         ``executor_factory`` + ``StreamingToolExecutor``。
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）
