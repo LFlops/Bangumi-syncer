@@ -7,9 +7,7 @@ import httpx
 import pytest
 
 from app.services.llm.models import (
-    ChatResponse,
     Message,
-    RedactedThinkingBlock,
     StreamAggregator,
     TextBlock,
     ThinkingBlock,
@@ -17,46 +15,6 @@ from app.services.llm.models import (
     ToolUseBlock,
 )
 from app.services.llm.providers.anthropic import AnthropicProvider
-
-
-def _make_mock_client(  # noqa: PLR0913
-    *,
-    status_code: int = 200,
-    json_body: dict | None = None,
-    json_side_effect: Exception | None = None,
-    post_side_effect: Exception | None = None,
-    raise_for_status_side_effect: Exception | None = None,
-):
-    """创建一个 mock httpx.AsyncClient，准备用于 `async with`。"""
-
-    mock_response = Mock()
-    mock_response.status_code = status_code
-    if json_side_effect is not None:
-        mock_response.json = Mock(side_effect=json_side_effect)
-    else:
-        mock_response.json = Mock(return_value=json_body or {})
-
-    if raise_for_status_side_effect is not None:
-        mock_response.raise_for_status = Mock(side_effect=raise_for_status_side_effect)
-    else:
-        mock_response.raise_for_status = Mock()
-
-    mock_client = AsyncMock()
-    if post_side_effect is not None:
-        mock_client.post = AsyncMock(side_effect=post_side_effect)
-    else:
-        mock_client.post = AsyncMock(return_value=mock_response)
-
-    mock_client.aclose = AsyncMock()
-
-    mock_client.__aenter__.return_value = mock_client
-
-    async def _mock_aexit(*args, **kwargs):
-        await mock_client.aclose()
-
-    mock_client.__aexit__ = _mock_aexit
-
-    return mock_client
 
 
 def _make_provider(
@@ -388,343 +346,18 @@ class TestBuildRequest:
 # ===================================================================
 
 
-class TestParseResponse:
-    """_parse_response 纯函数测试。"""
-
-    def test_text_response(self):
-        """纯文本响应解析。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [{"type": "text", "text": "你好"}],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 20},
-            }
-        )
-        assert resp.content == "你好"
-        assert isinstance(resp.blocks[0], TextBlock)
-        assert resp.stop_reason == "end_turn"
-        assert resp.model == "claude-sonnet-4-6"
-        # Anthropic usage 字段映射
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 10
-        assert resp.usage.completion_tokens == 20
-        assert resp.usage.total_tokens == 30
-
-    def test_thinking_block_not_in_content(self):
-        """thinking block 解析但不进入 content。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [
-                    {"type": "thinking", "thinking": "思考中..."},
-                    {"type": "text", "text": "答案"},
-                ],
-                "stop_reason": "end_turn",
-            }
-        )
-        assert resp.content == "答案"
-        assert isinstance(resp.blocks[0], ThinkingBlock)
-        assert isinstance(resp.blocks[1], TextBlock)
-
-    def test_thinking_block_with_signature(self):
-        """thinking block 携带 signature。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [{"type": "thinking", "thinking": "x", "signature": "sig1"}],
-                "stop_reason": "end_turn",
-            }
-        )
-        assert isinstance(resp.blocks[0], ThinkingBlock)
-        assert resp.blocks[0].signature == "sig1"
-
-    def test_redacted_thinking_block(self):
-        """redacted_thinking block 容错解析。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [{"type": "redacted_thinking", "data": "xxx"}],
-                "stop_reason": "end_turn",
-            }
-        )
-        assert len(resp.blocks) == 1
-        assert isinstance(resp.blocks[0], RedactedThinkingBlock)
-
-    def test_unknown_block_type_skipped(self):
-        """真正未知 block 类型跳过不崩溃，content 只取 text（tool_use 已被正式解析，不在此列）。"""
-        provider = _make_provider()
-        with patch("app.services.llm.providers.anthropic.logger") as mock_log:
-            resp = provider._parse_response(
-                {
-                    "content": [
-                        {"type": "bogus_unknown", "foo": 1},
-                        {"type": "text", "text": "结果"},
-                    ],
-                    "stop_reason": "end_turn",
-                }
-            )
-        assert resp.content == "结果"
-        assert len(resp.blocks) == 1
-        assert isinstance(resp.blocks[0], TextBlock)
-        assert resp.stop_reason == "end_turn"
-        mock_log.warning.assert_called_once()
-
-    def test_no_usage(self):
-        """无 usage 字段时 usage 为 None。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {"content": [{"type": "text", "text": "hi"}], "stop_reason": "end_turn"}
-        )
-        assert resp.usage is None
-
-    def test_empty_content(self):
-        """空 content 数组 + max_tokens 结束原因。"""
-        provider = _make_provider()
-        resp = provider._parse_response({"content": [], "stop_reason": "max_tokens"})
-        assert resp.content == ""
-        assert resp.blocks == []
-        assert resp.stop_reason == "max_tokens"
-
-
-# ===================================================================
-# chat() 集成（mock httpx）
-# ===================================================================
-
-
-class TestAnthropicProviderChat:
-    """chat() 集成测试。"""
-
-    @pytest.mark.asyncio
-    async def test_request_format(self):
-        """发送到 /v1/messages 的请求格式正确。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "Hello, world!"}],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 20},
-            }
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider()
-            messages = [
-                Message(role="system", content="You are helpful."),
-                Message(role="user", content="Hello"),
-            ]
-            await provider.chat(messages)
-
-        mock_client.post.assert_called_once()
-        call_args = mock_client.post.call_args
-
-        assert call_args[0][0] == "https://api.anthropic.com/v1/messages"
-
-        body = call_args[1]["json"]
-        assert body["system"] == "You are helpful."
-        assert body["messages"] == [
-            {"role": "user", "content": [{"type": "text", "text": "Hello"}]}
-        ]
-
-        headers = call_args[1]["headers"]
-        assert headers["Authorization"] == "Bearer sk-test"
-        # x-api-key 为 Anthropic 官方标准认证头，与 Bearer 双发兼容两类网关
-        assert headers["x-api-key"] == "sk-test"
-        assert headers["Content-Type"] == "application/json"
-        assert headers["anthropic-version"] == "2023-06-01"
-
-        assert call_args[1]["timeout"] == 60
-
-    @pytest.mark.asyncio
-    async def test_request_logged_at_debug(self):
-        """请求日志与 openai/provider 侧一致，使用 debug 级别而非 info。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "ok"}],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "end_turn",
-            }
-        )
-        with (
-            patch("httpx.AsyncClient", return_value=mock_client),
-            patch("app.services.llm.providers.anthropic.logger") as mock_log,
-        ):
-            provider = _make_provider()
-            await provider.chat([Message(role="user", content="Q")])
-
-        mock_log.debug.assert_called_once()
-        mock_log.info.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_normal_response_parsing(self):
-        """chat() 正常响应解析。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "The answer is 42."}],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 15, "output_tokens": 8},
-            }
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider()
-            resp = await provider.chat([Message(role="user", content="Q")])
-
-        assert isinstance(resp, ChatResponse)
-        assert resp.content == "The answer is 42."
-        assert resp.model == "claude-sonnet-4-6"
-        assert resp.stop_reason == "end_turn"
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 15
-        assert resp.usage.completion_tokens == 8
-        assert resp.usage.total_tokens == 23
-
-    @pytest.mark.asyncio
-    async def test_thinking_request(self):
-        """thinking_level 开启时请求体含 thinking 且 temperature=1。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [
-                    {"type": "thinking", "thinking": "思考"},
-                    {"type": "text", "text": "答案"},
-                ],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 100, "output_tokens": 50},
-            }
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider(thinking_level="medium")
-            resp = await provider.chat([Message(role="user", content="Q")])
-
-        body = mock_client.post.call_args[1]["json"]
-        assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}
-        # 默认 max_tokens=2000 < budget=4096，自动抬升
-        assert body["max_tokens"] == 4096 + 1024
-        assert body["temperature"] == 1
-        # thinking 不计入 content
-        assert resp.content == "答案"
-        assert resp.usage is not None
-        assert resp.usage.total_tokens == 150
-
-    @pytest.mark.asyncio
-    async def test_thinking_degrades_forced_tool_choice_to_auto(self):
-        """thinking 开启时强制 tool_choice 降级为 auto（Anthropic/DeepSeek 约束）。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "ok"}],
-                "model": "deepseek-v4-pro",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-            }
-        )
-        tools = [
-            {
-                "name": "submit_suggestion",
-                "description": "提交建议",
-                "input_schema": {"type": "object", "properties": {}},
-            }
-        ]
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider(thinking_level="medium")
-            await provider.chat(
-                [Message(role="user", content="Q")],
-                tools=tools,
-                tool_choice="submit_suggestion",
-            )
-        body = mock_client.post.call_args[1]["json"]
-        assert body["thinking"]["type"] == "enabled"
-        assert body["tool_choice"] == {"type": "auto"}
-
-    @pytest.mark.asyncio
-    async def test_forced_tool_choice_kept_when_thinking_off(self):
-        """thinking off 时强制 tool_choice 保持 tool 形态（不降级）。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "ok"}],
-                "model": "deepseek-chat",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-            }
-        )
-        tools = [
-            {
-                "name": "submit_suggestion",
-                "description": "提交建议",
-                "input_schema": {"type": "object", "properties": {}},
-            }
-        ]
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider(thinking_level="off")
-            await provider.chat(
-                [Message(role="user", content="Q")],
-                tools=tools,
-                tool_choice="submit_suggestion",
-            )
-        body = mock_client.post.call_args[1]["json"]
-        assert "thinking" not in body
-        assert body["tool_choice"] == {"type": "tool", "name": "submit_suggestion"}
-
-    @pytest.mark.asyncio
-    async def test_force_tool_choice_degraded_flag_degrades_to_auto(self):
-        """端点级降级标志置位后，强制 tool_choice 归一化为 auto。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "content": [{"type": "text", "text": "ok"}],
-                "model": "deepseek-v4-pro",
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 10, "output_tokens": 5},
-            }
-        )
-        tools = [
-            {
-                "name": "submit_suggestion",
-                "description": "提交建议",
-                "input_schema": {"type": "object", "properties": {}},
-            }
-        ]
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider()
-            provider._force_tool_choice_degraded = True
-            await provider.chat(
-                [Message(role="user", content="Q")],
-                tools=tools,
-                tool_choice="submit_suggestion",
-            )
-        body = mock_client.post.call_args[1]["json"]
-        assert body["tool_choice"] == {"type": "auto"}
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [401, 429, 500])
-    async def test_http_error_handling(self, status_code):
-        """HTTP 错误抛出 httpx.HTTPStatusError。"""
-        mock_client = _make_mock_client(
-            status_code=status_code,
-            raise_for_status_side_effect=httpx.HTTPStatusError(
-                "error",
-                request=Mock(),
-                response=Mock(status_code=status_code),
-            ),
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider()
-            with pytest.raises(httpx.HTTPStatusError):
-                await provider.chat([Message(role="user", content="Q")])
-
-
 # ===================================================================
 # stream() 集成（mock httpx SSE）
 # ===================================================================
 
 
-def _message_start(input_tokens: int = 10) -> tuple[str, dict]:
-    return (
-        "message_start",
-        {
-            "type": "message_start",
-            "message": {"usage": {"input_tokens": input_tokens, "output_tokens": 1}},
-        },
-    )
+def _message_start(input_tokens: int = 10, model: str = "") -> tuple[str, dict]:
+    message: dict = {
+        "usage": {"input_tokens": input_tokens, "output_tokens": 1},
+    }
+    if model:
+        message["model"] = model
+    return ("message_start", {"type": "message_start", "message": message})
 
 
 def _block_start(index: int, block: dict) -> tuple[str, dict]:
@@ -838,6 +471,55 @@ class TestAnthropicProviderStream:
         assert block.name == "get_weather"
         assert block.input == {"location": "Tokyo"}
         assert resp.stop_reason == "tool_use"
+
+    @pytest.mark.asyncio
+    async def test_model_from_message_start_attached(self):
+        """model：message_start 的 message.model 附到首个产出事件，聚合后保留。"""
+        lines = _sse_lines(
+            _message_start(model="claude-real-1"),
+            _block_delta(0, {"type": "text_delta", "text": "Hi"}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        assert chunks[0].model == "claude-real-1"
+        assert all(c.model == "" for c in chunks[1:])
+        assert _aggregate(chunks).model == "claude-real-1"
+
+    @pytest.mark.asyncio
+    async def test_tool_use_stop_from_content_block_stop(self):
+        """content_block_stop 且 index 为 tool_use 块 → tool_use_stop 停点事件。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(
+                0, {"type": "tool_use", "id": "toolu_1", "name": "get_weather"}
+            ),
+            _block_delta(0, {"type": "input_json_delta", "partial_json": "{}"}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _message_delta(stop_reason="tool_use", output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        stops = [c for c in chunks if c.type == "tool_use_stop"]
+        assert len(stops) == 1
+        assert stops[0].tool_use_id == "toolu_1"
+
+    @pytest.mark.asyncio
+    async def test_content_block_stop_for_text_ignored(self):
+        """text 块的 content_block_stop 不产出 tool_use_stop。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "text", "text": ""}),
+            _block_delta(0, {"type": "text_delta", "text": "hi"}),
+            ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        assert not [c for c in chunks if c.type == "tool_use_stop"]
 
     @pytest.mark.asyncio
     async def test_usage_merges_input_and_output_tokens(self):

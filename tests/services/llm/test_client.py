@@ -144,6 +144,9 @@ def _response_chunks(resp: ChatResponse) -> list[StreamChunk]:
     if resp.usage is not None:
         chunks.append(StreamChunk(type="usage", usage=resp.usage))
     chunks.append(StreamChunk(type="stop", stop_reason=resp.stop_reason))
+    if resp.model and chunks:
+        # 流式为唯一形态：ChatResponse.model 由事件携带，测试构造时填到首个事件
+        chunks[0].model = resp.model
     return chunks
 
 
@@ -728,7 +731,11 @@ class TestParamRejectionDegradation:
     async def test_param_rejection_latency_excludes_failed_attempt(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """顺手项 1：降级重试不把首次失败请求耗时计入成功 latency。"""
+        """降级重试：成功落库的 latency 由 stream_chat 全程墙钟测量。
+
+        调用顺序（time.time）：chat.t0 → stream_chat.t0 → retry.t_attempt
+        → 降级重置 t_attempt → stream_chat 成功时刻 → chat 收尾时刻。
+        """
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -750,15 +757,15 @@ class TestParamRejectionDegradation:
             calls,
         )
 
-        # time.time 序列：首次尝试起点 1000 → 降级重置 2000 → 成功测得 2000.5
-        times = [1000.0, 2000.0, 2000.5, 2000.5, 2000.5]
+        times = [1000.0, 2000.0, 2000.5, 2000.5, 2000.5, 2000.5]
         with patch("app.services.llm.client.time.time", side_effect=times):
             client = LLMClient()
             client._provider = provider
             resp = await client.chat([Message(role="user", content="Q")])
 
-        # 旧实现未重置 t_attempt → latency=(2000.5-1000)=1000ms；修复后=500ms
-        assert resp.latency == 500
+        # stream_chat 墙钟 = 2000.5 - 2000.0 = 500ms；chat 别名 latency = 全程墙钟
+        assert mock_log_usage.call_args[1]["latency_ms"] == 500
+        assert resp.latency == int((2000.5 - 1000.0) * 1000)
 
     @pytest.mark.asyncio
     async def test_non_param_400_terminal_no_degradation(
@@ -1292,19 +1299,15 @@ class TestStreamChat:
         assert provider._extras_disabled is True
 
     @pytest.mark.asyncio
-    async def test_stream_rejection_falls_back_and_marks_provider(
+    async def test_stream_rejection_raises_llm_call_error_no_retry(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """场景 6：400 stream 拒绝 → 置 _stream_unsupported + fallback；后续不再尝试 stream。"""
-        from app.services.llm.client import LLMClient
+        """场景 6：400 stream 拒绝 → 确定性 LLMCallError（不重试、不降级、不伪装）。"""
+        from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
         stream_calls: list[dict] = []
-        fallback = ChatResponse(
-            content="fallback",
-            model="gpt-4o-mini",
-            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
+        mock_sleep = AsyncMock()
 
         provider = OpenAICompatProvider(
             api_base="https://test.api.com/v1", api_key="sk"
@@ -1312,39 +1315,32 @@ class TestStreamChat:
         provider.stream = _stream_fn(
             [_httpx_status(400, "stream is not supported")], stream_calls
         )
-        provider.chat = AsyncMock(return_value=fallback)
 
         client = LLMClient()
         client._provider = provider
 
-        resp = await client.chat([Message(role="user", content="Q")])
-        assert resp.content == "fallback"
-        assert provider._stream_unsupported is True
-        assert len(stream_calls) == 1
-        assert provider.chat.await_count == 1
+        with patch(_sleep_patch_path(), mock_sleep):
+            with pytest.raises(LLMCallError) as exc_info:
+                await client.chat([Message(role="user", content="Q")])
 
-        # 后续调用不再尝试 stream，直接 fallback
-        resp2 = await client.chat([Message(role="user", content="Q")])
-        assert resp2.content == "fallback"
-        assert len(stream_calls) == 1  # 未再调用 stream
-        assert provider.chat.await_count == 2
-        assert mock_log_usage.call_count == 2  # 每次 fallback 落库一次
+        assert exc_info.value.retryable is False
+        assert "端点不支持流式调用" in str(exc_info.value)
+        assert len(stream_calls) == 1  # 不重试
+        assert mock_sleep.await_count == 0  # 无退避
+        assert provider._extras_disabled is False  # 不降级
+        assert not hasattr(provider, "_stream_unsupported")  # 不再有伪装/兜底标记
+        mock_log_usage.assert_called_once()
+        assert mock_log_usage.call_args[1]["status"] == "error"
 
     @pytest.mark.asyncio
-    async def test_stream_rejection_unrecognized_parameter_stream_falls_back(
+    async def test_stream_rejection_unrecognized_parameter_stream_terminal(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """M1：网关文案 "unrecognized parameter 'stream' is not supported"
-        必须走 fallback（而非普通参数降级）。"""
-        from app.services.llm.client import LLMClient
+        """M1：网关文案 "unrecognized parameter 'stream' is not supported" 判为终态流拒绝。"""
+        from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
         stream_calls: list[dict] = []
-        fallback = ChatResponse(
-            content="fallback",
-            model="gpt-4o-mini",
-            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
         provider = OpenAICompatProvider(
             api_base="https://test.api.com/v1", api_key="sk"
         )
@@ -1357,55 +1353,19 @@ class TestStreamChat:
             ],
             stream_calls,
         )
-        provider.chat = AsyncMock(return_value=fallback)
 
         client = LLMClient()
         client._provider = provider
 
-        resp = await client.chat([Message(role="user", content="Q")])
+        with pytest.raises(LLMCallError) as exc_info:
+            await client.chat([Message(role="user", content="Q")])
 
-        assert resp.content == "fallback"
-        assert provider._stream_unsupported is True  # 标记流式不支持
-        assert provider.chat.await_count == 1  # fallback 触发
+        assert exc_info.value.retryable is False
         assert len(stream_calls) == 1  # 不重试 stream
         # 关键：不得走普通参数降级（否则会带 stream 重试直至耗尽）
         assert provider._extras_disabled is False
         mock_log_usage.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_fallback_llm_call_error_not_retried(
-        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
-    ):
-        """S1：fallback 抛出确定性 LLMCallError → 不套用重试策略，原样透传。
-
-        评审定位为 stream except；实证放大点实际在 ``_call_with_retry``
-        对冒泡的 ``LLMCallError`` 再次重试（provider.chat 被调 3 次且
-        retryable 被改写为 True）。两处均须直接透传。
-        """
-        from app.services.llm.client import LLMCallError, LLMClient
-        from app.services.llm.providers.openai_compat import OpenAICompatProvider
-
-        stream_calls: list[dict] = []
-        mock_sleep = AsyncMock()
-        provider = OpenAICompatProvider(
-            api_base="https://test.api.com/v1", api_key="sk"
-        )
-        provider.stream = _stream_fn(
-            [_httpx_status(400, "stream is not supported")], stream_calls
-        )
-        provider.chat = AsyncMock(side_effect=LLMCallError("det fail", retryable=False))
-
-        client = LLMClient()
-        client._provider = provider
-
-        with patch(_sleep_patch_path(), mock_sleep):
-            with pytest.raises(LLMCallError) as exc_info:
-                await client.chat([Message(role="user", content="Q")])
-
-        assert exc_info.value.retryable is False  # 原样透传，未被改写
-        assert provider.chat.await_count == 1  # fallback 只调用一次
-        assert len(stream_calls) == 1  # stream 只尝试一次
-        assert mock_sleep.await_count == 0  # 不重试
+        assert mock_log_usage.call_args[1]["status"] == "error"
 
     @pytest.mark.asyncio
     async def test_stream_error_after_first_chunk_no_retry(
@@ -1454,33 +1414,6 @@ class TestStreamChat:
 
         mock_log_usage.assert_not_called()
         mock_logger.warning.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_fallback_logs_success_once(
-        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
-    ):
-        """场景 9：fallback 路径落库一次（不双计）。"""
-        from app.services.llm.client import LLMClient
-        from app.services.llm.providers.openai_compat import OpenAICompatProvider
-
-        fallback = ChatResponse(
-            content="fallback",
-            model="gpt-4o-mini",
-            usage=Usage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
-        )
-        provider = OpenAICompatProvider(
-            api_base="https://test.api.com/v1", api_key="sk"
-        )
-        provider.stream = _stream_fn([_httpx_status(400, "unknown parameter: stream")])
-        provider.chat = AsyncMock(return_value=fallback)
-
-        client = LLMClient()
-        client._provider = provider
-        resp = await client.chat([Message(role="user", content="Q")], job_name="j")
-
-        assert resp.content == "fallback"
-        mock_log_usage.assert_called_once()
-        assert mock_log_usage.call_args[1]["status"] == "success"
 
     @pytest.mark.asyncio
     async def test_stream_terminal_401_no_retry(
@@ -1576,6 +1509,90 @@ class TestStreamChat:
         assert resp.content == "Hello"
         # 3 个 chunk 只被聚合一次（修复前 chat()+stream_chat() 双重聚合 → 6）
         assert feed_count["n"] == len(chunks)
+
+
+# ===================================================================
+# R1：stream_chat 纯公开契约 + 元数据跟踪
+# ===================================================================
+
+
+class TestStreamChatContract:
+    """stream_chat 纯公开契约（无下划线参数）与轻量元数据跟踪。"""
+
+    def test_stream_chat_signature_has_no_private_params(self):
+        """stream_chat 不再暴露 _state / _result 下划线参数。"""
+        import inspect
+
+        from app.services.llm.client import LLMClient
+
+        params = inspect.signature(LLMClient.stream_chat).parameters
+        assert "_state" not in params
+        assert "_result" not in params
+
+    @pytest.mark.asyncio
+    async def test_usage_missing_logs_zero_and_warns(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """流未上报 usage → 落库 0 且记 warning（网关忽略 stream_options 可见）。"""
+        chunks = [
+            StreamChunk(type="text_delta", text="hi"),
+            StreamChunk(type="stop", stop_reason="end_turn"),
+        ]
+        with patch(_sleep_patch_path(), AsyncMock()):
+            client = _build_client()
+            client._provider.stream = _stream_fn([chunks])
+            await client.chat([Message(role="user", content="Q")])
+
+        kwargs = mock_log_usage.call_args[1]
+        assert kwargs["status"] == "success"
+        assert kwargs["prompt_tokens"] == 0
+        assert kwargs["completion_tokens"] == 0
+        assert kwargs["total_tokens"] == 0
+        warning_messages = [c.args[0] for c in mock_logger.warning.call_args_list]
+        assert any("usage" in msg for msg in warning_messages)
+
+    @pytest.mark.asyncio
+    async def test_chat_alias_equivalent_to_collect_and_latency_nonzero(
+        self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
+    ):
+        """chat() 别名等价 collect(stream_chat)，且 latency 由别名填入（非零）。"""
+        from app.services.llm.models import collect
+
+        chunks = [
+            StreamChunk(type="text_delta", text="Hello", model="gpt-4o"),
+            StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            ),
+            StreamChunk(type="stop", stop_reason="end_turn"),
+        ]
+        # time.time 调用顺序：chat.t0 → stream_chat.t0 → retry.t_attempt
+        #   → stream_chat 成功时刻 → chat 收尾时刻
+        times = [
+            1000.0,
+            1000.0,
+            1000.0,
+            1000.0,
+            1000.5,
+            1000.5,
+            1000.5,
+            1000.5,
+        ]
+        with (
+            patch(_sleep_patch_path(), AsyncMock()),
+            patch("app.services.llm.client.time.time", side_effect=times),
+        ):
+            client = _build_client()
+            client._provider.stream = _stream_fn([chunks])
+            resp = await client.chat([Message(role="user", content="Q")])
+            agg = await collect(client.stream_chat([Message(role="user", content="Q")]))
+
+        assert resp.content == agg.content == "Hello"
+        assert resp.blocks == agg.blocks
+        assert resp.stop_reason == agg.stop_reason
+        assert resp.usage == agg.usage
+        assert resp.model == agg.model == "gpt-4o"
+        assert resp.latency == 500  # 非零
 
 
 # ===================================================================

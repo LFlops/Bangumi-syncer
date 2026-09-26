@@ -3,7 +3,7 @@
 基于 httpx 实现的 BaseProvider，与遵循 OpenAI /v1/responses API 规范的端点通信。
 
 Responses API 与 /v1/chat/completions 差异较大，全部收敛在
-_build_request / _parse_response / stream 内：
+_build_request / stream 内：
 
 - system 消息抽为顶层 ``instructions``（多条用 ``\\n\\n`` 连接）
 - 对话历史为扁平 ``input`` 数组：普通消息 ``{role, content}``；工具调用与结果
@@ -23,12 +23,10 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import (
-    ChatResponse,
     ContentBlock,
     Message,
     StreamChunk,
     TextBlock,
-    ThinkingBlock,
     ThinkingLevel,
     ToolResultBlock,
     ToolUseBlock,
@@ -109,48 +107,6 @@ class OpenAIResponsesProvider(BaseProvider):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-
-    async def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
-        """向 API 发送 Responses 请求（非流式，降级路径用）。
-
-        Args:
-            messages: 对话消息列表。
-            **kwargs: 覆盖默认的 model、max_tokens、temperature、thinking_level，
-                以及可选的 tools / tool_choice。
-
-        Returns:
-            包含助手回复内容和可选用量的 ChatResponse。
-
-        Raises:
-            httpx.HTTPStatusError: HTTP 错误响应。
-            httpx.TimeoutException: 请求超时。
-            ValueError: JSON 解码失败。
-        """
-        url = self._url
-        model = kwargs.get("model", self.model)
-        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
-        logger.debug(
-            f"LLM request: url={url}, model={model}, "
-            f"timeout={self.timeout}s{proxy_label}"
-        )
-
-        body = self._build_request(messages, **kwargs)
-
-        async with create_async_client(
-            proxy=self.proxy,
-            timeout=self.timeout,
-            follow_redirects=True,
-        ) as client:
-            response = await client.post(
-                url,
-                json=body,
-                headers=self._headers(),
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        return self._parse_response(data)
 
     def _build_request(self, messages: list[Message], **kwargs: Any) -> dict:
         """内部模型 → Responses wire 格式（请求体）。"""
@@ -336,68 +292,6 @@ class OpenAIResponsesProvider(BaseProvider):
             return None
         return self._REASONING_EFFORT.get(level)
 
-    def _parse_response(self, data: dict) -> ChatResponse:
-        """Responses wire 格式 → 内部模型。"""
-        blocks: list[ContentBlock] = []
-        text_parts: list[str] = []
-        has_function_call = False
-
-        for item in data.get("output", []) or []:
-            itype = item.get("type")
-            if itype == "message":
-                text = "".join(
-                    part.get("text", "")
-                    for part in (item.get("content") or [])
-                    if part.get("type") == "output_text"
-                )
-                if text:
-                    text_parts.append(text)
-                    blocks.append(TextBlock(text=text))
-            elif itype == "function_call":
-                has_function_call = True
-                blocks.append(
-                    ToolUseBlock(
-                        id=item.get("call_id", ""),
-                        name=item.get("name", ""),
-                        input=self._parse_arguments(item.get("arguments", "")),
-                    )
-                )
-            elif itype == "reasoning":
-                summary = "".join(
-                    part.get("text", "") for part in (item.get("summary") or [])
-                )
-                blocks.append(ThinkingBlock(thinking=summary, signature=""))
-            else:
-                # 未知 output 项类型：宽容跳过 + 记录，不崩溃
-                logger.debug(f"Responses 未知 output 项类型 {itype!r}，已跳过")
-
-        status = data.get("status", "")
-        if has_function_call:
-            stop_reason = "tool_use"
-        elif status == "incomplete":
-            stop_reason = "max_tokens"
-        else:
-            stop_reason = "end_turn"
-
-        return ChatResponse(
-            content="".join(text_parts),
-            blocks=blocks,
-            stop_reason=stop_reason,
-            model=data.get("model", ""),
-            usage=self._usage_from(data.get("usage")),
-        )
-
-    @staticmethod
-    def _parse_arguments(raw: Any) -> dict:
-        """解析 function_call 的 arguments JSON 字符串，失败兜底 {"raw": ...}。"""
-        try:
-            parsed = json.loads(raw) if raw else {}
-        except (json.JSONDecodeError, TypeError):
-            parsed = {"raw": raw}
-        if not isinstance(parsed, dict):
-            return {"raw": raw}
-        return parsed
-
     @staticmethod
     def _usage_from(usage: dict | None) -> Usage | None:
         """Responses usage → 内部 Usage（input/output/total_tokens）。"""
@@ -418,7 +312,7 @@ class OpenAIResponsesProvider(BaseProvider):
 
         Args:
             messages: 对话消息列表。
-            **kwargs: 同 chat()。
+            **kwargs: provider 特定的额外参数。
 
         Yields:
             provider 无关的归一化流式事件 StreamChunk。
@@ -433,6 +327,17 @@ class OpenAIResponsesProvider(BaseProvider):
 
         # item.id → call_id 映射（function_call_arguments.delta 只带 item_id）
         item_call_ids: dict[str, str] = {}
+        stopped: set[str] = set()
+        model_sent = False
+
+        def _attach_model(chunk: StreamChunk, response_data: dict) -> StreamChunk:
+            nonlocal model_sent
+            if not model_sent:
+                model = response_data.get("model") or ""
+                if model:
+                    chunk.model = model
+                    model_sent = True
+            return chunk
 
         async with create_async_client(
             proxy=self.proxy,
@@ -457,14 +362,18 @@ class OpenAIResponsesProvider(BaseProvider):
                         continue
                     # 事件名在 event: 字段或 data JSON 的 type 字段，两者兼容
                     name = sse.event or payload.get("type")
+                    response_data = payload.get("response") or {}
                     if name == "response.output_item.added":
                         item = payload.get("item") or {}
                         if item.get("type") == "function_call":
                             item_call_ids[item.get("id", "")] = item.get("call_id", "")
-                            yield StreamChunk(
-                                type="tool_use_start",
-                                tool_use_id=item.get("call_id", ""),
-                                tool_name=item.get("name", ""),
+                            yield _attach_model(
+                                StreamChunk(
+                                    type="tool_use_start",
+                                    tool_use_id=item.get("call_id", ""),
+                                    tool_name=item.get("name", ""),
+                                ),
+                                response_data,
                             )
                         else:
                             logger.debug(
@@ -472,33 +381,64 @@ class OpenAIResponsesProvider(BaseProvider):
                                 f"{item.get('type')!r}"
                             )
                     elif name == "response.output_text.delta":
-                        yield StreamChunk(
-                            type="text_delta", text=payload.get("delta", "")
+                        yield _attach_model(
+                            StreamChunk(
+                                type="text_delta", text=payload.get("delta", "")
+                            ),
+                            response_data,
                         )
                     elif name == "response.function_call_arguments.delta":
                         item_id = payload.get("item_id", "")
                         tool_use_id = payload.get("call_id") or item_call_ids.get(
                             item_id, item_id
                         )
-                        yield StreamChunk(
-                            type="tool_use_delta",
-                            tool_use_id=tool_use_id,
-                            partial_json=payload.get("delta", ""),
+                        yield _attach_model(
+                            StreamChunk(
+                                type="tool_use_delta",
+                                tool_use_id=tool_use_id,
+                                partial_json=payload.get("delta", ""),
+                            ),
+                            response_data,
                         )
                     elif name == "response.reasoning_summary_text.delta":
-                        yield StreamChunk(
-                            type="thinking_delta", thinking=payload.get("delta", "")
+                        yield _attach_model(
+                            StreamChunk(
+                                type="thinking_delta", thinking=payload.get("delta", "")
+                            ),
+                            response_data,
                         )
+                    elif name == "response.output_item.done":
+                        # function_call 项完成 → 参数已完整、可校验：停点事件
+                        item = payload.get("item") or {}
+                        if item.get("type") == "function_call":
+                            call_id = item.get("call_id", "")
+                            if call_id not in stopped:
+                                stopped.add(call_id)
+                                yield _attach_model(
+                                    StreamChunk(
+                                        type="tool_use_stop", tool_use_id=call_id
+                                    ),
+                                    response_data,
+                                )
+                        else:
+                            logger.debug(
+                                f"Responses output_item.done 忽略 item 类型 "
+                                f"{item.get('type')!r}"
+                            )
                     elif name in ("response.completed", "response.incomplete"):
                         # M2：incomplete（截断）与 completed 同路径产出 usage + stop，
                         # stop_reason 由 _stop_reason_of 依 status 判定
-                        response_data = payload.get("response") or {}
                         usage = self._usage_from(response_data.get("usage"))
                         if usage is not None:
-                            yield StreamChunk(type="usage", usage=usage)
-                        yield StreamChunk(
-                            type="stop",
-                            stop_reason=self._stop_reason_of(response_data),
+                            yield _attach_model(
+                                StreamChunk(type="usage", usage=usage), response_data
+                            )
+                        yield _attach_model(
+                            StreamChunk(
+                                type="stop",
+                                stop_reason=self._stop_reason_of(response_data),
+                            ),
+                            response_data,
                         )
                     elif name in ("response.failed", "error"):
                         raise ValueError(self._error_message(name, payload))
@@ -525,7 +465,7 @@ class OpenAIResponsesProvider(BaseProvider):
         """从 response.completed / response.incomplete 的 response 对象推导 stop_reason。
 
         优先级：有 function_call → ``tool_use``；``status == "incomplete"``（截断）
-        → ``max_tokens``；否则 ``end_turn``。与非流式 ``_parse_response`` 口径一致（M2）。
+        → ``max_tokens``；否则 ``end_turn``。
         """
         has_function_call = any(
             item.get("type") == "function_call"

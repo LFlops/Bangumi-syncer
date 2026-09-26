@@ -3,8 +3,8 @@
 基于 httpx 实现的 BaseProvider，与任何遵循 Anthropic /v1/messages
 API 规范的端点通信（官方 API 或兼容代理/网关）。
 
-内部中立模型 → Anthropic wire 格式的差异收敛在 _build_request /
-_parse_response 两个方法内：
+流式（唯一调用形态）：``stream()`` 把 wire SSE 事件映射为归一化 StreamChunk；
+内部中立模型 → Anthropic wire 格式的差异收敛在 ``_build_request`` 内：
 - system prompt 抽为顶层参数（多条用 \\n\\n 连接）
 - content 统一为 content blocks 数组
 - thinking_level 映射为 thinking.budget_tokens（模型不支持时降级）
@@ -18,13 +18,10 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import (
-    ChatResponse,
     ContentBlock,
     Message,
-    RedactedThinkingBlock,
     StreamChunk,
     TextBlock,
-    ThinkingBlock,
     ThinkingLevel,
     ToolResultBlock,
     ToolUseBlock,
@@ -87,56 +84,15 @@ class AnthropicProvider(BaseProvider):
         self.proxy = proxy
         self.thinking_level = thinking_level
 
-    async def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
-        """向 API 发送聊天补全请求。
-
-        Args:
-            messages: 对话消息列表。
-            **kwargs: 覆盖默认的 model、max_tokens、temperature 或 thinking_level。
-
-        Returns:
-            包含助手回复内容和可选用量的 ChatResponse。
-
-        Raises:
-            httpx.HTTPStatusError: HTTP 错误响应。
-            httpx.TimeoutException: 请求超时。
-        """
-        url = f"{self.api_base}/messages"
-        model = kwargs.get("model", self.model)
-        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
-        logger.debug(
-            f"LLM request: url={url}, model={model}, "
-            f"timeout={self.timeout}s{proxy_label}"
-        )
-
-        body = self._build_request(messages, **kwargs)
-        headers = self._auth_headers()
-
-        async with create_async_client(
-            proxy=self.proxy,
-            timeout=self.timeout,
-            follow_redirects=True,
-        ) as client:
-            response = await client.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        return self._parse_response(data)
-
     async def stream(
         self, messages: list[Message], **kwargs: Any
     ) -> AsyncIterator[StreamChunk]:
         """以 SSE 流式方式向 API 发送请求，逐条产出归一化事件。
 
         请求体复用 :meth:`_build_request`（thinking budget 映射、max_tokens
-        抬升、temperature、tool_choice 降级等逻辑与 chat() 完全一致），并追加
-        ``stream: true``。响应逐行交给 :func:`iter_sse_events` 解析后映射为
-        provider 无关的 :class:`StreamChunk`。
+        抬升、temperature、tool_choice 降级等逻辑），并追加 ``stream: true``。
+        响应逐行交给 :func:`iter_sse_events` 解析后映射为 provider 无关的
+        :class:`StreamChunk`。
 
         Args:
             messages: 对话消息列表。
@@ -197,10 +153,21 @@ class AnthropicProvider(BaseProvider):
 
         跨事件状态：``tool_index`` 维护 content block index → (tool_use_id,
         tool_name)（input_json_delta 只带 index，需据此回填 tool_use_id）；
-        ``input_tokens`` 暂存 message_start 的输入用量，待 message_delta 合并。
+        ``input_tokens`` 暂存 message_start 的输入用量，待 message_delta 合并；
+        ``pending_model`` 暂存 message_start 的真实模型名，附到首个产出事件上。
         """
         tool_index: dict[int, tuple[str, str]] = {}
+        stopped: set[int] = set()
         input_tokens = 0
+        pending_model = ""
+        model_sent = False
+
+        def _attach_model(chunk: StreamChunk) -> StreamChunk:
+            nonlocal model_sent
+            if pending_model and not model_sent:
+                chunk.model = pending_model
+                model_sent = True
+            return chunk
 
         async for event in iter_sse_events(lines):
             payload = self._decode_sse_payload(event)
@@ -210,18 +177,23 @@ class AnthropicProvider(BaseProvider):
 
             if etype == "message_start":
                 input_tokens = self._extract_input_tokens(payload)
+                pending_model = self._extract_model(payload)
             elif etype == "content_block_start":
                 chunk = self._map_content_block_start(payload, tool_index)
                 if chunk is not None:
-                    yield chunk
+                    yield _attach_model(chunk)
             elif etype == "content_block_delta":
                 chunk = self._map_content_block_delta(payload, tool_index)
                 if chunk is not None:
-                    yield chunk
+                    yield _attach_model(chunk)
+            elif etype == "content_block_stop":
+                chunk = self._map_content_block_stop(payload, tool_index, stopped)
+                if chunk is not None:
+                    yield _attach_model(chunk)
             elif etype == "message_delta":
                 usage_chunk, stop_chunk = self._map_message_delta(payload, input_tokens)
-                yield usage_chunk
-                yield stop_chunk
+                yield _attach_model(usage_chunk)
+                yield _attach_model(stop_chunk)
             elif etype == "message_stop":
                 return
             else:
@@ -248,6 +220,12 @@ class AnthropicProvider(BaseProvider):
         return int(usage.get("input_tokens", 0) or 0)
 
     @staticmethod
+    def _extract_model(payload: dict) -> str:
+        """从 message_start 事件提取真实模型名。"""
+        message = payload.get("message") or {}
+        return str(message.get("model") or "")
+
+    @staticmethod
     def _map_content_block_start(
         payload: dict, tool_index: dict[int, tuple[str, str]]
     ) -> StreamChunk | None:
@@ -264,6 +242,23 @@ class AnthropicProvider(BaseProvider):
             tool_use_id=tool_use_id,
             tool_name=tool_name,
         )
+
+    @staticmethod
+    def _map_content_block_stop(
+        payload: dict,
+        tool_index: dict[int, tuple[str, str]],
+        stopped: set[int],
+    ) -> StreamChunk | None:
+        """content_block_stop → tool_use_stop（仅对 tool_use 块，且不重复补发）。
+
+        Anthropic 的 content_block_stop 标志该 content block 结束，对 tool_use
+        块即意味着其 input_json 已完整、可校验——映射为停点事件。
+        """
+        index = payload.get("index", 0)
+        if index not in tool_index or index in stopped:
+            return None
+        stopped.add(index)
+        return StreamChunk(type="tool_use_stop", tool_use_id=tool_index[index][0])
 
     @staticmethod
     def _map_content_block_delta(
@@ -502,57 +497,3 @@ class AnthropicProvider(BaseProvider):
                 "is_error": block.is_error,
             }
         return block.model_dump(exclude_none=True)
-
-    def _parse_response(self, data: dict) -> ChatResponse:
-        """Anthropic wire 格式 → 内部模型。"""
-        blocks: list[ContentBlock] = []
-        text_parts: list[str] = []
-        for block in data.get("content", []):
-            btype = block.get("type")
-            if btype == "text":
-                text = block.get("text", "")
-                blocks.append(TextBlock(text=text))
-                text_parts.append(text)
-            elif btype == "thinking":
-                blocks.append(
-                    ThinkingBlock(
-                        thinking=block.get("thinking", ""),
-                        signature=block.get("signature"),
-                    )
-                )
-            elif btype == "redacted_thinking":
-                blocks.append(RedactedThinkingBlock(data=block.get("data", "")))
-            elif btype == "tool_use":
-                # 工具调用请求块：转为内部 ToolUseBlock，
-                # stop_reason 为 "tool_use" 时由调用方驱动 agent 循环执行工具。
-                blocks.append(
-                    ToolUseBlock(
-                        id=block.get("id", ""),
-                        name=block.get("name", ""),
-                        input=block.get("input", {}) or {},
-                    )
-                )
-            else:
-                # 真正未知的 block 类型：跳过 + warning，不崩溃
-                logger.warning(f"未知 content block 类型 {btype!r}，已跳过")
-
-        # Anthropic usage 字段映射：input_tokens → prompt_tokens,
-        # output_tokens → completion_tokens
-        usage: Usage | None = None
-        if "usage" in data:
-            u = data["usage"]
-            prompt = u.get("input_tokens", 0)
-            completion = u.get("output_tokens", 0)
-            usage = Usage(
-                prompt_tokens=prompt,
-                completion_tokens=completion,
-                total_tokens=prompt + completion,
-            )
-
-        return ChatResponse(
-            content="".join(text_parts),
-            blocks=blocks,
-            stop_reason=data.get("stop_reason", ""),
-            model=data.get("model", ""),
-            usage=usage,
-        )

@@ -1,20 +1,21 @@
 """LLM provider 抽象基类。
 
-所有 LLM provider 实现必须继承 BaseProvider 并实现 async chat() 方法。
+所有 LLM provider 实现必须继承 BaseProvider 并实现 async stream() 方法
+（流式为唯一调用形态；聚合由 models.collect() 复用消费）。
 """
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.services.llm.models import ChatResponse, Message, StreamChunk
+from app.services.llm.models import Message, StreamChunk
 
 
 class BaseProvider(ABC):
     """LLM 服务提供者抽象基类。
 
-    子类必须实现 async chat() 方法，接收消息列表和额外关键字参数，
-    返回 ChatResponse。
+    子类必须实现 async stream() 方法，接收消息列表和额外关键字参数，
+    逐条产出归一化的 StreamChunk。
 
     Attributes:
         _extras_disabled: 端点拒绝扩展参数（thinking/reasoning 等）后由
@@ -30,22 +31,10 @@ class BaseProvider(ABC):
     _force_tool_choice_degraded: bool = False
 
     @abstractmethod
-    async def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
-        """向 LLM 发送消息并返回响应。
-
-        Args:
-            messages: 表示对话历史的 Message 对象列表。
-            **kwargs: provider 特定的额外参数。
-
-        Returns:
-            包含助手回复和可选用量统计的 ChatResponse。
-        """
-        ...
-
-    async def stream(
+    def stream(
         self, messages: list[Message], **kwargs: Any
     ) -> AsyncIterator[StreamChunk]:
-        """流式调用（SSE 增量事件）。子类应实现；默认未实现。
+        """流式调用（SSE 增量事件）。
 
         Args:
             messages: 表示对话历史的 Message 对象列表。
@@ -54,5 +43,4 @@ class BaseProvider(ABC):
         Yields:
             provider 无关的归一化流式事件 StreamChunk。
         """
-        raise NotImplementedError("provider 未实现流式")
-        yield  # 使函数成为 async generator
+        ...

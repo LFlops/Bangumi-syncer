@@ -13,8 +13,8 @@ from app.services.llm.models import (
     ThinkingBlock,
     ToolUseBlock,
     Usage,
+    collect,
 )
-from app.services.llm.providers.base import BaseProvider
 
 
 class TestContentBlock:
@@ -328,18 +328,97 @@ class TestStreamAggregator:
         assert resp.usage is None
 
 
-class TestBaseProviderStream:
-    """BaseProvider.stream 默认实现契约。"""
+class TestStreamChunkModelField:
+    """StreamChunk.model 与 tool_use_stop 事件字段。"""
+
+    def test_tool_use_stop_event_accepted(self):
+        """tool_use_stop 是合法事件类型（停点：参数已完整、可校验）。"""
+        chunk = StreamChunk(type="tool_use_stop", tool_use_id="t1")
+        assert chunk.type == "tool_use_stop"
+        assert chunk.tool_use_id == "t1"
+
+    def test_model_field_defaults_empty(self):
+        """model 默认为空串（provider 从流事件填入真实模型名）。"""
+        assert StreamChunk(type="text_delta", text="x").model == ""
+
+    def test_model_field_settable(self):
+        chunk = StreamChunk(type="text_delta", text="x", model="gpt-4o")
+        assert chunk.model == "gpt-4o"
+
+
+class TestStreamAggregatorModelTracking:
+    """聚合器跟踪真实 model（非空覆盖）。"""
+
+    def test_finalize_uses_tracked_model(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x", model="gpt-4o-real"))
+        resp = agg.finalize()
+        assert resp.model == "gpt-4o-real"
+
+    def test_finalize_model_empty_without_any_model(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x"))
+        assert agg.finalize().model == ""
+
+    def test_later_non_empty_model_overrides(self):
+        """后续非空 model 覆盖先前值；空值不覆盖。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x", model="first"))
+        agg.feed(StreamChunk(type="text_delta", text="y"))
+        agg.feed(StreamChunk(type="text_delta", text="z", model="second"))
+        assert agg.finalize().model == "second"
+
+
+class TestAggregatorIgnoresToolUseStop:
+    """tool_use_stop 停点事件不参与参数累积，安全忽略且不告警。"""
+
+    def test_tool_use_stop_safely_ignored(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="f"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{}")
+        )
+        agg.feed(StreamChunk(type="tool_use_stop", tool_use_id="t1"))
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.input == {}
+
+
+class TestCollect:
+    """模块级 collect()：把事件流消费至结束并聚合为完整响应。"""
 
     @pytest.mark.asyncio
-    async def test_stream_default_raises_not_implemented(self):
-        """子类未实现 stream → 迭代时抛 NotImplementedError。"""
+    async def test_collect_aggregates_stream(self):
+        async def _stream():
+            yield StreamChunk(type="text_delta", text="Hello", model="gpt-4o")
+            yield StreamChunk(type="text_delta", text=" world")
+            yield StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            )
+            yield StreamChunk(type="stop", stop_reason="end_turn")
 
-        class ChatOnlyProvider(BaseProvider):
-            async def chat(self, messages, **kwargs):
-                return ChatResponse(content="mocked")
+        resp = await collect(_stream())
 
-        provider = ChatOnlyProvider()
-        with pytest.raises(NotImplementedError):
-            async for _ in provider.stream([Message(role="user", content="hi")]):
-                pass
+        assert resp.content == "Hello world"
+        assert resp.model == "gpt-4o"
+        assert resp.stop_reason == "end_turn"
+        assert resp.usage is not None
+        assert resp.usage.total_tokens == 5
+
+    @pytest.mark.asyncio
+    async def test_collect_empty_stream(self):
+        async def _stream():
+            if False:  # pragma: no cover - 空 async generator
+                yield StreamChunk(type="text_delta", text="")
+
+        resp = await collect(_stream())
+
+        assert resp.content == ""
+        assert resp.blocks == []
+        assert resp.usage is None
+        assert resp.model == ""

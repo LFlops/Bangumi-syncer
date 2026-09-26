@@ -5,7 +5,7 @@
 字节流，真实穿透以下链路：
 
     provider.stream（httpx.AsyncClient.stream + iter_sse_events 解析）
-        → LLMClient.stream_chat（重试 / 降级 / 兜底）
+        → LLMClient.stream_chat（重试 / 降级）
         → StreamAggregator 聚合
 
 因此可捕获「wire 字节 → 归一化事件 → 聚合响应」全链路的真实行为，而非各层各自
@@ -556,29 +556,15 @@ class TestRawSSEErrorRetry:
         mock_sleep.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_stream_rejection_falls_back_to_non_stream(
+    async def test_stream_rejection_raises_terminal_error(
         self, reset_llm_singleton, mock_log_usage, mock_sleep
     ):
-        """stream 参数被拒 → 标记 provider 并切非流式兜底（同一 transport）。"""
+        """stream 参数被拒 → 确定性 LLMCallError（不重试、不降级、不伪装）。"""
         calls = {"n": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
-            if calls["n"] == 1:
-                return httpx.Response(400, text='{"error": "stream is not supported"}')
-            # 非流式兜底：普通 JSON 响应
-            return httpx.Response(
-                200,
-                json={
-                    "choices": [{"message": {"content": "fallback"}}],
-                    "model": "gpt-4o-mini",
-                    "usage": {
-                        "prompt_tokens": 1,
-                        "completion_tokens": 1,
-                        "total_tokens": 2,
-                    },
-                },
-            )
+            return httpx.Response(400, text='{"error": "stream is not supported"}')
 
         provider = OpenAICompatProvider(
             api_base="https://test.api.com/v1", api_key="sk-test"
@@ -589,8 +575,11 @@ class TestRawSSEErrorRetry:
             "app.services.llm.providers.openai_compat.create_async_client",
             _mock_transport_client(handler),
         ):
-            resp = await client.chat([Message(role="user", content="Q")])
+            with pytest.raises(LLMCallError) as exc_info:
+                await client.chat([Message(role="user", content="Q")])
 
-        assert resp.content == "fallback"
-        assert calls["n"] == 2
-        assert provider._stream_unsupported is True
+        assert exc_info.value.retryable is False
+        assert "端点不支持流式调用" in str(exc_info.value)
+        assert calls["n"] == 1  # 只发一次，不重试
+        mock_sleep.assert_not_awaited()
+        assert not hasattr(provider, "_stream_unsupported")

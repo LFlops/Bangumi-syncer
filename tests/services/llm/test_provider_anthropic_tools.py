@@ -6,15 +6,11 @@
 - tools 参数透传进 body（name/description/input_schema 由调用方构造，provider 仅透传）
 - tool_choice 参数透传进 body
 - cache_control：tools 参数级别的 cache_control 标记随 tools dict 透传（实现以透传为主）
-- _parse_response：wire tool_use → ToolUseBlock + stop_reason="tool_use"；文本+工具混合解析
 
-测试直接调用 _build_request / _parse_response，沿用 test_provider_anthropic 的 mock 风格。
+测试直接调用 _build_request，沿用 test_provider_anthropic 的 mock 风格。
 """
 
-import pytest
-
 from app.services.llm.models import (
-    ChatResponse,
     Message,
     TextBlock,
     ToolResultBlock,
@@ -316,128 +312,6 @@ class TestBuildRequestToolsAndToolChoice:
 # ===================================================================
 # Feature 2: 响应解析 — 工具协议
 # ===================================================================
-
-
-class TestParseResponseToolUse:
-    """_parse_response：wire tool_use → ToolUseBlock + stop_reason="tool_use"。"""
-
-    def test_parse_response_tool_use_to_block(self):
-        """wire tool_use block → ToolUseBlock，stop_reason 保留为 tool_use。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "tu_1",
-                        "name": "search_bangumi",
-                        "input": {"title": "eva"},
-                    }
-                ],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "tool_use",
-                "usage": {"input_tokens": 10, "output_tokens": 20},
-            }
-        )
-        assert resp.stop_reason == "tool_use"
-        assert len(resp.blocks) == 1
-        block = resp.blocks[0]
-        assert isinstance(block, ToolUseBlock)
-        assert block.id == "tu_1"
-        assert block.name == "search_bangumi"
-        assert block.input == {"title": "eva"}
-        # tool_use 不产生纯文本内容
-        assert resp.content == ""
-
-    def test_parse_response_text_and_tool_mixed(self):
-        """文本 + tool_use 混合解析：text 进 content，tool_use 进 blocks，stop_reason 保留。"""
-        provider = _make_provider()
-        resp = provider._parse_response(
-            {
-                "content": [
-                    {"type": "text", "text": "我查一下番组"},
-                    {
-                        "type": "tool_use",
-                        "id": "tu_1",
-                        "name": "search_bangumi",
-                        "input": {"title": "eva"},
-                    },
-                ],
-                "stop_reason": "tool_use",
-            }
-        )
-        assert resp.content == "我查一下番组"
-        assert len(resp.blocks) == 2
-        assert isinstance(resp.blocks[0], TextBlock)
-        assert resp.blocks[0].text == "我查一下番组"
-        assert isinstance(resp.blocks[1], ToolUseBlock)
-        assert resp.blocks[1].name == "search_bangumi"
-        assert resp.stop_reason == "tool_use"
-
-
-# ===================================================================
-# chat() 集成（mock httpx）— tools/tool_choice 真实发送
-# ===================================================================
-
-
-class TestAnthropicProviderChatTools:
-    """chat() 集成：tools/tool_choice 透传至请求体。"""
-
-    @pytest.mark.asyncio
-    async def test_tools_and_tool_choice_sent_in_request(self):
-        """chat() 把 tools/tool_choice 透传到 /v1/messages 请求体。"""
-        from unittest.mock import AsyncMock, Mock, patch
-
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_response.json = Mock(
-            return_value={
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "id": "tu_1",
-                        "name": "search_bangumi",
-                        "input": {"title": "eva"},
-                    }
-                ],
-                "model": "claude-sonnet-4-6",
-                "stop_reason": "tool_use",
-            }
-        )
-        mock_response.raise_for_status = Mock()
-
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_response)
-        mock_client.aclose = AsyncMock()
-        mock_client.__aenter__.return_value = mock_client
-
-        async def _mock_aexit(*args, **kwargs):
-            await mock_client.aclose()
-
-        mock_client.__aexit__ = _mock_aexit
-
-        tools = [
-            {
-                "name": "search_bangumi",
-                "description": "按标题搜索番组",
-                "input_schema": {"type": "object", "properties": {}},
-            }
-        ]
-        tool_choice = {"type": "tool", "name": "submit_suggestion"}
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = _make_provider()
-            resp = await provider.chat(
-                [Message(role="user", content="Hello")],
-                tools=tools,
-                tool_choice=tool_choice,
-            )
-
-        body = mock_client.post.call_args[1]["json"]
-        assert body["tools"] == tools
-        assert body["tool_choice"] == tool_choice
-        assert isinstance(resp, ChatResponse)
-        assert resp.stop_reason == "tool_use"
-        assert isinstance(resp.blocks[0], ToolUseBlock)
 
 
 # ===================================================================

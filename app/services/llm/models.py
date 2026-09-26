@@ -9,6 +9,7 @@ Messages API 的 content blocks，各 provider 负责与自己的 wire 格式互
 
 import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -119,8 +120,15 @@ class StreamChunk:
     - text_delta / thinking_delta: 增量文本，分别填 text / thinking（signature 亦增量）
     - tool_use_start: 新建工具调用槽，填 tool_use_id / tool_name
     - tool_use_delta: 工具入参 JSON 增量片段，填 tool_use_id / partial_json
+    - tool_use_stop: **停点事件**——该工具（tool_use_id）参数已完整、可校验并执行。
+      能力分级：支持 per-tool 停点信号的 provider（anthropic content_block_stop、
+      openai_responses output_item.done）原生映射；openai_compat 无该信号，
+      在 finish_reason 出现时对尚未补发停点的 tool_calls 补发。
     - usage: 填 usage
     - stop: 填 stop_reason
+
+    ``model`` 为真实模型名（provider 从流事件顶层字段提取），通常首个带 model 的
+    事件填入一次即可，后续留空；供 client/聚合器回填 ChatResponse.model。
     """
 
     type: Literal[
@@ -128,6 +136,7 @@ class StreamChunk:
         "thinking_delta",
         "tool_use_start",
         "tool_use_delta",
+        "tool_use_stop",
         "usage",
         "stop",
     ]
@@ -139,6 +148,7 @@ class StreamChunk:
     partial_json: str = ""
     usage: Usage | None = None
     stop_reason: str | None = None
+    model: str = ""
 
 
 @dataclass
@@ -151,7 +161,9 @@ class StreamAggregator:
       ThinkingBlock（thinking / signature 均增量拼接）
     - tool_use_start → 新建 ToolUseBlock 槽；tool_use_delta 按 tool_use_id
       累积 partial_json，finalize 时 json.loads，失败兜底 {"raw": ...}
+    - tool_use_stop 为停点标记，不参与参数累积（参数照常从 delta 累积）
     - usage / stop 事件透传到 ChatResponse 的 usage / stop_reason
+    - 非空 model 事件跟踪为真实模型名，finalize 回填 ChatResponse.model
     - blocks 顺序 = 各块「首次出现」的事件顺序
     """
 
@@ -163,9 +175,12 @@ class StreamAggregator:
     _tool_json_parts: dict[str, list[str]] = field(default_factory=dict)
     _usage: Usage | None = None
     _stop_reason: str | None = None
+    _model: str = ""
 
     def feed(self, chunk: StreamChunk) -> None:
         """累积一个流式事件。"""
+        if chunk.model:
+            self._model = chunk.model
         if chunk.type == "text_delta":
             self._append_text(chunk.text)
         elif chunk.type == "thinking_delta":
@@ -174,6 +189,9 @@ class StreamAggregator:
             self._start_tool(chunk.tool_use_id, chunk.tool_name)
         elif chunk.type == "tool_use_delta":
             self._append_tool_json(chunk.tool_use_id, chunk.partial_json)
+        elif chunk.type == "tool_use_stop":
+            # 停点事件：参数已从 tool_use_delta 累积完毕，无需额外处理
+            pass
         elif chunk.type == "usage":
             self._usage = chunk.usage
         elif chunk.type == "stop":
@@ -249,5 +267,14 @@ class StreamAggregator:
             content=text,
             blocks=blocks,
             stop_reason=self._stop_reason or "",
+            model=self._model,
             usage=self._usage,
         )
+
+
+async def collect(stream: AsyncIterator[StreamChunk]) -> ChatResponse:
+    """把事件流消费至结束并聚合为完整响应（消费方式之一，非独立模式）。"""
+    aggregator = StreamAggregator()
+    async for chunk in stream:
+        aggregator.feed(chunk)
+    return aggregator.finalize()

@@ -1,6 +1,6 @@
 """OpenAI 兼容 provider 工具协议测试。
 
-覆盖 _build_request / _parse_response 的 tool 拆并与 tools/tool_choice 透传，
+覆盖 _build_request 的 tool 拆并与 tools/tool_choice 透传，
 以及 wire→内部历史消息合并。
 """
 
@@ -222,111 +222,6 @@ class TestOpenAICompatToolsBuildRequest:
             cache_control={"type": "ephemeral"},
         )
         assert "cache_control" not in body
-
-
-class TestOpenAICompatToolsParseResponse:
-    """_parse_response：OpenAI wire → 内部模型（tool_calls 解析）。"""
-
-    def _provider(self):
-        return OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-
-    def test_tool_calls_to_tool_use_blocks(self):
-        """wire tool_calls → ToolUseBlock 列表；stop_reason 映射为 tool_use。"""
-        provider = self._provider()
-        data = {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {
-                                    "name": "search_bangumi",
-                                    "arguments": '{"title": "x"}',
-                                },
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "model": "gpt-4o-mini",
-        }
-        resp = provider._parse_response(data)
-        assert resp.stop_reason == "tool_use"
-        assert len(resp.blocks) == 1
-        assert isinstance(resp.blocks[0], ToolUseBlock)
-        assert resp.blocks[0].id == "call_1"
-        assert resp.blocks[0].name == "search_bangumi"
-        assert resp.blocks[0].input == {"title": "x"}
-
-    def test_invalid_json_arguments_fallback(self):
-        """arguments 非法 JSON → 兜底 {"raw": "<原字符串>"}。"""
-        provider = self._provider()
-        data = {
-            "choices": [
-                {
-                    "message": {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "call_1",
-                                "type": "function",
-                                "function": {"name": "f", "arguments": "not-json{"},
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "model": "gpt-4o-mini",
-        }
-        resp = provider._parse_response(data)
-        assert resp.blocks[0].input == {"raw": "not-json{"}
-
-    def test_text_and_tool_calls_in_response(self):
-        """响应含文本与 tool_calls：content 拼文本，blocks 含 Text + ToolUse。"""
-        provider = self._provider()
-        data = {
-            "choices": [
-                {
-                    "message": {
-                        "content": "让我查一下",
-                        "tool_calls": [
-                            {
-                                "id": "c1",
-                                "type": "function",
-                                "function": {"name": "f", "arguments": "{}"},
-                            }
-                        ],
-                    },
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "model": "m",
-        }
-        resp = provider._parse_response(data)
-        assert resp.content == "让我查一下"
-        assert isinstance(resp.blocks[0], TextBlock)
-        assert isinstance(resp.blocks[1], ToolUseBlock)
-        assert resp.blocks[1].input == {}
-
-    def test_finish_reason_stop_unchanged(self):
-        """非 tool_calls 的 finish_reason 保持原值（与 OpenAI 映射行为一致）。"""
-        provider = self._provider()
-        resp = provider._parse_response(
-            {
-                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
-                "model": "m",
-            }
-        )
-        assert resp.stop_reason == "stop"
 
 
 class TestOpenAICompatWireToMessages:

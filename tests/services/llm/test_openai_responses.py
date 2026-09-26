@@ -41,32 +41,6 @@ class _AsyncCM:
         return False
 
 
-def _make_mock_client(
-    *,
-    status_code: int = 200,
-    json_body: dict | None = None,
-    raise_for_status_side_effect: Exception | None = None,
-):
-    """创建 mock httpx.AsyncClient（chat 非流式路径）。"""
-    mock_response = Mock()
-    mock_response.status_code = status_code
-    mock_response.json = Mock(return_value=json_body or {})
-    if raise_for_status_side_effect is not None:
-        mock_response.raise_for_status = Mock(side_effect=raise_for_status_side_effect)
-    else:
-        mock_response.raise_for_status = Mock()
-
-    mock_client = AsyncMock()
-    mock_client.post = AsyncMock(return_value=mock_response)
-    mock_client.__aenter__.return_value = mock_client
-
-    async def _mock_aexit(*args, **kwargs):
-        await mock_client.aclose()
-
-    mock_client.__aexit__ = _mock_aexit
-    return mock_client
-
-
 def _make_stream_client(
     lines: list[str],
     *,
@@ -199,149 +173,6 @@ class TestBuildRequestMapping:
 # --------------------------------------------------------------------------- #
 # 场景 2：响应解析（message/function_call/reasoning）
 # --------------------------------------------------------------------------- #
-class TestParseResponse:
-    """Responses wire → 内部模型。"""
-
-    def test_message_function_call_and_reasoning(self):
-        data = {
-            "model": "o4-mini",
-            "status": "completed",
-            "output": [
-                {
-                    "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": "想一下"}],
-                },
-                {
-                    "type": "message",
-                    "content": [{"type": "output_text", "text": "答案是 42"}],
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_1",
-                    "name": "search",
-                    "arguments": '{"q": "x"}',
-                },
-            ],
-        }
-        resp = _provider()._parse_response(data)
-
-        assert resp.content == "答案是 42"
-        assert resp.model == "o4-mini"
-        assert isinstance(resp.blocks[0], ThinkingBlock)
-        assert resp.blocks[0].thinking == "想一下"
-        assert resp.blocks[0].signature == ""
-        assert isinstance(resp.blocks[1], TextBlock)
-        assert resp.blocks[1].text == "答案是 42"
-        assert isinstance(resp.blocks[2], ToolUseBlock)
-        assert resp.blocks[2].id == "call_1"
-        assert resp.blocks[2].name == "search"
-        assert resp.blocks[2].input == {"q": "x"}
-
-    def test_message_multiple_output_text_parts_concatenated(self):
-        resp = _provider()._parse_response(
-            {
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [
-                            {"type": "output_text", "text": "第一段"},
-                            {"type": "output_text", "text": "第二段"},
-                        ],
-                    }
-                ]
-            }
-        )
-        assert resp.content == "第一段第二段"
-
-    def test_invalid_arguments_fallback(self):
-        resp = _provider()._parse_response(
-            {
-                "output": [
-                    {
-                        "type": "function_call",
-                        "call_id": "c1",
-                        "name": "f",
-                        "arguments": "not-json{",
-                    }
-                ]
-            }
-        )
-        assert resp.blocks[0].input == {"raw": "not-json{"}
-
-    def test_unknown_output_item_skipped(self):
-        resp = _provider()._parse_response(
-            {
-                "output": [
-                    {"type": "web_search_call", "id": "ws1"},
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "ok"}],
-                    },
-                ]
-            }
-        )
-        assert resp.content == "ok"
-
-
-# --------------------------------------------------------------------------- #
-# 场景 3：usage / status 映射
-# --------------------------------------------------------------------------- #
-class TestParseUsageAndStatus:
-    """usage 与 stop_reason 映射。"""
-
-    def test_usage_mapping(self):
-        resp = _provider()._parse_response(
-            {
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "hi"}],
-                    }
-                ],
-                "usage": {
-                    "input_tokens": 11,
-                    "output_tokens": 22,
-                    "total_tokens": 33,
-                },
-            }
-        )
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 11
-        assert resp.usage.completion_tokens == 22
-        assert resp.usage.total_tokens == 33
-
-    def test_missing_usage_is_none(self):
-        resp = _provider()._parse_response({"status": "completed", "output": []})
-        assert resp.usage is None
-
-    def test_status_completed_maps_end_turn(self):
-        resp = _provider()._parse_response({"status": "completed", "output": []})
-        assert resp.stop_reason == "end_turn"
-
-    def test_status_incomplete_maps_max_tokens(self):
-        resp = _provider()._parse_response({"status": "incomplete", "output": []})
-        assert resp.stop_reason == "max_tokens"
-
-    def test_function_call_maps_tool_use(self):
-        resp = _provider()._parse_response(
-            {
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "function_call",
-                        "call_id": "c",
-                        "name": "f",
-                        "arguments": "{}",
-                    }
-                ],
-            }
-        )
-        assert resp.stop_reason == "tool_use"
-
-
-# --------------------------------------------------------------------------- #
-# 场景 4：tools 扁平化 + tool_choice
-# --------------------------------------------------------------------------- #
 class TestToolsFlattening:
     """tools 扁平形态与 tool_choice 归一。"""
 
@@ -472,36 +303,6 @@ class TestDegradation:
 
 # --------------------------------------------------------------------------- #
 # chat 集成（端点 / 认证头）
-# --------------------------------------------------------------------------- #
-class TestChat:
-    """chat() 非流式路径（mock httpx）。"""
-
-    @pytest.mark.asyncio
-    async def test_chat_posts_to_responses_with_bearer(self):
-        mock_client = _make_mock_client(
-            json_body={
-                "model": "o4-mini",
-                "status": "completed",
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "hi"}],
-                    }
-                ],
-            }
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            resp = await _provider().chat([Message(role="user", content="q")])
-
-        call = mock_client.post.call_args
-        assert call[0][0] == "https://api.openai.com/v1/responses"
-        assert call[1]["headers"]["Authorization"] == "Bearer sk-test"
-        assert call[1]["headers"]["Content-Type"] == "application/json"
-        assert resp.content == "hi"
-
-
-# --------------------------------------------------------------------------- #
-# 场景 7：流式文本
 # --------------------------------------------------------------------------- #
 class TestStreamText:
     """流式文本增量。"""
@@ -634,6 +435,110 @@ class TestStreamToolCall:
 
 
 # --------------------------------------------------------------------------- #
+# R1：model 填充与 tool_use_stop 停点事件
+# --------------------------------------------------------------------------- #
+class TestStreamModelAndToolStop:
+    """model 填充（completed/首个可用事件）与 output_item.done → tool_use_stop。"""
+
+    @pytest.mark.asyncio
+    async def test_model_from_completed_response(self):
+        lines = _sse(
+            "response.output_text.delta",
+            {"type": "response.output_text.delta", "delta": "hi"},
+        ) + _sse(
+            "response.completed",
+            {
+                "type": "response.completed",
+                "response": {
+                    "status": "completed",
+                    "model": "gpt-4o-real",
+                    "output": [],
+                },
+            },
+        )
+        mock_client = _make_stream_client(lines)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            chunks = await _collect(_provider(), [Message(role="user", content="q")])
+
+        models = [c.model for c in chunks if c.model]
+        assert models == ["gpt-4o-real"]
+        # 聚合后 model 保留
+        from app.services.llm.models import StreamAggregator
+
+        agg = StreamAggregator()
+        for chunk in chunks:
+            agg.feed(chunk)
+        assert agg.finalize().model == "gpt-4o-real"
+
+    @pytest.mark.asyncio
+    async def test_output_item_done_function_call_emits_tool_use_stop(self):
+        lines = (
+            _sse(
+                "response.output_item.added",
+                {
+                    "type": "response.output_item.added",
+                    "item": {
+                        "type": "function_call",
+                        "id": "item_1",
+                        "call_id": "call_1",
+                        "name": "search",
+                    },
+                },
+            )
+            + _sse(
+                "response.output_item.done",
+                {
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "id": "item_1",
+                        "call_id": "call_1",
+                        "name": "search",
+                    },
+                },
+            )
+            + _sse(
+                "response.completed",
+                {
+                    "type": "response.completed",
+                    "response": {
+                        "status": "completed",
+                        "output": [
+                            {
+                                "type": "function_call",
+                                "call_id": "call_1",
+                                "name": "search",
+                            }
+                        ],
+                    },
+                },
+            )
+        )
+        mock_client = _make_stream_client(lines)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            chunks = await _collect(_provider(), [Message(role="user", content="q")])
+
+        stops = [c for c in chunks if c.type == "tool_use_stop"]
+        assert len(stops) == 1
+        assert stops[0].tool_use_id == "call_1"
+
+    @pytest.mark.asyncio
+    async def test_output_item_done_non_function_ignored(self):
+        lines = _sse(
+            "response.output_item.done",
+            {
+                "type": "response.output_item.done",
+                "item": {"type": "message", "id": "m1"},
+            },
+        )
+        mock_client = _make_stream_client(lines)
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            chunks = await _collect(_provider(), [Message(role="user", content="q")])
+
+        assert not [c for c in chunks if c.type == "tool_use_stop"]
+
+
+# --------------------------------------------------------------------------- #
 # 场景 9：流式 reasoning 摘要
 # --------------------------------------------------------------------------- #
 class TestStreamReasoningSummary:
@@ -716,7 +621,7 @@ class TestStreamCompleted:
 # M2：流式 incomplete（截断）与 _stop_reason_of 一致性
 # --------------------------------------------------------------------------- #
 class TestStreamIncomplete:
-    """response.incomplete → usage + max_tokens stop；与 _parse_response 一致。"""
+    """response.incomplete → usage + max_tokens stop（截断口径一致）。"""
 
     def test_stop_reason_of_incomplete_maps_max_tokens(self):
         assert (
@@ -873,19 +778,7 @@ class TestEventNameCompatibility:
 # 场景 12：HTTP 错误
 # --------------------------------------------------------------------------- #
 class TestHttpErrors:
-    """非 2xx → 抛异常（chat 与 stream 两路径）。"""
-
-    @pytest.mark.asyncio
-    async def test_chat_http_error_raises(self):
-        mock_client = _make_mock_client(
-            status_code=500,
-            raise_for_status_side_effect=httpx.HTTPStatusError(
-                "error", request=Mock(), response=Mock(status_code=500)
-            ),
-        )
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            with pytest.raises(httpx.HTTPStatusError):
-                await _provider().chat([Message(role="user", content="q")])
+    """非 2xx → 抛异常（流式路径）。"""
 
     @pytest.mark.asyncio
     async def test_stream_http_error_raises(self):

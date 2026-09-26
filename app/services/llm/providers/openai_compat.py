@@ -3,8 +3,8 @@
 基于 httpx 实现的 BaseProvider，与任何遵循 OpenAI /v1/chat/completions
 API 规范的端点通信。
 
-内部中立模型 → OpenAI wire 格式的差异收敛在 _build_request /
-_parse_response 两个方法内（与 AnthropicProvider 结构对称）：
+流式（唯一调用形态）：``stream()`` 把 wire SSE 事件映射为归一化 StreamChunk；
+内部中立模型 → OpenAI wire 格式的差异收敛在 ``_build_request`` 内：
 - content 为 list[ContentBlock] 时取 text block 拼接（OpenAI wire 为字符串；
   thinking/tool 等 block 不适用于当前端点）
 - thinking_level → reasoning_effort（仅 o 系列模型生效，其余忽略并告警）
@@ -19,7 +19,6 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import (
-    ChatResponse,
     ContentBlock,
     Message,
     StreamChunk,
@@ -90,63 +89,17 @@ class OpenAICompatProvider(BaseProvider):
         self.proxy = proxy
         self.thinking_level = thinking_level
 
-    async def chat(self, messages: list[Message], **kwargs: Any) -> ChatResponse:
-        """向 API 发送聊天补全请求。
-
-        Args:
-            messages: 对话消息列表。
-            **kwargs: 覆盖默认的 model、max_tokens 或 temperature。
-
-        Returns:
-            包含助手回复内容和可选用量的 ChatResponse。
-
-        Raises:
-            httpx.HTTPStatusError: HTTP 错误响应。
-            httpx.TimeoutException: 请求超时。
-            ValueError: JSON 解码失败。
-        """
-        url = f"{self.api_base}/chat/completions"
-        model = kwargs.get("model", self.model)
-        proxy_label = f", proxy={self.proxy}" if self.proxy else ""
-        logger.debug(
-            f"LLM request: url={url}, model={model}, "
-            f"timeout={self.timeout}s{proxy_label}"
-        )
-
-        body = self._build_request(messages, **kwargs)
-
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-
-        async with create_async_client(
-            proxy=self.proxy,
-            timeout=self.timeout,
-            follow_redirects=True,
-        ) as client:
-            response = await client.post(
-                url,
-                json=body,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-        return self._parse_response(data)
-
     async def stream(
         self, messages: list[Message], **kwargs: Any
     ) -> AsyncIterator[StreamChunk]:
         """以 SSE 流式方式发送聊天补全请求。
 
-        请求构造复用 chat() 的 _build_request（reasoning_effort 映射、
+        请求构造复用 :meth:`_build_request`（reasoning_effort 映射、
         _extras_disabled / _force_tool_choice_degraded 降级、tools 规范化
-        全部沿用），仅追加 stream / stream_options 以启用增量与 usage 上报。
+        全部沿用），并追加 stream / stream_options 以启用增量与 usage 上报。
 
         provider 层不重试、不吞异常：httpx 异常/状态错误直接向上抛，
-        由 client 层（T7）负责重试与降级；已产出部分事件后发生的异常在
+        由 client 层负责重试与降级；已产出部分事件后发生的异常在
         迭代中自然抛出。
 
         Args:
@@ -180,6 +133,9 @@ class OpenAICompatProvider(BaseProvider):
         # index → (id, name)：OpenAI 仅在首个 tool_call 分片给出 id/name，
         # 后续 arguments 增量需据此还原归属。
         tool_index: dict[int, tuple[str, str]] = {}
+        # 跨事件状态：model_seen（真实模型名仅首个带 model 的事件填一次）、
+        # stopped（已补发 tool_use_stop 的 tool_call index，避免重复补发）。
+        state: dict[str, Any] = {"model_seen": False, "stopped": set()}
 
         async with create_async_client(
             proxy=self.proxy,
@@ -194,7 +150,7 @@ class OpenAICompatProvider(BaseProvider):
                 timeout=self.timeout,
             ) as response:
                 if not response.is_success:
-                    # 读取错误体并记录，便于上游日志/重试判断；再抛状态错误（与 chat() 一致）
+                    # 读取错误体并记录，便于上游日志/重试判断；再抛状态错误
                     error_body = (await response.aread()).decode("utf-8", "replace")
                     logger.warning(
                         f"LLM 流式请求失败: status={response.status_code}, "
@@ -205,15 +161,21 @@ class OpenAICompatProvider(BaseProvider):
                     if event.data == "[DONE]":
                         logger.debug("LLM 流式收到 [DONE]，结束迭代")
                         return
-                    for chunk in self._map_stream_event(event.data, tool_index):
+                    for chunk in self._map_stream_event(event.data, tool_index, state):
                         yield chunk
 
     def _map_stream_event(
-        self, raw: str, tool_index: dict[int, tuple[str, str]]
+        self, raw: str, tool_index: dict[int, tuple[str, str]], state: dict[str, Any]
     ) -> list[StreamChunk]:
         """单个 OpenAI chat.completion.chunk → 零或多个 StreamChunk。
 
         tool_index 为跨事件维护的 index → (id, name) 映射（原地更新）。
+        state 为跨事件状态：``model_seen`` 记录是否已填过真实 model；
+        ``stopped`` 记录已补发 tool_use_stop 的 index。
+
+        openai_compat 无 per-tool 停点信号：在 ``finish_reason`` 出现时为所有
+        已收到但尚未补发停点的 tool_calls（按 index 升序）补发 tool_use_stop，
+        并在其**之后**产出 stop 事件。
         """
         try:
             data = json.loads(raw)
@@ -238,10 +200,11 @@ class OpenAICompatProvider(BaseProvider):
             )
             finish_reason = choice.get("finish_reason")
             if finish_reason:
-                # 与 _parse_response 一致：tool_calls → tool_use，其余透传
+                # tool_calls → tool_use，其余透传
                 stop_reason = (
                     "tool_use" if finish_reason == "tool_calls" else finish_reason
                 )
+                chunks.extend(self._emit_tool_stops(tool_index, state))
                 chunks.append(StreamChunk(type="stop", stop_reason=stop_reason))
 
         usage = data.get("usage")
@@ -255,6 +218,28 @@ class OpenAICompatProvider(BaseProvider):
                         total_tokens=usage.get("total_tokens", 0),
                     ),
                 )
+            )
+
+        model = data.get("model") or ""
+        if model and not state.get("model_seen") and chunks:
+            # 真实模型名：首个带 model 的事件内首个产出事件填一次即可
+            chunks[0].model = model
+            state["model_seen"] = True
+        return chunks
+
+    @staticmethod
+    def _emit_tool_stops(
+        tool_index: dict[int, tuple[str, str]], state: dict[str, Any]
+    ) -> list[StreamChunk]:
+        """为所有已收到但尚未补发停点的 tool_calls 补发 tool_use_stop。"""
+        stopped: set = state.setdefault("stopped", set())
+        chunks: list[StreamChunk] = []
+        for index in sorted(tool_index):
+            if index in stopped:
+                continue
+            stopped.add(index)
+            chunks.append(
+                StreamChunk(type="tool_use_stop", tool_use_id=tool_index[index][0])
             )
         return chunks
 
@@ -473,64 +458,6 @@ class OpenAICompatProvider(BaseProvider):
             )
             return None
         return self._REASONING_EFFORT.get(level)
-
-    def _parse_response(self, data: dict) -> ChatResponse:
-        """OpenAI wire 格式 → 内部模型。"""
-        choice = data["choices"][0]
-        message = choice.get("message", {})
-        content = message.get("content")
-        refusal = message.get("refusal")
-        # finish_reason → stop_reason（与 Anthropic 对齐，供 max_tokens 截断判断用）；
-        # "tool_calls" 统一映射为内部 "tool_use"
-        finish_reason = choice.get("finish_reason") or ""
-        stop_reason = "tool_use" if finish_reason == "tool_calls" else finish_reason
-
-        if content is None:
-            if refusal:
-                raise ValueError(f"模型拒绝响应: {refusal}")
-            content = ""
-
-        blocks: list[ContentBlock] = []
-        text_parts: list[str] = []
-        if content:
-            text_parts.append(content)
-            blocks.append(TextBlock(text=content))
-
-        # wire tool_calls → ToolUseBlock 列表（arguments JSON 字符串解析，
-        # 解析失败兜底 {"raw": "<原字符串>"}）
-        for tc in message.get("tool_calls", []) or []:
-            fn = tc.get("function", {})
-            raw_args = fn.get("arguments", "{}")
-            try:
-                parsed = json.loads(raw_args) if raw_args else {}
-            except (json.JSONDecodeError, TypeError):
-                parsed = {"raw": raw_args}
-            blocks.append(
-                ToolUseBlock(
-                    id=tc.get("id", ""),
-                    name=fn.get("name", ""),
-                    input=parsed,
-                )
-            )
-
-        model = data.get("model", "")
-
-        usage: Usage | None = None
-        if "usage" in data:
-            u = data["usage"]
-            usage = Usage(
-                prompt_tokens=u.get("prompt_tokens", 0),
-                completion_tokens=u.get("completion_tokens", 0),
-                total_tokens=u.get("total_tokens", 0),
-            )
-
-        return ChatResponse(
-            content="".join(text_parts),
-            blocks=blocks,
-            model=model,
-            usage=usage,
-            stop_reason=stop_reason,
-        )
 
     def _wire_to_messages(self, wire_messages: list[dict]) -> list[Message]:
         """OpenAI wire 消息列表 → 内部消息列表（历史合并）。

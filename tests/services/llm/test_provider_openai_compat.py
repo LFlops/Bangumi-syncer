@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 import pytest
 
-from app.services.llm.models import ChatResponse, Message, StreamAggregator
+from app.services.llm.models import Message, StreamAggregator
 from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
 
@@ -81,209 +81,6 @@ class TestOpenAICompatProviderInit:
         assert provider.timeout == 30
 
 
-class TestOpenAICompatProviderChat:
-    """使用 mock httpx 的 chat() 方法集成测试。"""
-
-    @pytest.mark.asyncio
-    async def test_request_format(self):
-        """验证发送到 API 的请求格式正确。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "choices": [{"message": {"content": "Hello, world!"}}],
-                "model": "gpt-4o-mini",
-                "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 20,
-                    "total_tokens": 30,
-                },
-            }
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1",
-                api_key="sk-test",
-                model="gpt-4o-mini",
-                max_tokens=2000,
-                temperature=0.7,
-                timeout=60,
-            )
-            messages = [
-                Message(role="system", content="You are helpful."),
-                Message(role="user", content="Hello"),
-            ]
-            await provider.chat(messages)
-
-        mock_client.post.assert_called_once()
-        call_args = mock_client.post.call_args
-
-        # 验证 URL
-        assert call_args[0][0] == "https://api.openai.com/v1/chat/completions"
-
-        # 验证请求体
-        body = call_args[1]["json"]
-        assert body["model"] == "gpt-4o-mini"
-        assert body["max_tokens"] == 2000
-        assert body["temperature"] == 0.7
-        assert body["messages"] == [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"},
-        ]
-
-        # 验证 headers
-        headers = call_args[1]["headers"]
-        assert headers["Authorization"] == "Bearer sk-test"
-        assert headers["Content-Type"] == "application/json"
-
-        # 验证超时
-        assert call_args[1]["timeout"] == 60
-
-    @pytest.mark.asyncio
-    async def test_normal_response_parsing(self):
-        """验证正常的响应解析能提取内容和 usage。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "choices": [{"message": {"content": "The answer is 42."}}],
-                "model": "gpt-4o-mini",
-                "usage": {
-                    "prompt_tokens": 15,
-                    "completion_tokens": 8,
-                    "total_tokens": 23,
-                },
-            }
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            resp = await provider.chat([Message(role="user", content="Q")])
-
-        assert isinstance(resp, ChatResponse)
-        assert resp.content == "The answer is 42."
-        assert resp.model == "gpt-4o-mini"
-        assert resp.usage is not None
-        assert resp.usage.prompt_tokens == 15
-        assert resp.usage.completion_tokens == 8
-        assert resp.usage.total_tokens == 23
-
-    @pytest.mark.asyncio
-    async def test_response_without_usage(self):
-        """没有 usage 字段的响应也应正确解析。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "choices": [{"message": {"content": "No usage here."}}],
-                "model": "some-model",
-            }
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            resp = await provider.chat([Message(role="user", content="Q")])
-
-        assert resp.content == "No usage here."
-        assert resp.model == "some-model"
-        assert resp.usage is None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("status_code", [401, 429, 500])
-    async def test_http_error_handling(self, status_code):
-        """HTTP 错误应抛出 httpx.HTTPStatusError。"""
-        mock_client = _make_mock_client(
-            status_code=status_code,
-            raise_for_status_side_effect=httpx.HTTPStatusError(
-                "error",
-                request=Mock(),
-                response=Mock(status_code=status_code),
-            ),
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            with pytest.raises(httpx.HTTPStatusError):
-                await provider.chat([Message(role="user", content="Q")])
-
-    @pytest.mark.asyncio
-    async def test_timeout_handling(self):
-        """超时应作为 httpx.TimeoutException 传播。"""
-        mock_client = _make_mock_client(
-            post_side_effect=httpx.TimeoutException("timeout")
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            with pytest.raises(httpx.TimeoutException):
-                await provider.chat([Message(role="user", content="Q")])
-
-    @pytest.mark.asyncio
-    async def test_json_parse_failure(self):
-        """非 JSON 响应应抛出 JSON 解码错误。"""
-        mock_client = _make_mock_client(json_side_effect=ValueError("Invalid JSON"))
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            with pytest.raises(ValueError, match="Invalid JSON"):
-                await provider.chat([Message(role="user", content="Q")])
-
-    @pytest.mark.asyncio
-    async def test_extra_kwargs_override_defaults(self):
-        """传递给 chat() 的额外 kwargs 应覆盖默认参数。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "choices": [{"message": {"content": "OK"}}],
-                "model": "gpt-4o-mini",
-                "usage": {
-                    "prompt_tokens": 1,
-                    "completion_tokens": 1,
-                    "total_tokens": 2,
-                },
-            }
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            await provider.chat(
-                [Message(role="user", content="Q")],
-                model="gpt-4o",
-                max_tokens=100,
-                temperature=0.1,
-            )
-
-        call_body = mock_client.post.call_args[1]["json"]
-        assert call_body["model"] == "gpt-4o"
-        assert call_body["max_tokens"] == 100
-        assert call_body["temperature"] == 0.1
-
-    @pytest.mark.asyncio
-    async def test_context_manager_cleanup(self):
-        """httpx 客户端应通过上下文管理器正确关闭。"""
-        mock_client = _make_mock_client(
-            json_body={
-                "choices": [{"message": {"content": "OK"}}],
-                "model": "gpt-4o-mini",
-            }
-        )
-
-        with patch("httpx.AsyncClient", return_value=mock_client):
-            provider = OpenAICompatProvider(
-                api_base="https://api.openai.com/v1", api_key="sk-test"
-            )
-            await provider.chat([Message(role="user", content="Q")])
-
-        # 在 `async with` 内部，__aexit__ 应调用 aclose
-        mock_client.aclose.assert_awaited_once()
-
-
 class TestOpenAICompatBuildRequest:
     """Phase 2.2：_build_request / _to_wire_message / reasoning_effort 映射。"""
 
@@ -334,27 +131,6 @@ class TestOpenAICompatBuildRequest:
         assert body["reasoning_effort"] == "medium"
 
 
-class TestOpenAICompatParseResponse:
-    """Phase 2.2：_parse_response（含 refusal / 缺省字段）。"""
-
-    def test_refusal_raises(self):
-        provider = OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-        with pytest.raises(ValueError, match="模型拒绝响应"):
-            provider._parse_response(
-                {"choices": [{"message": {"content": None, "refusal": "不行"}}]}
-            )
-
-    def test_missing_usage_and_model_defaults(self):
-        provider = OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-        resp = provider._parse_response({"choices": [{"message": {}}]})
-        assert resp.content == ""
-        assert resp.usage is None
-
-
 class TestReasoningTemperatureAlignment:
     """H3：o 系列发 reasoning_effort 时 temperature 强制 1（与 Anthropic 侧对齐），
     避免推理模型对非 1 temperature 的硬 400。"""
@@ -393,43 +169,6 @@ class TestReasoningTemperatureAlignment:
             [Message(role="user", content="Q")], temperature=0.2
         )
         assert body["temperature"] == 1
-
-
-class TestFinishReasonMapping:
-    """M10：OpenAI finish_reason → stop_reason（与 Anthropic 对齐，供 P4 截断判断）。"""
-
-    def test_finish_reason_stop_mapped(self):
-        provider = OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-        resp = provider._parse_response(
-            {
-                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
-                "model": "gpt-4o-mini",
-            }
-        )
-        assert resp.stop_reason == "stop"
-
-    def test_finish_reason_length_mapped(self):
-        provider = OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-        resp = provider._parse_response(
-            {
-                "choices": [{"message": {"content": "ok"}, "finish_reason": "length"}],
-                "model": "gpt-4o-mini",
-            }
-        )
-        assert resp.stop_reason == "length"
-
-    def test_missing_finish_reason_defaults_empty(self):
-        provider = OpenAICompatProvider(
-            api_base="https://api.openai.com/v1", api_key="sk-test"
-        )
-        resp = provider._parse_response(
-            {"choices": [{"message": {"content": "ok"}}], "model": "gpt-4o-mini"}
-        )
-        assert resp.stop_reason == ""
 
 
 class _AsyncStreamCtx:
@@ -489,12 +228,17 @@ def _make_mock_stream_client(
     return mock_client
 
 
-def _chunk_payload(delta: dict, finish_reason: str | None = None) -> str:
+def _chunk_payload(
+    delta: dict, finish_reason: str | None = None, model: str | None = None
+) -> str:
     """构造一个 OpenAI chat.completion.chunk 的 data 负载。"""
     choice: dict = {"delta": delta}
     if finish_reason is not None:
         choice["finish_reason"] = finish_reason
-    return json.dumps({"choices": [choice]})
+    data: dict = {"choices": [choice]}
+    if model is not None:
+        data["model"] = model
+    return json.dumps(data)
 
 
 class TestOpenAICompatProviderStream:
@@ -636,6 +380,92 @@ class TestOpenAICompatProviderStream:
         stops = [c for c in chunks if c.type == "stop"]
         assert len(stops) == 1
         assert stops[0].stop_reason == "stop"
+
+    async def test_model_field_populated_from_first_chunk(self):
+        """model 填充：任一 chunk 顶层 model → 首个产出事件带上真实模型名。"""
+        payloads = [
+            _chunk_payload({"content": "Hello"}, model="gpt-4o-real"),
+            _chunk_payload({"content": " world"}, model="gpt-4o-real"),
+            _chunk_payload({}, finish_reason="stop", model="gpt-4o-real"),
+            "[DONE]",
+        ]
+        mock_client = _make_mock_stream_client(sse_lines=_sse_lines(*payloads))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = self._provider()
+            chunks = await self._collect(provider, [Message(role="user", content="x")])
+
+        assert chunks[0].model == "gpt-4o-real"
+        # 只填一次：后续事件不再携带 model
+        assert all(c.model == "" for c in chunks[1:])
+
+        agg = StreamAggregator()
+        for chunk in chunks:
+            agg.feed(chunk)
+        assert agg.finalize().model == "gpt-4o-real"
+
+    async def test_tool_use_stop_emitted_before_stop(self):
+        """openai_compat 无 per-tool 停点：finish_reason 时为已收到 tool_calls 补发 stop。"""
+        payloads = [
+            _chunk_payload(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_abc",
+                            "function": {"name": "f", "arguments": "{}"},
+                        }
+                    ]
+                }
+            ),
+            _chunk_payload({}, finish_reason="tool_calls"),
+            "[DONE]",
+        ]
+        mock_client = _make_mock_stream_client(sse_lines=_sse_lines(*payloads))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = self._provider()
+            chunks = await self._collect(provider, [Message(role="user", content="x")])
+
+        types = [c.type for c in chunks]
+        assert "tool_use_stop" in types
+        assert types.index("tool_use_stop") < types.index("stop")
+        stop_chunks = [c for c in chunks if c.type == "tool_use_stop"]
+        assert len(stop_chunks) == 1
+        assert stop_chunks[0].tool_use_id == "call_abc"
+
+    async def test_tool_use_stop_not_duplicated(self):
+        """重复 finish_reason 不重复补发 tool_use_stop。"""
+        payloads = [
+            _chunk_payload(
+                {"tool_calls": [{"index": 0, "id": "c0", "function": {"name": "f"}}]}
+            ),
+            _chunk_payload({}, finish_reason="tool_calls"),
+            _chunk_payload({}, finish_reason="tool_calls"),
+            "[DONE]",
+        ]
+        mock_client = _make_mock_stream_client(sse_lines=_sse_lines(*payloads))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = self._provider()
+            chunks = await self._collect(provider, [Message(role="user", content="x")])
+
+        stop_chunks = [c for c in chunks if c.type == "tool_use_stop"]
+        assert len(stop_chunks) == 1
+
+    async def test_no_tool_use_stop_without_tool_calls(self):
+        """无 tool_calls 时不产出 tool_use_stop。"""
+        payloads = [
+            _chunk_payload({"content": "ok"}, finish_reason="stop"),
+            "[DONE]",
+        ]
+        mock_client = _make_mock_stream_client(sse_lines=_sse_lines(*payloads))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = self._provider()
+            chunks = await self._collect(provider, [Message(role="user", content="x")])
+
+        assert not [c for c in chunks if c.type == "tool_use_stop"]
 
     async def test_usage_event_from_final_chunk(self):
         """usage 事件：末 chunk 含 usage → 产出 usage 事件且 token 数正确。"""
