@@ -86,6 +86,14 @@ from app.core.config import config_manager  # noqa: E402
 from app.core.database import database_manager  # noqa: E402
 from app.models.trakt import TraktConfig  # noqa: E402
 
+# ===== 场景装配（Composition Root）=====
+# 必须在任何测试运行前、且在 CONFIG_FILE / DB 重定向等环境准备完成后执行：
+# 静态装配 match 场景，使调度器等经 get_scenario("match") 取用运行时可用。
+# import llm_assist 会触发其依赖链加载，故置于环境准备之后。
+from app.services.scenarios import wire_scenarios  # noqa: E402
+
+wire_scenarios()
+
 
 @pytest.fixture
 def test_db():
@@ -514,6 +522,39 @@ def clean_proxy_env():
     # 恢复（可选，如果 scope 是 function 则必须恢复）
     for key, value in stash.items():
         os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _speed_up_bangumi_rate_limit():
+    """测试加速：把进程级 Bangumi API 令牌桶替换为高速率实例。
+
+    令牌桶默认 1 req/s、burst=3，多个测试连续发请求会触发真实 sleep 拖慢套件。
+    需要验证限速行为的测试（tests/utils/test_bangumi_rate_limit.py）会在用例内
+    显式 reset 为注入假时钟的实例，不受此 fixture 影响。
+    """
+    from app.utils.bangumi_api.rate_limit import (
+        RateLimiter,
+        reset_bgm_rate_limiter,
+    )
+
+    reset_bgm_rate_limiter(RateLimiter(rate=1_000_000.0, burst=1_000_000))
+    yield
+    reset_bgm_rate_limiter(RateLimiter(rate=1_000_000.0, burst=1_000_000))
+
+
+@pytest.fixture(autouse=True)
+def _clear_llm_match_active_runs():
+    """测试隔离：清空 LLM 匹配调度器的进程级 active run 集合。
+
+    ``llm_match_scheduler._active_run_ids`` 是模块级进程状态，测试中预置或
+    残留会跨用例、跨测试模块污染（导致恢复扫描被误跳过）。此处统一在每条
+    测试前后清空，与 ``_speed_up_bangumi_rate_limit`` 等全局 fixture 风格一致。
+    """
+    from app.services.llm_match_scheduler import _clear_active_runs
+
+    _clear_active_runs()
+    yield
+    _clear_active_runs()
 
 
 @pytest.fixture(autouse=True)

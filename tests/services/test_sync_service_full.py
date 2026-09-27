@@ -438,6 +438,117 @@ def test_sync_custom_item_anime_completes_collection(mock_database, mock_bangumi
     )
 
 
+def test_sync_custom_item_anime_completes_collection_with_archive(
+    mock_database, mock_bangumi_api
+):
+    """开启 Archive 离线层时总集数取自 Archive 补全的 eps，自动归档照常生效。"""
+    service = SyncService()
+    mock_instance = mock_bangumi_api.return_value
+    mock_instance.get_subject_collection.return_value = {"type": 3, "ep_status": 12}
+
+    def get_subject_side_effect(subject_id, use_archive=True):
+        # Archive 在 get_subject 数据边界补全 eps，离线命中同样带总集数
+        return {"id": 123, "name": "Test Anime", "eps": 12}
+
+    mock_instance.get_subject.side_effect = get_subject_side_effect
+
+    with (
+        patch("app.services.sync_service.config_manager") as mock_cfg,
+        patch(
+            "app.core.accounts.list_bangumi_accounts",
+            return_value=[{"section_name": "bangumi"}],
+        ),
+        patch(
+            "app.core.accounts.get_single_mode_media_usernames",
+            return_value=["testuser"],
+        ),
+    ):
+
+        def get_side_effect(section, key, fallback=None):
+            if section == "sync" and key == "anime_mark_subject_completed":
+                return True
+            if section == "sync" and key == "mode":
+                return "single"
+            if section == "sync" and key == "blocked_keywords":
+                return ""
+            if section == "bangumi_data" and key == "enabled":
+                return False
+            return fallback
+
+        mock_cfg.get.side_effect = get_side_effect
+        mock_cfg.get_single_mode_media_usernames.return_value = ["testuser"]
+        mock_cfg.get_user_mappings.return_value = {}
+        mock_cfg.get_bangumi_configs.return_value = {}
+
+        item = CustomItem(
+            user_name="testuser",
+            title="TV Anime X",
+            ori_title=None,
+            season=1,
+            episode=12,
+            media_type="episode",
+            release_date="",
+        )
+
+        with patch.object(service, "_find_subject_id", return_value=("456", False, "")):
+            with patch.object(
+                service,
+                "_get_bangumi_config_for_user",
+                return_value={
+                    "username": "testuser",
+                    "access_token": "***",
+                    "private": True,
+                },
+            ):
+                result = service.sync_custom_item(item, "custom")
+
+    assert result.status == "success"
+    mock_instance.change_collection_state.assert_called_once_with(
+        subject_id="123", state=2
+    )
+    # 总集数不绕过 Archive：use_archive 保持默认，eps 由 Archive 数据边界补全
+    assert "use_archive" not in mock_instance.get_subject.call_args.kwargs
+
+
+def test_other_accounts_archive_uses_archive_total_eps():
+    """其余账号的归档判定同样以 Archive 补全的 eps 为总集数，不绕过 Archive。"""
+    from unittest.mock import MagicMock
+
+    service = SyncService()
+    other = MagicMock()
+    other.get_subject_collection.return_value = {"type": 3, "ep_status": 12}
+
+    def get_subject_side_effect(subject_id, use_archive=True):
+        # Archive 在 get_subject 数据边界补全 eps，离线命中同样带总集数
+        return {"id": 123, "name": "Test Anime", "eps": 12}
+
+    other.get_subject.side_effect = get_subject_side_effect
+
+    item = CustomItem(
+        user_name="testuser",
+        title="TV Anime X",
+        ori_title=None,
+        season=1,
+        episode=12,
+        media_type="episode",
+        release_date="",
+    )
+
+    with patch("app.services.sync_service.config_manager") as mock_cfg:
+
+        def get_side_effect(section, key, fallback=None):
+            if section == "sync" and key == "anime_mark_subject_completed":
+                return True
+            return fallback
+
+        mock_cfg.get.side_effect = get_side_effect
+        service._mark_subject_completed_if_needed(item, other, "123", "TV Anime X")
+
+    other.change_collection_state.assert_called_once_with(subject_id="123", state=2)
+    # 其余账号同样不绕过 Archive
+    assert "use_archive" not in other.get_subject.call_args.kwargs
+
+
 def test_check_season_info_in_title(mock_config, mock_database):
     """测试检查标题中的季度信息"""
     service = SyncService()
@@ -898,8 +1009,7 @@ def test_find_subject_id_api_top_is_movie_no_related_keeps_first():
 
 
 def test_find_subject_id_api_top_movie_picks_mainline_over_derivative():
-    """完美世界场景：首条是剧场版（movie），候选中有衍生短番（双食记 6 集）
-    和多季主线剧集，应优先选主线剧集（按 eps 择优），而非衍生短番。
+    """完美世界场景回归测试（行为变更，2026-09-08 匹配调研决策）。
 
     模拟真实搜索结果：
     - 542046 完美世界剧场版 九劫焚天（movie，detect 排除）
@@ -907,7 +1017,20 @@ def test_find_subject_id_api_top_movie_picks_mainline_over_derivative():
     - 403251 完美世界 第三季（episode，eps=52 主线剧集）
     - 345811 完美世界 第二季（episode，eps=52 主线剧集）
 
-    应选 403251 或 345811（eps 最大），而非 175141。
+    **新行为**（收紧 `_media_type_reselect` 触发条件后）：API 排序将
+    剧场版排到末尾，175141（双食记，WEB）成为 top。top 与 request 同为
+    episode → 不触发改选 → 直接接受 175141。
+
+    **旧行为**（已删除）：`need_reselect = top_detected != request_media_type or
+    not top_exact_match` —— 后者 `not top_exact_match` 在 "完美世界" 不等于
+    "完美世界双食记" 时为真 → 触发改选 → `_pick_mainline_episode_candidate`
+    按"eps 最大"跨季择优选到 403251/345811（但跨季时反而选到集数更多的前作，
+    副作用见 S3_季后缀 4 条错配）。
+
+    **决策**（grill-me 2026-09-08）：宁可信任 top / API 排序，宁可漏标。
+    本测试在权衡下接受 175141 作为新基线，理由：用户对"错标污染 Bangumi 收藏"
+    的容忍度更低，宁可错配衍生短番（用户能立刻发现并补映射），也不要让
+    `not top_exact_match` 这种宽触发条件继续在跨季场景制造隐式错配。
     """
     with _patched_sync_service_deps() as cfg:
 
@@ -970,10 +1093,13 @@ def test_find_subject_id_api_top_movie_picks_mainline_over_derivative():
                             release_date="",
                         )
                     )
-        # 应改选到主线剧集（403251 或 345811），而非衍生短番 175141
+        # 新行为：top 175141（双食记，WEB，episode 类型一致 → 不触发改选）
+        # 旧行为：会改选到 403251/345811（主线剧集），但跨季副作用是 S3 错配 4 条
         sid_str = str(sid)
-        assert sid_str in {"403251", "345811"}, f"应改选到主线剧集，实际命中 {sid_str}"
-        assert sid_str != "175141", "不应命中衍生短番双食记"
+        assert sid_str == "175141", (
+            f"新行为：信任 API 排序，应直接接受 top 175141（双食记），"
+            f"实际命中 {sid_str}。如确需重新启用跨季改选，请评估 S3 4 条错配的回归。"
+        )
 
 
 def test_pick_mainline_episode_candidate_prefers_exact_title_match():
@@ -1003,8 +1129,14 @@ def test_pick_mainline_episode_candidate_prefers_season_keyword():
     assert result["id"] == 403251
 
 
-def test_pick_mainline_episode_candidate_falls_back_to_max_eps():
-    """_pick_mainline_episode_candidate：无精确匹配且无季番声明时按 eps 择优。"""
+def test_pick_mainline_episode_candidate_falls_back_to_first_when_no_season_keyword():
+    """_pick_mainline_episode_candidate：无精确匹配且无季番声明时取第一个候选。
+
+    行为变更（2026-09-08 匹配调研决策）：原「按 eps 最大择优」被删除，
+    跨季场景下该规则不安全（凡人修仙传 81 集会盖过凡人修仙传 新年番 48 集）。
+    新语义：宁可取第一个候选（API 返回顺序），不再按集数取最大。
+    "宁可漏标"原则 —— 错选比漏选代价更高。
+    """
     service = SyncService()
     candidates = [
         {"id": 1, "name": "完美世界A", "name_cn": "完美世界A", "eps": 10},
@@ -1012,7 +1144,7 @@ def test_pick_mainline_episode_candidate_falls_back_to_max_eps():
         {"id": 3, "name": "完美世界C", "name_cn": "完美世界C", "eps": 50},
     ]
     result = service._pick_mainline_episode_candidate(candidates, "完美世界")
-    assert result["id"] == 2
+    assert result["id"] == 1  # 取第一个（不再按 eps 排序）
 
 
 def test_find_subject_id_api_disabled_no_bgm_instance():
@@ -1120,10 +1252,13 @@ def test_find_subject_id_archive_hit_marks_stage_as_archive():
         archive_steps = [s for s in trace.steps if s.stage == "archive"]
         assert len(archive_steps) == 2
         assert all(s.status == "hit" for s in archive_steps)
-        # APISearchStep 的 archive step 携带候选（source="archive"）
+        # C4：archive 短路 step 与 APISearchStep（stage_override=archive）都携带候选。
+        # 此前只有 APISearchStep 落地时才产出候选，archive 短路是「无候选盲信」。
         steps_with_candidates = [s for s in archive_steps if s.candidates]
-        assert len(steps_with_candidates) == 1
-        assert all(c.source == "archive" for c in steps_with_candidates[0].candidates)
+        assert len(steps_with_candidates) == 2
+        assert all(
+            c.source == "archive" for s in steps_with_candidates for c in s.candidates
+        )
         # 不应出现 stage="api_search" 的命中步骤
         api_hit_steps = [
             s for s in trace.steps if s.stage == "api_search" and s.status == "hit"

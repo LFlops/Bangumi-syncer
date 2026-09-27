@@ -2,12 +2,15 @@
 Summary AI 观影报告任务管理 API。
 """
 
+import json
 from urllib.parse import unquote
 
 from fastapi import APIRouter, Depends, HTTPException
+from sse_starlette.sse import EventSourceResponse
 
 from ..core.config import config_manager
 from ..core.database import database_manager
+from ..core.logging import logger
 from ..models.summary import (
     ClearMemoryRequest,
     SummaryJobCreate,
@@ -15,14 +18,36 @@ from ..models.summary import (
     SummaryJobTestResponse,
     SummaryJobUpdate,
 )
+from ..services.llm.models import StreamChunk
 from ..services.memory.service import MemoryService
 from ..services.summary import SummaryJobConfig, summary_scheduler, summary_service
+from ..services.summary.service import SummaryStreamResult
 from .deps import get_current_user_flexible
 
 router = APIRouter(prefix="/api/summary/jobs", tags=["summary_jobs"])
 
 # 记忆清理入口（改名联动 / clear-memory 端点）
 memory_service = MemoryService(database_manager.memory)
+
+
+def _reload_config_best_effort() -> None:
+    """持久层写入成功后的内存重载：失败仅记日志，不向上抛出。
+
+    持久层（ini/SQLite）已经成功，内存态会在下次启动/保存时自行收敛；
+    若在此抛 500，用户会误以为操作失败而重试，但重试寻址可能已失效。
+    """
+    try:
+        config_manager.reload_config()
+    except Exception as e:
+        logger.error(f"配置已写入但内存重载失败（将在下次启动/保存时收敛）: {e}")
+
+
+async def _apply_scheduler_config_best_effort() -> None:
+    """调度器同步：失败仅记日志，不改变持久层成功语义。"""
+    try:
+        await summary_scheduler.apply_config_after_save()
+    except Exception as e:
+        logger.error(f"配置已写入但调度器同步失败（将在下次启动/保存时收敛）: {e}")
 
 
 def _validate_job_name(name: str, old_name: str = "") -> None:
@@ -53,8 +78,10 @@ async def create_summary_job(
     _validate_job_name(body.name)
     data = body.model_dump()
     config_manager.save_summary_config(data)
-    config_manager.reload_config()
-    await summary_scheduler.apply_config_after_save()
+    # save 成功后持久层语义已成立：reload/apply 属运行时同步，
+    # 失败只降级为日志（内存会自行收敛），避免误报 500 诱导重复创建。
+    _reload_config_best_effort()
+    await _apply_scheduler_config_best_effort()
     return {"status": "success", "message": "摘要任务已创建"}
 
 
@@ -69,26 +96,43 @@ async def update_summary_job(
         if updates["name"] != decoded:
             old_type = f"watching_summary_{decoded}"
             new_type = f"watching_summary_{updates['name']}"
+            # 先迁记忆、再改配置名：rename_task 失败时旧名配置仍在，任务依旧可寻址，
+            # 用户重试即可自愈（rename_task 幂等）；避免配置改名成功后记忆迁移失败，
+            # 导致旧名寻址失效、记忆成为孤儿且无法重试。
+            try:
+                memory_service.rename_task(
+                    "summary", f"summary-{decoded}", f"summary-{updates['name']}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"任务改名记忆迁移失败（{decoded}→{updates['name']}）: {e}"
+                )
+                raise HTTPException(
+                    500, "任务改名失败：记忆迁移异常，请稍后重试"
+                ) from e
             config_manager.rename_notification_type(old_type, new_type)
-            # 记忆跟随任务（与 rename_notification_type 同流程）
-            memory_service.rename_task(
-                "summary", f"summary-{decoded}", f"summary-{updates['name']}"
-            )
     config_manager.save_summary_config(updates, old_name=decoded)
-    config_manager.reload_config()
-    await summary_scheduler.apply_config_after_save()
+    # save 成功后持久层语义已成立：reload/apply 失败只降级为日志。
+    _reload_config_best_effort()
+    await _apply_scheduler_config_best_effort()
     return {"status": "success", "message": "摘要任务已更新"}
 
 
 @router.delete("/{name:path}")
 async def delete_summary_job(name: str, _=Depends(get_current_user_flexible)):
     decoded = unquote(name)
+    # 先清记忆、再删配置：clear_task 失败时配置仍在，任务名依旧可寻址，
+    # 用户重试即可自愈（clear_task 幂等收敛）；若先删配置，则中途失败会留下
+    # 无法寻址的孤儿记忆（主表 + 归档 + 消费标记，同一事务）。
+    try:
+        memory_service.clear_task("summary", f"summary-{decoded}")
+    except Exception as e:
+        logger.error(f"删除任务时清理记忆失败（{decoded}）: {e}")
+        raise HTTPException(500, "删除任务失败：记忆清理异常，请稍后重试") from e
     config_manager.delete_summary_config(decoded)
-    # 清理该任务记忆（主表 + 归档 + 消费标记，同一事务）：
-    # 避免孤儿记忆行与悬挂 consumed_run_id（重名重建 job 时产生虚假 overlap）。
-    memory_service.clear_task("summary", f"summary-{decoded}")
-    config_manager.reload_config()
-    await summary_scheduler.apply_config_after_save()
+    # 持久层已成功：reload/apply 运行时同步失败只降级为日志（无需重试，内存会自行收敛）。
+    _reload_config_best_effort()
+    await _apply_scheduler_config_best_effort()
     return {"status": "success", "message": "摘要任务已删除"}
 
 
@@ -138,13 +182,74 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
     )
 
 
-@router.post("/{name:path}/trigger")
-async def trigger_summary_job(name: str, _=Depends(get_current_user_flexible)):
-    """手动立即触发一次摘要任务（生成摘要 + 发送通知）。"""
+def _chunk_to_stream_event(chunk: StreamChunk) -> dict | None:
+    """把 LLM 归一化事件映射为前端可消费的 SSE 事件体。
+
+    仅透传正文/思考增量；usage/stop/tool_use 等由服务层聚合为 done 事件，
+    不在增量阶段重复推送（返回 None 表示该事件不产生 SSE 输出）。
+    """
+    if chunk.type == "text_delta":
+        return {"type": "delta", "text": chunk.text}
+    if chunk.type == "thinking_delta":
+        return {"type": "thinking", "text": chunk.thinking}
+    return None
+
+
+async def _summary_test_stream_generator(job_config: SummaryJobConfig):
+    """试生成 SSE 事件生成器：delta/thinking 增量 → done（聚合）→ 或 error。"""
+    result = SummaryStreamResult()
+    try:
+        async for chunk in summary_service.generate_summary_stream(job_config, result):
+            event = _chunk_to_stream_event(chunk)
+            if event is not None:
+                yield {"data": json.dumps(event, ensure_ascii=False)}
+
+        usage = result.usage
+        done = {
+            "type": "done",
+            "model": result.model,
+            "prompt_tokens": usage.prompt_tokens if usage else 0,
+            "completion_tokens": usage.completion_tokens if usage else 0,
+            "total_tokens": usage.total_tokens if usage else 0,
+            "latency_ms": result.latency_ms,
+            "record_count": result.record_count,
+        }
+        yield {"data": json.dumps(done, ensure_ascii=False)}
+    except Exception as e:
+        # 异常统一转 error 事件（不 500）：前端据 type=error 展示失败。
+        # CancelledError（客户端断开）不属 Exception，会向上传播终止生成器。
+        logger.error(f"Summary job '{job_config.name}' 流式试生成失败: {e}")
+        yield {
+            "data": json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+        }
+
+
+@router.get("/{name:path}/test/stream")
+async def test_summary_job_stream(name: str, _=Depends(get_current_user_flexible)):
+    """流式试生成摘要（SSE）——逐 token 推送，末尾 done 携带用量/延迟。
+
+    与 POST /test 的区别：不等待全量结果，正文增量渲染；预览语义一致
+    （不含记忆注入、不写记忆、不发通知）。任务不存在时在建立流之前返回 404。
+    """
     decoded = unquote(name)
     target = _find_config(decoded)
     job_config = SummaryJobConfig.from_config_dict(target)
-    await summary_service.execute_job(job_config)
+    return EventSourceResponse(_summary_test_stream_generator(job_config))
+
+
+@router.post("/{name:path}/trigger")
+async def trigger_summary_job(name: str, _=Depends(get_current_user_flexible)):
+    """手动立即触发一次摘要任务（生成摘要 + 发送通知）。
+
+    任务已在执行（手动连点或与 cron 重叠）时返回 skipped，避免重复 LLM 调用、
+    重复记忆写入与重复通知。
+    """
+    decoded = unquote(name)
+    target = _find_config(decoded)
+    job_config = SummaryJobConfig.from_config_dict(target)
+    executed = await summary_service.execute_job(job_config)
+    if not executed:
+        return {"status": "skipped", "message": "任务正在执行中，本次触发已跳过"}
     return {"status": "success", "message": f"任务 '{job_config.name}' 已触发"}
 
 
@@ -163,7 +268,11 @@ async def clear_summary_job_memory(
     _find_config(decoded)  # 任务不存在 404
     if not body.confirm:
         raise HTTPException(422, "必须携带 confirm=true 确认清空")
-    deleted = memory_service.clear_task("summary", f"summary-{decoded}")
+    try:
+        deleted = memory_service.clear_task("summary", f"summary-{decoded}")
+    except Exception as e:
+        logger.error(f"清空任务记忆失败（{decoded}）: {e}")
+        raise HTTPException(500, "清空任务记忆失败，请稍后重试") from e
     return {
         "status": "success",
         "message": "任务记忆已清空",
@@ -186,6 +295,8 @@ async def summary_job_memory_stats(name: str, _=Depends(get_current_user_flexibl
     task_id = f"summary-{decoded}"
 
     rows = database_manager.memory.get_recent("summary", task_id, limit=1000)
+    # 摘要失败占位行（summary=""）只承载消费标记，不计入统计与注入估算（B1 读取侧适配）
+    rows = [e for e in rows if e.summary]
     total_count = len(rows)
     total_chars = sum(len(e.summary) for e in rows)
     avg_chars = round(total_chars / total_count) if total_count else 0

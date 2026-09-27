@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.services.memory.models import MemoryEntry
+from app.models.memory import MemoryEntry
 
 MAIN_COLS = "id, task_type, task_id, run_id, summary, full_text, outcome, tokens_used, created_at"
 
@@ -158,7 +158,9 @@ class TestStoreAndMark:
         assert rows[0][3] == "run-1"  # run_id
         assert rows[0][4] == "昨日看了芙莉莲"  # summary
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         by_id = {r["id"]: r for r in recs}
         assert by_id[r1]["consumed_run_ids"] == {"run-1"}
         assert by_id[r2]["consumed_run_ids"] == {"run-1"}
@@ -168,7 +170,9 @@ class TestStoreAndMark:
         db.memory.store_and_mark(_entry("run-2"), [])
 
         assert len(_main_rows(db)) == 1
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert all(r["consumed_run_ids"] == set() for r in recs)
 
     def test_duplicate_run_id_raises(self, temp_dir, reset_singletons):
@@ -402,9 +406,23 @@ class TestQueryConsumed:
         r1 = _log_record(db)
         db.memory.store_and_mark(_entry("run-1"), [r1])
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert recs and "consumed_run_ids" in recs[0]
         assert recs[0]["consumed_run_ids"] == {"run-1"}
+
+    def test_default_query_omits_consumed_and_returns_empty_set(
+        self, temp_dir, reset_singletons
+    ):
+        """P1：默认（轻量）查询返回空集合（无 JOIN/GROUP BY，记忆关闭场景）。"""
+        db = _make_db(temp_dir)
+        r1 = _log_record(db)
+        db.memory.store_and_mark(_entry("run-1"), [r1])
+
+        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        assert recs and "consumed_run_ids" in recs[0]
+        assert recs[0]["consumed_run_ids"] == set()
 
 
 # ── 2.0.3 清理与重置：rename_task / clear_task（C1-C12）──────────────────
@@ -489,7 +507,9 @@ class TestRenameTask:
         db.memory.store_and_mark(_entry("run-1", task_id="summary-daily"), [r1])
         db.memory.rename_task("summary", "summary-daily", "summary-daily2")
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert recs[0]["consumed_run_ids"] == {"run-1"}
 
     def test_rename_scoped_to_task_type_and_task(self, temp_dir, reset_singletons):
@@ -531,7 +551,9 @@ class TestClearTask:
         assert n == 6
         assert _main_rows(db) == []
         assert _archive_rows(db) == []
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert all(r["consumed_run_ids"] == set() for r in recs)
 
     def test_clear_task_isolation(self, temp_dir, reset_singletons):
@@ -578,7 +600,9 @@ class TestClearTask:
         # 与 C3 相同验证，此处显式断言 u1/u2/u3 三个标记（含归档 run_id）全清
         db.memory.clear_task("summary", "summary-daily")
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         marked = [r for r in recs if r["consumed_run_ids"]]
         assert marked == []
 
@@ -598,7 +622,9 @@ class TestClearTask:
 
         db.memory.clear_task("summary", "summary-daily")
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         by_id = {r["id"]: r for r in recs}
         assert by_id[r_daily]["consumed_run_ids"] == set()  # daily 标记被清
         assert by_id[r_yearly]["consumed_run_ids"] == {"y1"}  # yearly 标记保留
@@ -617,13 +643,50 @@ class TestClearTask:
         db.memory.store_and_mark(_entry("run-daily", task_id="summary-daily"), [r1])
         db.memory.store_and_mark(_entry("run-yearly", task_id="summary-yearly"), [r1])
 
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert recs[0]["consumed_run_ids"] == {"run-daily", "run-yearly"}
 
         # 清 daily → 只删 daily 的标记，yearly 保留
         db.memory.clear_task("summary", "summary-daily")
-        recs = db.get_records_in_date_range("2000-01-01", "2100-01-01")
+        recs = db.get_records_in_date_range(
+            "2000-01-01", "2100-01-01", include_consumed=True
+        )
         assert recs[0]["consumed_run_ids"] == {"run-yearly"}
+
+
+# ── 清理/改名写库异常必须传播（不得静默返回 0）────────────────────────
+# 真实验证路径：底层 SQL 执行（execute）抛异常，经 _run_write 上传导给调用方。
+# 不 mock _run_write 本身，避免掩盖"是否传入 reraise=True"。
+
+
+class TestCleanupWriteFailurePropagation:
+    """clear_task / rename_task 的写库异常必须向上抛出，而非吞掉返回 0。
+
+    对照 store_and_mark（reraise=True）：清理/改名是对用户可见的破坏性操作，
+    失败必须让 API 返回 500，不能假成功。
+    """
+
+    def _drop_main_table(self, db) -> None:
+        """删掉主表，令后续 SQL execute 抛 sqlite3.OperationalError。"""
+        db._get_connection().execute("DROP TABLE agent_working_memory")
+
+    def test_clear_task_write_failure_propagates(self, temp_dir, reset_singletons):
+        """clear_task：底层 execute 抛异常 → 异常向上传播（不返回 0）。"""
+        db = _make_db(temp_dir)
+        self._drop_main_table(db)
+
+        with pytest.raises(sqlite3.OperationalError):
+            db.memory.clear_task("summary", "summary-daily")
+
+    def test_rename_task_write_failure_propagates(self, temp_dir, reset_singletons):
+        """rename_task：底层 execute 抛异常 → 异常向上传播（不返回 0）。"""
+        db = _make_db(temp_dir)
+        self._drop_main_table(db)
+
+        with pytest.raises(sqlite3.OperationalError):
+            db.memory.rename_task("summary", "summary-daily", "summary-daily2")
 
 
 # ── 同剧关联联表（S5/S6/S7：get_related_titles）─────────────────────

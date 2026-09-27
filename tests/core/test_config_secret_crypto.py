@@ -76,6 +76,45 @@ def test_encrypt_without_master_returns_plaintext():
         assert csc.encrypt("still-plain") == "still-plain"
 
 
+def test_encrypt_warns_once_when_secret_missing(monkeypatch):
+    """无 secret_key 时 encrypt 仅 warning 一次（防刷屏），且行为保持明文透传。"""
+    monkeypatch.setattr(csc, "_master_secret", lambda: "")
+    # 重置模块级 flag，保证测试独立
+    monkeypatch.setattr(csc, "_encrypt_missing_master_warned", False)
+
+    with patch("app.core.logging.logger.warning") as warn_warn:
+        out1 = csc.encrypt("first-secret")
+        out2 = csc.encrypt("second-secret")
+
+    assert out1 == "first-secret"
+    assert out2 == "second-secret"
+    # 仅第一次调用触发 warning
+    assert warn_warn.call_count == 1
+    msg = warn_warn.call_args[0][0]
+    assert "secret_key" in msg
+
+
+def test_warn_if_master_missing_helper(monkeypatch):
+    """启动期 helper：无 secret_key 时 warning 一次并返回 True。"""
+    monkeypatch.setattr(csc, "_master_secret", lambda: "")
+    with patch("app.core.logging.logger.warning") as warn_warn:
+        result = csc.warn_if_master_missing()
+    assert result is True
+    assert warn_warn.call_count == 1
+    msg = warn_warn.call_args[0][0]
+    assert "secret_key" in msg
+    assert "明文" in msg
+
+
+def test_warn_if_master_present_helper(monkeypatch):
+    """启动期 helper：有 secret_key 时不告警并返回 False。"""
+    monkeypatch.setattr(csc, "_master_secret", lambda: "configured-key")
+    with patch("app.core.logging.logger.warning") as warn_warn:
+        result = csc.warn_if_master_missing()
+    assert result is False
+    warn_warn.assert_not_called()
+
+
 def test_decrypt_wrong_key_returns_ciphertext_string():
     """密文无法用当前 master 解密时回退为原串（兼容损坏或轮换密钥）。"""
     with patch.object(csc, "_master_secret", return_value="key-a"):

@@ -6,7 +6,7 @@ prune 降级到归档表（冷记忆，search_archive 用 LIKE 检索）。
 
 from __future__ import annotations
 
-from app.services.memory.models import MemoryEntry
+from app.models.memory import MemoryEntry
 
 from .base_repository import BaseRepository
 
@@ -129,7 +129,9 @@ class AgentMemoryRepository(BaseRepository):
             ).rowcount
             return n1 + n2
 
-        return self._run_write(_write, error_msg="迁移任务记忆失败", default=0)
+        return self._run_write(
+            _write, error_msg="迁移任务记忆失败", default=0, reraise=True
+        )
 
     def clear_task(self, task_type: str, task_id: str) -> int:
         """同一事务清空该 task 的记忆 + 消费标记。
@@ -180,7 +182,9 @@ class AgentMemoryRepository(BaseRepository):
                 ).rowcount
             return n1 + n2 + n3
 
-        return self._run_write(_write, error_msg="清空任务记忆失败", default=0)
+        return self._run_write(
+            _write, error_msg="清空任务记忆失败", default=0, reraise=True
+        )
 
     # ------------------------------------------------------------------
     # 读取

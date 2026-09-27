@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import time
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 from uuid import uuid4
 
+from app.core.config import config_manager
 from app.core.database import database_manager
 from app.core.logging import logger
+from app.models.memory import MemoryEntry
 
-from ..llm import Message, get_llm_client
-from ..memory.models import MemoryEntry
+from ..llm import ChatResponse, Message, collect, get_llm_client
+from ..llm.models import StreamAggregator, StreamChunk, Usage
 from ..memory.service import MemoryService
 from ..notification_service import notification_service
 from .models import SummaryJobConfig, SummaryRecord
@@ -26,6 +31,29 @@ _STAGE_QUERY = "query"  # 查询明细 + 注入记忆 + 构建消息
 _STAGE_CHAT = "chat"  # LLM 调用
 _STAGE_STORE = "store"  # 记忆写入（含消费标记）
 _STAGE_NOTIFY = "notify"  # 通知投递
+
+
+def _utc_to_local_date(created_at: str, tz: tzinfo | None = None) -> str | None:
+    """把 agent_working_memory.created_at（SQLite datetime('now')，UTC）转成本地日期。
+
+    ``created_at`` 形如 "YYYY-MM-DD HH:MM:SS"（按 UTC 解释）；``tz`` 为目标时区，
+    None 表示系统本地时区。返回 "YYYY-MM-DD"；空值或格式非法时返回 None，
+    由调用方回退 lookback_days，避免 date_from 变成非法/倒置的窗口。
+    """
+    if not created_at:
+        return None
+    try:
+        dt_utc = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        # 防御分支：脏数据格式异常，记录后可观测，由调用方回退 lookback
+        logger.warning(
+            f"Unparsable agent memory created_at, fallback to lookback: {created_at!r}"
+        )
+        return None
+    return dt_utc.astimezone(tz).strftime("%Y-%m-%d")
+
 
 _STAGE_FAILURE_META = {
     _STAGE_QUERY: {
@@ -49,12 +77,41 @@ _STAGE_FAILURE_META = {
 }
 
 
+@dataclass
+class SummaryStreamResult:
+    """流式试生成的终态元数据（生成器耗尽后由调用方读取）。
+
+    纯业务 DTO：全部字段由 SummaryService 在消费事件流过程中自行收集
+    （model 取事件真实值/回退配置、usage 取 usage 事件、latency 业务计时），
+    任何 LLM client 侧代码都不得引用或回填本类型（R1 后 client 已无
+    私有状态容器协议）。
+    """
+
+    model: str = ""
+    latency_ms: int = 0
+    usage: Usage | None = None
+    record_count: int = 0
+
+
+def _configured_model() -> str:
+    """当前 LLM 配置的 model（流式事件未携带真实模型名时的展示回退）。"""
+    try:
+        return config_manager.get_llm_config().get("model", "")
+    except Exception as e:  # noqa: BLE001 - 配置不可读仅影响展示，不阻断业务
+        # 防御分支：配置异常时回退空串并留日志，避免静默
+        logger.warning(f"读取 LLM 配置 model 失败，回退空串: {e}")
+        return ""
+
+
 class SummaryService:
     """生成 AI 驱动的追番观影总结。"""
 
     def __init__(self):
         # 记忆统一入口（extractor/retriever 是其内部组件，业务层不直接碰 repository）
         self.memory = MemoryService(database_manager.memory)
+        # 正在执行的任务名集合：进程内任务级互斥。手动 trigger 不经调度器
+        # max_instances=1 限制，可能与 cron 执行或自身连点并发重叠，这里兜底。
+        self._running: set[str] = set()
 
     @property
     def llm_client(self):
@@ -72,8 +129,9 @@ class SummaryService:
 
         增量窗口（incremental=True，execute_job 使用）：记忆开启
         （memory_limit>0）且本任务存在历史记忆时，date_from = 本任务最后一条
-        记忆的 created_at 日期（只总结上次总结点之后的增量记录）；无历史记忆
-        或 preview（generate_summary，incremental=False）时回退 lookback_days。
+        记忆的 created_at（UTC）转本地时区的日期（只总结上次总结点之后的增量
+        记录）；无历史记忆、created_at 无法解析或 preview（generate_summary，
+        incremental=False）时回退 lookback_days。
         """
         now = datetime.now()
         date_to = now.strftime("%Y-%m-%d")
@@ -86,17 +144,28 @@ class SummaryService:
             task_id = f"summary-{job_config.name}"
             last = self.memory.recent("summary", task_id, limit=1)
             if last and last[0].created_at:
-                # "YYYY-MM-DD HH:MM:SS" → 日期；长度不足（异常格式）时跳过
-                # 保持 lookback 默认，避免 date_from 变非法字符串
-                last_date = last[0].created_at[:10]
-                if len(last_date) == 10:
+                # created_at 是 SQLite 的 UTC 时间，须转本地日期后再与本地
+                # timestamp/date_to 对齐；转换失败（None）保持 lookback 默认
+                last_date = _utc_to_local_date(last[0].created_at)
+                if last_date:
                     date_from = last_date
 
+        # 防御：时钟回拨等异常导致记忆 created_at 落在未来时，增量起点会晚于终点；
+        # 夹紧为单日窗口，避免倒置区间静默返回空结果
+        if date_from > date_to:
+            logger.warning(
+                "Incremental summary window inverted (clock skew?): "
+                f"date_from={date_from} > date_to={date_to}; clamped to {date_to}"
+            )
+            date_from = date_to
+
+        # 查询记录（仅记忆开启时携带消费标记做排除，避免无条件加重查询）
         records = database_manager.get_records_in_date_range(
             date_from=date_from,
             date_to=date_to,
             limit=job_config.max_records,
             user_name=job_config.user_name.strip() or None,
+            include_consumed=(job_config.memory_limit > 0),
         )
         converted = [
             SummaryRecord(
@@ -172,6 +241,10 @@ class SummaryService:
 
         lines = []
         for e, is_related in merged:
+            # 摘要失败占位行（summary=""）不注入：它只用于承载消费标记，
+            # 注入会产生裸 "- " 空条目（B1 读取侧适配）
+            if not e.summary:
+                continue
             prefix = "[同剧历史] " if is_related else ""
             lines.append(f"- {prefix}{e.summary}")
         return "\n".join(lines)
@@ -180,34 +253,126 @@ class SummaryService:
     # 对外入口
     # ------------------------------------------------------------------
 
-    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
-        """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
+    def _build_preview_context(
+        self, job_config: SummaryJobConfig
+    ) -> tuple[list[Message], int, str, str]:
+        """试生成共用路径：查询记录 → 解析 system prompt → 构建消息。
 
-        返回字典，包含以下键：summary_text、model、usage、record_count、
-        date_from、date_to。
+        返回 ``(messages, record_count, date_from, date_to)``。聚合路径
+        （``generate_summary``）与流式路径（``generate_summary_stream``）共用，
+        保证两条预览路径的消息与统计口径一致。
         """
         records, date_from, date_to = self._query_records(job_config)
         system_prompt = job_config.system_prompt.strip()
         if not system_prompt:
             system_prompt = SummaryJobConfig.system_prompt
         messages = self._build_messages(records, system_prompt, date_from, date_to)
+        return messages, len(records), date_from, date_to
 
-        response = await self.llm_client.chat(
-            messages,
-            job_name=job_config.name,
+    async def _call_llm(
+        self, messages: list[Message], job_config: SummaryJobConfig
+    ) -> ChatResponse:
+        """流式为唯一形态：消费 ``stream_chat`` 聚合为 ``ChatResponse``。
+
+        与 ``generate_summary_stream`` 同源（均直连 ``stream_chat``），差别只是
+        此处一次性聚合；latency 由业务侧墙钟计时（client 不再回填容器）。
+        ``job_name`` 经参数显式传入，保证 LLM 用量归属正确落库。
+        """
+        t0 = time.monotonic()
+        response = await collect(
+            self.llm_client.stream_chat(
+                messages,
+                job_name=job_config.name,
+                thinking_level=job_config.thinking_level,
+            )
         )
+        response.latency = int((time.monotonic() - t0) * 1000)
+        return response
+
+    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
+        """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
+
+        返回字典，包含以下键：summary_text、model、usage、record_count、
+        date_from、date_to。
+        """
+        messages, record_count, date_from, date_to = self._build_preview_context(
+            job_config
+        )
+
+        response = await self._call_llm(messages, job_config)
 
         return {
             "summary_text": response.content,
             "model": response.model,
             "usage": response.usage,
             "latency_ms": response.latency,
-            "record_count": len(records),
+            "record_count": record_count,
             "date_from": date_from,
             "date_to": date_to,
         }
 
-    async def execute_job(self, job_config: SummaryJobConfig) -> None:
+    async def generate_summary_stream(
+        self,
+        job_config: SummaryJobConfig,
+        result: SummaryStreamResult | None = None,
+    ) -> AsyncIterator[StreamChunk]:
+        """流式试生成：逐条透传 ``stream_chat`` 事件，终态元数据由业务收集。
+
+        与 ``generate_summary`` 共用消息构造与配置解析（``_build_preview_context``），
+        差别仅在底层走流式；预览语义（不含记忆注入、不写记忆、不发通知）保持一致。
+
+        元数据来源（不依赖任何 client 私有协议）：
+        - ``model``：事件 ``chunk.model`` 非空即取，全程缺失时回退配置 model；
+        - ``usage``：``usage`` 事件聚合；
+        - ``latency_ms``：业务侧 ``time.monotonic()`` 包住整个消费过程。
+
+        ``result`` 传入时承载上述元数据；异常（如 ``LLMCallError``）向上透传，
+        由调用方（SSE 端点）转 error 事件。
+        """
+        holder = result if result is not None else SummaryStreamResult()
+        messages, record_count, _date_from, _date_to = self._build_preview_context(
+            job_config
+        )
+        aggregator = StreamAggregator()
+        t0 = time.monotonic()
+        async for chunk in self.llm_client.stream_chat(
+            messages,
+            job_name=job_config.name,
+            thinking_level=job_config.thinking_level,
+        ):
+            aggregator.feed(chunk)
+            yield chunk
+        # 生成器耗尽：聚合终态元数据回填到业务 DTO
+        aggregated = aggregator.finalize()
+        holder.model = aggregated.model or _configured_model()
+        holder.usage = aggregated.usage
+        holder.latency_ms = int((time.monotonic() - t0) * 1000)
+        holder.record_count = record_count
+
+    async def execute_job(self, job_config: SummaryJobConfig) -> bool:
+        """完整执行入口：任务级互斥守卫 + 实际执行。
+
+        返回值语义：``True``=本次实际执行；``False``=该任务已在执行（手动 trigger
+        不经调度器 ``max_instances=1`` 限制，可能与 cron 执行或连点并发重叠）被跳过。
+
+        守卫在检查→登记之间不含 await（单事件循环内保持原子），因此并发同任务
+        只有一次能进入；被跳过的一次不查库、不调 LLM、不写记忆、不通知。
+        ``CancelledError``（超时取消）不被 inner 的 ``except Exception`` 捕获，
+        会直接传播到 ``finally`` 正确释放登记。
+        """
+        name = job_config.name
+        if name in self._running:
+            logger.warning(f"Summary job '{name}' 正在执行中，本次触发已跳过")
+            return False
+
+        self._running.add(name)
+        try:
+            await self._execute_job_inner(job_config)
+        finally:
+            self._running.discard(name)
+        return True
+
+    async def _execute_job_inner(self, job_config: SummaryJobConfig) -> None:
         """完整执行：查询 → 注入记忆 → 调 LLM → 提取记忆 → 发送通知。
 
         错误处理策略：**总结过程任何阶段出错都向用户发送失败通知**，
@@ -251,12 +416,9 @@ class SummaryService:
                 )
             messages = self._build_messages(records, system_prompt, date_from, date_to)
 
-            # 2. 调 LLM 生成总结
+            # 2. 调 LLM 生成总结（流式唯一形态：collect(stream_chat)）
             stage = _STAGE_CHAT
-            response = await self.llm_client.chat(
-                messages,
-                job_name=job_config.name,
-            )
+            response = await self._call_llm(messages, job_config)
 
             # 3. 提取记忆（读写同开关：memory_limit=0 不注入也不写入）
             if memory_enabled:

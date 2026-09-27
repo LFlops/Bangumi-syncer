@@ -5,7 +5,7 @@
 import json
 import time
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from ..logging import (
     get_batch_id,
@@ -21,28 +21,29 @@ class SyncRecordsRepository(BaseRepository):
     def __init__(self, conn, inbox_repository=None):
         super().__init__(conn)
         self._inbox = inbox_repository
-        self._heatmap_cache: Optional[list] = None
+        self._heatmap_cache: list | None = None
         self._heatmap_cache_time: float = 0
 
     def log_sync_record(
         self,
         user_name: str,
         title: str,
-        ori_title: Optional[str],
+        ori_title: str | None,
         season: int,
         episode: int,
-        subject_id: Optional[str] = None,
-        episode_id: Optional[str] = None,
+        subject_id: str | None = None,
+        episode_id: str | None = None,
         status: str = "success",
         message: str = "",
         source: str = "custom",
         media_type: str = "episode",
         bgm_title: str = "",
         match_method: str = "",
-        match_score: Optional[float] = None,
+        match_score: float | None = None,
         match_platform: str = "",
-        match_trace: Optional[dict] = None,
-    ) -> Optional[int]:
+        match_trace: dict | None = None,
+        account_results: list | None = None,
+    ) -> int | None:
         """记录同步日志到数据库，返回新记录 id（失败时 None）
 
         匹配追踪相关字段：
@@ -57,6 +58,7 @@ class SyncRecordsRepository(BaseRepository):
             self._conn._ensure_sync_records_bgm_title(cursor)
             self._conn._ensure_sync_records_match_fields(cursor)
             self._conn._ensure_sync_records_link_fields(cursor)
+            self._conn._ensure_sync_records_account_results(cursor)
 
         def _write(conn):
             local_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -66,8 +68,8 @@ class SyncRecordsRepository(BaseRepository):
             cursor = conn.execute(
                 """
                 INSERT INTO sync_records
-                (timestamp, user_name, title, ori_title, season, episode, subject_id, episode_id, status, message, source, media_type, bgm_title, match_method, match_score, match_platform, match_trace, run_id, batch_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (timestamp, user_name, title, ori_title, season, episode, subject_id, episode_id, status, message, source, media_type, bgm_title, match_method, match_score, match_platform, match_trace, run_id, batch_id, account_results)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     local_time,
@@ -89,6 +91,11 @@ class SyncRecordsRepository(BaseRepository):
                     trace_json,
                     get_sync_run_id() or "",
                     get_batch_id() or "",
+                    (
+                        json.dumps(account_results, ensure_ascii=False)
+                        if account_results
+                        else ""
+                    ),
                 ),
             )
             record_id = cursor.lastrowid
@@ -105,12 +112,12 @@ class SyncRecordsRepository(BaseRepository):
         self,
         limit: int = 100,
         offset: int = 0,
-        status: Optional[str] = None,
-        user_name: Optional[str] = None,
-        source: Optional[str] = None,
-        source_prefix: Optional[str] = None,
-        match_method: Optional[str] = None,
-        match_platform: Optional[str] = None,
+        status: str | None = None,
+        user_name: str | None = None,
+        source: str | None = None,
+        source_prefix: str | None = None,
+        match_method: str | None = None,
+        match_platform: str | None = None,
         skip_count: bool = False,
     ) -> dict[str, Any]:
         """获取同步记录"""
@@ -120,6 +127,7 @@ class SyncRecordsRepository(BaseRepository):
             self._conn._ensure_sync_records_bgm_title(cursor)
             self._conn._ensure_sync_records_match_fields(cursor)
             self._conn._ensure_sync_records_link_fields(cursor)
+            self._conn._ensure_sync_records_account_results(cursor)
 
         def _read(conn):
             cursor = conn.cursor()
@@ -214,7 +222,7 @@ class SyncRecordsRepository(BaseRepository):
             ensure_schema=_ensure_schema,
         )
 
-    def get_sync_record_by_id(self, record_id: int) -> Optional[dict[str, Any]]:
+    def get_sync_record_by_id(self, record_id: int) -> dict[str, Any] | None:
         """根据ID获取单个同步记录"""
 
         def _ensure_schema(cursor):
@@ -222,6 +230,7 @@ class SyncRecordsRepository(BaseRepository):
             self._conn._ensure_sync_records_bgm_title(cursor)
             self._conn._ensure_sync_records_match_fields(cursor)
             self._conn._ensure_sync_records_link_fields(cursor)
+            self._conn._ensure_sync_records_account_results(cursor)
 
         def _read(conn):
             cursor = conn.cursor()
@@ -229,7 +238,7 @@ class SyncRecordsRepository(BaseRepository):
                 """
                 SELECT id, timestamp, user_name, title, ori_title, season, episode,
                        subject_id, episode_id, status, message, source, media_type, bgm_title,
-                       match_method, match_score, match_platform, match_trace, run_id, batch_id
+                       match_method, match_score, match_platform, match_trace, run_id, batch_id, account_results
                 FROM sync_records
                 WHERE id = ?
             """,
@@ -265,6 +274,7 @@ class SyncRecordsRepository(BaseRepository):
                 "match_trace": row[17] or "",
                 "run_id": row[18] or "",
                 "batch_id": row[19] or "",
+                "account_results": row[20] or "",
             }
         return None
 
@@ -321,10 +331,10 @@ class SyncRecordsRepository(BaseRepository):
     def update_sync_record_match_fields(
         self,
         record_id: int,
-        match_method: Optional[str] = None,
-        match_trace: Optional[dict] = None,
-        match_score: Optional[float] = None,
-        match_platform: Optional[str] = None,
+        match_method: str | None = None,
+        match_trace: dict | None = None,
+        match_score: float | None = None,
+        match_platform: str | None = None,
     ) -> bool:
         """回写同步记录的匹配字段，用于重试成功后覆盖原始失败记录的 match_method 等。
 
@@ -366,9 +376,9 @@ class SyncRecordsRepository(BaseRepository):
         self,
         limit: int = 50,
         offset: int = 0,
-        status: Optional[str] = None,
-        match_method: Optional[str] = None,
-        match_platform: Optional[str] = None,
+        status: str | None = None,
+        match_method: str | None = None,
+        match_platform: str | None = None,
     ) -> dict[str, Any]:
         """获取匹配记录（含匹配追踪字段）
 
@@ -380,6 +390,7 @@ class SyncRecordsRepository(BaseRepository):
             self._conn._ensure_sync_records_bgm_title(cursor)
             self._conn._ensure_sync_records_match_fields(cursor)
             self._conn._ensure_sync_records_link_fields(cursor)
+            self._conn._ensure_sync_records_account_results(cursor)
 
         def _read(conn):
             cursor = conn.cursor()
@@ -516,8 +527,9 @@ class SyncRecordsRepository(BaseRepository):
         date_from: str,
         date_to: str,
         limit: int = 200,
-        user_name: Optional[str] = None,
-        source: Optional[str] = None,
+        user_name: str | None = None,
+        source: str | None = None,
+        include_consumed: bool = False,
     ) -> list[dict[str, Any]]:
         """获取指定日期范围内的同步记录。
 
@@ -528,6 +540,9 @@ class SyncRecordsRepository(BaseRepository):
             limit:     最大返回条数，默认 200。
             user_name: 可选，按用户名过滤。
             source:    可选，按来源过滤。
+            include_consumed: 默认 ``False``（轻量查询——无 LEFT JOIN / GROUP BY，
+                ``consumed_run_ids`` 直接返回空集合）；``True`` 时 JOIN 关联表并
+                GROUP_CONCAT 聚合消费标记（记忆开启时消费排除所需）。
 
         Returns:
             按 ``timestamp DESC`` 排序的记录列表，每条为包含全部列的 dict。
@@ -547,19 +562,32 @@ class SyncRecordsRepository(BaseRepository):
 
             where = " WHERE " + " AND ".join(conditions)
             limit_clause = "LIMIT ?" if limit > 0 else ""
-            query = f"""
-                SELECT s.id, s.timestamp, s.user_name, s.title, s.ori_title,
-                       s.season, s.episode, s.subject_id, s.episode_id, s.status,
-                       s.message, s.source, s.media_type, s.bgm_title,
-                       s.run_id, s.batch_id,
-                       GROUP_CONCAT(c.run_id) AS consumed_run_ids
-                FROM sync_records s
-                LEFT JOIN sync_records_consumed c ON c.sync_record_id = s.id
-                {where}
-                GROUP BY s.id
-                ORDER BY s.timestamp DESC
-                {limit_clause}
-            """
+
+            if include_consumed:
+                query = f"""
+                    SELECT s.id, s.timestamp, s.user_name, s.title, s.ori_title,
+                           s.season, s.episode, s.subject_id, s.episode_id, s.status,
+                           s.message, s.source, s.media_type, s.bgm_title,
+                           s.run_id, s.batch_id,
+                           GROUP_CONCAT(c.run_id) AS consumed_run_ids
+                    FROM sync_records s
+                    LEFT JOIN sync_records_consumed c ON c.sync_record_id = s.id
+                    {where}
+                    GROUP BY s.id
+                    ORDER BY s.timestamp DESC
+                    {limit_clause}
+                """
+            else:
+                query = f"""
+                    SELECT id, timestamp, user_name, title, ori_title,
+                           season, episode, subject_id, episode_id, status,
+                           message, source, media_type, bgm_title,
+                           run_id, batch_id
+                    FROM sync_records
+                    {where}
+                    ORDER BY timestamp DESC
+                    {limit_clause}
+                """
             if limit > 0:
                 params.append(limit)
             cursor.execute(query, params)
@@ -581,9 +609,12 @@ class SyncRecordsRepository(BaseRepository):
                     "bgm_title": row[13] or "",
                     "run_id": row[14] or "",
                     "batch_id": row[15] or "",
-                    # 消费标记多对多（关联表）：逗号分隔 → 去空集合
+                    # 消费标记多对多（关联表）：include_consumed 时逗号分隔 → 去空集合；
+                    # 轻量路径该列不存在，直接给空集合（保持返回 dict 结构不变）。
                     "consumed_run_ids": (
-                        {x for x in row[16].split(",") if x} if row[16] else set()
+                        {x for x in row[16].split(",") if x}
+                        if include_consumed and row[16]
+                        else set()
                     ),
                 }
                 for row in cursor.fetchall()

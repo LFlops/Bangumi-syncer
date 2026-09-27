@@ -7,14 +7,18 @@ from app.services.llm.models import (
     ChatResponse,
     Message,
     RedactedThinkingBlock,
+    StreamAggregator,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
+    ToolUseBlock,
     Usage,
+    collect,
 )
 
 
 class TestContentBlock:
-    """ContentBlock 构造与校验（Scenario 3.1）。"""
+    """ContentBlock 构造与校验。"""
 
     def test_text_block(self):
         b = TextBlock(text="hi")
@@ -44,12 +48,39 @@ class TestContentBlock:
             ThinkingBlock(type="text", thinking="x")  # type: ignore[arg-type]
 
     def test_unknown_block_type_not_in_union(self):
-        """Phase 1 union 不含 tool_use——Message 解析 tool_use block 抛 ValidationError。"""
+        """Union 仅接受已知 block 类型。
+
+        tool_use / tool_result 已被纳入 ContentBlock，
+        故这两个类型现在可被 Message 正常解析；真正未知的 block type 仍抛
+        ValidationError（向后强约束）。
+        """
+        from app.services.llm.models import ToolResultBlock, ToolUseBlock
+
+        # tool_use / tool_result 现属合法 union 成员
+        msg = Message.model_validate(
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "u1", "name": "search"}],
+            }
+        )
+        assert isinstance(msg.content[0], ToolUseBlock)
+
+        msg2 = Message.model_validate(
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "u1", "content": "ok"}
+                ],
+            }
+        )
+        assert isinstance(msg2.content[0], ToolResultBlock)
+
+        # 真正未知的类型仍被拒绝
         with pytest.raises(ValidationError):
             Message.model_validate(
                 {
                     "role": "assistant",
-                    "content": [{"type": "tool_use", "id": "u1", "name": "search"}],
+                    "content": [{"type": "bogus", "foo": 1}],
                 }
             )
 
@@ -91,7 +122,7 @@ class TestMessage:
         assert msg.content == ""
 
     def test_message_content_blocks(self):
-        """Scenario 3.2: 新用法——content 为 list[ContentBlock]。"""
+        """新用法——content 为 list[ContentBlock]。"""
         msg = Message(role="assistant", content=[TextBlock(text="hi")])
         assert isinstance(msg.content, list)
         block = msg.content[0]
@@ -99,7 +130,7 @@ class TestMessage:
         assert block.text == "hi"
 
     def test_message_str_backward_compat(self):
-        """Scenario 3.2: 旧用法——content 为 str。"""
+        """旧用法——content 为 str。"""
         msg = Message(role="user", content="纯文本")
         assert isinstance(msg.content, str)
         assert msg.content == "纯文本"
@@ -187,3 +218,207 @@ class TestChatResponse:
             {"content": "Hi", "model": "m", "extra": "should-be-ignored"}
         )
         assert resp.content == "Hi"
+
+
+class TestStreamAggregator:
+    """StreamChunk 序列聚合为等价 ChatResponse。"""
+
+    def test_aggregate_text_deltas_concatenates_content(self):
+        """多个 text_delta → content 拼接、blocks 含单个 TextBlock。"""
+        agg = StreamAggregator()
+        for part in ("你", "好", "世界"):
+            agg.feed(StreamChunk(type="text_delta", text=part))
+
+        resp = agg.finalize()
+
+        assert resp.content == "你好世界"
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, TextBlock)
+        assert block.text == "你好世界"
+
+    def test_aggregate_thinking_and_signature_deltas(self):
+        """thinking_delta 与 signature 均按增量拼接。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="thinking_delta", thinking="思", signature="sig-1"))
+        agg.feed(StreamChunk(type="thinking_delta", thinking="考", signature="sig-2"))
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "思考"
+        assert block.signature == "sig-1sig-2"
+
+    def test_aggregate_tool_use_deltas_builds_input_dict(self):
+        """tool_use_start + 多段 tool_use_delta → 完整 input dict。"""
+        agg = StreamAggregator()
+        agg.feed(
+            StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="search")
+        )
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json='{"q":')
+        )
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json='"hi"}')
+        )
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.id == "t1"
+        assert block.name == "search"
+        assert block.input == {"q": "hi"}
+
+    def test_malformed_tool_json_falls_back_to_raw(self):
+        """partial_json 非法 → input 兜底 {"raw": <原字符串>}。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="x"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{bad")
+        )
+
+        resp = agg.finalize()
+
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.input == {"raw": "{bad"}
+
+    def test_usage_and_stop_propagated(self):
+        """usage / stop 事件传递到 ChatResponse。"""
+        agg = StreamAggregator()
+        usage = Usage(prompt_tokens=1, completion_tokens=2, total_tokens=3)
+        agg.feed(StreamChunk(type="usage", usage=usage))
+        agg.feed(StreamChunk(type="stop", stop_reason="tool_use"))
+
+        resp = agg.finalize()
+
+        assert resp.usage is not None
+        assert resp.usage.prompt_tokens == 1
+        assert resp.usage.total_tokens == 3
+        assert resp.stop_reason == "tool_use"
+
+    def test_blocks_order_follows_first_appearance(self):
+        """blocks 顺序 = 各块首次出现的事件顺序。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="thinking_delta", thinking="t"))
+        agg.feed(StreamChunk(type="text_delta", text="a"))
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="f"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{}")
+        )
+
+        resp = agg.finalize()
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "ThinkingBlock",
+            "TextBlock",
+            "ToolUseBlock",
+        ]
+
+    def test_empty_stream_finalize(self):
+        """无事件 finalize → 空 blocks、content 为空字符串。"""
+        resp = StreamAggregator().finalize()
+
+        assert resp.blocks == []
+        assert resp.content == ""
+        assert resp.usage is None
+
+
+class TestStreamChunkModelField:
+    """StreamChunk.model 与 tool_use_stop 事件字段。"""
+
+    def test_tool_use_stop_event_accepted(self):
+        """tool_use_stop 是合法事件类型（停点：参数已完整、可校验）。"""
+        chunk = StreamChunk(type="tool_use_stop", tool_use_id="t1")
+        assert chunk.type == "tool_use_stop"
+        assert chunk.tool_use_id == "t1"
+
+    def test_model_field_defaults_empty(self):
+        """model 默认为空串（provider 从流事件填入真实模型名）。"""
+        assert StreamChunk(type="text_delta", text="x").model == ""
+
+    def test_model_field_settable(self):
+        chunk = StreamChunk(type="text_delta", text="x", model="gpt-4o")
+        assert chunk.model == "gpt-4o"
+
+
+class TestStreamAggregatorModelTracking:
+    """聚合器跟踪真实 model（非空覆盖）。"""
+
+    def test_finalize_uses_tracked_model(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x", model="gpt-4o-real"))
+        resp = agg.finalize()
+        assert resp.model == "gpt-4o-real"
+
+    def test_finalize_model_empty_without_any_model(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x"))
+        assert agg.finalize().model == ""
+
+    def test_later_non_empty_model_overrides(self):
+        """后续非空 model 覆盖先前值；空值不覆盖。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="x", model="first"))
+        agg.feed(StreamChunk(type="text_delta", text="y"))
+        agg.feed(StreamChunk(type="text_delta", text="z", model="second"))
+        assert agg.finalize().model == "second"
+
+
+class TestAggregatorIgnoresToolUseStop:
+    """tool_use_stop 停点事件不参与参数累积，安全忽略且不告警。"""
+
+    def test_tool_use_stop_safely_ignored(self):
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="f"))
+        agg.feed(
+            StreamChunk(type="tool_use_delta", tool_use_id="t1", partial_json="{}")
+        )
+        agg.feed(StreamChunk(type="tool_use_stop", tool_use_id="t1"))
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.input == {}
+
+
+class TestCollect:
+    """模块级 collect()：把事件流消费至结束并聚合为完整响应。"""
+
+    @pytest.mark.asyncio
+    async def test_collect_aggregates_stream(self):
+        async def _stream():
+            yield StreamChunk(type="text_delta", text="Hello", model="gpt-4o")
+            yield StreamChunk(type="text_delta", text=" world")
+            yield StreamChunk(
+                type="usage",
+                usage=Usage(prompt_tokens=2, completion_tokens=3, total_tokens=5),
+            )
+            yield StreamChunk(type="stop", stop_reason="end_turn")
+
+        resp = await collect(_stream())
+
+        assert resp.content == "Hello world"
+        assert resp.model == "gpt-4o"
+        assert resp.stop_reason == "end_turn"
+        assert resp.usage is not None
+        assert resp.usage.total_tokens == 5
+
+    @pytest.mark.asyncio
+    async def test_collect_empty_stream(self):
+        async def _stream():
+            if False:  # pragma: no cover - 空 async generator
+                yield StreamChunk(type="text_delta", text="")
+
+        resp = await collect(_stream())
+
+        assert resp.content == ""
+        assert resp.blocks == []
+        assert resp.usage is None
+        assert resp.model == ""
