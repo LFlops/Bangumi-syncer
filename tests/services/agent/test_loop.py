@@ -1575,3 +1575,87 @@ async def test_double_injection_warns_and_prefers_stream(caplog):
     chat_fn.assert_not_awaited()
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert any("同时收到 stream_fn 与 chat_fn" in r.message for r in warnings)
+
+
+# ---------------------------------------------------------------------------
+# R2. 流中途异常的收敛块健壮性：BaseException 兜底 + 取消安全（边界评审修复）
+# ---------------------------------------------------------------------------
+
+
+class _FinalizeBaseError(BaseException):
+    """模拟 finalize 抛出的取消类/致命异常（非 Exception 子类）。"""
+
+
+async def test_stream_exception_not_masked_when_finalize_raises_base_exception():
+    """finalize 抛 BaseException（非 Exception）→ 仍向外抛原始流异常，不被掩盖。"""
+    import pytest
+
+    class _FatalFinalizeExecutor:
+        def feed(self, chunk):
+            pass
+
+        async def finalize(self):
+            raise _FinalizeBaseError("finalize cancelled")
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield _stream_start("a", "read_a")
+        yield _stream_delta("a", "{}")
+        yield _stream_stop("a")
+        raise RuntimeError("stream boom")
+
+    with pytest.raises(RuntimeError, match="stream boom"):
+        await run(
+            stream_fn=stream_fn,
+            executor_factory=_FatalFinalizeExecutor,
+            tools_schemas=[],
+            max_iterations=2,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )
+
+
+async def test_cancel_during_convergence_keeps_finalize_running_in_background():
+    """收敛期间外层被取消 → 原异常传播，且 shield 保护的 finalize 仍在后台完成。"""
+    import pytest
+
+    finalize_started = asyncio.Event()
+    finalize_done = asyncio.Event()
+    release = asyncio.Event()
+
+    class _SlowFinalizeExecutor:
+        def feed(self, chunk):
+            pass
+
+        async def finalize(self):
+            finalize_started.set()
+            await release.wait()  # 模拟收敛动作耗时，期间外层被取消
+            finalize_done.set()
+            return []
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield _stream_start("a", "read_a")
+        yield _stream_delta("a", "{}")
+        yield _stream_stop("a")
+        raise RuntimeError("stream boom")
+
+    task = asyncio.create_task(
+        run(
+            stream_fn=stream_fn,
+            executor_factory=_SlowFinalizeExecutor,
+            tools_schemas=[],
+            max_iterations=2,
+            tool_choice_terminal="submit_suggestion",
+            seed_messages=_seed(),
+        )
+    )
+    await asyncio.wait_for(finalize_started.wait(), timeout=1)
+    task.cancel()
+
+    # 原异常（而非取消）向外传播
+    with pytest.raises(RuntimeError, match="stream boom"):
+        await task
+
+    # shield 保证收敛动作不被取消打断：放行后 finalize 在后台完成
+    release.set()
+    await asyncio.wait_for(finalize_done.wait(), timeout=1)
+    assert finalize_done.is_set()

@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -111,9 +112,10 @@ async def _consume_stream(
     用于收尾调用等不执行工具的场景）。
 
     异常安全：执行器**先于消费构造**，流中途异常（httpx 超时/断连等）时先
-    ``await executor.finalize()`` 收敛已提前启动的任务（避免孤儿后台任务与
-    "exception never retrieved"、执行器引用丢失无法收敛），再向上抛出原异常。
-    收敛自身失败只记 warning，绝不掩盖原始异常。
+    ``await asyncio.shield(executor.finalize())`` 收敛已提前启动的任务（避免孤儿后台
+    任务与 "exception never retrieved"、执行器引用丢失无法收敛），再向上抛出原异常。
+    收敛经 ``shield`` 保护：外层协程被取消（关机/取消竞态）时收敛动作仍在后台完成。
+    收敛自身失败（含取消类 ``BaseException``）只记 warning，**绝不掩盖原始异常**。
     """
     aggregator = StreamAggregator()
     executor = executor_factory() if executor_factory is not None else None
@@ -125,12 +127,12 @@ async def _consume_stream(
     except BaseException:
         if executor is not None:
             try:
-                # finalize 内部 gather(return_exceptions=True) 收敛提前任务
-                await executor.finalize()
-            except Exception as e:
-                logger.warning(
-                    "流异常后收敛提前执行任务失败（已忽略，保留原始异常）: %s", e
-                )
+                # finalize 内部 gather(return_exceptions=True) 收敛提前任务。
+                # shield：外层被取消时收敛动作仍继续在后台完成（避免任务重新成孤儿）。
+                await asyncio.shield(executor.finalize())
+            except BaseException as e:
+                # 兜住 Exception 与取消类/致命异常；绝不掩盖原始流异常
+                logger.warning("流异常后收敛提前执行任务未完成（可能被取消）: %s", e)
         raise
     return aggregator.finalize(), executor
 
