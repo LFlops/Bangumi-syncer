@@ -34,7 +34,9 @@ class LLMConfigUpdate(BaseModel):
     max_tokens: int | None = None
     temperature: float | None = None
     timeout: int | None = None
-    provider: Literal["openai_compat", "anthropic_compat"] | None = None
+    provider: (
+        Literal["openai_compat", "anthropic_compat", "openai_responses"] | None
+    ) = None
     thinking_level: Literal["off", "low", "medium", "high"] | None = None
 
 
@@ -60,6 +62,8 @@ class SummaryJobCreate(BaseModel):
     # 记忆特性（未发布）：0=关闭；1–1000=注入最近 N 条摘要（对齐 prune 上限）
     memory_limit: int = Field(default=0, ge=0, le=1000)
     related_limit: int = Field(default=0, ge=0, le=1000)  # 0=关；>0=同剧关联最近 N 条
+    # 任务级思考强度：透传到 LLM provider（anthropic=budget_tokens / openai=reasoning_effort）
+    thinking_level: Literal["off", "low", "medium", "high"] = "off"
 
 
 class SummaryJobUpdate(BaseModel):
@@ -74,6 +78,7 @@ class SummaryJobUpdate(BaseModel):
     enabled: bool | None = None
     memory_limit: int | None = Field(default=None, ge=0, le=1000)
     related_limit: int | None = Field(default=None, ge=0, le=1000)
+    thinking_level: Literal["off", "low", "medium", "high"] | None = None
 
 
 class SummaryJobResponse(BaseModel):
@@ -88,6 +93,7 @@ class SummaryJobResponse(BaseModel):
     enabled: bool
     memory_limit: int = 0
     related_limit: int = 0
+    thinking_level: str = "off"
     # 只读的 notification_type，供前端展示
     notification_type: str = ""
 
@@ -129,6 +135,7 @@ class SummaryJobResponse(BaseModel):
             enabled=enabled,
             memory_limit=_limit("memory_limit"),
             related_limit=_limit("related_limit"),
+            thinking_level=str(data.get("thinking_level") or "off"),
             notification_type=notif_type,
         )
 

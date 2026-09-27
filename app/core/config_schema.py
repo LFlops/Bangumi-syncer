@@ -137,6 +137,14 @@ SECTIONS: dict[str, SectionMeta] = {
         name="sync",
         display_name="同步设置",
         order=20,
+        # llm_match_cron 是内部调度机制，不在配置页暴露；仅提供环境变量
+        # 高级调优入口（LLM_MATCH_CRON 覆盖 [sync] llm_match_cron）。
+        env_overrides={"llm_match_cron": "LLM_MATCH_CRON"},
+        # LLM 匹配结果保留天数：内部运维参数，无配置页入口（原因见 manual_keys）
+        manual_keys={
+            "llm_match_retention_days": "LLM 匹配结果保留策略参数（默认 30 天），"
+            "属内部运维项、一般无需修改；如需调整，编辑 config.ini 的 [sync] 段",
+        },
         fields=(
             FieldMeta(name="movie_playback_start_mark_watching", default_true=True),
             FieldMeta(name="movie_mark_subject_completed", default_true=True),
@@ -145,6 +153,8 @@ SECTIONS: dict[str, SectionMeta] = {
             # 模糊匹配置信度阈值（0~1）：低于该相似度的 Bangumi API 匹配
             # 不会自动采用，而是沉淀到待审队列由用户在 Web 界面人工确认。
             FieldMeta(name="match_confidence_threshold", default=0.6),
+            # LLM 匹配结果滑动窗口轮转天数（终态超窗 + 过期死行一并清理）
+            FieldMeta(name="llm_match_retention_days", default=30),
         ),
     ),
     "auth": SectionMeta(
@@ -396,6 +406,7 @@ SECTIONS: dict[str, SectionMeta] = {
         visible_in_ui=False,
         hidden_reason="在配置页「AI 追番总结」卡片中管理（经 /api/summary/jobs）",
         # summary 调度器为 instance 类型，配置联动由 summary_jobs API 直调
+        fields=(FieldMeta(name="thinking_level", default="off"),),
     ),
     "llm": SectionMeta(
         name="llm",
@@ -403,11 +414,12 @@ SECTIONS: dict[str, SectionMeta] = {
         order=610,
         sensitive_fields=frozenset({"api_key"}),
         fields=(
+            # provider 受控取值（与 _PROVIDER_MAP / LLMConfigUpdate.provider 一致）：
+            # openai_compat / anthropic_compat / openai_responses
             FieldMeta(name="provider", default="openai_compat"),
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),
             FieldMeta(name="timeout", default=60),
-            FieldMeta(name="thinking_level", default="off"),
         ),
     ),
     # ── 调度器全局（order 900）──

@@ -39,6 +39,7 @@ from ...utils.bangumi_constants import (
 from ...utils.bangumi_data import BangumiData, bangumi_data
 from ...utils.media_type_detector import detect_media_type as detect_media_type
 from ..mapping_service import mapping_service
+from ..matching.identity import build_match_business_key
 from ..notification_service import notification_service
 from .match_trace import MatchCandidate as MatchCandidate, MatchTrace
 from .retry import MARK_QUEUED, RetryMixin
@@ -248,7 +249,15 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         database_manager.update_pending_candidate_status(
             candidate_id, "confirmed", confirmed_subject_id=str(subject_id)
         )
-        # 批量更新同 key 的其它 pending 行，避免残留（去重后通常无额外行）
+        # 用户处理结果由 pending_candidates（status + resolved_at）承载，
+        # agent_runs 回归通用框架，确认候选不再改写 run 状态。
+        # 批量更新同业务身份的其它 pending 行，避免残留（去重后通常无额外行）。
+        # 使用 business_key 对齐 agent_runs 去重语义（去 source / 归一化标题）。
+        resolve_bk = build_match_business_key(
+            record.get("user_name", ""),
+            record.get("request_title", ""),
+            int(record.get("request_season") or 1),
+        )
         database_manager.resolve_similar_pending_candidates(
             request_title=title,
             request_season=season,
@@ -257,6 +266,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             status="confirmed",
             confirmed_subject_id=str(subject_id),
             exclude_id=candidate_id,
+            business_key=resolve_bk,
         )
 
         # 候选确认即补发：若有关联的 sync_record_id，自动触发重试
@@ -521,6 +531,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
             candidate_id, "rejected"
         ):
             return False, "候选记录不存在或已处理"
+        # 用户处理结果由 pending_candidates 承载，忽略候选不再改写 run 状态
 
         # 将被拒候选项的 subject_id 写入标题黑名单（容错：失败不影响 reject 主流程）
         try:
@@ -610,6 +621,8 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         并触发 pending_candidate 通知提醒用户前往 WebUI 确认。
 
         sync_record_id：关联的 sync_records 行 id，用于候选确认后回写原记录状态。
+        business_key：按 (user_name, normalize(title), season) 构造，对齐 agent_runs
+        业务身份去重，跨 source 共享同一 pending 行。
         """
         candidates = self._collect_candidates_from_trace(
             trace,
@@ -619,6 +632,8 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         )
         if not candidates:
             return
+        # 计算业务键：对齐 agent_runs 去重语义（去 source / 归一化标题）
+        bk = build_match_business_key(item.user_name, item.title, item.season)
         try:
             database_manager.log_pending_candidate(
                 request_title=item.title,
@@ -630,6 +645,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                 candidates=candidates,
                 trace=trace.to_dict(),
                 sync_record_id=sync_record_id,
+                business_key=bk,
             )
         except Exception as e:
             logger.warning(f"沉淀待确认候选失败（不影响主流程）: {e}")
