@@ -1614,8 +1614,18 @@ async def test_stream_exception_not_masked_when_finalize_raises_base_exception()
         )
 
 
-async def test_cancel_during_convergence_keeps_finalize_running_in_background():
-    """收敛期间外层被取消 → 原异常传播，且 shield 保护的 finalize 仍在后台完成。"""
+async def test_cancel_during_convergence_keeps_finalize_running_in_background(
+    caplog,
+):
+    """收敛期间外层被取消 → 原异常传播，shield 保护的 finalize 完成，且告警可辨识取消。
+
+    ``CancelledError`` 的 ``str(e)`` 为空，故告警必须打印异常类型名（CancelledError），
+    否则日志尾部只剩冒号空白，排障无法区分「被取消」与「finalize 真失败」。
+
+    ``loop.py`` 使用 stdlib ``logging.getLogger``，故此处用 ``caplog`` 捕获。
+    """
+    import logging
+
     import pytest
 
     finalize_started = asyncio.Event()
@@ -1659,3 +1669,15 @@ async def test_cancel_during_convergence_keeps_finalize_running_in_background():
     release.set()
     await asyncio.wait_for(finalize_done.wait(), timeout=1)
     assert finalize_done.is_set()
+
+    # 取消竞态下告警必须打印异常类型名，不能是空的 str(CancelledError)
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "收敛提前执行任务未完成" in r.getMessage()
+    ]
+    assert warnings, "收敛失败不应静默吞掉，必须记 warning"
+    assert any("CancelledError" in msg for msg in warnings), (
+        "取消竞态告警应打印异常类型名 CancelledError（str(CancelledError) 为空），"
+        f"实际：{warnings}"
+    )

@@ -131,8 +131,13 @@ async def _consume_stream(
                 # shield：外层被取消时收敛动作仍继续在后台完成（避免任务重新成孤儿）。
                 await asyncio.shield(executor.finalize())
             except BaseException as e:
-                # 兜住 Exception 与取消类/致命异常；绝不掩盖原始流异常
-                logger.warning("流异常后收敛提前执行任务未完成（可能被取消）: %s", e)
+                # 兜住 Exception 与取消类/致命异常；绝不掩盖原始流异常。
+                # 打印异常类型名：CancelledError 的 str(e) 为空，否则日志尾部只剩冒号空白，
+                # 无法区分「被取消」与「finalize 真失败」。
+                logger.warning(
+                    "流异常后收敛提前执行任务未完成（可能被取消）: %s",
+                    type(e).__name__,
+                )
         raise
     return aggregator.finalize(), executor
 
