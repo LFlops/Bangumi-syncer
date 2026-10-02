@@ -25,7 +25,7 @@ from typing import Any
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent import trace
-from app.services.agent.loop import RunResult, run as loop_run
+from app.services.agent.loop import ChatFn, RunResult, StreamFn, run as loop_run
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
@@ -48,8 +48,8 @@ async def run(
     hooks: ScenarioHooks,
     ctx: Any,
     thinking_level: str,
-    stream_fn: Callable | None = None,
-    chat_fn: Callable | None = None,
+    stream_fn: StreamFn | None = None,
+    chat_fn: ChatFn | None = None,
     notification_service: Any | None = None,
     span_recorder: TraceRecorder | None = None,
 ) -> str:
@@ -172,8 +172,8 @@ def _make_executor_factory(
 
 async def _invoke_loop(
     *,
-    stream_fn: Callable | None,
-    chat_fn: Callable | None,
+    stream_fn: StreamFn | None,
+    chat_fn: ChatFn | None,
     registry: ToolRegistry,
     span_recorder: TraceRecorder,
     tools_schemas: list[dict],
@@ -202,6 +202,8 @@ async def _invoke_loop(
             **common,
         )
     # 旧契约兼容路径（deprecated，仅测试/迁移期）：chat_fn + execute_batch
+    # run() 已保证「至少注入其一」：stream_fn 为空时 chat_fn 必非空
+    assert chat_fn is not None
     return await loop_run(
         chat_fn=span_recorder.wrap_chat_fn(chat_fn),
         tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),

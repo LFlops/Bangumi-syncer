@@ -19,6 +19,7 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime
+from app.services.agent.loop import ChatFn, StreamFn
 from app.services.agent.scenario import ScenarioHooks
 
 
@@ -38,8 +39,8 @@ class ScenarioRuntime:
         sync_record: dict,
         bgm: Any,
         thinking_level: str,
-        stream_fn: Callable | None = None,
-        chat_fn: Callable | None = None,
+        stream_fn: StreamFn | None = None,
+        chat_fn: ChatFn | None = None,
         notification_service: Any | None = None,
         span_recorder: Any | None = None,
     ) -> str:

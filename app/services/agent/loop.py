@@ -93,7 +93,7 @@ ChatFn = Callable[..., Awaitable[ChatResponse]]
 StreamFn = Callable[..., AsyncIterator[StreamChunk]]
 #: .. deprecated:: 旧契约兼容。``ToolCallsFn`` 仅测试/迁移期使用，后续清理时移除；
 #: 主路径请用 ``executor_factory`` + ``StreamingToolExecutor``。
-ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable[dict[str, Any]]]
+ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable[Any]]
 #: 按轮构造流式工具执行器（返回值需实现 feed / finalize 鸭子类型）
 ExecutorFactory = Callable[[], Any]
 
@@ -291,6 +291,8 @@ async def run(
                 executor_factory=executor_factory,
             )
         else:
+            # 入口不变式：双 None 已 raise、双注入已忽略 chat_fn，此处 chat_fn 必非空
+            assert chat_fn is not None
             resp = await chat_fn(messages, tools=tools_schemas, tool_choice=tool_choice)
 
         # ① end_turn → 终止
@@ -464,6 +466,8 @@ async def _final_recovery(
                 executor_factory=None,
             )
         else:
+            # 入口不变式：双 None 已 raise、双注入已忽略 chat_fn，此处 chat_fn 必非空
+            assert chat_fn is not None
             recovery_resp = await chat_fn(
                 messages, tools=terminal_schemas, tool_choice=tool_choice_terminal
             )
