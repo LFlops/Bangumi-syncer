@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -220,7 +220,7 @@ async def run(
     tools_schemas: list[dict],
     max_iterations: int,
     tool_choice_terminal: str,
-    seed_messages: list[Message],
+    seed_messages: Sequence[Message],
     stream_fn: StreamFn | None = None,
     executor_factory: ExecutorFactory | None = None,
     chat_fn: ChatFn | None = None,
@@ -249,8 +249,12 @@ async def run(
          ``executor_factory`` + ``StreamingToolExecutor``。
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
-    - ``seed_messages``：调用方构建的种子消息（system + user）
-    - ``recorder``：可选预算记录器（鸭子类型 ``record_budget(str)``），None 时跳过钩子
+    - ``seed_messages``：调用方构建的种子消息（system + user）。入口立即 ``list()``
+      做快照：不改写调用方对象、调用方仍可复用；用 ``Sequence`` 而非 ``Iterable``
+      ——seed 会被 runtime 的 ``write_seed_row`` 与 loop **多次消费**，生成器必须被
+      类型排除
+    - ``recorder``：可选预算记录器（鸭子类型 ``record_budget(str)``；不导入具体实现
+      以避免与 recorder.py 循环依赖），None 时跳过钩子
     - ``veto_terminal``：可选终止提交软护栏。非 None 时，命中终止工具的轮次会先询问
       该回调（入参=terminal input）；返回提示文案则**不终止**、注入配对 tool_result 后
       继续一轮（仅拦一次，且末轮不拦）。返回 None / 回调为 None 时行为与现状一致。
@@ -266,6 +270,8 @@ async def run(
         )
         chat_fn = None
 
+    # 物化快照：后续每轮原地 append（assistant/tool_result/预算消息），需可追加容器；
+    # list() 浅拷贝保证不改写调用方的 seed 对象（Message 视为不可变，只追加新对象）。
     messages: list[Message] = list(seed_messages)
     remaining = max_iterations
     resp: ChatResponse | None = None

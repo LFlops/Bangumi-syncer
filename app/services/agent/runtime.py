@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from app.core.database import get_database_manager
@@ -31,7 +31,11 @@ from app.services.agent.scenario import ScenarioHooks
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
-from app.services.llm.tools import ToolRegistry, serialize_tool_result
+from app.services.llm.tools import (
+    ToolRegistry,
+    ToolSpanRecorder,
+    serialize_tool_result,
+)
 
 # 非只读（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
@@ -47,7 +51,7 @@ async def run(
     stream_fn: Callable | None = None,
     chat_fn: Callable | None = None,
     notification_service: Any | None = None,
-    span_recorder: Any | None = None,
+    span_recorder: TraceRecorder | None = None,
 ) -> str:
     """执行一次 Agent 场景任务（通用编排），返回终态 status 字符串。
 
@@ -138,7 +142,7 @@ def _is_terminal_tool(registry: ToolRegistry, name: str) -> bool:
 
 
 def _make_executor_factory(
-    registry: ToolRegistry, span_recorder: Any
+    registry: ToolRegistry, span_recorder: ToolSpanRecorder
 ) -> Callable[[], StreamingToolExecutor]:
     """构造按轮新建 ``StreamingToolExecutor`` 的工厂（流式主路径）。
 
@@ -171,11 +175,11 @@ async def _invoke_loop(
     stream_fn: Callable | None,
     chat_fn: Callable | None,
     registry: ToolRegistry,
-    span_recorder: Any,
+    span_recorder: TraceRecorder,
     tools_schemas: list[dict],
     max_iterations: int,
     hooks: ScenarioHooks,
-    seed_messages: list[Message],
+    seed_messages: Sequence[Message],
 ) -> RunResult:
     """按注入形态选择主路径（流式）或旧路径（chat_fn）运行通用循环。
 

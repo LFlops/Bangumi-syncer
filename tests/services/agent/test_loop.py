@@ -1681,3 +1681,66 @@ async def test_cancel_during_convergence_keeps_finalize_running_in_background(
         "取消竞态告警应打印异常类型名 CancelledError（str(CancelledError) 为空），"
         f"实际：{warnings}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 18. seed_messages 类型契约：Sequence 宽化 + list() 快照隔离
+# ---------------------------------------------------------------------------
+
+
+async def test_run_accepts_tuple_seed_messages():
+    """契约锁定：``seed_messages`` 标注 ``Sequence``，tuple 亦可传入且不被改写。
+
+    类型标注不影响运行时，本测试改前改后均绿，仅锁定「宽化为 Sequence」的契约。
+    """
+    seed = tuple(_seed())
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield _stream_end_turn()
+
+    result = await run(
+        stream_fn=stream_fn,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=seed,
+    )
+
+    assert result.stop_reason == "end_turn"
+    # 调用方 tuple 未被改写（长度不变）
+    assert len(seed) == 2
+
+
+async def test_run_does_not_mutate_caller_seed_list():
+    """快照语义：loop 内部追加消息（assistant/tool_result/预算）不得污染调用方 seed。
+
+    构造一轮工具调用 + 一轮终结：内部会向 messages append 多条消息。若入口未做
+    ``list()`` 浅拷贝，调用方 list 将被追加而长度变化。
+    """
+    seed = _seed()
+    original_len = len(seed)
+    state = {"round": 0}
+
+    def _side_effect(*args, **kwargs):
+        state["round"] += 1
+        if state["round"] == 1:
+            return _resp("tool_use", [_tool_use("t1", "search_bangumi")])
+        return _resp("end_turn", None)
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock(
+        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
+    )
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=seed,
+    )
+
+    assert result.stop_reason == "end_turn"
+    # 调用方 list 长度不变（内部快照隔离）
+    assert len(seed) == original_len
