@@ -65,6 +65,11 @@ def test_match_iteration_strategy_high_returns_10():
     assert strategy.max_iterations("high") == 10
 
 
+def test_max_iterations_accepts_protocol_keyword():
+    """协议兼容：keyword 传参 ``thinking_level`` 必须被接受（签名与 IterationStrategy 对齐）。"""
+    assert MatchIterationStrategy().max_iterations(thinking_level="high") == 10
+
+
 def test_match_iteration_strategy_unknown_level_falls_back_to_medium():
     strategy = MatchIterationStrategy()
     assert strategy.max_iterations("bogus") == 5

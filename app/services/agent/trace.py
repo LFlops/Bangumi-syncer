@@ -239,7 +239,7 @@ class ReplayResult:
     total_tokens: int = 0
 
 
-def _parse_json(raw: str, default: Any = None) -> Any:
+def _parse_json(raw: str | None, default: Any = None) -> Any:
     try:
         return json.loads(raw) if raw else default
     except (ValueError, TypeError):

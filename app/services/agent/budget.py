@@ -35,7 +35,7 @@ class IterationStrategy(Protocol):
     def max_iterations(self, thinking_level: str) -> int: ...
 
 
-class MatchIterationStrategy:
+class MatchIterationStrategy(IterationStrategy):
     """match 场景预设（骨架默认注册）。
 
     medium=5 / high=10：思考模型（pro / eval）实测 3 轮偏紧，易在预算耗尽前
@@ -44,8 +44,10 @@ class MatchIterationStrategy:
 
     PRESET = {"off": 1, "low": 2, "medium": 5, "high": 10}
 
-    def max_iterations(self, level: str) -> int:
-        return self.PRESET.get(level, self.PRESET["medium"])  # 未知 level 回落 medium
+    def max_iterations(self, thinking_level: str) -> int:
+        return self.PRESET.get(
+            thinking_level, self.PRESET["medium"]
+        )  # 未知 level 回落 medium
 
 
 def register_iteration_strategy(task_type: str, strategy: IterationStrategy) -> None:

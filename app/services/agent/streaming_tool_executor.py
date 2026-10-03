@@ -193,9 +193,10 @@ class StreamingToolExecutor:
         self, st: _ToolState, *, record_span: bool
     ) -> ToolResultBlock:
         tool_use = ToolUseBlock(id=st.tool_use_id, name=st.name, input=st.args or {})
+        recorder = self._on_recorder
         span_id: str | None = None
-        if record_span and self._on_recorder is not None:
-            span_id = self._on_recorder.start_tool(tool_use, sequence=st.seq)
+        if record_span and recorder is not None:
+            span_id = recorder.start_tool(tool_use, sequence=st.seq)
         result: ToolResultBlock | None = None
         error_name = ""
         try:
@@ -213,8 +214,8 @@ class StreamingToolExecutor:
                 is_error=True,
             )
         finally:
-            if span_id is not None:
-                self._on_recorder.end_tool(span_id, result=result, error=error_name)
+            if recorder is not None and span_id is not None:
+                recorder.end_tool(span_id, result=result, error=error_name)
         return result
 
     # -- 收尾：await 提前任务 + 延迟执行 + 保序对齐 --------------------------

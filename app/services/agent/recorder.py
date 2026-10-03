@@ -32,6 +32,7 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from app.services.llm.tools import ToolSpanRecorder
 
 
 def _default_clock() -> float:
@@ -44,7 +45,7 @@ def _input_summary(inp: dict) -> str:
     return ", ".join(f"{k}:{type(v).__name__}" for k, v in (inp or {}).items())
 
 
-class TraceRecorder:
+class TraceRecorder(ToolSpanRecorder):
     """统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）。
 
     职责：

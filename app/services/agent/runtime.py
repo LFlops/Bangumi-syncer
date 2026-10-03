@@ -456,7 +456,7 @@ async def _replay_missing_tool(
     registry,
     messages: list,
     *,
-    span_recorder=None,
+    span_recorder: ToolSpanRecorder | None = None,
     sequence: int = 0,
 ) -> None:
     """补执行单条缺失的无副作用工具调用（readonly 门控）。
@@ -494,7 +494,7 @@ async def _replay_missing_tool(
         _append_tool_result(
             messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
         )
-        if span_id is not None:
+        if span_recorder is not None and span_id is not None:
             span_recorder.end_tool(
                 span_id,
                 result=ToolResultBlock(
@@ -515,7 +515,7 @@ async def _replay_missing_tool(
         content = f"工具执行失败: {type(e).__name__}"
         is_error = True
     _append_tool_result(messages, tool_use_id, content, is_error=is_error)
-    if span_id is not None:
+    if span_recorder is not None and span_id is not None:
         span_recorder.end_tool(
             span_id,
             result=ToolResultBlock(
