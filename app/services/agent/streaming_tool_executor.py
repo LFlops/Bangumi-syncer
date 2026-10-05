@@ -43,7 +43,11 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
-from app.services.llm.tools import _MAX_PARALLEL_TOOLS, serialize_tool_result
+from app.services.llm.tools import (
+    _MAX_PARALLEL_TOOLS,
+    ToolSpanRecorder,
+    serialize_tool_result,
+)
 
 # 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。
 # 正常业务路径不会消费它（terminal 轮 loop 直接走终止分支），仅作协议闭合兜底。
@@ -74,7 +78,7 @@ class StreamingToolExecutor:
         execute_fn: Callable[[ToolUseBlock], Awaitable[Any]],
         is_idempotent: Callable[[str], bool],
         is_terminal: Callable[[str], bool],
-        on_recorder: Any | None = None,
+        on_recorder: ToolSpanRecorder | None = None,
         batch_execute_fn: Callable[[list[ToolUseBlock]], Awaitable[Any]] | None = None,
         max_parallel: int = _MAX_PARALLEL_TOOLS,
     ) -> None:
@@ -283,6 +287,10 @@ class StreamingToolExecutor:
         results: Any, states: list[_ToolState]
     ) -> dict[str, ToolResultBlock]:
         """把 ``execute_batch`` 返回值按 tool_use_id 建索引。
+
+        参数刻意用 ``Any``：这是**非契约注入的鸭子边界**（注入方可能传 ``BatchResults``、
+        普通 dict 或测试替身），本函数只以 ``getattr`` 探测 ``ordered`` / ``get``，
+        不做 isinstance 收窄。
 
         生产契约：``BatchResults.ordered``（``list[tuple[tool_use_id, result]]``）。
         优先信任 ``ordered`` 槽位；若其缺失或未产出任何有效 ``ToolResultBlock``

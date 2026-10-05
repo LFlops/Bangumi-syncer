@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from app.core.logging import logger
 
@@ -33,6 +33,16 @@ class IterationStrategy(Protocol):
     """思考强度 → 轮次上限的映射协议（轻量策略模式，不过度工程化）。"""
 
     def max_iterations(self, thinking_level: str) -> int: ...
+
+
+class _LogLike(Protocol):
+    """极小日志协议：仅需 ``warning(message)``。
+
+    兼容 ``logging.Logger``（其 ``warning(msg, *args, **kwargs)`` 可接受单参调用），
+    也兼容测试注入的替身；用于收窄 ``_resolve_match_iterations_override`` 的 ``log``。
+    """
+
+    def warning(self, message: str) -> None: ...
 
 
 class MatchIterationStrategy(IterationStrategy):
@@ -79,7 +89,9 @@ def register_defaults() -> None:
     register_iteration_strategy("match", MatchIterationStrategy())
 
 
-def _resolve_match_iterations_override(raw_max: Any, log: Any = None) -> int | None:
+def _resolve_match_iterations_override(
+    raw_max: object, log: _LogLike | None = None
+) -> int | None:
     """解析 ``[sync] llm_match_max_iterations`` 覆盖值（自包含实现）。
 
     语义与 ``app/services/matching/llm_assist.py::resolve_max_iterations_override``

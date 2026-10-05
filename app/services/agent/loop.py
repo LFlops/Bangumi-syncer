@@ -41,7 +41,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Protocol
 
 from app.services.llm.models import (
     ChatResponse,
@@ -51,6 +51,10 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+
+if TYPE_CHECKING:
+    # 仅为类型别名/签名提供具体批量结果类型；不在运行时依赖 tools，保持通用骨架解耦。
+    from app.services.llm.tools import BatchResults
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +90,38 @@ class RunResult:
     last_response: ChatResponse | None = None
 
 
+class StreamingExecutor(Protocol):
+    """流式工具执行器协议。
+
+    本地声明（不 import 具体 ``StreamingToolExecutor``），保持通用骨架对执行器实现的
+    运行时解耦；返回值需实现 ``feed`` / ``finalize``。
+    """
+
+    def feed(self, chunk: StreamChunk) -> None: ...
+
+    async def finalize(self) -> list[ToolResultBlock]: ...
+
+
+class BudgetRecorder(Protocol):
+    """预算与工具 span 记录器协议。
+
+    本地声明（不 import 具体 ``TraceRecorder``），避免通用骨架与 recorder 循环依赖；
+    签名与 ``recorder.TraceRecorder`` 一致。
+    """
+
+    def record_budget(self, budget_message: str) -> None: ...
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None: ...
+
+    def end_tool(
+        self,
+        span_id: str,
+        *,
+        result: ToolResultBlock | None = None,
+        error: str = "",
+    ) -> None: ...
+
+
 # 注入的函数类型（仅做文档化提示，运行时不强制）
 #: .. deprecated:: 旧契约兼容。``ChatFn`` 仅测试/迁移期使用，后续清理时移除；
 #: 主路径请用 :data:`StreamFn`。
@@ -93,9 +129,9 @@ ChatFn = Callable[..., Awaitable[ChatResponse]]
 StreamFn = Callable[..., AsyncIterator[StreamChunk]]
 #: .. deprecated:: 旧契约兼容。``ToolCallsFn`` 仅测试/迁移期使用，后续清理时移除；
 #: 主路径请用 ``executor_factory`` + ``StreamingToolExecutor``。
-ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable[Any]]
-#: 按轮构造流式工具执行器（返回值需实现 feed / finalize 鸭子类型）
-ExecutorFactory = Callable[[], Any]
+ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable["BatchResults | dict[str, Any]"]]
+#: 按轮构造流式工具执行器（返回值需实现 ``StreamingExecutor``）
+ExecutorFactory = Callable[[], StreamingExecutor]
 
 
 async def _consume_stream(
@@ -105,7 +141,7 @@ async def _consume_stream(
     tools: list[dict] | None,
     tool_choice: str | None,
     executor_factory: ExecutorFactory | None,
-) -> tuple[ChatResponse, Any | None]:
+) -> tuple[ChatResponse, StreamingExecutor | None]:
     """消费一轮流：聚合响应，并把工具事件喂给执行器（若注入）。
 
     返回 ``(resp, executor)``；``executor_factory=None`` 时不构造执行器（纯聚合，
@@ -147,7 +183,9 @@ def _extract_tool_calls(resp: ChatResponse) -> list[ToolUseBlock]:
     return [b for b in resp.blocks if isinstance(b, ToolUseBlock)]
 
 
-def _align_results(tool_calls: list[ToolUseBlock], results: Any) -> list[Any]:
+def _align_results(
+    tool_calls: list[ToolUseBlock], results: BatchResults | dict[str, Any]
+) -> list[ToolResultBlock | None]:
     """把执行器返回值对齐为与 ``tool_calls`` 一一对应的结果槽位列表。
 
     - 执行器返回 ``BatchResults``（带 ``ordered`` 槽位）→ 按槽位取，重复 tool_use_id
@@ -186,7 +224,7 @@ def _inject_veto_hint(
 
 
 def _record_veto_tool(
-    recorder: Any | None,
+    recorder: BudgetRecorder | None,
     terminal_tc: ToolUseBlock,
     hint: str,
     *,
@@ -225,7 +263,7 @@ async def run(
     executor_factory: ExecutorFactory | None = None,
     chat_fn: ChatFn | None = None,
     tool_calls_fn: ToolCallsFn | None = None,
-    recorder: Any | None = None,
+    recorder: BudgetRecorder | None = None,
     veto_terminal: Callable[[dict], str | None] | None = None,
 ) -> RunResult:
     """运行轻量 Agent 循环，返回 ``RunResult``。
@@ -253,8 +291,8 @@ async def run(
       做快照：不改写调用方对象、调用方仍可复用；用 ``Sequence`` 而非 ``Iterable``
       ——seed 会被 runtime 的 ``write_seed_row`` 与 loop **多次消费**，生成器必须被
       类型排除
-    - ``recorder``：可选预算记录器（鸭子类型 ``record_budget(str)``；不导入具体实现
-      以避免与 recorder.py 循环依赖），None 时跳过钩子
+    - ``recorder``：可选预算记录器（满足本地 :class:`BudgetRecorder` 协议；不导入具体
+      实现以避免与 recorder.py 循环依赖），None 时跳过钩子
     - ``veto_terminal``：可选终止提交软护栏。非 None 时，命中终止工具的轮次会先询问
       该回调（入参=terminal input）；返回提示文案则**不终止**、注入配对 tool_result 后
       继续一轮（仅拦一次，且末轮不拦）。返回 None / 回调为 None 时行为与现状一致。
@@ -281,7 +319,7 @@ async def run(
         # 末轮（remaining==1 起手）强制 terminal 收尾；其余轮不指定 tool_choice
         tool_choice = tool_choice_terminal if remaining == 1 else None
 
-        executor: Any | None = None
+        executor: StreamingExecutor | None = None
         if stream_fn is not None:
             resp, executor = await _consume_stream(
                 stream_fn,
@@ -434,7 +472,7 @@ async def _final_recovery(
     tools_schemas: list[dict],
     tool_choice_terminal: str,
     messages: list[Message],
-    recorder: Any | None,
+    recorder: BudgetRecorder | None,
     last_response: ChatResponse | None,
     stream_fn: StreamFn | None = None,
     chat_fn: ChatFn | None = None,

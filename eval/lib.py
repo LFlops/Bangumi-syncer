@@ -33,6 +33,7 @@ from app.services.llm.models import (
 )
 from app.services.llm.tools import ToolRegistry
 from app.services.matching import llm_assist
+from app.services.notification_service import NotificationService
 
 CASSETTE_SCHEMA_VERSION = 1
 
@@ -314,8 +315,12 @@ def recording_execute_batch_factory(orig, sink):
     return wrapped
 
 
-class CountingNotifier:
-    """通知计数（断言通知次数；内容仅存可序列化摘要）。"""
+class CountingNotifier(NotificationService):
+    """通知计数替身（断言通知次数；内容仅存可序列化摘要）。
+
+    子类化 :class:`NotificationService` 以匹配场景运行的注入契约（``NotificationService``），
+    但覆写 ``notify`` 仅计数、不触发真实渠道发送（不调用 ``super().__init__``，行为不变）。
+    """
 
     def __init__(self):
         self.calls = []

@@ -36,6 +36,7 @@ from app.services.llm.tools import (
     ToolSpanRecorder,
     serialize_tool_result,
 )
+from app.services.notification_service import NotificationService
 
 # 非只读（write/terminal/未注册）缺失工具的占位 tool_result 文案
 # ——不重放副作用，仅闭合会话协议，真实调用由续跑 loop 触发
@@ -50,7 +51,7 @@ async def run(
     thinking_level: str,
     stream_fn: StreamFn | None = None,
     chat_fn: ChatFn | None = None,
-    notification_service: Any | None = None,
+    notification_service: NotificationService | None = None,
     span_recorder: TraceRecorder | None = None,
 ) -> str:
     """执行一次 Agent 场景任务（通用编排），返回终态 status 字符串。
@@ -216,7 +217,7 @@ async def continue_run(
     *,
     hooks: ScenarioHooks,
     ctx: Any,
-    notification_service: Any | None = None,
+    notification_service: NotificationService | None = None,
 ) -> None:
     """恢复续跑单一入口（通用状态机）：replay → 补执行 → 续跑 → 终局处理。
 
@@ -395,7 +396,7 @@ async def _execute_continuation(
     remaining: int,
     hooks: ScenarioHooks,
     ctx: Any,
-    notification_service: Any | None,
+    notification_service: NotificationService | None,
     anchor_replayed_round: bool,
 ) -> None:
     """注册工具 → 建 recorder → 补执行缺失工具 → 续跑 loop → 终局处理。
@@ -453,8 +454,8 @@ async def _execute_continuation(
 
 async def _replay_missing_tool(
     tool_call: dict,
-    registry,
-    messages: list,
+    registry: ToolRegistry,
+    messages: list[Message],
     *,
     span_recorder: ToolSpanRecorder | None = None,
     sequence: int = 0,
@@ -525,7 +526,7 @@ async def _replay_missing_tool(
 
 
 def _append_tool_result(
-    messages: list, tool_use_id: str, content: str, *, is_error: bool
+    messages: list[Message], tool_use_id: str, content: str, *, is_error: bool
 ) -> None:
     """追加一条 tool_result 消息（闭合 assistant 的 tool_use，F4/G5）。"""
     messages.append(

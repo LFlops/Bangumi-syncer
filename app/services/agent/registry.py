@@ -20,7 +20,9 @@ from typing import Any
 from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime
 from app.services.agent.loop import ChatFn, StreamFn
+from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
+from app.services.notification_service import NotificationService
 
 
 @dataclass(frozen=True)
@@ -29,7 +31,8 @@ class ScenarioRuntime:
 
     task_type: str
     hooks: ScenarioHooks
-    #: (sync_record, bgm) -> ctx（场景上下文，runtime 原样透传）
+    #: (sync_record, bgm) -> ctx（场景上下文，runtime 原样透传）。
+    #: 刻意用 ``Any``：ctx 结构由各场景自定义，通用层对其完全不可见（不透明边界）。
     make_ctx: Callable[[dict, Any], Any]
 
     async def run(
@@ -37,12 +40,13 @@ class ScenarioRuntime:
         run_id: str,
         *,
         sync_record: dict,
+        # 刻意用 Any：bgm 为场景侧对象（非通用层契约），仅原样透传给 make_ctx。
         bgm: Any,
         thinking_level: str,
         stream_fn: StreamFn | None = None,
         chat_fn: ChatFn | None = None,
-        notification_service: Any | None = None,
-        span_recorder: Any | None = None,
+        notification_service: NotificationService | None = None,
+        span_recorder: TraceRecorder | None = None,
     ) -> str:
         """执行一次场景任务（转发通用运行时）。
 
@@ -65,8 +69,9 @@ class ScenarioRuntime:
         run_id: str,
         *,
         sync_record: dict,
+        # 刻意用 Any：bgm 为场景侧对象（非通用层契约），仅原样透传给 make_ctx。
         bgm: Any,
-        notification_service: Any | None = None,
+        notification_service: NotificationService | None = None,
     ) -> None:
         """恢复续跑（转发通用状态机）。"""
         await agent_runtime.continue_run(

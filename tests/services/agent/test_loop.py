@@ -485,13 +485,30 @@ async def test_max_iterations_exhausted_returns_last_response():
 
 
 class _FakeBudgetRecorder:
-    """记录 record_budget 调用，便于断言预算消息。"""
+    """记录 record_budget 调用，便于断言预算消息。
+
+    满足 loop 的 ``BudgetRecorder`` 协议：本替身仅断言 ``record_budget``，
+    工具 span 相关方法为协议占位（不记录），由子类 ``_FakeToolRecorder`` 覆写。
+    """
 
     def __init__(self) -> None:
         self.budget_calls: list[str] = []
 
     def record_budget(self, budget_message: str) -> None:
         self.budget_calls.append(budget_message)
+
+    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None:
+        """协议占位：本替身不追踪工具 span（无 veto 场景不会触发）。"""
+        return None
+
+    def end_tool(
+        self,
+        span_id: str,
+        *,
+        result: ToolResultBlock | None = None,
+        error: str = "",
+    ) -> None:
+        """协议占位：见 :meth:`start_tool`。"""
 
 
 async def test_budget_record_budget_called_per_non_final_round_with_remaining():
