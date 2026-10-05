@@ -1129,10 +1129,13 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         item: CustomItem,
         subject_id: str,
         is_season_matched_id: bool,
-    ) -> tuple[str, str]:
+    ) -> tuple[int | str | None, int | str | None]:
         """根据 media_type 解析 Bangumi 季度与集数 ID。
 
         返回 (bgm_se_id, bgm_ep_id)；可能抛出 ValueError（认证错误由调用方处理）。
+
+        真实返回类型随链路而异（movie 返回 str、剧集返回 int），且未命中时为 None，
+        调用方（EpisodeResolveStep）已按可为 None 处理。
         """
         release_for_ep = None
         if item.release_date and len(item.release_date) >= 8:
@@ -1340,7 +1343,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         bgm_se_id: str,
         bgm_ep_id: str,
         bgm_title: str,
-    ) -> None:
+    ) -> list[dict]:
         """把已解析的单集标记到首选账号之外的其余 Bangumi 账号
 
         同一媒体服务器用户名可被多个 Bangumi 账号声明（一人多号、与亲友共享
@@ -1564,7 +1567,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
         return True, ""
 
-    def _is_title_blocked(self, title: str, ori_title: str = None) -> bool:
+    def _is_title_blocked(self, title: str, ori_title: str | None = None) -> bool:
         """检查番剧标题是否包含屏蔽关键词"""
         # 获取屏蔽关键词配置
         blocked_keywords_str = config_manager.get(

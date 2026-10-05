@@ -115,6 +115,10 @@ class SyncOrchestrator:
                 status_holder[0] = error_response.status
                 return error_response
 
+            # _match_subject 契约：失败/不可达时返回非空 error_response；
+            # 能走到此处即匹配成功，subject_id 必为真值（此处仅做类型收窄）。
+            assert subject_id is not None, "匹配成功但 subject_id 为空"
+
             # 7. bgm 实例校验（匹配成功但 bgm 缺失，标记阶段无法继续）
             bgm = self._sync._get_bangumi_api_for_user(item.user_name)
             if not bgm:
@@ -160,8 +164,8 @@ class SyncOrchestrator:
             # 11. bangumi_id_found 通知：使用解析后的正确季度 ID（cross_season
             #     改选后 current_outputs 的 subject_id 可能是跨季条目，subject_id
             #     仅为匹配阶段结果）。取值来源：结果链（SyncPipeline 统一回填）。
-            bgm_se_id = exec_ctx.current_outputs.get("subject_id") or subject_id
-            bgm_ep_id = exec_ctx.current_outputs.get("episode_id") or ""
+            bgm_se_id = str(exec_ctx.current_outputs.get("subject_id") or subject_id)
+            bgm_ep_id = str(exec_ctx.current_outputs.get("episode_id") or "")
             bgm_title = exec_ctx.current_outputs.get(
                 "bgm_title"
             ) or self._fetch_bgm_title(bgm, str(bgm_se_id))
@@ -190,6 +194,12 @@ class SyncOrchestrator:
                     trace,
                     status_holder,
                 )
+
+            # 成功路径的 mark_status 由 ResultStep 结算（缺失会抛错），
+            # queued(-1) 已在上方 return；此处仅做类型收窄。
+            assert mark_status is not None, (
+                "成功路径缺少通过 ResultStep 结算的 mark_status"
+            )
 
             # 13. 其余 Bangumi 账号补标记（同一媒体服务器用户名绑定多个账号）
             other_results = self._sync._mark_episode_for_other_accounts(
@@ -449,7 +459,12 @@ class SyncOrchestrator:
         )
 
         # persist 后关联落库：created 为回填主指针，in_flight/复用为刷新主指针
-        if assist_enabled and decision != "enqueue_failed" and actual_run_id:
+        if (
+            assist_enabled
+            and decision != "enqueue_failed"
+            and actual_run_id
+            and sync_record_id is not None
+        ):
             self._link_run_sync_record(actual_run_id, sync_record_id, decision)
 
         from . import notification_service
@@ -587,8 +602,10 @@ class SyncOrchestrator:
             subject_info = bgm.get_subject(bgm_se_id)
             if subject_info:
                 return subject_info.get("name_cn") or subject_info.get("name") or ""
-        except Exception:
-            logger.debug(f"获取条目标题失败: {bgm_se_id}", exc_info=True)
+        except Exception as e:
+            # 自定义 Logger.debug 不支持 exc_info（传了会 TypeError），
+            # 故将异常信息并入 message，保持可排查性。
+            logger.debug(f"获取条目标题失败: {bgm_se_id} ({type(e).__name__}: {e})")
         return ""
 
     # ------------------------------------------------------------------
@@ -861,11 +878,12 @@ class SyncOrchestrator:
         message: str,
         bgm_title: str = "",
         account_results: list[dict] | None = None,
-    ) -> int:
+    ) -> int | None:
         """统一收口 trace→DB 的 finish+to_dict+log 样板（原 5 处重复）
 
         trace 已由调用方 finish，此处仅负责 to_dict + log_sync_record。
-        返回 sync_record_id（供通知 in_app_ref_id 与候选沉淀使用）。
+        返回 sync_record_id（供通知 in_app_ref_id 与候选沉淀使用）；
+        落库失败时返回 None（由调用方按可选值处理）。
         """
         from . import database_manager
 

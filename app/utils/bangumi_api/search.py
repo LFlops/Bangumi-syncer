@@ -121,7 +121,9 @@ class SearchMixin:
         self._put_cache("search", cache_key, result)
         return result
 
-    def get_subject(self, subject_id: int, use_archive: bool = True) -> dict[str, Any]:
+    def get_subject(
+        self, subject_id: int | str, use_archive: bool = True
+    ) -> dict[str, Any]:
         # 使用实例缓存避免内存泄漏。key 区分 use_archive：Archive 数据不含
         # images 字段，混用同一槽位会污染 API 结果的封面解析。
         cache_key = (subject_id, use_archive)

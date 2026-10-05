@@ -47,7 +47,7 @@ class EpisodesMixin:
 
     def _fetch_episodes_page(
         self,
-        subject_id: int,
+        subject_id: int | str,
         _type: int = 0,
         *,
         limit: int = _EPISODES_PAGE_LIMIT,
@@ -92,7 +92,7 @@ class EpisodesMixin:
 
     def get_episodes(
         self,
-        subject_id: int,
+        subject_id: int | str,
         _type: int = 0,
         fetch_all: bool = False,
     ) -> dict[str, Any] | list[dict[str, Any]]:
@@ -132,7 +132,7 @@ class EpisodesMixin:
         return result
 
     def _find_episode_by_sort(
-        self, subject_id: int, target_sort: int, _type: int = 0
+        self, subject_id: int | str, target_sort: int, _type: int = 0
     ) -> dict | None:
         """在 subject 内按 sort/ep 规则查找章节。
 
@@ -227,11 +227,11 @@ class EpisodesMixin:
 
     def _episode_lookup_failed(
         self,
-        subject_id: int,
+        subject_id: int | str,
         target_ep: int,
         release_date: str | None,
         target_season: int = 1,
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[int | str | None, int | str | None]:
         """季集匹配失败后的统一回退。
 
         回退顺序：
@@ -257,7 +257,7 @@ class EpisodesMixin:
 
     def _try_resolve_continuous_season_episode(
         self,
-        subject_id: int,
+        subject_id: int | str,
         target_season: int,
         target_ep: int,
     ) -> tuple[str | int, str | int] | None:
@@ -521,12 +521,12 @@ class EpisodesMixin:
 
     def get_target_season_episode_id(
         self,
-        subject_id: int,
+        subject_id: int | str,
         target_season: int,
         target_ep: int,
         is_season_subject_id: bool = False,
         release_date: str | None = None,
-    ) -> tuple[int | None, int | None]:
+    ) -> tuple[int | str | None, int | str | None]:
         max_season, max_episode = self._get_episode_sync_limits()
 
         if target_season > max_season or (target_ep and target_ep > max_episode):
@@ -582,7 +582,7 @@ class EpisodesMixin:
             release_date,
         )
 
-    def _find_next_sequel_id(self, current_id: int) -> int | None:
+    def _find_next_sequel_id(self, current_id: int | str) -> int | None:
         """从关联条目中查找续集 subject_id，无则返回 None"""
         # Archive 短路：本地命中即返回（int 或 None）
         shortcut = self._archive.try_find_next_sequel_id(current_id)
@@ -602,7 +602,7 @@ class EpisodesMixin:
         return next_id[0]["id"] if next_id else None
 
     def _find_related_id_by_relation(
-        self, subject_id: int, relation: str
+        self, subject_id: int | str, relation: str
     ) -> int | None:
         """从关联条目中按 relation 查找 subject_id。
 
@@ -1165,7 +1165,7 @@ class EpisodesMixin:
 
     def _find_season_one_episode(
         self,
-        subject_id: int,
+        subject_id: int | str,
         target_ep: int,
         root_type: int,
         root_platform: str,
@@ -1217,7 +1217,7 @@ class EpisodesMixin:
 
     def _find_multi_season_episode(
         self,
-        subject_id: int,
+        subject_id: int | str,
         target_season: int,
         target_ep: int,
         root_type: int,

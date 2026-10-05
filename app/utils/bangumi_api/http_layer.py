@@ -64,7 +64,22 @@ _UPSTREAM_GATEWAY_ERROR_STATUS = 502
 
 
 class HttpLayerMixin:
-    """HTTP 请求层相关方法（供 BangumiApi 组合）"""
+    """HTTP 请求层相关方法（供 BangumiApi 组合）
+
+    本 mixin 依赖宿主类（``BangumiApi``）提供的状态与方法；以下类级注解
+    仅用于静态类型解析，不产生运行时属性（真正的赋值发生在 ``BangumiApi.__init__``）。
+    """
+
+    # 宿主类提供的实例状态
+    ssl_verify: bool
+    access_token: str | None
+    http_proxy: str | None
+    _proxy_failed: bool
+    username: str | None
+
+    def mark_api_unreachable(self) -> None:
+        """由宿主类实现：标记 API 不可达（TTL 内走降级）"""
+        ...
 
     def _apply_rate_limit_notification(self, res: httpx.Response) -> None:
         """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）
@@ -89,17 +104,17 @@ class HttpLayerMixin:
         logger.debug(f"🔄 尝试直连: {url}")
 
         # 创建一个临时的 SyncHttpClient，不使用代理
-        temp_session = (
-            SyncHttpClient(
-                label="Bangumi-直连",
-                verify=self.ssl_verify,
-                ech=getattr(self, "ech_mode", "off"),
-                max_retries=0,
-            )
-            .prefix("📚")
-            .success_tpl("直连请求成功")
-            .failure_tpl("直连请求失败")
+        # 链式配置方法返回 HttpClientBase，会丢失 SyncHttpClient 的 client/request/close；
+        # 故逐条调用保留 temp_session 的 SyncHttpClient 静态类型（运行时等价）。
+        temp_session = SyncHttpClient(
+            label="Bangumi-直连",
+            verify=self.ssl_verify,
+            ech=getattr(self, "ech_mode", "off"),
+            max_retries=0,
         )
+        temp_session.prefix("📚")
+        temp_session.success_tpl("直连请求成功")
+        temp_session.failure_tpl("直连请求失败")
         temp_session.client.headers.update(
             {
                 "Accept": "application/json",
@@ -155,7 +170,10 @@ class HttpLayerMixin:
                 hostname, port, socket.AF_UNSPEC, socket.SOCK_STREAM
             )
             ips = [ip[4][0] for ip in ip_list]
-            logger.debug(f"✅ DNS解析成功: {hostname} -> {', '.join(set(ips))}")
+            # 地址可能是 str/bytes/int 混合，统一 str 后再去重拼接
+            logger.debug(
+                f"✅ DNS解析成功: {hostname} -> {', '.join({str(ip) for ip in ips})}"
+            )
         except socket.gaierror as e:
             logger.error(f"❌ DNS解析失败: {e}")
             logger.debug("💡 建议检查:")
@@ -207,7 +225,16 @@ class HttpLayerMixin:
         # 如果之前代理已经失败过，直接使用直连
         if self.http_proxy and self._proxy_failed:
             logger.debug("💡 检测到代理之前已失败，本次请求直接使用直连")
-            return self._try_direct_connection(method, url, **kwargs)
+            direct_result = self._try_direct_connection(method, url, **kwargs)
+            if direct_result is None:
+                # _try_direct_connection 仅在直连返回 >=400 时返回 None；
+                # 与下方"直连回退也失败"路径保持一致：标记不可达并抛出，
+                # 避免向调用方返回 None（会让 _validate_response 抛 AttributeError）。
+                self.mark_api_unreachable()
+                raise httpx.HTTPError(
+                    f"代理不可用且直连返回错误状态码: {method.upper()} {url}"
+                )
+            return direct_result
 
         try:
             get_bgm_rate_limiter().acquire()
