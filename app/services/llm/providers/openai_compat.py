@@ -254,15 +254,17 @@ class OpenAICompatProvider(BaseProvider):
             fn = tc.get("function") or {}
             name = fn.get("name")
 
-            if index not in tool_index and name:
-                # 首次出现且带 name → 新建工具调用槽（id 仅首个分片提供）
+            if index not in tool_index:
+                # 首次出现即建槽，不依赖 name：首分片可能只带 index+id，name 缺失
+                # （如某些兼容端点在 arguments 才补齐）。若等待 name 才建槽，后续
+                # arguments 分片会产出无前置 tool_use_start 的孤立 delta，且丢失真实 id。
                 call_id = tc.get("id") or f"call_{index}"
-                tool_index[index] = (call_id, name)
+                tool_index[index] = (call_id, name or "")
                 chunks.append(
                     StreamChunk(
                         type="tool_use_start",
                         tool_use_id=call_id,
-                        tool_name=name,
+                        tool_name=name or "",
                     )
                 )
 

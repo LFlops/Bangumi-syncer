@@ -1458,6 +1458,63 @@ async def test_stream_path_malformed_json_error_and_loop_continues():
     assert "JSON" in blocks[0].content
 
 
+async def test_stream_path_pads_missing_slots_to_close_protocol(caplog):
+    """执行器槽位不足且顺序破坏 → 补齐：每条 tool_use 都有配对 tool_result。
+
+    流式执行器 ``finalize`` 因协议破坏返回少于 tool_calls 的槽位时，若直接 ``zip``
+    截断，多出的 tool_use 会缺少 tool_result 闭合，下一轮真实端点可能 400。
+    此处只返回 b 的结果（a 缺失且顺序破坏），断言 a 以 slot mismatch 错误块回填。
+    """
+    import logging
+
+    calls: list[list[Message]] = []
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        calls.append(list(messages))
+        if len(calls) == 1:
+            yield _stream_start("a", "read_a")
+            yield _stream_delta("a", "{}")
+            yield _stream_stop("a")
+            yield _stream_start("b", "read_b")
+            yield _stream_delta("b", "{}")
+            yield _stream_stop("b")
+            yield StreamChunk(type="stop", stop_reason="tool_use")
+        else:
+            yield _stream_end_turn()
+
+    class _ShortFinalizeExecutor:
+        def feed(self, chunk):
+            pass
+
+        async def finalize(self):
+            # 少一个槽位 + 顺序破坏：只给 b 的结果（a 的槽位缺失）
+            return [ToolResultBlock(tool_use_id="b", content="res-b", is_error=False)]
+
+    result = await run(
+        stream_fn=stream_fn,
+        executor_factory=_ShortFinalizeExecutor,
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "end_turn"
+    assistant = next(m for m in calls[1] if m.role == "assistant")
+    tool_use_ids = [b.id for b in assistant.content if b.type == "tool_use"]
+    assert tool_use_ids == ["a", "b"]
+
+    blocks = _collect_tool_results(calls[1])
+    by_id = {b.tool_use_id: b for b in blocks}
+    assert set(by_id) == {"a", "b"}, "每条 tool_use 都应有配对 tool_result"
+    assert by_id["b"].content == "res-b"
+    assert by_id["a"].is_error is True
+    assert "slot mismatch" in by_id["a"].content
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("槽位数" in r.getMessage() for r in warnings)
+
+
 async def test_stream_path_budget_and_recovery_use_stream():
     """耗尽后收尾也走流式：收尾返回 terminal → submit_suggestion。"""
     state = {"round": 0}

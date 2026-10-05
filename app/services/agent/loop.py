@@ -204,6 +204,36 @@ def _align_results(
     return [getter(tc.id) for tc in tool_calls]
 
 
+def _pad_aligned(
+    tool_calls: list[ToolUseBlock], aligned: Sequence[ToolResultBlock | None]
+) -> list[ToolResultBlock | None]:
+    """把执行器结果槽位补齐到与 ``tool_calls`` 等长，闭合会话协议。
+
+    防御协议破坏（``finalize`` 返回槽位少于 ``tool_calls`` 或顺序错乱）：按
+    ``tool_use_id`` 贪心匹配现有结果，未匹配到的 tool_use 以 ``slot mismatch``
+    错误块回填。若直接 ``zip(strict=False)`` 截断，多出的 tool_use 会缺少配对
+    tool_result，下一轮真实端点可能 400。
+    """
+    remaining = [r for r in aligned if isinstance(r, ToolResultBlock)]
+    patched: list[ToolResultBlock | None] = []
+    for tc in tool_calls:
+        match_idx = next(
+            (i for i, r in enumerate(remaining) if r.tool_use_id == tc.id), None
+        )
+        if match_idx is not None:
+            patched.append(remaining.pop(match_idx))
+            continue
+        # 防御兜底：该 tool_use 无对应执行结果（协议破坏）→ 以错误块闭合，不静默
+        logger.warning(
+            "执行器结果缺少 tool_use_id=%s 的槽位，以 slot mismatch 错误块回填",
+            tc.id,
+        )
+        patched.append(
+            ToolResultBlock(tool_use_id=tc.id, content="slot mismatch", is_error=True)
+        )
+    return patched
+
+
 def _inject_veto_hint(
     messages: list[Message], terminal_tc: ToolUseBlock, hint: str
 ) -> None:
@@ -362,9 +392,10 @@ async def run(
         # tool_use 一并回传（Anthropic/DeepSeek 约束，否则真实端点 400：
         # "content[].thinking ... must be passed back"）；OpenAI 兼容层在 provider
         # 侧按各自协议处理（thinking 块跳过）。
-        assistant_blocks: list[ContentBlock] = list(resp.blocks) or [
-            ToolUseBlock(id=tc.id, name=tc.name, input=tc.input) for tc in tool_calls
-        ]
+        # 无需 ``or [ToolUseBlock(...)]`` 兜底：上方 ``if not tool_calls: return`` 已保证
+        # 本轮存在 ToolUseBlock，而 ``tool_calls`` 正是从 ``resp.blocks`` 提取，故
+        # ``resp.blocks`` 必非空，兜底分支不可达。
+        assistant_blocks: list[ContentBlock] = list(resp.blocks)
         messages.append(Message(role="assistant", content=assistant_blocks))
 
         # ④ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
@@ -407,12 +438,14 @@ async def run(
         if executor is not None:
             aligned = await executor.finalize()
             if len(aligned) != len(tool_calls):
-                # 防御：执行器结果槽位数与 tool_calls 不一致（协议破坏），记录后仍尽力对齐
+                # 防御：执行器结果槽位数与 tool_calls 不一致（协议破坏）→ 补齐，
+                # 保证每条 tool_use 都有配对 tool_result（否则 zip 截断留下悬垂 tool_use）
                 logger.warning(
                     "流式执行器结果槽位数（%d）与 tool_calls（%d）不一致",
                     len(aligned),
                     len(tool_calls),
                 )
+                aligned = _pad_aligned(tool_calls, aligned)
         elif tool_calls_fn is not None:
             results = await tool_calls_fn(tool_calls)
             aligned = _align_results(tool_calls, results)

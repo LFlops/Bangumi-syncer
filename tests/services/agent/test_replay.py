@@ -503,6 +503,59 @@ class TestReplayRebuildsFullBlocks:
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("blocks" in line for line in warns)
 
+    def test_derives_tool_calls_from_blocks_when_field_missing(self, dbm, log_records):
+        """``tool_calls`` 字段缺失但 blocks 含 tool_use → 从 blocks 推导（不丢工具调用）。
+
+        replay_delta 局部损坏（tool_calls 丢失）时，若不推导会被当作「终局响应」，
+        tool_use 静默丢弃、后续恢复误判。断言 assistant 消息依 blocks 重建，
+        且 missing 检测基于推导结果生效。
+        """
+        _write_seed(dbm, "run-derive", [])
+        span_id = trace.start_span("run-derive", "llm_chat", 0, 0)
+        trace.end_span(
+            span_id,
+            replay_delta={
+                "response": {
+                    "stop_reason": "tool_use",
+                    "content": "",
+                    # 关键：无 "tool_calls" 字段，仅 blocks 含 tool_use
+                    "blocks": [
+                        ToolUseBlock(
+                            id="t1", name="search_bangumi", input={"title": "foo"}
+                        ).model_dump()
+                    ],
+                }
+            },
+        )
+
+        result = trace.replay("run-derive")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [type(b) for b in assistant.content] == [ToolUseBlock]
+        assert assistant.content[0].id == "t1"
+        # 未执行 → missing 基于推导出的 tool_calls 生效
+        assert [tc["id"] for tc in result.missing_tool_calls] == ["t1"]
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("blocks" in line and "推导" in line for line in warns)
+
+    def test_empty_tool_calls_derives_from_blocks_with_tool_use(self, dbm):
+        """``tool_calls`` 为空列表（非缺失）但 blocks 含 tool_use → 同样推导。"""
+        _write_seed(dbm, "run-derive-empty", [])
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-derive-empty",
+            0,
+            [],
+            [ToolUseBlock(id="t2", name="get_subject_detail", input={}).model_dump()],
+        )
+        _write_tool_exec(dbm, "run-derive-empty", 0, 1, "t2", "res2")
+
+        result = trace.replay("run-derive-empty")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [type(b) for b in assistant.content] == [ToolUseBlock]
+        assert result.missing_tool_calls == [], "已执行完毕不应判缺失"
+
     def test_terminal_round_with_thinking_returned_as_last_response(self, dbm):
         """终局轮：thinking + 终止工具调用（无 tool_execute）→ 作为 last_response 交回。"""
         _write_seed(dbm, "run-term-th", [])

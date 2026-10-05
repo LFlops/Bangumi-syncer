@@ -349,6 +349,44 @@ class TestOpenAICompatProviderStream:
         assert len(starts) == 1
         assert starts[0].tool_use_id == "call_0"
 
+    async def test_first_fragment_without_name_still_emits_start(self):
+        """首分片只有 index+id（无 name）→ 仍建槽并 emit start，次分片 delta 带真实 id。
+
+        否则后续 arguments 分片会产出无前置 start 的孤立 delta，且 id 丢失
+        （旧代码回退 ``call_0``），下游聚合只能自愈并产生 warning 噪声。
+        """
+        payloads = [
+            _chunk_payload(
+                {"tool_calls": [{"index": 0, "id": "call_xyz"}]},
+            ),
+            _chunk_payload(
+                {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}
+            ),
+            _chunk_payload({}, finish_reason="tool_calls"),
+            "[DONE]",
+        ]
+        mock_client = _make_mock_stream_client(sse_lines=_sse_lines(*payloads))
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            provider = self._provider()
+            chunks = await self._collect(provider, [Message(role="user", content="x")])
+
+        events = [c for c in chunks if c.type in ("tool_use_start", "tool_use_delta")]
+        assert [c.type for c in events] == ["tool_use_start", "tool_use_delta"]
+        assert events[0].tool_use_id == "call_xyz"
+        assert events[0].tool_name == ""
+        assert events[1].tool_use_id == "call_xyz"
+        assert events[1].partial_json == "{}"
+
+        # 下游聚合无「缺少 start 自愈」告警
+        agg = StreamAggregator()
+        for chunk in chunks:
+            agg.feed(chunk)
+        resp = agg.finalize()
+        tool_blocks = [b for b in resp.blocks if b.type == "tool_use"]
+        assert len(tool_blocks) == 1
+        assert tool_blocks[0].id == "call_xyz"
+
     async def test_finish_reason_tool_calls_maps_to_tool_use(self):
         """finish_reason=tool_calls → stop_reason=tool_use（与 _parse_response 一致）。"""
         payloads = [

@@ -385,11 +385,25 @@ def replay(run_id: str) -> ReplayResult:
             )
             break
 
-        tool_calls = response.get("tool_calls") or []
+        tool_calls: list[dict[str, Any]] = response.get("tool_calls") or []
         # 重建 assistant 消息：优先消费全量 blocks（含 thinking，与 live
         # ``list(resp.blocks)`` 逐条一致）；blocks 缺失/非法时回退 tool_calls
         # （旧数据兼容）。thinking 块必须随 tool_use 回传，否则续跑请求会 400。
         blocks = _restore_response_blocks(response)
+        # replay_delta 局部损坏：``tool_calls`` 缺失/为空但 blocks 含 tool_use 时，
+        # 从 blocks 推导（保持顺序）。否则会被当「终局响应」处理，tool_use 被静默
+        # 丢弃、后续恢复误判。
+        if not tool_calls and blocks is not None:
+            derived = [b for b in blocks if isinstance(b, ToolUseBlock)]
+            if derived:
+                derived_calls: list[dict[str, Any]] = [
+                    {"id": b.id, "name": b.name, "input": b.input} for b in derived
+                ]
+                tool_calls = derived_calls
+                logger.warning(
+                    f"[trace] replay iteration={it} tool_calls 缺失/为空但 blocks 含 "
+                    f"{len(derived)} 个 tool_use，已从 blocks 推导"
+                )
         if blocks is not None:
             assistant_content: list[ContentBlock] = blocks
         else:
