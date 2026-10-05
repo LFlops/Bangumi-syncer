@@ -238,7 +238,7 @@ async def test_replay_case_performs_no_network_access(monkeypatch, fixtures_dir:
 
 
 # ---------------------------------------------------------------------------
-# 5. R4：ChatResponse → StreamChunk 展开（无停点 → 轮级降级）
+# 5. ChatResponse → StreamChunk 展开（无停点 → 轮级降级）
 # ---------------------------------------------------------------------------
 
 

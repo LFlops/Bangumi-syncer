@@ -75,11 +75,11 @@ def test_enabled_already_bool():
     assert cfg_false.enabled is False
 
 
-# ── memory_limit / related_limit（R6 配置透传，0=关）────────────────────
+# ── memory_limit / related_limit（配置透传，0=关）────────────────────
 
 
 def test_memory_config_parsed():
-    """R6：[summary-xxx] memory_limit=3、related_limit=2 → 透传。"""
+    """[summary-xxx] memory_limit=3、related_limit=2 → 透传。"""
     cfg = SummaryJobConfig.from_config_dict(
         {"name": "daily", "memory_limit": "3", "related_limit": "2"}
     )
@@ -185,7 +185,7 @@ def test_no_user_prompt_template_attribute():
 
 
 def test_bad_lookback_days_does_not_crash():
-    """H2：非法 lookback_days/max_records 不抛异常（坏配置不拖垮调度注册）。"""
+    """非法 lookback_days/max_records 不抛异常（坏配置不拖垮调度注册）。"""
     cfg = SummaryJobConfig.from_config_dict(
         {"name": "t", "lookback_days": "abc", "max_records": "1.5"}
     )

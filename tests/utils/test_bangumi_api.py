@@ -1045,7 +1045,7 @@ class TestGetTargetSeasonEpisodeId:
             result = api.get_target_season_episode_id(
                 "123", 1, 0, is_season_subject_id=True
             )
-        # P0-3 修复: 返回 tuple (subject_id, None) 保持解包契约
+        # 修复: 返回 tuple (subject_id, None) 保持解包契约
         assert result == ("123", None)
 
     def test_is_season_subject_id_match_sort(self):
@@ -1097,7 +1097,7 @@ class TestGetTargetSeasonEpisodeId:
         api = BangumiApi()
         with patch.object(api, "get_subject", return_value=self._MOCK_SUBJECT):
             result = api.get_target_season_episode_id("123", 1, 0)
-        # P0-3 修复: 返回 tuple (subject_id, None) 保持解包契约
+        # 修复: 返回 tuple (subject_id, None) 保持解包契约
         assert result == ("123", None)
 
     @pytest.fixture
@@ -1537,7 +1537,7 @@ class TestBgmSearch:
             assert result is None
 
     def test_low_similarity_triggers_fallback(self):
-        """精确搜索相似度低于0.5时触发兜底搜索（P1-3 修复后保留低相似度候选）
+        """精确搜索相似度低于0.5时触发兜底搜索（修复后保留低相似度候选）
 
         修复前：精确搜索命中低相似度候选(0.2) → 触发兜底 → 兜底全 miss →
         清空 bgm_data → 返回 None，候选被丢弃无法沉淀。

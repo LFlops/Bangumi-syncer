@@ -565,7 +565,7 @@ class TestAnthropicProviderFactory:
         assert provider.thinking_level == "high"
 
     def test_openai_provider_accepts_thinking_level(self, reset_llm_singleton):
-        """Phase 2.2：双 provider 统一传 thinking_level（openai 侧映射 reasoning_effort）。"""
+        """：双 provider 统一传 thinking_level（openai 侧映射 reasoning_effort）。"""
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -818,13 +818,13 @@ class TestParamRejectionDegradation:
 
 
 class TestTerminalErrorsNoRetry:
-    """M7/M9：确定性错误（refusal/4xx）不重试；429 尊重 Retry-After。"""
+    """确定性错误（refusal/4xx）不重试；429 尊重 Retry-After。"""
 
     @pytest.mark.asyncio
     async def test_refusal_valueerror_no_retry(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """M7：refusal（ValueError）为终态——只尝试一次，不再退避重试。"""
+        """refusal（ValueError）为终态——只尝试一次，不再退避重试。"""
         from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -847,7 +847,7 @@ class TestTerminalErrorsNoRetry:
 
     @pytest.mark.asyncio
     async def test_401_no_retry(self, reset_llm_singleton, mock_config, mock_log_usage):
-        """M9：401（密钥错误）为终态——只尝试一次，抛 LLMCallError。"""
+        """401（密钥错误）为终态——只尝试一次，抛 LLMCallError。"""
         from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -874,7 +874,7 @@ class TestTerminalErrorsNoRetry:
     async def test_429_respects_retry_after(
         self, reset_llm_singleton, mock_config, mock_log_usage
     ):
-        """M9：429 尊重 Retry-After（5s）→ 退避 5s 重试。"""
+        """429 尊重 Retry-After（5s）→ 退避 5s 重试。"""
         from app.services.llm.client import LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -940,7 +940,7 @@ class TestTerminalErrorsNoRetry:
 
 
 class TestParamRejectionExtended:
-    """M8：Anthropic invalid_request_error / 422 网关也触发降级。"""
+    """Anthropic invalid_request_error / 422 网关也触发降级。"""
 
     def test_anthropic_text_422_matches(self):
         from app.services.llm.client import _is_param_rejection
@@ -968,7 +968,7 @@ class TestParamRejectionExtended:
 
 
 class TestStreamRejectionDetection:
-    """T7：stream 拒绝模式识别，且优先于通用参数拒绝。"""
+    """stream 拒绝模式识别，且优先于通用参数拒绝。"""
 
     @pytest.mark.parametrize(
         "text",
@@ -979,7 +979,7 @@ class TestStreamRejectionDetection:
             "unsupported parameter: stream",
             "unknown parameter: stream",
             "stream: not supported",
-            # M1：网关文案 "unrecognized parameter 'stream' is not supported"
+            # 网关文案 "unrecognized parameter 'stream' is not supported"
             "unrecognized parameter 'stream' is not supported",
             'unrecognized parameter "stream" is not supported',
         ],
@@ -990,7 +990,7 @@ class TestStreamRejectionDetection:
         assert _is_stream_rejection(_httpx_status(400, text)) is True
 
     def test_stream_options_not_mistaken_as_stream_rejection(self):
-        """M1：'unrecognized parameter stream_options' 不应误判为 stream 拒绝。"""
+        """'unrecognized parameter stream_options' 不应误判为 stream 拒绝。"""
         from app.services.llm.client import _is_stream_rejection
 
         e = _httpx_status(
@@ -1180,12 +1180,12 @@ class TestLLMCallError:
 
 
 # ===================================================================
-# T7：stream_chat / fallback / 落库防双计
+# stream_chat / fallback / 落库防双计
 # ===================================================================
 
 
 class TestStreamChat:
-    """stream_chat() 增量消费、重试、降级与兜底（T7）。"""
+    """stream_chat() 增量消费、重试、降级与兜底。"""
 
     @pytest.mark.asyncio
     async def test_collect_aggregates_stream_events(
@@ -1369,7 +1369,7 @@ class TestStreamChat:
     async def test_stream_rejection_unrecognized_parameter_stream_terminal(
         self, reset_llm_singleton, mock_config, mock_log_usage, mock_logger
     ):
-        """M1：网关文案 "unrecognized parameter 'stream' is not supported" 判为终态流拒绝。"""
+        """网关文案 "unrecognized parameter 'stream' is not supported" 判为终态流拒绝。"""
         from app.services.llm.client import LLMCallError, LLMClient
         from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -1477,7 +1477,7 @@ class TestStreamChat:
 
 
 # ===================================================================
-# R1：stream_chat 纯公开契约 + 元数据跟踪
+# stream_chat 纯公开契约 + 元数据跟踪
 # ===================================================================
 
 
@@ -1526,12 +1526,12 @@ class TestStreamChatContract:
 
 
 # ===================================================================
-# openai_responses 工厂分支与枚举收口（T8）
+# openai_responses 工厂分支与枚举收口
 # ===================================================================
 
 
 class TestOpenAIResponsesProviderFactory:
-    """openai_responses 注册与枚举收口（T8）。
+    """openai_responses 注册与枚举收口。
 
     覆盖：_build_provider 构建并透传参数、LLMClient 集成路径、
     枚举三处一致（_PROVIDER_MAP / Literal / 非法值拒绝）。

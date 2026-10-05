@@ -773,7 +773,7 @@ class TestRefreshStartedAt:
     def test_refresh_started_at_cas_matching_expected_updates_and_returns_true(
         self, tmp_path
     ):
-        """S1：expected_started_at 与当前值一致 → CAS 成功，started_at 被刷新。"""
+        """expected_started_at 与当前值一致 → CAS 成功，started_at 被刷新。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("cas-ok", "match", 1)
@@ -794,7 +794,7 @@ class TestRefreshStartedAt:
     def test_refresh_started_at_cas_mismatch_returns_false_and_keeps_value(
         self, tmp_path
     ):
-        """S2：expected_started_at 不匹配（已被其他执行者刷新）→ False，原值不变。"""
+        """expected_started_at 不匹配（已被其他执行者刷新）→ False，原值不变。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("cas-bad", "match", 1)
@@ -812,7 +812,7 @@ class TestRefreshStartedAt:
             dbm._connection._conn.close()
 
     def test_refresh_started_at_cas_non_processing_returns_false(self, tmp_path):
-        """S2：CAS 同时要求 status='processing'，非活性态不生效。"""
+        """CAS 同时要求 status='processing'，非活性态不生效。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("cas-p", "match", 1)  # 仍为 pending
@@ -1288,7 +1288,7 @@ class TestEnqueueMatchRun:
     BK = "match|alice|test|1"
 
     def test_no_history_creates_new(self, tmp_path):
-        """S1 无历史 → created，返回传入 run_id，库中新增 pending run"""
+        """无历史 → created，返回传入 run_id，库中新增 pending run"""
         dbm = _make_db(tmp_path)
         try:
             res = _enqueue(
@@ -1305,7 +1305,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_processing_in_flight_returns_existing_and_refreshes(self, tmp_path):
-        """S2 同键在途 processing → in_flight，返回已有 run_id，不新建并刷新主指针"""
+        """同键在途 processing → in_flight，返回已有 run_id，不新建并刷新主指针"""
         dbm = _make_db(tmp_path)
         try:
             _enqueue(dbm, run_id="run-b", business_key=self.BK, sync_record_id=100)
@@ -1323,7 +1323,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_pending_in_flight_returns_existing(self, tmp_path):
-        """S2 同键 pending → in_flight，返回已有 run_id，不新建"""
+        """同键 pending → in_flight，返回已有 run_id，不新建"""
         dbm = _make_db(tmp_path)
         try:
             _enqueue(dbm, run_id="run-a", business_key=self.BK, sync_record_id=100)
@@ -1341,7 +1341,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_failed_below_limit_creates_new_run(self, tmp_path):
-        """S3 同键 failed 累计 2（<10）→ created，返回新 run_id，不复用旧行"""
+        """同键 failed 累计 2（<10）→ created，返回新 run_id，不复用旧行"""
         dbm = _make_db(tmp_path)
         try:
             for rid in ("f1", "f2"):
@@ -1365,7 +1365,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_failed_at_limit_exhausted_no_new_run(self, tmp_path):
-        """S4 同键 failed 累计达上限（10）→ exhausted，不写库"""
+        """同键 failed 累计达上限（10）→ exhausted，不写库"""
         dbm = _make_db(tmp_path)
         try:
             for i in range(10):
@@ -1387,7 +1387,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_succeeded_with_pending_candidate_reuses_holding_forever(self, tmp_path):
-        """S5 succeeded + 候选 pending → reuse_holding（无限期，不复用窗口限制）"""
+        """succeeded + 候选 pending → reuse_holding（无限期，不复用窗口限制）"""
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
@@ -1403,7 +1403,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_succeeded_with_rejected_candidate_within_window_reuses(self, tmp_path):
-        """S6 rejected 且 resolved_at 20 天前（<30 天）→ reuse_holding"""
+        """rejected 且 resolved_at 20 天前（<30 天）→ reuse_holding"""
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
@@ -1417,7 +1417,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_succeeded_with_rejected_candidate_outside_window_creates(self, tmp_path):
-        """S6 rejected 且 resolved_at 40 天前（>30 天）→ created 重新评估"""
+        """rejected 且 resolved_at 40 天前（>30 天）→ created 重新评估"""
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
@@ -1433,7 +1433,7 @@ class TestEnqueueMatchRun:
     def test_succeeded_with_confirmed_candidate_valid_mapping_reuses_accepted(
         self, tmp_path
     ):
-        """S7 confirmed + accepted_mapping_valid=True → reuse_accepted（不限时间）"""
+        """confirmed + accepted_mapping_valid=True → reuse_accepted（不限时间）"""
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
@@ -1455,7 +1455,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_succeeded_with_confirmed_candidate_invalid_mapping_creates(self, tmp_path):
-        """S7 confirmed + accepted_mapping_valid=False（映射已删除）→ created"""
+        """confirmed + accepted_mapping_valid=False（映射已删除）→ created"""
         dbm = _make_db(tmp_path)
         try:
             _seed_succeeded_run(dbm, "r1", self.BK, 100)
@@ -1535,7 +1535,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_policy_params_are_required_keywords(self, tmp_path):
-        """P2-5 决策策略参数必填（禁默认值兜底）：任一缺失 → TypeError"""
+        """决策策略参数必填（禁默认值兜底）：任一缺失 → TypeError"""
         dbm = _make_db(tmp_path)
         try:
             with pytest.raises(TypeError):
@@ -1560,7 +1560,7 @@ class TestEnqueueMatchRun:
     def test_internal_exception_propagates_not_fake_created(
         self, tmp_path, monkeypatch
     ):
-        """P2-1 内部异常必须抛出（不得谎报 created），由调用方降级 enqueue_failed"""
+        """内部异常必须抛出（不得谎报 created），由调用方降级 enqueue_failed"""
         dbm = _make_db(tmp_path)
         try:
 
@@ -1579,7 +1579,7 @@ class TestEnqueueMatchRun:
             dbm._connection._conn.close()
 
     def test_integrity_error_falls_back_to_in_flight(self, tmp_path, monkeypatch):
-        """P2-1 并发唯一索引冲突（IntegrityError）→ 兜底复用已在途 run，不抛出"""
+        """并发唯一索引冲突（IntegrityError）→ 兜底复用已在途 run，不抛出"""
         dbm = _make_db(tmp_path)
         try:
             conn = dbm._connection._conn
@@ -1606,13 +1606,13 @@ class TestEnqueueMatchRun:
 
 
 # ---------------------------------------------------------------------------
-# P2-4：进程级 active 集合由 tests/conftest.py 的 autouse fixture 统一隔离
+# 进程级 active 集合由 tests/conftest.py 的 autouse fixture 统一隔离
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _seed_scheduler_active_runs():
-    """S5：模块首条测试前预先污染进程级 active 集合。
+    """模块首条测试前预先污染进程级 active 集合。
 
     conftest 的 autouse fixture 在每条测试 setup 阶段清理；模块级 fixture 的
     setup 早于函数级 fixture，因此首条用例即可观测到 conftest 清理已生效。
@@ -1624,7 +1624,7 @@ def _seed_scheduler_active_runs():
 
 
 def test_scheduler_active_runs_cleared_by_conftest_fixture():
-    """S5：预置的 active run 元素被 conftest 的 autouse fixture 清空。"""
+    """预置的 active run 元素被 conftest 的 autouse fixture 清空。"""
     import app.services.llm_match_scheduler as sched_module
 
     assert sched_module._active_run_ids == set()

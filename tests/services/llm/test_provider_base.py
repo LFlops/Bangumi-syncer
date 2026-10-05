@@ -1,4 +1,4 @@
-"""app.services.llm.providers.base 测试（任务 1.2）。"""
+"""app.services.llm.providers.base 测试。"""
 
 import pytest
 
@@ -9,7 +9,7 @@ from app.services.llm.providers.base import BaseProvider
 class TestBaseProvider:
     """BaseProvider ABC 接口契约测试。
 
-    R1：chat() 抽象方法已删除，stream() 提升为唯一抽象入口。
+    chat() 抽象方法已删除，stream() 提升为唯一抽象入口。
     """
 
     def test_cannot_instantiate_abstract(self):

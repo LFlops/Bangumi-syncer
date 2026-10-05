@@ -218,7 +218,7 @@ def _assert_candidate_written(sync_record_id, subject_id="123", reason="跨季�
 
 
 # ---------------------------------------------------------------------------
-# M5：有候选 + submit_suggestion → 更新既有 pending_candidates 行
+# 有候选 + submit_suggestion → 更新既有 pending_candidates 行
 # ---------------------------------------------------------------------------
 
 
@@ -277,7 +277,7 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# M5b：无候选 → 新建行（candidates_json=[] + llm 两列）
+# 无候选 → 新建行（candidates_json=[] + llm 两列）
 # ---------------------------------------------------------------------------
 
 
@@ -315,13 +315,13 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
 
 
 # ---------------------------------------------------------------------------
-# B1：LLM 新建候选必须写入 business_key，闭合「写→查→复用」去重契约
+# LLM 新建候选必须写入 business_key，闭合「写→查→复用」去重契约
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
-    """B1：无候选新建行时 business_key 必须与 enqueue 同口径（user/title/season）。"""
+    """无候选新建行时 business_key 必须与 enqueue 同口径（user/title/season）。"""
     run_id = "run-bk-new"
     sr_id = 901
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -348,7 +348,7 @@ async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch):
-    """B1 端到端：run 落库候选后，同一 business_key 经入队决策命中 reuse_holding。"""
+    """端到端：run 落库候选后，同一 business_key 经入队决策命中 reuse_holding。"""
     run_id = "run-bk-loop"
     sr_id = 902
     sr = _make_sync_record(with_candidates=False, sync_record_id=sr_id)
@@ -388,7 +388,7 @@ async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch)
 async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
     monkeypatch,
 ):
-    """B1：更新既有（历史无 business_key）行时补写业务键，供后续复用命中。"""
+    """更新既有（历史无 business_key）行时补写业务键，供后续复用命中。"""
     run_id = "run-bk-backfill"
     sr_id = 903
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -422,7 +422,7 @@ async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
 
 
 # ---------------------------------------------------------------------------
-# 评论#12：candidates_json 为唯一写入源——仓储读取投影，DB 两列不再写入
+# candidates_json 为唯一写入源——仓储读取投影，DB 两列不再写入
 # ---------------------------------------------------------------------------
 
 
@@ -508,7 +508,7 @@ async def test_run_submit_suggestion_marks_existing_candidate_on_duplicate_subje
 
 
 # ---------------------------------------------------------------------------
-# 评论#3：恢复续跑/迟到提交与用户确认的竞态——候选不得「复活」
+# 恢复续跑/迟到提交与用户确认的竞态——候选不得「复活」
 # ---------------------------------------------------------------------------
 
 
@@ -623,7 +623,7 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
 
 
 def test_persist_content_cas_skips_when_json_concurrently_modified(monkeypatch):
-    """B3：SELECT 后候选 JSON 被并发修改（内容型 CAS 失配）→ 不覆盖并发值。
+    """SELECT 后候选 JSON 被并发修改（内容型 CAS 失配）→ 不覆盖并发值。
 
     status 保持 pending（隔离「状态守卫」语义），仅由另一连接改写 candidates_json：
     - 无内容 CAS 时：UPDATE 命中 1 行 → 覆盖并发写入 → 双写 + 双通知（缺陷）
@@ -711,7 +711,7 @@ def test_persist_content_cas_skips_when_json_concurrently_modified(monkeypatch):
 
 @pytest.mark.parametrize("raw_value", [None, ""], ids=["null", "empty"])
 def test_persist_content_cas_matches_null_or_empty_json(raw_value):
-    """B3：COALESCE 语义——candidates_json 为 NULL/空串时 CAS 仍能命中并正常落库。"""
+    """COALESCE 语义——candidates_json 为 NULL/空串时 CAS 仍能命中并正常落库。"""
     sr_id = 36 if raw_value is None else 37
     run_id = f"run-cas-raw-{sr_id}"
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1273,7 +1273,7 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
 async def test_run_candidate_committed_and_visible_to_independent_connection(
     monkeypatch,
 ):
-    """复检 P1：run 落库后必须已 commit——独立 sqlite3 连接应能看到候选行与
+    """run 落库后必须已 commit——独立 sqlite3 连接应能看到候选行与
     agent_runs 终态，而非停留在主连接未提交事务中。"""
     run_id = "run-commit-visible"
     sr_id = 1001
@@ -1311,7 +1311,7 @@ async def test_run_candidate_committed_and_visible_to_independent_connection(
 
 
 def test_persist_llm_candidate_race_skip_commits_cancelled_state(monkeypatch):
-    """复检 P1：竞态跳过路径（返回 None）同样必须 commit——run 的 cancelled
+    """竞态跳过路径（返回 None）同样必须 commit——run 的 cancelled
     终态要能被独立连接看到，不得依赖后续写操作代提交。"""
     run_id = "run-race-skip-commit"
     sr_id = 1002
@@ -1358,7 +1358,7 @@ def test_persist_llm_candidate_race_skip_commits_cancelled_state(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch):
-    """复检 P2-2：两个独立 run（不同 run_id / sync_record）经 asyncio.gather
+    """两个独立 run（不同 run_id / sync_record）经 asyncio.gather
     并发执行收尾落库路径。
 
     ``_handle_result_async`` 在线程池执行 ``_persist_and_notify``，真实触发
@@ -1539,7 +1539,7 @@ def _wire_stream_client(client, response_fn):
 
 
 # ---------------------------------------------------------------------------
-# G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
+# register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
 #     且覆盖时不得产生“重复注册”warning（quiet=True）
 
 
@@ -1551,7 +1551,7 @@ def test_register_match_tools_overwrite_no_warning(caplog):
     registry = ToolRegistry()
     bgm = _make_bgm()
 
-    # 连续两次注册到同一 registry：第二次应覆盖 handler（G1），且不刷 warning
+    # 连续两次注册到同一 registry：第二次应覆盖 handler，且不刷 warning
     with caplog.at_level(logging.WARNING):
         llm_assist.register_match_tools(registry, bgm)
         llm_assist.register_match_tools(registry, bgm)
@@ -1569,7 +1569,7 @@ def test_register_match_tools_overwrite_no_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
-# T13：match 场景 5 个工具显式标注幂等属性（契约语义，不再依赖缺省推导）
+# match 场景 5 个工具显式标注幂等属性（契约语义，不再依赖缺省推导）
 
 
 def test_register_match_tools_idempotent_flags():
@@ -1654,7 +1654,7 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
 
 
 # ---------------------------------------------------------------------------
-# G1：register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
+# register_match_tools 重复注册必须覆盖 handler 闭包（重新绑定 bgm），
 # 否则多用户跨 run 复用首次注册的错误 token
 # ---------------------------------------------------------------------------
 
@@ -1724,7 +1724,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
 
 
 # ---------------------------------------------------------------------------
-# F5：场景运行入口将 config_override（llm_match_max_iterations）透传给
+# 场景运行入口将 config_override（llm_match_max_iterations）透传给
 # get_max_iterations（优先级：配置覆盖 > 策略 > 默认）；空值传 None
 # ---------------------------------------------------------------------------
 
@@ -1809,7 +1809,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# G3：config_override 非正数（0 / 负值）→ 告警并回退 None（由策略默认接管），
+# config_override 非正数（0 / 负值）→ 告警并回退 None（由策略默认接管），
 # 否则 max_iterations<=0 会让循环空跑并把 run 滞留在 processing
 # ---------------------------------------------------------------------------
 
@@ -1910,7 +1910,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# F8：事务内不应发起 HTTP（bgm.get_subject 在事务外预取一次）
+# 事务内不应发起 HTTP（bgm.get_subject 在事务外预取一次）
 # ---------------------------------------------------------------------------
 
 
@@ -2117,7 +2117,7 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
-    """S4.1：正常 run 全链路——seed 行存在、chat span model/tokens 专用列有值、
+    """正常 run 全链路——seed 行存在、chat span model/tokens 专用列有值、
     tool_execute span 由 executor 包裹产生、replay_delta 格式与现状一致。"""
     run_id = "run-tr-full"
     sr_id = 90
@@ -2210,7 +2210,7 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
-    """S4.2：span_recorder=None 路径语义保持——run 结果正确、loop 领域语义不破。"""
+    """span_recorder=None 路径语义保持——run 结果正确、loop 领域语义不破。"""
     run_id = "run-tr-none"
     sr_id = 91
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -2237,7 +2237,7 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
 
 
 def test_trace_recorder_wrap_chat_fn_tracks_iteration():
-    """S1.4：wrap_chat_fn 每轮 start/end span，iteration 自增。"""
+    """wrap_chat_fn 每轮 start/end span，iteration 自增。"""
     import asyncio
     from unittest.mock import patch
 
@@ -2284,7 +2284,7 @@ def test_trace_recorder_wrap_chat_fn_tracks_iteration():
 
 
 def test_trace_recorder_tool_start_end_idempotent():
-    """S1.3：end_tool 幂等——同 span_id 二次调用不崩溃。"""
+    """end_tool 幂等——同 span_id 二次调用不崩溃。"""
     from unittest.mock import patch
 
     from app.services.llm.models import ToolResultBlock
@@ -2330,7 +2330,7 @@ def test_trace_recorder_tool_start_end_idempotent():
 
 
 def test_trace_recorder_budget_falls_back_to_chat_span():
-    """S1.5：budget 钩子定位本轮最后 tool span，无则回退 chat span。"""
+    """budget 钩子定位本轮最后 tool span，无则回退 chat span。"""
     from unittest.mock import patch
 
     budget_targets = []
@@ -2361,12 +2361,12 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
 
 
 # ---------------------------------------------------------------------------
-# P0-1：wrap_chat_fn chat span 与 tool span 同轮 iteration 一致
+# wrap_chat_fn chat span 与 tool span 同轮 iteration 一致
 # ---------------------------------------------------------------------------
 
 
 def test_wrap_chat_fn_chat_and_tool_same_iteration():
-    """P0-1：同一轮内 chat span 与 tool span 的 iteration 必须一致；连续两轮时第二轮 iteration=1。"""
+    """同一轮内 chat span 与 tool span 的 iteration 必须一致；连续两轮时第二轮 iteration=1。"""
     import asyncio
     from unittest.mock import patch
 
@@ -2437,12 +2437,12 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
 
 
 # ---------------------------------------------------------------------------
-# P0-2：wrap_chat_fn 异常不得被 UnboundLocalError 遮蔽
+# wrap_chat_fn 异常不得被 UnboundLocalError 遮蔽
 # ---------------------------------------------------------------------------
 
 
 def test_wrap_chat_fn_exception_propagates_original():
-    """P0-2：chat_fn 抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
+    """chat_fn 抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
     import asyncio
     from unittest.mock import patch
 
@@ -2476,28 +2476,28 @@ def test_wrap_chat_fn_exception_propagates_original():
 
 
 # ---------------------------------------------------------------------------
-# P1：_build_default_chat_fn 必填 thinking_level
+# _build_default_chat_fn 必填 thinking_level
 # ---------------------------------------------------------------------------
 
 
 def test_build_default_chat_fn_requires_thinking_level():
-    """P1：_build_default_stream_fn 不传 thinking_level 应抛 TypeError。"""
+    """_build_default_stream_fn 不传 thinking_level 应抛 TypeError。"""
     with pytest.raises(TypeError):
         llm_assist._build_default_stream_fn()
 
 
 # ---------------------------------------------------------------------------
-# P1-a：_persist_llm_candidate ended_at 必须为 epoch 整数（与 mark_succeeded 一致）
+# _persist_llm_candidate ended_at 必须为 epoch 整数（与 mark_succeeded 一致）
 # ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
-# P1-b：TraceRecorder 增加必填 start_iteration 构造参数
+# TraceRecorder 增加必填 start_iteration 构造参数
 # ---------------------------------------------------------------------------
 
 
 def test_trace_recorder_requires_start_iteration():
-    """P1-b：TraceRecorder 构造函数要求必填 start_iteration（不得有默认值）。"""
+    """TraceRecorder 构造函数要求必填 start_iteration（不得有默认值）。"""
     import inspect
 
     sig = inspect.signature(llm_assist.TraceRecorder.__init__)
@@ -2509,7 +2509,7 @@ def test_trace_recorder_requires_start_iteration():
 
 
 def test_trace_recorder_start_iteration_affects_first_chat_iteration():
-    """P1-b：start_iteration=N → 首轮 chat span iteration=N。"""
+    """start_iteration=N → 首轮 chat span iteration=N。"""
     import asyncio
     from unittest.mock import patch
 
@@ -2539,12 +2539,12 @@ def test_trace_recorder_start_iteration_affects_first_chat_iteration():
 
 
 # ---------------------------------------------------------------------------
-# P1-c：TraceRecorder.begin_replayed_round 锚定到指定轮次
+# TraceRecorder.begin_replayed_round 锚定到指定轮次
 # ---------------------------------------------------------------------------
 
 
 def test_trace_recorder_begin_replayed_round_sets_current_iteration():
-    """P1-c：begin_replayed_round(N) 后 start_tool 的 iteration=N。"""
+    """begin_replayed_round(N) 后 start_tool 的 iteration=N。"""
     from unittest.mock import patch
 
     from app.services.llm.models import ToolUseBlock
@@ -2570,7 +2570,7 @@ def test_trace_recorder_begin_replayed_round_sets_current_iteration():
 
 
 # ---------------------------------------------------------------------------
-# T4：LLMCallError 处理（run 捕获分流 + _handle_result 新增分支）
+# LLMCallError 处理（run 捕获分流 + _handle_result 新增分支）
 # ---------------------------------------------------------------------------
 
 
@@ -2847,12 +2847,12 @@ def test_begin_replayed_round_sets_next_iteration_to_iteration_plus_one():
 
 
 # ---------------------------------------------------------------------------
-# P1-a 回归：_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数
+# _persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数
 # ---------------------------------------------------------------------------
 
 
 def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
-    """P1-a：_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数。"""
+    """_persist_llm_candidate 写入 agent_runs.ended_at 为 epoch 整数。"""
     import time
 
     run_id = "run-ended-at"
@@ -2950,7 +2950,7 @@ def _medium_cfg(raw_max: str = "") -> dict:
     }
 
 
-# S3：end_turn 分派 ---------------------------------------------------------
+# end_turn 分派 ---------------------------------------------------------
 
 
 def test_continue_run_end_turn_marks_no_suggestion_without_llm():
@@ -2984,7 +2984,7 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
     loop.assert_not_awaited()
 
 
-# S4：submit 分派 -----------------------------------------------------------
+# submit 分派 -----------------------------------------------------------
 
 
 def test_continue_run_submit_suggestion_dispatches_to_handle_result():
@@ -3037,7 +3037,7 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
 
 
 def test_continue_run_submit_uses_replayed_total_tokens():
-    """P2-1：submit_suggestion 直接分派分支把 replay 累计 tokens 传给 _handle_result。
+    """submit_suggestion 直接分派分支把 replay 累计 tokens 传给 _handle_result。
 
     恢复路径无实时 recorder，历史轮次 tokens 由 ``ReplayResult.total_tokens`` 携带；
     不得再硬编码 0。
@@ -3085,7 +3085,7 @@ def test_continue_run_submit_uses_replayed_total_tokens():
     loop.assert_not_awaited()
 
 
-# S5：补执行缺失工具 ---------------------------------------------------------
+# 补执行缺失工具 ---------------------------------------------------------
 
 
 def test_continue_run_tool_use_backfills_and_continues_loop():
@@ -3129,7 +3129,7 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
     loop.assert_awaited_once()
 
 
-# S6：last_response=None 完整续跑 -------------------------------------------
+# last_response=None 完整续跑 -------------------------------------------
 
 
 def test_continue_run_last_response_none_runs_loop_and_lands_result():
@@ -3165,7 +3165,7 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
 
 
 def test_continue_run_continuation_sums_replay_and_new_round_tokens():
-    """S4/P2-3：通用续跑分支 total_tokens = replay 历史累计 + 本次新轮累计。
+    """通用续跑分支 total_tokens = replay 历史累计 + 本次新轮累计。
 
     replay 历史 150 + 本次新产生 50 → ``_handle_result`` 必须收到 200，
     避免恢复续跑路径只记本次新轮、丢失历史 tokens。
@@ -3205,7 +3205,7 @@ def test_continue_run_continuation_sums_replay_and_new_round_tokens():
     )
 
 
-# G3：config_override 非正数回退 None ---------------------------------------
+# config_override 非正数回退 None ---------------------------------------
 
 
 def _run_continue_run_with_config(raw_max: str):
@@ -3258,7 +3258,7 @@ def test_continue_run_positive_config_override_is_passed_through():
     assert override == 7
 
 
-# G4：预算耗尽必须落终态 -----------------------------------------------------
+# 预算耗尽必须落终态 -----------------------------------------------------
 
 
 def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
@@ -3370,7 +3370,7 @@ def test_continue_run_replay_exhausted_logs_warning():
     )
 
 
-# G4b：终局优先于预算耗尽判定（恢复路径顺序调整） ------------------------------
+# 终局优先于预算耗尽判定（恢复路径顺序调整） ------------------------------
 
 
 def test_continue_run_zero_remaining_with_submit_uses_terminal():
@@ -3496,7 +3496,7 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
     )
 
 
-# S7：LLM 调用失败按可重试性分流 --------------------------------------------
+# LLM 调用失败按可重试性分流 --------------------------------------------
 
 
 def test_continue_run_llm_call_error_retryable_false_marks_failed():
@@ -3573,7 +3573,7 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
 
 
 def test_continue_run_outer_exception_logs_current_run_status():
-    """P2-3：最外层 except 日志须带当前 run 状态，便于定位「已终态后的异常」。"""
+    """最外层 except 日志须带当前 run 状态，便于定位「已终态后的异常」。"""
     repo = _make_continuation_repo()
     repo.get_run.return_value = {"status": "processing"}
     rr = _make_replay_result(executed=0, missing=[], last_response=None)
@@ -3611,7 +3611,7 @@ def test_continue_run_outer_exception_logs_current_run_status():
     repo.increment_attempts.assert_called_once()
 
 
-# F4 / G5：缺失工具补执行（readonly 执行 / 非 read 占位闭合协议） -------------
+# 缺失工具补执行（readonly 执行 / 非 read 占位闭合协议） -------------
 
 
 def test_replay_missing_tool_appends_tool_result_to_messages():
@@ -3803,7 +3803,7 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
     assert json.loads(blk.content) == {"id": 2, "name": "花咲くいろは"}
 
 
-# T3：补执行门控仍以 readonly（无副作用语义）为准，与 idempotent 正交 ---------
+# 补执行门控仍以 readonly（无副作用语义）为准，与 idempotent 正交 ---------
 
 
 def test_replay_missing_non_idempotent_read_tool_still_replayed():
@@ -3867,7 +3867,7 @@ def test_replay_missing_idempotent_write_tool_appends_placeholder():
     assert blk.is_error is False
 
 
-# P1-c：补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
+# 补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
 
 
 def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):
@@ -4026,7 +4026,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     assert run_row["status"] == "no_suggestion"
 
 
-# P0-3：恢复续跑写 chat span + thinking_level 透传 -------------------------
+# 恢复续跑写 chat span + thinking_level 透传 -------------------------
 
 
 def test_continue_run_writes_chat_span(monkeypatch):
@@ -4173,7 +4173,7 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
     )
 
 
-# P1-b：续跑新 span iteration 严格大于既有最大 iteration ----------------------
+# 续跑新 span iteration 严格大于既有最大 iteration ----------------------
 
 
 def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
@@ -4222,7 +4222,7 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
     )
 
 
-# P1-e2e：二次恢复不产生额外 LLM 调用，且 chat span 无撞号 --------------------
+# 二次恢复不产生额外 LLM 调用，且 chat span 无撞号 --------------------
 
 
 @pytest.mark.asyncio
@@ -4333,7 +4333,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     )
 
 
-# S8：run() 可重试失败达上限单点置终态（无双写） -----------------------------
+# run() 可重试失败达上限单点置终态（无双写） -----------------------------
 
 
 def test_run_retryable_llm_error_at_limit_single_terminal_write():
@@ -4373,7 +4373,7 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
 
 
 # ---------------------------------------------------------------------------
-# T8b：total_tokens 全轮累计（非仅末轮）
+# total_tokens 全轮累计（非仅末轮）
 # ---------------------------------------------------------------------------
 
 
@@ -4406,7 +4406,7 @@ def _submit_response_with_usage(tokens: int, subject_id="123", reason="跨季匹
 
 
 def test_trace_recorder_accumulates_total_tokens_across_rounds():
-    """S2：wrap_chat_fn 逐轮累计 usage.total_tokens。"""
+    """wrap_chat_fn 逐轮累计 usage.total_tokens。"""
     import asyncio
     from unittest.mock import patch
 
@@ -4432,7 +4432,7 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
 
 @pytest.mark.asyncio
 async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
-    """S2：2 轮 chat 各 100 tokens → 终态 agent_runs.total_tokens == 200。"""
+    """2 轮 chat 各 100 tokens → 终态 agent_runs.total_tokens == 200。"""
     run_id = "run-tokens-accum"
     sr_id = 520
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -4464,7 +4464,7 @@ async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_total_tokens_zero_when_no_usage():
-    """S2：响应无 usage 时累计为 0（不报错、不误记）。"""
+    """响应无 usage 时累计为 0（不报错、不误记）。"""
     run_id = "run-tokens-zero"
     sr_id = 521
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -4491,7 +4491,7 @@ async def test_total_tokens_zero_when_no_usage():
 
 
 # ---------------------------------------------------------------------------
-# P2-2：函数内 import 守卫（白名单为空 = 全部禁止，import 统一在模块头部）
+# 函数内 import 守卫（白名单为空 = 全部禁止，import 统一在模块头部）
 # ---------------------------------------------------------------------------
 
 
@@ -4523,7 +4523,7 @@ def test_llm_assist_module_no_unlisted_function_level_imports():
 
 
 # ---------------------------------------------------------------------------
-# PR#8 评审修复：静默分支补日志 / _prefetch_bgm_name 失败记 error /
+# 静默分支补日志 / _prefetch_bgm_name 失败记 error /
 # TraceRecorder docstring 与 _SYSTEM_SUFFIX 文案清理
 #
 # 说明：本模块使用 ``app.core.logging.logger``（自定义 print 实现），
@@ -4661,7 +4661,7 @@ def test_system_suffix_describes_interactive_rounds_not_tool_call_count():
 
 
 # ---------------------------------------------------------------------------
-# PR#8 评论#21：收尾路径异步化 —— 消除事件循环上的同步阻塞
+# 收尾路径异步化 —— 消除事件循环上的同步阻塞
 #
 # 收尾链 ``_handle_result``（同步）含阻塞 HTTP（``_validate_subject_id`` /
 # ``_prefetch_bgm_name``）与限速器同步 sleep，必须移入线程池执行，否则
@@ -4740,7 +4740,7 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
 async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
     monkeypatch,
 ):
-    """A2：收尾线程池执行期间，事件循环/其他线程并发 DB 操作必须安全。
+    """收尾线程池执行期间，事件循环/其他线程并发 DB 操作必须安全。
 
     窗口构造：``_prefetch_bgm_name`` 调用 ``bgm.get_subject`` 时置位 ``entered``
     并阻塞在 ``release`` 上，把收尾线程钉在慢预取窗口内；测试侧在窗口内用
@@ -5134,7 +5134,7 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
 
 
 # ---------------------------------------------------------------------------
-# R4：流式注入端到端（mock 事件流）——停点提前执行 search + submit 捕获落库
+# 流式注入端到端（mock 事件流）——停点提前执行 search + submit 捕获落库
 # ---------------------------------------------------------------------------
 
 

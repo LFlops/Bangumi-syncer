@@ -17,7 +17,7 @@ from app.services.summary.models import SummaryJobConfig
 def _make_stream_client() -> MagicMock:
     """构造非空流响应的 mock client（走成功通知路径）。
 
-    R2 后 summary 服务统一走 ``stream_chat``（流式唯一形态），故 mock 该入口。
+    summary 服务统一走 ``stream_chat``（流式唯一形态），故 mock 该入口。
     """
     chunks = [
         StreamChunk(type="text_delta", text="测试总结", model="test-model"),

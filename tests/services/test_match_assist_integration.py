@@ -6,7 +6,7 @@
 - 开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）
 - LLM 配置缺失 → 不落任务 + 日志含 "LLM 配置缺失"
 - 入队决策：enqueue_match_run 返回 dict（decision/run_id），orchestrator 记录 decision
-- S12：confirm/reject 候选不再改写 run 状态（用户结果由 pending_candidates 承载）
+- confirm/reject 候选不再改写 run 状态（用户结果由 pending_candidates 承载）
 - 不带 llm_subject_id 的既有 confirm → 原逻辑闭环
 - API：confirm 端点接收可选 llm_subject_id 并优先使用
 """
@@ -162,7 +162,7 @@ def test_handle_match_failure_enqueues_when_enabled(
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_handle_match_failure_switch_off_no_enqueue(mock_db, mock_cfg, mock_notify):
-    """M3：开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）"""
+    """开关关 → 原失败逻辑完全不变（无 agent_runs 调用、无 trace step）"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
     mock_cfg.get.return_value = "false"
@@ -185,7 +185,7 @@ def test_handle_match_failure_switch_off_no_enqueue(mock_db, mock_cfg, mock_noti
 def test_handle_match_failure_llm_missing_no_enqueue(
     mock_db, mock_cfg, mock_notify, capsys
 ):
-    """M4：LLM 配置缺失 → 不落任务 + 日志含 'LLM 配置缺失'"""
+    """LLM 配置缺失 → 不落任务 + 日志含 'LLM 配置缺失'"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
     mock_cfg.get.return_value = "true"
@@ -263,7 +263,7 @@ def test_enqueue_decision_reuse_holding_logged(mock_db, mock_cfg, mock_notify, c
 
 
 # ----------------------------------------------------------------------
-# T6：入队前移 + trace 记录实际 run_id + run↔record 关联 + 文案
+# 入队前移 + trace 记录实际 run_id + run↔record 关联 + 文案
 # ----------------------------------------------------------------------
 
 
@@ -271,7 +271,7 @@ def test_enqueue_decision_reuse_holding_logged(mock_db, mock_cfg, mock_notify, c
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_trace_records_actual_new_run_id_when_created(mock_db, mock_cfg, mock_notify):
-    """S1：created → persist 的 trace 里 llm_assist.step.run_id == 实际新建 run
+    """created → persist 的 trace 里 llm_assist.step.run_id == 实际新建 run
 
     入队前移：enqueue 在 persist 之前调用，此时尚无 sync_record_id。
     """
@@ -316,7 +316,7 @@ def test_trace_records_actual_new_run_id_when_created(mock_db, mock_cfg, mock_no
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_trace_records_actual_reused_run_id(mock_db, mock_cfg, mock_notify, decision):
-    """S2：复用/在途 → trace 记录的是实际承担评估的已有 run B（非预生成 id）"""
+    """复用/在途 → trace 记录的是实际承担评估的已有 run B（非预生成 id）"""
     orch = _make_orchestrator()
     agent_runs = _make_orchestrator_agent_runs(decision=decision, run_id="run-B")
     mock_cfg.get.return_value = "true"
@@ -345,7 +345,7 @@ def test_trace_records_actual_reused_run_id(mock_db, mock_cfg, mock_notify, deci
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 def test_run_link_and_pointer_written_after_persist(mock_cfg, mock_notify, tmp_path):
-    """S3：persist 后写关联表 + 刷新 run 主指针 sync_record_id（真实 DB）"""
+    """persist 后写关联表 + 刷新 run 主指针 sync_record_id（真实 DB）"""
     from app.core.database import DatabaseManager
 
     dbm = DatabaseManager(str(tmp_path / "t6_link.db"))
@@ -384,7 +384,7 @@ def test_run_link_and_pointer_written_after_persist(mock_cfg, mock_notify, tmp_p
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_llm_assist_step_after_result_step(mock_db, mock_cfg, mock_notify):
-    """S4：llm_assist step 出现在 result 之后，且通过公开接口挂入"""
+    """llm_assist step 出现在 result 之后，且通过公开接口挂入"""
     orch = _make_orchestrator()
     agent_runs = _make_orchestrator_agent_runs()
     mock_cfg.get.return_value = "true"
@@ -410,7 +410,7 @@ def test_llm_assist_step_after_result_step(mock_db, mock_cfg, mock_notify):
 
 
 def test_orchestrator_no_private_step_finish_call():
-    """S4：orchestrator 不再调用 trace 私有收尾方法 _finish_current_step"""
+    """orchestrator 不再调用 trace 私有收尾方法 _finish_current_step"""
     import inspect
 
     from app.services.sync_service import orchestrator as orch_mod
@@ -422,7 +422,7 @@ def test_orchestrator_no_private_step_finish_call():
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_existing_llm_assist_step_not_reenqueued(mock_db, mock_cfg, mock_notify):
-    """S5：trace 已含 llm_assist（异常重入）→ 不重复 enqueue、不重复挂 step、不写关联"""
+    """trace 已含 llm_assist（异常重入）→ 不重复 enqueue、不重复挂 step、不写关联"""
     orch = _make_orchestrator()
     agent_runs = _make_orchestrator_agent_runs()
     mock_cfg.get.return_value = "true"
@@ -455,7 +455,7 @@ def test_existing_llm_assist_step_not_reenqueued(mock_db, mock_cfg, mock_notify)
 def test_message_and_notify_mention_ai_assist_when_enabled(
     mock_db, mock_cfg, mock_notify
 ):
-    """S6：启用时 SyncResponse.message 与 anime_not_found 通知含启用说明"""
+    """启用时 SyncResponse.message 与 anime_not_found 通知含启用说明"""
     orch = _make_orchestrator()
     mock_cfg.get.return_value = "true"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
@@ -481,7 +481,7 @@ def test_message_and_notify_mention_ai_assist_when_enabled(
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")
 def test_message_plain_when_assist_disabled(mock_db, mock_cfg, mock_notify):
-    """S6：未启用时保持原文案，不含启用说明"""
+    """未启用时保持原文案，不含启用说明"""
     orch = _make_orchestrator()
     mock_cfg.get.return_value = "false"
     mock_cfg.get_llm_config.return_value = {"api_key": "sk"}
@@ -504,7 +504,7 @@ def test_message_plain_when_assist_disabled(mock_db, mock_cfg, mock_notify):
 def test_enqueue_exception_degrades_without_blocking(
     mock_db, mock_cfg, mock_notify, capsys
 ):
-    """S7：enqueue 抛异常 → 主流程正常返回 error、warning 日志、decision=enqueue_failed、不写关联"""
+    """enqueue 抛异常 → 主流程正常返回 error、warning 日志、decision=enqueue_failed、不写关联"""
     orch = _make_orchestrator()
     agent_runs = MagicMock()
     agent_runs.enqueue_match_run.side_effect = RuntimeError("db down")
@@ -534,7 +534,7 @@ def test_enqueue_exception_degrades_without_blocking(
 
 
 # ----------------------------------------------------------------------
-# confirm / reject 不再触碰 agent_runs（S12）
+# confirm / reject 不再触碰 agent_runs
 # ----------------------------------------------------------------------
 
 
@@ -548,13 +548,13 @@ def _patch_db_for_confirm(record: dict, agent_runs: MagicMock) -> MagicMock:
 
 
 def test_linkage_methods_removed():
-    """S12 业务联动方法已删除（用户处理结果由 pending_candidates 承载）"""
+    """业务联动方法已删除（用户处理结果由 pending_candidates 承载）"""
     assert not hasattr(SyncService, "_linkage_mark_applied")
     assert not hasattr(SyncService, "_linkage_mark_rejected")
 
 
 def test_confirm_does_not_touch_agent_runs():
-    """S12 候选确认 → 写映射 + 更新候选状态，不再改写 agent_runs"""
+    """候选确认 → 写映射 + 更新候选状态，不再改写 agent_runs"""
     svc = SyncService()
     record = {
         "id": 5,
@@ -591,7 +591,7 @@ def test_confirm_does_not_touch_agent_runs():
 
 
 def test_reject_does_not_touch_agent_runs():
-    """S12 候选忽略 → 更新候选状态，不触碰 agent_runs"""
+    """候选忽略 → 更新候选状态，不触碰 agent_runs"""
     svc = SyncService()
     record = {
         "id": 8,

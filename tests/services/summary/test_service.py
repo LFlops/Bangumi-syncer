@@ -1,4 +1,4 @@
-"""测试 SummaryService：generate_summary 和 execute_job（任务 3.2）。"""
+"""测试 SummaryService：generate_summary 和 execute_job。"""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def _mock_stream_client(
     *,
     error: Exception | None = None,
 ) -> MagicMock:
-    """构造 mock LLM 客户端：``stream_chat`` 产出等价事件流（R1 新契约）。
+    """构造 mock LLM 客户端：``stream_chat`` 产出等价事件流（新契约）。
 
     - response：要还原的 ChatResponse（content/model/usage）
     - error：若给定，流在首个事件前抛该异常（模拟 LLM 调用失败）
@@ -250,7 +250,7 @@ class TestGenerateSummary:
 
     @pytest.mark.asyncio
     async def test_include_consumed_true_when_memory_on(self):
-        """P1：memory_limit>0 时传 include_consumed=True（消费排除所需）。"""
+        """memory_limit>0 时传 include_consumed=True（消费排除所需）。"""
         from app.services.summary.service import SummaryService
 
         svc = SummaryService()
@@ -274,7 +274,7 @@ class TestGenerateSummary:
 
     @pytest.mark.asyncio
     async def test_include_consumed_false_when_memory_off(self):
-        """P1：memory_limit=0（默认）时传 include_consumed=False（轻量查询）。"""
+        """memory_limit=0（默认）时传 include_consumed=False（轻量查询）。"""
         from app.services.summary.service import SummaryService
 
         svc = SummaryService()
@@ -767,7 +767,7 @@ class TestExecuteJob:
         data = mock_ns.notify.call_args.kwargs
         assert data["tokens_used"] == 0
 
-    # ── 记忆注入（Phase 2.0.2）──────────────────────────────────────
+    # ── 记忆注入──────────────────────────────────────
 
     @staticmethod
     def _svc_with_real_memory(temp_dir, job_name="test_job"):
@@ -781,7 +781,7 @@ class TestExecuteJob:
 
     @pytest.mark.asyncio
     async def test_memory_disabled_short_circuits(self, temp_dir, reset_singletons):
-        """R4：memory_limit=0（默认）→ 不注入不写入。"""
+        """memory_limit=0（默认）→ 不注入不写入。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         db.memory.store_and_mark(
             MemoryEntry(
@@ -813,7 +813,7 @@ class TestExecuteJob:
 
     @pytest.mark.asyncio
     async def test_memory_injects_recent_context(self, temp_dir, reset_singletons):
-        """R1：memory_limit>0 → system prompt 含历史上下文（最近 2 条摘要）。"""
+        """memory_limit>0 → system prompt 含历史上下文（最近 2 条摘要）。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         db.memory.store_and_mark(
             MemoryEntry(
@@ -857,7 +857,7 @@ class TestExecuteJob:
 
     @pytest.mark.asyncio
     async def test_recent_limit_passed_to_service(self, temp_dir, reset_singletons):
-        """R8：memory_limit 透传给 memory.recent；related_limit=0 时不调 related。"""
+        """memory_limit 透传给 memory.recent；related_limit=0 时不调 related。"""
         svc, _ = self._svc_with_real_memory(temp_dir)
         config = _make_config(memory_limit=3, related_limit=0)
 
@@ -882,7 +882,7 @@ class TestExecuteJob:
     async def test_extract_failure_does_not_block_notification(
         self, temp_dir, reset_singletons
     ):
-        """R7：提取记忆失败（DB 异常）不影响 _dispatch_notification。"""
+        """提取记忆失败（DB 异常）不影响 _dispatch_notification。"""
         svc, _ = self._svc_with_real_memory(temp_dir)
         svc.memory.extract_and_store = AsyncMock(side_effect=RuntimeError("db down"))
         config = _make_config(memory_limit=5)
@@ -939,7 +939,7 @@ class TestExecuteJob:
 
     @pytest.mark.asyncio
     async def test_no_consumed_no_exclusion(self, temp_dir, reset_singletons):
-        """S3a：明细全部未消费 → 记录全部进 user prompt，无排除。"""
+        """明细全部未消费 → 记录全部进 user prompt，无排除。"""
         svc, _ = self._svc_with_real_memory(temp_dir)
         config = _make_config(memory_limit=5)
         _llm_patch, mock_client = self._patch_llm(_mock_chat_response())
@@ -963,7 +963,7 @@ class TestExecuteJob:
     async def test_consumed_records_excluded_from_prompt(
         self, temp_dir, reset_singletons
     ):
-        """S2：本任务已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
+        """本任务已消费记录不进 user prompt（信息由摘要承继）；未消费记录正常。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         # 先写入本任务的记忆条目（run-own 属于本任务），再标记对应记录已消费
         db.memory.store_and_mark(
@@ -1005,7 +1005,7 @@ class TestExecuteJob:
     async def test_consumed_by_other_task_kept_in_prompt(
         self, temp_dir, reset_singletons
     ):
-        """S2c（跨任务隔离）：记录被其他任务消费（consumed_run_id 非空但不属于
+        """记录被其他任务消费（consumed_run_id 非空但不属于
         本任务）→ 仍保留在 prompt——每日总结消费后年度总结仍可消费。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         # 其他任务（summary-yearly）消费了 run-other；本任务无该 run
@@ -1042,7 +1042,7 @@ class TestExecuteJob:
 
     @pytest.mark.asyncio
     async def test_all_consumed_results_in_no_records(self, temp_dir, reset_singletons):
-        """S2b：窗口内全部被【本任务】消费 → user prompt 记录为空（走"无记录"路径）。"""
+        """窗口内全部被【本任务】消费 → user prompt 记录为空（走"无记录"路径）。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         db.memory.store_and_mark(
             MemoryEntry(
@@ -1078,7 +1078,7 @@ class TestExecuteJob:
     async def test_placeholder_row_prevents_rerun_of_consumed_records(
         self, temp_dir, reset_singletons
     ):
-        """T2 端到端防重跑：第一次执行摘要提取失败 → 写占位行 + 消费标记；
+        """端到端防重跑：第一次执行摘要提取失败 → 写占位行 + 消费标记；
         第二次执行同窗口 → 这批记录被消费排除（不再进 LLM prompt）。"""
         db = _temp_db(temp_dir)
         svc = SummaryService()
@@ -1243,7 +1243,7 @@ class TestExecuteJob:
 
 
 class TestRelatedInjection:
-    """related 注入：合并去重 + [同剧历史] 前缀（F2 S5/S6）。"""
+    """related 注入：合并去重 + [同剧历史] 前缀。"""
 
     @pytest.mark.asyncio
     async def test_related_prefix_and_dedup(self, temp_dir, reset_singletons):
@@ -1287,7 +1287,7 @@ class TestRelatedInjection:
 
 
 class TestMemoryContextSkipsPlaceholder:
-    """T2：摘要失败占位行（summary=""）不得进入提示词注入（recent 与 related 两路径）。"""
+    """摘要失败占位行（summary=""）不得进入提示词注入（recent 与 related 两路径）。"""
 
     def test_placeholder_skipped_in_recent(self):
         """recent 返回 [正常行, 占位行] → 注入文本只含正常摘要，无空条目。"""
@@ -1389,7 +1389,7 @@ class TestUTCToLocalDate:
 
 
 class TestIncrementalWindow:
-    """T3 增量窗口：记忆开启时 date_from = 上次总结点（本任务最后一条记忆的
+    """增量窗口：记忆开启时 date_from = 上次总结点（本任务最后一条记忆的
     created_at 日期）；无历史记忆时回退 lookback_days。"""
 
     def _svc(self, temp_dir):
@@ -1523,7 +1523,7 @@ class TestIncrementalWindow:
     def test_placeholder_row_serves_as_incremental_start(
         self, temp_dir, reset_singletons
     ):
-        """T2：最近一条是摘要失败占位行（summary=""）时，增量窗口起点仍取它的
+        """最近一条是摘要失败占位行（summary=""）时，增量窗口起点仍取它的
         created_at 日期——占位行是有效的"上次总结点"，不得因空摘要被跳过导致窗口回退。"""
         svc, db = self._svc(temp_dir)
         with (
@@ -1686,7 +1686,7 @@ class TestIncrementalWindow:
 
 
 class TestEmptyContentWithModel:
-    """H1：空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
+    """空 content 但 model 非空 → 仍须判失败（旧逻辑误走成功分支）。"""
 
     @pytest.mark.asyncio
     async def test_empty_content_with_model_name_sends_failure(
@@ -1711,7 +1711,7 @@ class TestEmptyContentWithModel:
 
 
 class TestRelatedIndependentOfMemoryLimit:
-    """M1：related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
+    """related_limit 独立于 memory_limit（0/关 不影响 related 生效）。"""
 
     @pytest.mark.asyncio
     async def test_related_works_when_memory_limit_zero(

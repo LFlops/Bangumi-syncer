@@ -1252,7 +1252,7 @@ def test_find_subject_id_archive_hit_marks_stage_as_archive():
         archive_steps = [s for s in trace.steps if s.stage == "archive"]
         assert len(archive_steps) == 2
         assert all(s.status == "hit" for s in archive_steps)
-        # C4：archive 短路 step 与 APISearchStep（stage_override=archive）都携带候选。
+        # archive 短路 step 与 APISearchStep（stage_override=archive）都携带候选。
         # 此前只有 APISearchStep 落地时才产出候选，archive 短路是「无候选盲信」。
         steps_with_candidates = [s for s in archive_steps if s.candidates]
         assert len(steps_with_candidates) == 2

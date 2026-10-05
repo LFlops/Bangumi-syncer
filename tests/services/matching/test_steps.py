@@ -1,4 +1,4 @@
-"""阶段三 4 个 step 单测：NormalizeStep / CustomMappingStep / BangumiDataStep / APISearchStep
+"""4 个 step 单测：NormalizeStep / CustomMappingStep / BangumiDataStep / APISearchStep
 
 重点验证各 step 的 outcome 状态、ctx 字段设置与 stage_override 行为。
 APISearchStep 的 post_search 改选逻辑由 test_sync_service_full.py 的集成测试覆盖，
@@ -348,7 +348,7 @@ class TestAPISearchStep:
         outcome = APISearchStep().execute(ctx)
 
         # 命中应改选到动画版 406306，而非真人剧 434076
-        # P2-1 修复后 subject_id 为 str 类型
+        # 修复后 subject_id 为 str 类型
         assert outcome.status == "hit"
         assert outcome.subject_id == "406306"
         assert ctx.subject_id == "406306"

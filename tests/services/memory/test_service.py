@@ -1,6 +1,6 @@
-"""MemoryService 测试（Phase 2.0.3 统一入口）。
+"""MemoryService 测试（统一入口）。
 
-覆盖：rename_task / clear_task 委托（C1/C3 语义）+ 读写能力收口。
+覆盖：rename_task / clear_task 委托（语义）+ 读写能力收口。
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ def _make_service(db) -> MemoryService:
 
 class TestRenameTask:
     def test_rename_migrates_memory(self, temp_dir, reset_singletons):
-        """C1：经 MemoryService 改名迁移记忆（主表）。"""
+        """经 MemoryService 改名迁移记忆（主表）。"""
         db = _make_db(temp_dir)
         db.memory.store_and_mark(
             MemoryEntry(
@@ -52,7 +52,7 @@ class TestRenameTask:
 
 class TestClearTask:
     def test_clear_removes_memory_and_marks(self, temp_dir, reset_singletons):
-        """C3：经 MemoryService 清空记忆 + 消费标记。"""
+        """经 MemoryService 清空记忆 + 消费标记。"""
         db = _make_db(temp_dir)
         r1 = db.log_sync_record(
             "dad",

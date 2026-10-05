@@ -1,10 +1,10 @@
 """replay(run_id) 断点重放测试（新签名：无 seed_builder / max_iterations）。
 
 覆盖：
-- S2.1：完整 run 重建与原执行逐字节等价（含 seed 前缀，无 seed_builder）
-- S2.2：断点续跑：missing 仅缺失项；已成功不重跑；不完整轮不计 executed_iterations
-- S2.3：终局响应分派；行缺失/空 delta 从该轮 break 不抛异常
-- S2.4：replay_delta 加密读回透明
+- 完整 run 重建与原执行逐字节等价（含 seed 前缀，无 seed_builder）
+- 断点续跑：missing 仅缺失项；已成功不重跑；不完整轮不计 executed_iterations
+- 终局响应分派；行缺失/空 delta 从该轮 break 不抛异常
+- replay_delta 加密读回透明
 """
 
 from __future__ import annotations
@@ -154,7 +154,7 @@ def _write_tool_exec(dbm, run_id, iteration, sequence, tool_use_id, content):
 
 class TestReplayReconstructsFullRun:
     def test_replay_with_seed_prefix(self, dbm):
-        """S2.1：replay 从 seed 行还原种子消息作为 messages 前缀。"""
+        """replay 从 seed 行还原种子消息作为 messages 前缀。"""
         seed = [
             Message(role="system", content="sys"),
             Message(role="user", content="ctx"),
@@ -169,7 +169,7 @@ class TestReplayReconstructsFullRun:
         assert result.messages[1] == seed[1]
 
     def test_replay_byte_equivalent_to_loop_run(self, dbm):
-        """S2.1：replay 重建的 messages 与原执行路径逐字节一致。"""
+        """replay 重建的 messages 与原执行路径逐字节一致。"""
         seed = [
             Message(role="system", content="sys"),
             Message(role="user", content="ctx"),
@@ -539,7 +539,7 @@ class TestReplayRebuildsFullBlocks:
 
 
 class TestReplayTotalTokens:
-    """P2-1：replay 累计已发生 llm_chat span 的 tokens，供恢复路径写回 total_tokens。"""
+    """replay 累计已发生 llm_chat span 的 tokens，供恢复路径写回 total_tokens。"""
 
     def test_replay_accumulates_total_tokens(self, dbm):
         """2 轮 llm_chat（tokens=100/50）→ ReplayResult.total_tokens == 150。"""
@@ -580,7 +580,7 @@ class TestReplayTotalTokens:
 
 class TestReplayCheckpointResume:
     def test_missing_only_missing_tool(self, dbm):
-        """S2.2：missing_tool_calls 仅含缺失的工具。"""
+        """missing_tool_calls 仅含缺失的工具。"""
         _write_seed(dbm, "run-miss", [])
         _write_llm_chat(
             dbm,
@@ -613,7 +613,7 @@ class TestReplayCheckpointResume:
         assert tr_ids == ["t1"]
 
     def test_incomplete_round_not_counted(self, dbm):
-        """S2.2：不完整轮不计 executed_iterations、不追加预算消息。"""
+        """不完整轮不计 executed_iterations、不追加预算消息。"""
         _write_seed(dbm, "run-inc", [])
         _write_llm_chat(
             dbm,
@@ -637,7 +637,7 @@ class TestReplayCheckpointResume:
         assert budget_msgs == []
 
     def test_completed_rounds_not_replayed_as_missing(self, dbm):
-        """S2.2：已完整执行的轮次不重跑，missing 仅最后一轮缺失项。"""
+        """已完整执行的轮次不重跑，missing 仅最后一轮缺失项。"""
         _write_seed(dbm, "run-comp", [])
         # 轮 0 完整
         _write_llm_chat(dbm, "run-comp", 0, [{"id": "a", "name": "x", "input": {}}])
@@ -662,7 +662,7 @@ class TestReplayCheckpointResume:
 
 class TestReplayTerminalDispatch:
     def test_end_turn_returns_last_response(self, dbm):
-        """S2.3：终局 end_turn 响应分派到 last_response。"""
+        """终局 end_turn 响应分派到 last_response。"""
         _write_seed(dbm, "run-end", [])
         _write_llm_chat(
             dbm, "run-end", 0, [], stop_reason="end_turn", content="no suggestion"
@@ -675,7 +675,7 @@ class TestReplayTerminalDispatch:
         assert result.executed_iterations == 0
 
     def test_break_on_empty_delta_no_exception(self, dbm):
-        """S2.3：空 delta 的轮次从该轮 break，不抛异常。"""
+        """空 delta 的轮次从该轮 break，不抛异常。"""
         _write_seed(dbm, "run-empty", [])
         # 轮 0：llm_chat 的 replay_delta 为空（异常数据）
         trace.start_span("run-empty", "llm_chat", 0, 0)
@@ -687,7 +687,7 @@ class TestReplayTerminalDispatch:
         assert result.last_response is None
 
     def test_break_on_missing_llm_chat_no_exception(self, dbm):
-        """S2.3：某轮无 llm_chat（仅有 tool_execute）时 break，不抛异常。"""
+        """某轮无 llm_chat（仅有 tool_execute）时 break，不抛异常。"""
         _write_seed(dbm, "run-nochat", [])
         # 轮 0 只有 tool_execute 无 llm_chat
         _write_tool_exec(dbm, "run-nochat", 0, 1, "t1", "r1")
@@ -713,7 +713,7 @@ class TestReplaySortingStability:
 
 class TestReplayEncryptionTransparent:
     def test_replay_reads_encrypted_delta_transparently(self, dbm, crypto_on):
-        """S2.4：replay_delta 加密落库，replay 读取时透明解密。"""
+        """replay_delta 加密落库，replay 读取时透明解密。"""
         seed = [Message(role="user", content="ctx")]
         _write_seed(dbm, "run-crypt", seed)
         _write_llm_chat(

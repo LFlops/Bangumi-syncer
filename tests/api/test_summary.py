@@ -419,7 +419,7 @@ class TestSummaryJobResponse:
         assert model.name == "Extra Keys"
 
     def test_from_config_dict_invalid_int_falls_back_to_default(self):
-        """F3（H2 同源）：lookback_days/max_records 为非法字符串时回落默认而非抛 500。
+        """lookback_days/max_records 为非法字符串时回落默认而非抛 500。
 
         config.ini 写 `lookback_days=abc`/`max_records=abc` 不得让整个端点 500。
         """
@@ -792,7 +792,7 @@ class _FakeLLMStream:
 
 
 class TestTestLLMConnection:
-    """POST /api/llm/test 端点测试（T10：改走流式 stream_chat）。"""
+    """POST /api/llm/test 端点测试（改走流式 stream_chat）。"""
 
     @pytest.mark.asyncio
     async def test_successful_llm_connection(self):
@@ -1089,7 +1089,7 @@ class TestListSummaryJobs:
 
     @pytest.mark.asyncio
     async def test_returns_200_with_invalid_int_config(self):
-        """F3（API 级）：config.ini 含非法整型字段时整体返回 200 而非 500。
+        """config.ini 含非法整型字段时整体返回 200 而非 500。
 
         旧实现裸 `int()` 会让 `lookback_days=abc`/`max_records=abc` 直接 500。
         """
@@ -1479,9 +1479,9 @@ class TestTestSummaryJob:
 
     @pytest.mark.asyncio
     async def test_empty_summary_text_with_usage_fails(self):
-        """F6（H1-API 回归）：summary_text 为空但 usage 存在 → success=False + error_message。
+        """summary_text 为空但 usage 存在 → success=False + error_message。
 
-        H1 修复后判定条件为仅 `not summary_text`；此前缺此缺陷场景测试。
+        修复后判定条件为仅 `not summary_text`；此前缺此缺陷场景测试。
         """
         from fastapi import FastAPI
         from httpx import ASGITransport, AsyncClient
@@ -1694,7 +1694,7 @@ class TestLLMUsageStatsResponse:
         assert len(model.daily) == 1
 
 
-# ========== 记忆清理与改名联动（Phase 2.0.3，S1/S3/S5） ==========
+# ========== 记忆清理与改名联动 ==========
 
 
 def _make_summary_app():
@@ -1730,7 +1730,7 @@ def _assert_422_detail_contract(response, loc_field):
 
 
 class TestSummaryLimitValidation:
-    """记忆/关联条数越界契约测试（T1）。
+    """记忆/关联条数越界契约测试。
 
     锁定后端对 memory_limit / related_limit 的校验契约：
     非法值 → 422 且 detail 为对象数组（含 msg 与 loc），且不得入库；
@@ -1834,7 +1834,7 @@ class TestSummaryLimitValidation:
 class TestClearMemoryApi:
     @pytest.mark.asyncio
     async def test_requires_confirm(self):
-        """C4/S3：无 confirm → 422，不删除。"""
+        """无 confirm → 422，不删除。"""
         from httpx import ASGITransport, AsyncClient
 
         app = _make_summary_app()
@@ -1851,7 +1851,7 @@ class TestClearMemoryApi:
 
     @pytest.mark.asyncio
     async def test_clear_memory_success(self):
-        """S3：confirm=true → success + deleted_records，委托 MemoryService。"""
+        """confirm=true → success + deleted_records，委托 MemoryService。"""
         from httpx import ASGITransport, AsyncClient
 
         app = _make_summary_app()
@@ -1894,7 +1894,7 @@ class TestClearMemoryApi:
 
     @pytest.mark.asyncio
     async def test_clear_failure_returns_error(self):
-        """S5：清空失败返回错误响应（不影响任务配置）。"""
+        """清空失败返回错误响应（不影响任务配置）。"""
         from httpx import ASGITransport, AsyncClient
 
         app = _make_summary_app()
@@ -1919,7 +1919,7 @@ class TestClearMemoryApi:
 class TestRenameMemoryLinkage:
     @pytest.mark.asyncio
     async def test_rename_migrates_memory(self):
-        """S1：改名 PUT → MemoryService.rename_task 联动（记忆跟随）。"""
+        """改名 PUT → MemoryService.rename_task 联动（记忆跟随）。"""
         from httpx import ASGITransport, AsyncClient
 
         app = _make_summary_app()
@@ -2191,7 +2191,7 @@ class TestSummaryJobRuntimeSyncDegradation:
 
 
 class TestMemoryStatsApi:
-    """S10'/S11'：memory-stats 返回记忆总量与注入估算（绝对量，无百分比）。"""
+    """memory-stats 返回记忆总量与注入估算（绝对量，无百分比）。"""
 
     @pytest.mark.asyncio
     async def test_stats_with_no_memory(self):
@@ -2263,7 +2263,7 @@ class TestMemoryStatsApi:
 
     @pytest.mark.asyncio
     async def test_stats_excludes_placeholder_rows(self):
-        """T2：摘要失败占位行（summary=""）不计入 total_count/chars/avg 与注入估算。"""
+        """摘要失败占位行（summary=""）不计入 total_count/chars/avg 与注入估算。"""
         from httpx import ASGITransport, AsyncClient
 
         from app.models.memory import MemoryEntry
@@ -2314,7 +2314,7 @@ class TestMemoryStatsApi:
 
 
 class TestMemoryStatsEstimateM11:
-    """M11：注入估算需体现 related 独立生效（不因 memory_limit=0 而遗漏 related）。"""
+    """注入估算需体现 related 独立生效（不因 memory_limit=0 而遗漏 related）。"""
 
     @pytest.mark.asyncio
     async def test_stats_includes_related_when_memory_zero(self):
@@ -2438,7 +2438,7 @@ class TestSummaryThinkingLevelAPIFlow:
         assert job["thinking_level"] == "low"
 
 
-# ========== 试生成流式 SSE 端点（T9） ==========
+# ========== 试生成流式 SSE 端点 ==========
 
 
 def _parse_sse_data_events(body: str) -> list[dict]:

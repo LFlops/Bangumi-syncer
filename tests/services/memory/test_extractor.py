@@ -1,4 +1,4 @@
-"""MemoryExtractor 测试（Phase 2.0.1 摘要生成）。
+"""MemoryExtractor 测试（摘要生成）。
 
 覆盖 BDD 场景 W1/W2/W3/W5。
 """
@@ -34,7 +34,7 @@ def _make_llm(
     model: str = "m",
     side_effect=None,
 ) -> MagicMock:
-    """mock LLM 客户端：``stream_chat`` 产出 text_delta 事件流（R3 契约）。
+    """mock LLM 客户端：``stream_chat`` 产出 text_delta 事件流（契约）。
 
     ``side_effect`` 传入时直接作为 ``stream_chat`` 的副作用（可抛异常或产出
     自定义事件流）；否则按 ``content`` 生成单条 text_delta 事件。
@@ -60,7 +60,7 @@ def _make_extractor(
     return extractor, repo, llm
 
 
-# ── W1 成功路径写入 ─────────────────────────────────────────────────────
+# ── 成功路径写入 ─────────────────────────────────────────────────────
 
 
 class TestExtractAndStore:
@@ -103,7 +103,7 @@ class TestExtractAndStore:
 
     @pytest.mark.asyncio
     async def test_forwards_job_name_to_stream_chat(self):
-        """R3：job_name 原样透传给 stream_chat（摘要 token 归属 llm_usage）。"""
+        """job_name 原样透传给 stream_chat（摘要 token 归属 llm_usage）。"""
         extractor, _repo, llm = _make_extractor()
 
         await extractor._summarize(_messages(), _response(), job_name="summary_daily")
@@ -111,7 +111,7 @@ class TestExtractAndStore:
         assert llm.stream_chat.call_args.kwargs["job_name"] == "summary_daily"
 
 
-# ── W2 摘要 LLM 失败规则兜底 ────────────────────────────────────────────
+# ── 摘要 LLM 失败规则兜底 ────────────────────────────────────────────
 
 
 class TestLazyLlmClient:
@@ -130,11 +130,11 @@ class TestLazyLlmClient:
         mock_llm.stream_chat.assert_called_once()
 
 
-# ── 摘要失败写「消费占位行」（B1：无截断兜底，所有非空入库摘要均为 LLM 完整输出）──
+# ── 摘要失败写「消费占位行」（无截断兜底，所有非空入库摘要均为 LLM 完整输出）──
 
 
 class TestSummarizeFailWritesPlaceholder:
-    """S9/B1：摘要失败（异常/空摘要）写 summary 留空的占位行，让 run 有归属。
+    """摘要失败（异常/空摘要）写 summary 留空的占位行，让 run 有归属。
 
     消费标记与占位行同事务写入（store_and_mark），消费排除因此生效，
     下次调度不再重复总结同一批记录（避免重复通知 + token 白烧）。
@@ -142,7 +142,7 @@ class TestSummarizeFailWritesPlaceholder:
 
     @pytest.mark.asyncio
     async def test_llm_exception_writes_placeholder_and_prunes(self):
-        """S9/B1：_summarize LLM 抛异常 → 返回空串，extract_and_store 反写占位行。"""
+        """_summarize LLM 抛异常 → 返回空串，extract_and_store 反写占位行。"""
         extractor, repo, llm = _make_extractor(
             llm=_make_llm(side_effect=RuntimeError("llm down"))
         )
@@ -231,7 +231,7 @@ class TestSummarizeFailWritesPlaceholder:
 
     @pytest.mark.asyncio
     async def test_long_summary_kept_intact(self):
-        """S8：成功路径零截断——LLM 输出多长存多长（无 _SUMMARY_MAX_LEN）。"""
+        """成功路径零截断——LLM 输出多长存多长（无 _SUMMARY_MAX_LEN）。"""
         long_text = "长" * 500
         extractor, repo, llm = _make_extractor(llm=_make_llm(long_text))
         response = _response("全文")
@@ -256,7 +256,7 @@ class TestSummarizeFailWritesPlaceholder:
 class TestEmptyResponse:
     @pytest.mark.asyncio
     async def test_empty_response_writes_placeholder(self):
-        """W3/B1：主总结空响应 → 占位行（full_text 空、outcome=summary_failed），不触发摘要调用。"""
+        """主总结空响应 → 占位行（full_text 空、outcome=summary_failed），不触发摘要调用。"""
         extractor, repo, llm = _make_extractor()
         empty = ChatResponse(content="", model="", usage=None, latency=5)
 
@@ -282,7 +282,7 @@ class TestEmptyResponse:
 
     @pytest.mark.asyncio
     async def test_llm_call_error_mid_stream_writes_placeholder(self):
-        """R3 失败语义：流中途抛 LLMCallError → 摘要返回空串，写消费占位行。"""
+        """失败语义：流中途抛 LLMCallError → 摘要返回空串，写消费占位行。"""
 
         async def _boom(messages, *, job_name=None, **kwargs):
             yield StreamChunk(type="text_delta", text="部分输出")
@@ -314,13 +314,13 @@ class TestEmptyResponse:
         assert entry.tokens_used == 150
 
 
-# ── W5 写入失败不影响调用方 ─────────────────────────────────────────────
+# ── 写入失败不影响调用方 ─────────────────────────────────────────────
 
 
 class TestFailurePropagation:
     @pytest.mark.asyncio
     async def test_repo_failure_propagates_to_caller(self):
-        """W5：DB 写入异常向上传播（execute_job 外层 try/except 处理）。"""
+        """DB 写入异常向上传播（execute_job 外层 try/except 处理）。"""
         repo = MagicMock()
         repo.store_and_mark.side_effect = RuntimeError("db down")
         extractor, _, _ = _make_extractor(repo=repo)

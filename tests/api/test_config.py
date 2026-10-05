@@ -1045,7 +1045,7 @@ def mock_sync_cm():
 
 @pytest.mark.asyncio
 async def test_sync_config_endpoint_removed(app_with_auth, mock_config_manager):
-    """GET /api/sync/config 已删除，前端改为复用 /api/config 数据（评论#5）。"""
+    """GET /api/sync/config 已删除，前端改为复用 /api/config 数据。"""
     async with AsyncClient(
         transport=ASGITransport(app=app_with_auth), base_url="http://test"
     ) as client:

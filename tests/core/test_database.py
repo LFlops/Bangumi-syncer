@@ -977,7 +977,7 @@ class TestDatabaseDockerAndTrakt:
     def test_error_sync_record_no_longer_creates_in_app_notification(
         self, temp_dir, reset_singletons
     ):
-        """P4.5：log_sync_record 移除隐式站内信副作用后，error 记录不再自动写站内信。
+        """log_sync_record 移除隐式站内信副作用后，error 记录不再自动写站内信。
 
         站内信由 notification_service.notify() 显式触发，数据库层只负责记录 sync_records。
         """
@@ -1023,7 +1023,7 @@ class TestDatabaseDockerAndTrakt:
 
             db = DatabaseManager(str(db_path))
 
-        # P4.5：站内信由 notification_service.notify() 显式创建，
+        # 站内信由 notification_service.notify() 显式创建，
         # 此处直接调用 insert_notification 模拟显式写入
         db.insert_notification("sync_failed", "同步失败：A S1E1", "e", ref_id=1)
         assert db.count_unread_notifications() == 1
@@ -1106,7 +1106,7 @@ class TestDatabaseDockerAndTrakt:
             message="fail",
             source="test",
         )
-        # P4.5：显式创建站内信（关联 sync_records.id）
+        # 显式创建站内信（关联 sync_records.id）
         db.insert_notification(
             "sync_failed",
             "同步失败：联动番剧 S1E1",
@@ -1124,7 +1124,7 @@ class TestDatabaseDockerAndTrakt:
 
             db = DatabaseManager(str(db_path))
 
-        # P4.5：显式创建两条同标题站内信，模拟 notification_service.notify() 写入
+        # 显式创建两条同标题站内信，模拟 notification_service.notify() 写入
         db.insert_notification("sync_failed", "同步失败：组内番剧 S1E1", "e1", ref_id=1)
         db.insert_notification("sync_failed", "同步失败：组内番剧 S1E2", "e2", ref_id=2)
         assert db.count_unread_notifications() == 2
@@ -1313,7 +1313,7 @@ class TestCleanupOldRecords:
     def test_cleanup_removes_orphan_assoc_rows(self, temp_dir, reset_singletons):
         """清理旧记录时，关联表 sync_records_consumed 孤儿行一并清除。
 
-        P2-1：DELETE sync_records 后关联表残留指向已删记录的消费标记，
+        DELETE sync_records 后关联表残留指向已删记录的消费标记，
         表体积膨胀。级联清理避免孤儿行积累。
         """
         db_path = temp_dir / "cleanup_orphan.db"

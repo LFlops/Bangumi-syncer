@@ -2666,7 +2666,7 @@ class TestBangumiDataDateOptimalTamayura:
         assert result[2] is True
 
     def test_upstream_single_candidate_logic_selects_prequel_here(self):
-        """对照（实现前）：PR #117/#120 前的「仅考察日期最近单个候选」策略在此场景回落前传（错误）。
+        """对照（实现前）：「仅考察日期最近单个候选」策略在此场景回落前传（错误）。
 
         复刻旧逻辑用于对照：取日期最近的单个部分匹配做安全校验，未通过则放弃
         整个日期择优并回落到日期最远的完全匹配。玉响场景中最近的候选是同期播出

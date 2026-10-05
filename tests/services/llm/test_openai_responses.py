@@ -1,7 +1,7 @@
-"""app.services.llm.providers.openai_responses 测试（任务 T6）。
+"""app.services.llm.providers.openai_responses 测试。
 
 覆盖 OpenAI Responses API provider 的请求构造、响应解析与流式事件映射。
-BDD 场景与测试一一对应（见任务 T6 规格）。
+BDD 场景与测试一一对应。
 """
 
 from __future__ import annotations
@@ -435,7 +435,7 @@ class TestStreamToolCall:
 
 
 # --------------------------------------------------------------------------- #
-# R1：model 填充与 tool_use_stop 停点事件
+# model 填充与 tool_use_stop 停点事件
 # --------------------------------------------------------------------------- #
 class TestStreamModelAndToolStop:
     """model 填充（completed/首个可用事件）与 output_item.done → tool_use_stop。"""
@@ -618,7 +618,7 @@ class TestStreamCompleted:
 
 
 # --------------------------------------------------------------------------- #
-# M2：流式 incomplete（截断）与 _stop_reason_of 一致性
+# 流式 incomplete（截断）与 _stop_reason_of 一致性
 # --------------------------------------------------------------------------- #
 class TestStreamIncomplete:
     """response.incomplete → usage + max_tokens stop（截断口径一致）。"""

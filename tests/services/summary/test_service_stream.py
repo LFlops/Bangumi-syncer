@@ -1,4 +1,4 @@
-"""测试 SummaryService.generate_summary_stream：试生成流式变体（T9）。
+"""测试 SummaryService.generate_summary_stream：试生成流式变体。
 
 覆盖：
 - 事件透传（text_delta/usage/stop 原样产出，顺序不变）
@@ -177,7 +177,7 @@ class TestGenerateSummaryStream:
     async def test_fills_result_meta(self):
         """耗尽后 result 回填业务自采元数据：model / usage / latency / record_count。
 
-        R1 后 client 不再回填容器：model 取自事件 chunk.model，latency 由 service
+        后 client 不再回填容器：model 取自事件 chunk.model，latency 由 service
         自行计时（此处只断言非负，不依赖 client 传值）。
         """
         svc = SummaryService()

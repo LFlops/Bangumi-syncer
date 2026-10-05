@@ -1,4 +1,4 @@
-"""app.services.llm.providers.openai_compat 测试（任务 1.3）。"""
+"""app.services.llm.providers.openai_compat 测试。"""
 
 import json
 from unittest.mock import AsyncMock, Mock, patch
@@ -82,7 +82,7 @@ class TestOpenAICompatProviderInit:
 
 
 class TestOpenAICompatBuildRequest:
-    """Phase 2.2：_build_request / _to_wire_message / reasoning_effort 映射。"""
+    """：_build_request / _to_wire_message / reasoning_effort 映射。"""
 
     def _provider(self, thinking_level="off", model="gpt-4o-mini"):
         return OpenAICompatProvider(
@@ -132,7 +132,7 @@ class TestOpenAICompatBuildRequest:
 
 
 class TestReasoningTemperatureAlignment:
-    """H3：o 系列发 reasoning_effort 时 temperature 强制 1（与 Anthropic 侧对齐），
+    """o 系列发 reasoning_effort 时 temperature 强制 1（与 Anthropic 侧对齐），
     避免推理模型对非 1 temperature 的硬 400。"""
 
     def test_o_series_forces_temperature_one(self):
@@ -242,7 +242,7 @@ def _chunk_payload(
 
 
 class TestOpenAICompatProviderStream:
-    """T4：OpenAI 兼容 provider 的 SSE 流式实现。"""
+    """OpenAI 兼容 provider 的 SSE 流式实现。"""
 
     def _provider(self, **kwargs) -> OpenAICompatProvider:
         return OpenAICompatProvider(

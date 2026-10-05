@@ -1,4 +1,4 @@
-"""端到端流式集成测试（T10）：真实 httpx 传输层 + 原始 SSE 字节流。
+"""端到端流式集成测试：真实 httpx 传输层 + 原始 SSE 字节流。
 
 与分层 mock 的既有测试（直接替换 ``provider.stream`` 或 patch ``httpx.AsyncClient``
 类）不同，本文件只在 **httpx transport 层**（``httpx.MockTransport``）注入原始 SSE

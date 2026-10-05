@@ -1038,7 +1038,7 @@ class TestFindEpisodeAcrossSeasons:
         assert result[1] == 30002
 
     def test_archive_sequel_chain_no_target_falls_back_to_hop_by_hop(self):
-        """archive 命中但链上无 target_ep 时降级到逐跳 API（P1-5 修复）。
+        """archive 命中但链上无 target_ep 时降级到逐跳 API。
 
         场景：archive 链 [200] 但 S2 的 sort 范围不含 target_ep=1000，
         且 200 无续集。archive 链不完整时必须降级到逐跳 API 兜底，
@@ -1060,7 +1060,7 @@ class TestFindEpisodeAcrossSeasons:
 
         result = api.find_episode_across_seasons(100, 1000)
         assert result is None
-        # P1-5 修复：archive 链未命中目标时应降级到逐跳 API
+        # archive 链未命中目标时应降级到逐跳 API
         assert api.get_related_subjects.called
 
     def test_archive_prequel_chain_finds_target_sort(self):

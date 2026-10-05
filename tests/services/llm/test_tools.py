@@ -567,7 +567,7 @@ async def test_execute_batch_duplicate_tool_use_id_executes_only_first():
     results = await reg.execute_batch(calls)
     # handler 仅被调用一次（第一个执行，第二个不执行）
     assert called == [1]
-    # G2：独立槽位与 tool_calls 一一对应（顺序一致）
+    # 独立槽位与 tool_calls 一一对应（顺序一致）
     assert len(results.ordered) == len(calls)
     first_id, first = results.ordered[0]
     second_id, second = results.ordered[1]
@@ -650,7 +650,7 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     assert results["a"].content == '"ran"'
     assert results["b"].is_error is False
     assert results["b"].content == '"ran"'
-    # G2：重复 id 的首个槽位保留真实结果，第二个槽位为错误块
+    # 重复 id 的首个槽位保留真实结果，第二个槽位为错误块
     slots = results.ordered
     assert [i for i, _ in slots] == ["a", "dup", "dup", "b"]
     assert slots[1][1].is_error is False
@@ -1048,7 +1048,7 @@ async def test_recorder_重复id_占位错误块同样有span且is_error():
 
 
 # ---------------------------------------------------------------------------
-# T3：幂等（idempotent）维度 —— 默认推导 + 显式覆盖
+# 幂等（idempotent）维度 —— 默认推导 + 显式覆盖
 #   幂等 ≠ 无副作用：access 是副作用语义，idempotent 是重复执行安全性，二者正交
 # ---------------------------------------------------------------------------
 
@@ -1127,7 +1127,7 @@ def test_tool_definition_idempotent_and_readonly_are_independent():
 
 
 # ---------------------------------------------------------------------------
-# T3：ToolRegistry.is_idempotent 查询（与 is_readonly 并存、未注册口径一致）
+# ToolRegistry.is_idempotent 查询（与 is_readonly 并存、未注册口径一致）
 # ---------------------------------------------------------------------------
 
 
@@ -1189,7 +1189,7 @@ def test_is_idempotent_unregistered_returns_false_like_is_readonly():
 
 
 # ---------------------------------------------------------------------------
-# T3：execute_batch 分段判据改为幂等（连续幂等段并行 / 非幂等串行）
+# execute_batch 分段判据改为幂等（连续幂等段并行 / 非幂等串行）
 # ---------------------------------------------------------------------------
 
 
@@ -1376,7 +1376,7 @@ async def test_execute_batch_idempotent_write_tool_runs_in_parallel():
 
 
 # ---------------------------------------------------------------------------
-# S3：幂等段并发上限（_MAX_PARALLEL_TOOLS）
+# 幂等段并发上限（_MAX_PARALLEL_TOOLS）
 # ---------------------------------------------------------------------------
 
 

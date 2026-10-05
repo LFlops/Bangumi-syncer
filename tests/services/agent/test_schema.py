@@ -1,8 +1,8 @@
 """agent_runs / agent_steps schema 演进测试（FK 级联 / epoch / 删 payload_json）。
 
 覆盖：
-- S3.4：PRAGMA foreign_keys=ON 后，删除 agent_runs 行 → agent_steps 级联消失
-- S3.1：时间列存储 epoch 秒整数
+- PRAGMA foreign_keys=ON 后，删除 agent_runs 行 → agent_steps 级联消失
+- 时间列存储 epoch 秒整数
 - agent_steps 无 payload_json 列（schema 检查）
 """
 
@@ -29,7 +29,7 @@ def dbm(tmp_path: Path) -> Iterator[DatabaseManager]:
 
 class TestForeignKeyCascade:
     def test_delete_run_cascades_steps(self, dbm):
-        """S3.4：删除 agent_runs 行 → agent_steps 级联消失。"""
+        """删除 agent_runs 行 → agent_steps 级联消失。"""
         conn = dbm._connection._get_connection()
         # 确认 FK 已开启
         fk = conn.execute("PRAGMA foreign_keys").fetchone()[0]
@@ -70,7 +70,7 @@ class TestForeignKeyCascade:
 
 class TestEpochColumns:
     def test_time_columns_are_epoch_integers(self, dbm):
-        """S3.1：时间列存储 epoch 秒整数（agent_runs / agent_steps）。"""
+        """时间列存储 epoch 秒整数（agent_runs / agent_steps）。"""
         import time
 
         run_id = "run-epoch"

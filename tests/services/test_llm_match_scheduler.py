@@ -115,7 +115,7 @@ def test_get_driver_config_returns_cron():
 
 
 # ---------------------------------------------------------------------------
-# C1：cron 空串/非法值 fail-loud（不注册 job + error 日志含原值）
+# cron 空串/非法值 fail-loud（不注册 job + error 日志含原值）
 #
 # 集中 getter 已移除默认值兜底（符合「配置类参数禁默认值兜底」沉淀），空串会直达
 # 调度器；基类 _schedule_or_refresh_job 的 `or DEFAULT_CRON` 与 _parse_cron 的
@@ -395,7 +395,7 @@ def test_recovery_present_sync_record_continues():
 
 
 def test_recover_run_calls_continue_run_single_entry():
-    """S1：_recover_run 只调场景层公开单一入口 continue_run，并透传 run_id/sync_record/bgm/通知服务。"""
+    """_recover_run 只调场景层公开单一入口 continue_run，并透传 run_id/sync_record/bgm/通知服务。"""
     sched = LlmMatchScheduler()
     repo = _make_repo()
     fake_svc = MagicMock()
@@ -429,7 +429,7 @@ def test_recover_run_calls_continue_run_single_entry():
 
 
 def test_scheduler_source_no_scenario_private_symbols():
-    """S2：调度器不得再引用场景层私有符号/内部实现（组合模式，不嵌套场景内部）。"""
+    """调度器不得再引用场景层私有符号/内部实现（组合模式，不嵌套场景内部）。"""
     import inspect
 
     source = inspect.getsource(sched_module)
@@ -485,7 +485,7 @@ def test_process_pending_respects_batch_limit_five():
     cm = _make_config()
     repo = _make_repo()
     # 即便 repo 返回 7 条，调度器也只处理 5 条
-    # （sync_record_id 用正数：0/空 现表示"尚未回填"，会按 T7 规则跳过）
+    # （sync_record_id 用正数：0/空 现表示"尚未回填"，会按规则跳过）
     repo.list_pending.return_value = [
         {"run_id": f"r{i}", "task_type": "match", "sync_record_id": i + 1}
         for i in range(7)
@@ -594,7 +594,7 @@ def test_exception_in_one_run_does_not_stop_others():
 
 
 # ---------------------------------------------------------------------------
-# F5：正常处理路径透传 thinking_level（统一从集中配置读取）
+# 正常处理路径透传 thinking_level（统一从集中配置读取）
 # ---------------------------------------------------------------------------
 
 
@@ -661,7 +661,7 @@ def test_process_run_passes_notification_service_to_scenario_runtime_run():
 
 
 # ---------------------------------------------------------------------------
-# T5：模块级 active run 重入防护（跳过运行中 run / 统一时间戳抢占 / 互斥 / 释放）
+# 模块级 active run 重入防护（跳过运行中 run / 统一时间戳抢占 / 互斥 / 释放）
 # ---------------------------------------------------------------------------
 
 
@@ -766,7 +766,7 @@ def test_concurrent_recover_same_run_only_one_acquires():
 
 
 def test_recover_run_cas_loser_skips_continuation_and_releases_active():
-    """S2：CAS 刷新失败（已被其他执行者抢占/状态已变）→ 跳过续跑并释放执行权。"""
+    """CAS 刷新失败（已被其他执行者抢占/状态已变）→ 跳过续跑并释放执行权。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -856,12 +856,12 @@ def test_process_run_skips_active_run():
 
 
 # ---------------------------------------------------------------------------
-# T7：recover/pending 共享信号量并发消费
+# recover/pending 共享信号量并发消费
 # ---------------------------------------------------------------------------
 
 
 def test_stale_and_pending_share_concurrency_limit():
-    """S1：1 stale + 3 pending，limit=2 → 并发峰值恰好 2，且 4 条都被处理。"""
+    """1 stale + 3 pending，limit=2 → 并发峰值恰好 2，且 4 条都被处理。"""
     sched = LlmMatchScheduler()
     cm = _make_config(concurrency=2)
     repo = _make_repo()
@@ -900,7 +900,7 @@ def test_stale_and_pending_share_concurrency_limit():
 
 
 def test_recover_and_pending_consume_concurrently():
-    """S2：recover 任务尚未结束时 pending 任务已开始执行（非严格先后）。"""
+    """recover 任务尚未结束时 pending 任务已开始执行（非严格先后）。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -948,7 +948,7 @@ def test_recover_and_pending_consume_concurrently():
 
 
 def test_consume_exception_isolated_and_logged_error():
-    """S3：某 run 处理抛异常 → 记 error 且不影响同批其他 run 完成。"""
+    """某 run 处理抛异常 → 记 error 且不影响同批其他 run 完成。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -986,7 +986,7 @@ def test_consume_exception_isolated_and_logged_error():
 
 
 # ---------------------------------------------------------------------------
-# T7：S7 并发配置解析（非法/缺失回退 3，非正数下限 1）
+# 并发配置解析（非法/缺失回退 3，非正数下限 1）
 # ---------------------------------------------------------------------------
 
 
@@ -1029,7 +1029,7 @@ def _measure_peak_concurrency(concurrency_value: int, n_pending: int = 3) -> int
     ],
 )
 def test_concurrency_config_parsing(value, expected_peak):
-    """S7：调度器消费集中 getter 的 llm_match_concurrency，非正数下限 1。
+    """调度器消费集中 getter 的 llm_match_concurrency，非正数下限 1。
 
     非法/缺失值回退 3 属 getter 职责，见 tests/core/test_config.py。
     """
@@ -1037,7 +1037,7 @@ def test_concurrency_config_parsing(value, expected_peak):
 
 
 # ---------------------------------------------------------------------------
-# T7：S4 三处调度失败日志应为 error 级
+# 三处调度失败日志应为 error 级
 # ---------------------------------------------------------------------------
 
 
@@ -1099,7 +1099,7 @@ def test_list_pending_failure_logged_at_error_level():
 
 
 # ---------------------------------------------------------------------------
-# T7：S6 sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮
+# sync_record_id 尚未回填（前移窗口）→ 跳过本轮
 # ---------------------------------------------------------------------------
 
 
@@ -1168,12 +1168,12 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
 
 
 # ---------------------------------------------------------------------------
-# T8b：run 参数 BaseModel 化 + 行解析防御 + import 规范化
+# run 参数 BaseModel 化 + 行解析防御 + import 规范化
 # ---------------------------------------------------------------------------
 
 
 def test_agent_run_record_aligns_schema_allows_extra_and_null_sync_record():
-    """S1：AgentRunRecord 对齐 agent_runs 列，允许未来新增列，sync_record_id 可空。"""
+    """AgentRunRecord 对齐 agent_runs 列，允许未来新增列，sync_record_id 可空。"""
     rec = AgentRunRecord.model_validate(
         {
             "id": 1,
@@ -1201,7 +1201,7 @@ def test_agent_run_record_aligns_schema_allows_extra_and_null_sync_record():
 
 
 def test_run_sync_job_converts_rows_to_agent_run_record():
-    """S1：repo 返回的 dict 行被转换为 AgentRunRecord 后交给处理函数。"""
+    """repo 返回的 dict 行被转换为 AgentRunRecord 后交给处理函数。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -1233,7 +1233,7 @@ def test_run_sync_job_converts_rows_to_agent_run_record():
 
 
 def test_run_sync_job_skips_unparseable_row_and_logs_error():
-    """S1：非法行构造失败 → error 日志 + 跳过，不影响同批其他 run。"""
+    """非法行构造失败 → error 日志 + 跳过，不影响同批其他 run。"""
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
@@ -1265,7 +1265,7 @@ def test_run_sync_job_skips_unparseable_row_and_logs_error():
 
 
 def test_scheduler_module_has_no_function_level_imports():
-    """S3：调度器模块的 import 统一在头部，函数体内不得残留 import。"""
+    """调度器模块的 import 统一在头部，函数体内不得残留 import。"""
     import ast
     import inspect
 
@@ -1281,7 +1281,7 @@ def test_scheduler_module_has_no_function_level_imports():
 
 
 def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
-    """S3：构造 BangumiApi 异常 → warning 不含原始异常文本（防 access_token 泄漏），
+    """构造 BangumiApi 异常 → warning 不含原始异常文本（防 access_token 泄漏），
     但保留可诊断的用户维度与异常类型。"""
     sched = LlmMatchScheduler()
     log = MagicMock()

@@ -382,7 +382,7 @@ class TestRecordBudgetMessage:
 
 
 class TestRecorderWrapStreamFn:
-    """R4：``wrap_stream_fn`` 透传事件 + 内部 fold，流结束后写 span（schema 不变）。"""
+    """``wrap_stream_fn`` 透传事件 + 内部 fold，流结束后写 span（schema 不变）。"""
 
     def test_wrap_stream_fn_forwards_chunks_and_persists_folded_response(self, dbm):
         import asyncio
