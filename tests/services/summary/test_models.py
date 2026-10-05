@@ -162,17 +162,43 @@ def test_max_records_coercion():
 
 
 def test_system_prompt_default_value():
-    """默认 system_prompt 包含规范中的关键短语。"""
-    expected = (
-        "你是一个轻松有趣的追番助手。用户会给你一段指定时间范围内的观影记录，请你用亲切自然的中文生成追番总结。\n\n"
-        "规则：\n"
-        '1. 如果记录为 0 条，告知用户"这段时间还没有追番记录哦~"\n'
-        '2. 按番剧分组，简要描述观看进度（如"《芙莉莲》追到 S1E10"）\n'
-        "3. 如果涉及多用户（记录中 user_name 不同），按用户分开描述\n"
-        "4. 加一两句轻松评论，语气像朋友聊天，不要太正式\n"
-        "5. 限制在 300 字以内"
+    """默认 system_prompt 覆盖规范关键规则（独立语义锚点，不整段复制实现文案）。
+
+    刻意逐条校验关键子句而非整段相等：文案微调（标点/措辞）不应误报，但语义
+    规则被删改（角色、0 条告知、分组、字数上限）必须红。
+    """
+    prompt = SummaryJobConfig.system_prompt
+    assert "追番助手" in prompt, "应保留角色设定"
+    assert "追番总结" in prompt, "应说明产出目标"
+    assert "还没有追番记录" in prompt, "应保留 0 条记录告知规则"
+    assert "按番剧分组" in prompt, "应保留按番剧分组规则"
+    assert "300 字以内" in prompt, "应保留 300 字字数上限"
+
+
+# ── thinking_level ────────────────────────────────────────────────────
+
+
+def test_thinking_level_valid_values_passthrough():
+    """合法 thinking_level（含大小写/空白）归一化后透传。"""
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "thinking_level": "medium"}
+        ).thinking_level
+        == "medium"
     )
-    assert SummaryJobConfig.system_prompt == expected
+    assert (
+        SummaryJobConfig.from_config_dict(
+            {"name": "t", "thinking_level": "  HIGH  "}
+        ).thinking_level
+        == "high"
+    )
+
+
+def test_thinking_level_invalid_falls_back_off():
+    """非法 thinking_level 回落 'off'（坏配置不得拖垮调度注册）。"""
+    for value in ("bogus", "highest", "", "   "):
+        cfg = SummaryJobConfig.from_config_dict({"name": "t", "thinking_level": value})
+        assert cfg.thinking_level == "off", f"thinking_level={value!r} 应回落 off"
 
 
 # ── user_prompt_template is NOT a dataclass field ─────────────────────

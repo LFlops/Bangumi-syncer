@@ -33,6 +33,13 @@ def test_ensure_llm_columns_removed_from_llm_assist():
     )
 
 
+def test_span_recorder_removed_from_llm_assist():
+    """旧 _SpanRecorder 实现已删除（统一为 TraceRecorder），不应回归。"""
+    assert not hasattr(llm_assist, "_SpanRecorder"), (
+        "llm_assist._SpanRecorder 应已删除（统一为 TraceRecorder）"
+    )
+
+
 def test_llm_match_cross_call_cache_removed_from_config():
     """llm_match_cross_call_cache 已删除（enqueue_match_run 的 reused 决策无条件实现）。"""
     import inspect

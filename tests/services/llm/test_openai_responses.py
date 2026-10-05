@@ -785,9 +785,9 @@ class TestHttpErrors:
         mock_client = _make_stream_client(
             [],
             raise_for_status_side_effect=httpx.HTTPStatusError(
-                "error", request=Mock(), response=Mock(status_code=500)
+                "HTTP 500", request=Mock(), response=Mock(status_code=500)
             ),
         )
         with patch("httpx.AsyncClient", return_value=mock_client):
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx.HTTPStatusError, match="500"):
                 await _collect(_provider(), [Message(role="user", content="q")])

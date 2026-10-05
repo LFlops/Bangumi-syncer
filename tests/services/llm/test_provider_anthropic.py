@@ -333,12 +333,19 @@ class TestBuildRequest:
         assert "thinking" not in body
         assert body["temperature"] == 0.7
 
-    def test_thinking_enabled_unknown_model_ok(self):
-        """未知模型按支持处理。"""
+    def test_thinking_unknown_model_enabled_and_invalid_level_falls_back_off(self):
+        """未知模型按支持处理（请求体开启 thinking）；未知 level 回落 off（不传 thinking）。"""
         provider = _make_provider(thinking_level="medium")
-        assert provider._thinking_enabled("medium", "unknown-model") == 4096
-        assert provider._thinking_enabled("off", "claude-sonnet-4-6") == 0
-        assert provider._thinking_enabled("invalid-level", "claude-sonnet-4-6") == 0
+        body = provider._build_request(
+            [Message(role="user", content="Q")], model="unknown-model"
+        )
+        assert body["thinking"] == {"type": "enabled", "budget_tokens": 4096}
+
+        off_body = provider._build_request(
+            [Message(role="user", content="Q")], thinking_level="invalid-level"
+        )
+        assert "thinking" not in off_body
+        assert off_body["temperature"] == 0.7
 
 
 # ===================================================================
@@ -611,13 +618,13 @@ class TestAnthropicProviderStream:
             [],
             status_code=status_code,
             raise_for_status_side_effect=httpx.HTTPStatusError(
-                "error",
+                f"HTTP {status_code}",
                 request=Mock(),
                 response=Mock(status_code=status_code),
             ),
         )
         provider = _make_provider()
         with patch("httpx.AsyncClient", return_value=mock_client):
-            with pytest.raises(httpx.HTTPStatusError):
+            with pytest.raises(httpx.HTTPStatusError, match=str(status_code)):
                 async for _ in provider.stream([Message(role="user", content="Q")]):
                     pass

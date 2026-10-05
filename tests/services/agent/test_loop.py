@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock
 
-from app.services.agent import loop as loop_module
 from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
     ChatResponse,
@@ -58,6 +57,30 @@ def _seed() -> list[Message]:
 
 def _ok_result(tc: ToolUseBlock, content: str = "ok") -> ToolResultBlock:
     return ToolResultBlock(tool_use_id=tc.id, content=content, is_error=False)
+
+
+# 末轮/收尾提示的独立语义锚点（刻意不引用 loop 模块常量，避免同源期望值：
+# 常量文案被改坏时关键词断言仍会红）。
+_FINAL_ROUND_KEYWORDS = ("最后一轮", "必须调用 submit_suggestion", "不得再调用")
+_FINAL_RECOVERY_KEYWORDS = (
+    "最终收尾",
+    "轮次预算已耗尽",
+    "请立即调用 submit_suggestion",
+)
+
+
+def _assert_final_round_message(content: str) -> None:
+    """断言末轮强化提示语义（强制提交结论 + 禁止再检索）。"""
+    assert all(kw in content for kw in _FINAL_ROUND_KEYWORDS), (
+        f"末轮强化提示应含语义关键词 {_FINAL_ROUND_KEYWORDS}，实际：{content!r}"
+    )
+
+
+def _assert_final_recovery_message(content: str) -> None:
+    """断言收尾提示语义（预算耗尽 + 立即给出结论）。"""
+    assert all(kw in content for kw in _FINAL_RECOVERY_KEYWORDS), (
+        f"收尾提示应含语义关键词 {_FINAL_RECOVERY_KEYWORDS}，实际：{content!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +335,7 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    assert last_msg.content == loop_module.FINAL_ROUND_BUDGET_MESSAGE
+    _assert_final_round_message(last_msg.content)
 
 
 # ---------------------------------------------------------------------------
@@ -534,27 +557,38 @@ async def test_budget_record_budget_called_per_non_final_round_with_remaining():
 
     # 3 轮中前 2 轮递减后 remaining>0（2、1）→ 各记录一次；末轮递减后 remaining==0
     # 的预算消息从未发给 LLM，不得记录；循环结束后收尾提示记录一次
-    assert recorder.budget_calls == [
-        "[剩余轮次：2]",
-        loop_module.FINAL_ROUND_BUDGET_MESSAGE,
-        loop_module.FINAL_RECOVERY_MESSAGE,
-    ]
+    assert len(recorder.budget_calls) == 3
+    assert recorder.budget_calls[0] == "[剩余轮次：2]"
+    _assert_final_round_message(recorder.budget_calls[1])
+    _assert_final_recovery_message(recorder.budget_calls[2])
     assert "[剩余轮次：0]" not in recorder.budget_calls
 
 
-async def test_budget_recorder_none_is_noop():
-    """recorder=None 时不应抛错（可空实现）。"""
-    chat_fn = AsyncMock(return_value=_resp("end_turn", None))
+async def test_budget_recorder_none_runs_exhausted_path_without_error():
+    """recorder=None 时跑满 max_iterations 并进入收尾调用，不抛错、正常返回 exhausted。
 
-    await run(
+    覆盖两处 ``if recorder is not None`` 守卫（循环内预算记录 + `_final_recovery` 收尾
+    记录）：守卫被删/失效时对 None 调 ``record_budget`` 会抛 AttributeError。
+    """
+    chat_fn = AsyncMock(
+        return_value=_resp("tool_use", [_tool_use("t", "search_bangumi")])
+    )
+    tool_calls_fn = AsyncMock(
+        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    )
+
+    result = await run(
         chat_fn=chat_fn,
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
-        max_iterations=3,
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=None,
     )
+
+    assert result.stop_reason == "exhausted"
+    assert result.last_response is not None
 
 
 async def test_budget_appended_to_messages_even_without_recorder():
@@ -584,7 +618,7 @@ async def test_budget_appended_to_messages_even_without_recorder():
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    assert last_msg.content == loop_module.FINAL_ROUND_BUDGET_MESSAGE
+    _assert_final_round_message(last_msg.content)
 
 
 async def test_budget_no_phantom_message_on_final_round():
@@ -617,7 +651,8 @@ async def test_budget_no_phantom_message_on_final_round():
 
     assert result.stop_reason == "exhausted"
     # 末轮递减后 remaining==0 不记录剩余轮次；循环后收尾提示记录一次
-    assert recorder.budget_calls == [loop_module.FINAL_RECOVERY_MESSAGE]
+    assert len(recorder.budget_calls) == 1
+    _assert_final_recovery_message(recorder.budget_calls[0])
     phantom = [
         m.content
         for m in observed[0]
@@ -934,7 +969,7 @@ async def test_exhausted_final_recovery_submits_suggestion():
     assert result.suggestion == {"subject_id": "49892", "reason": "收尾确定"}
     assert result.last_response is recovery
     # 收尾请求的 messages 末尾为收尾提示
-    assert calls[2][0][-1].content == loop_module.FINAL_RECOVERY_MESSAGE
+    _assert_final_recovery_message(calls[2][0][-1].content)
 
 
 async def test_exhausted_final_recovery_still_no_submit_returns_exhausted():
@@ -1055,7 +1090,9 @@ async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
         recorder=recorder,
     )
 
-    assert loop_module.FINAL_RECOVERY_MESSAGE in recorder.budget_calls
+    assert any(
+        all(kw in c for kw in _FINAL_RECOVERY_KEYWORDS) for c in recorder.budget_calls
+    ), f"收尾提示须经预算通道记录，实际 {recorder.budget_calls!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -1554,7 +1591,7 @@ async def test_run_requires_stream_fn_or_chat_fn():
     """二者都不提供 → ValueError（显式契约）。"""
     import pytest
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="stream_fn"):
         await run(
             tools_schemas=[],
             tool_calls_fn=AsyncMock(),

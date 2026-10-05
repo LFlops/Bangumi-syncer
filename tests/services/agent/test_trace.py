@@ -335,11 +335,36 @@ class TestEndSpanDoesNotOverwriteStartedAt:
 
 
 class TestAgentStepsVsLlmUsageSplit:
-    def test_docstring_documents_agent_steps_vs_llm_usage_split(self):
-        """模块 docstring 明确 agent_steps 与 llm_usage_logs 的职责分工。"""
-        doc = trace.__doc__ or ""
-        assert "llm_usage_logs" in doc
-        assert "agent_steps" in doc
+    def test_record_budget_message_lands_in_agent_steps_not_llm_usage(self, dbm):
+        """职责分离行为契约：预算消息并入 agent_steps.replay_delta，
+        llm_usage_logs 行数不变（用量聚合与重放载荷互不写入）。"""
+        _ensure_run(dbm, "run-split")
+        sid = trace.start_span("run-split", "tool_execute", 0, 1)
+        trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "r"))
+        assert dbm.llm_usage.log_usage(model="m", total_tokens=1) is True
+
+        conn = dbm._connection._get_connection()
+        steps_before = conn.execute("SELECT COUNT(*) FROM agent_steps").fetchone()[0]
+        usage_before = conn.execute("SELECT COUNT(*) FROM llm_usage_logs").fetchone()[0]
+        assert usage_before == 1
+
+        trace.record_budget_message(sid, "[剩余轮次：2]")
+
+        steps_after = conn.execute("SELECT COUNT(*) FROM agent_steps").fetchone()[0]
+        usage_after = conn.execute("SELECT COUNT(*) FROM llm_usage_logs").fetchone()[0]
+        # 预算消息并入既有 step（UPDATE，不新增行），且绝不写 llm_usage_logs
+        assert steps_after == steps_before
+        assert usage_after == usage_before == 1
+        raw = conn.execute(
+            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
+        ).fetchone()[0]
+        # 兼顾加密开启/关闭：decrypt 对 BGS1: 密文解密，对明文原样返回
+        from app.core.config_secret_crypto import decrypt
+
+        obj = json.loads(decrypt(raw))
+        assert obj["budget_message"] == "[剩余轮次：2]"
+        # 原 tool_result 载荷必须保留（并入而非覆盖）
+        assert obj["tool_result"]["tool_use_id"] == "t1"
 
 
 class TestRecordBudgetMessage:

@@ -400,12 +400,43 @@ async def test_early_execution_caps_parallelism_at_max_parallel():
     assert all(not r.is_error for r in results)
 
 
-async def test_early_execution_default_cap_matches_max_parallel_tools():
-    """默认 max_parallel 与 tools._MAX_PARALLEL_TOOLS 一致（单一来源）。"""
+async def test_early_execution_default_cap_limits_peak_concurrency():
+    """默认构造（不注入 max_parallel）下峰值并发**恰好**为 tools._MAX_PARALLEL_TOOLS。
+
+    行为断言：喂入上限 +3 个幂等停点，观测到的峰值并发必须等于默认上限（不是 ≤，
+    否则默认值被改小/改大都会漏检）。
+    """
     from app.services.llm.tools import _MAX_PARALLEL_TOOLS
 
-    ex = _make_executor()
-    assert ex._max_parallel == _MAX_PARALLEL_TOOLS
+    limit = _MAX_PARALLEL_TOOLS
+    active = 0
+    max_active = 0
+    gate = asyncio.Event()
+
+    async def execute_fn(tool_use):
+        nonlocal active, max_active
+        active += 1
+        max_active = max(max_active, active)
+        await gate.wait()
+        active -= 1
+        return tool_use.id
+
+    ex = _make_executor(execute_fn=execute_fn)  # 不注入 max_parallel，走默认上限
+    for i in range(limit + 3):
+        tid = f"t{i}"
+        ex.feed(_start(tid, "read_x"))
+        ex.feed(_delta(tid, "{}"))
+        ex.feed(_stop(tid))
+    # 让全部已 create_task 的协程都有机会被调度
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert max_active == limit, f"默认上限应恰好压到 {limit}，实际峰值 {max_active}"
+
+    gate.set()
+    results = await ex.finalize()
+    assert len(results) == limit + 3
+    assert all(not r.is_error for r in results)
 
 
 # ---------------------------------------------------------------------------

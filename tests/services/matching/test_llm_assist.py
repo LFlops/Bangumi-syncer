@@ -4644,14 +4644,6 @@ def test_prefetch_bgm_name_none_bgm_returns_empty_without_error(log_records):
     )
 
 
-def test_trace_recorder_docstring_has_no_legacy_span_recorder_reference():
-    """TraceRecorder docstring 不应再引用已删除的旧 _SpanRecorder 实现。"""
-    doc = llm_assist.TraceRecorder.__doc__ or ""
-
-    assert "_SpanRecorder" not in doc, "docstring 不应残留旧 _SpanRecorder 表述"
-    assert "统一 trace 记录器" in doc, "应保留中性职责描述"
-
-
 def test_system_suffix_describes_interactive_rounds_not_tool_call_count():
     """[剩余轮次] 文案应表述为可交互轮次（每轮可执行多个工具）。"""
     suffix = llm_assist._SYSTEM_SUFFIX

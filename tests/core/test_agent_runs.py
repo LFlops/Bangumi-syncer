@@ -1188,6 +1188,9 @@ class TestStepsOrdering:
             assert [s["span_id"] for s in steps] == ["t1", "t2", "t3"]
             stmt = next(s for s in recorder.statements if "FROM agent_steps" in s)
             normalized = " ".join(stmt.split())
+            # 脆弱点：断言 SQL 文本（同键并列顺序在 SQLite 不可外部观测）。
+            # 等价的 SQL 改写（如 `id ASC` → `id` 或调整空白）会误报；保留是为
+            # 防回归（末级 id 排序是 replay 稳定承诺），仅在确需改写 SQL 时同步更新。
             assert normalized.endswith("ORDER BY iteration ASC, sequence ASC, id ASC")
         finally:
             dbm._connection._conn.close()
