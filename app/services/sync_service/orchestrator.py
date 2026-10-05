@@ -144,7 +144,7 @@ class SyncOrchestrator:
                         (outcome.error_detail or {}).get("message", outcome.reason)
                     )
                     return self._handle_sync_exception(
-                        item, source, actual_source, trace, err, status_holder
+                        item, actual_source, trace, err, status_holder
                     )
                 if stage == "cross_season" and outcome.status == "miss":
                     # 集数不存在：不发 bangumi_id_found（旧实现 resolve 成功后
@@ -231,7 +231,7 @@ class SyncOrchestrator:
         except Exception as e:
             logger.error(f"自定义同步处理出错: {e}")
             return self._handle_sync_exception(
-                item, source, actual_source, trace, e, status_holder
+                item, actual_source, trace, e, status_holder
             )
 
     # ------------------------------------------------------------------
@@ -268,7 +268,7 @@ class SyncOrchestrator:
 
         # API 不可达短路（补发模式开启时跳过本轮匹配）
         bgm = self._sync._get_bangumi_api_for_user(item.user_name)
-        unreachable_resp = self._check_api_unreachable(item, actual_source, bgm, trace)
+        unreachable_resp = self._check_api_unreachable(item, bgm, trace)
         if unreachable_resp is not None:
             return None, False, unreachable_resp, trace
 
@@ -320,7 +320,6 @@ class SyncOrchestrator:
     def _check_api_unreachable(
         self,
         item: CustomItem,
-        actual_source: str,
         bgm: Any,
         trace: MatchTrace,
     ) -> SyncResponse | None:
@@ -822,7 +821,6 @@ class SyncOrchestrator:
     def _handle_sync_exception(
         self,
         item: CustomItem,
-        source: str,
         actual_source: str,
         trace: MatchTrace | None,
         e: Exception,

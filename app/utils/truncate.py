@@ -43,7 +43,7 @@ def _shrink(obj: Any, max_bytes: int, _depth: int = 0) -> Any:
     return obj
 
 
-def _safe_json_dumps(obj: Any, max_bytes: int) -> str | None:
+def _safe_json_dumps(obj: Any) -> str | None:
     """尝试 json.dumps，深度嵌套导致 RecursionError 时返回 None。"""
     try:
         return json.dumps(obj, ensure_ascii=False)
@@ -67,7 +67,7 @@ def truncate_json(payload: Any, max_bytes: int = MAX_PAYLOAD_JSON_BYTES) -> str:
     if isinstance(payload, str):
         text = payload
     else:
-        dumped = _safe_json_dumps(payload, max_bytes)
+        dumped = _safe_json_dumps(payload)
         if dumped is None:
             # 序列化即 RecursionError（病态深嵌套）：直接降级包壳
             return _build_truncation_shell("", max_bytes)

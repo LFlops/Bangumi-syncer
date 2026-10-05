@@ -125,7 +125,7 @@ class TestTruncateFailureLogging:
         deep = _make_recursion_error_object()
 
         with patch("app.utils.truncate.logger") as mock_logger:
-            result = _safe_json_dumps(deep, MAX_PAYLOAD_JSON_BYTES)
+            result = _safe_json_dumps(deep)
 
         assert result is None
         mock_logger.error.assert_called_once()

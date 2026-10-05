@@ -156,6 +156,14 @@ class UpgradeService:
         return upgrade_id
 
     async def _run_upgrade(self, upgrade_id: str, target_version: Optional[str]):
+        """执行升级流程（下载 → 备份 → 替换 → 重启）。
+
+        .. note::
+            ``target_version`` 目前为**预留/未接线**参数：上游 API
+            ``POST /app/upgrade`` 的 ``UpgradeRequest.target_version`` 已暴露给用户，
+            但本方法固定走 ``_download_zip`` 拉取最新版本，尚未按指定版本选择下载源。
+            保留该参数以维持调用契约，待实现"升级到指定版本"时接线。
+        """
         temp_dir = Path("data/upgrade_temp")
         backup_dir = Path("backups")
         app_backup_dir: Optional[Path] = None

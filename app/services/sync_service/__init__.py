@@ -271,7 +271,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
         # 候选确认即补发：若有关联的 sync_record_id，自动触发重试
         replay_msg = self._auto_replay_after_confirm(
-            record.get("sync_record_id"), record, title
+            record.get("sync_record_id"), title
         )
         final_msg = f"已确认并写入映射：{title} → subject/{subject_id}"
         if replay_msg:
@@ -281,7 +281,6 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
     def _auto_replay_after_confirm(
         self,
         sync_record_id: int | None,
-        candidate_record: dict[str, Any],
         title: str,
     ) -> str:
         """候选确认后自动补发原同步记录。
@@ -843,7 +842,6 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
                     # 未启用补发：让异常向上抛，由外层捕获为 error
                     raise
                 self._enqueue_pending_sync(
-                    bgm_api=bgm,
                     subject_id=e.subject_id,
                     ep_id=e.ep_id,
                     reason=e.reason,

@@ -61,7 +61,6 @@ class RetryMixin:
                         f"ep={e.ep_id} reason={e.reason}"
                     )
                     self._enqueue_pending_sync(
-                        bgm_api=bgm_api,
                         subject_id=e.subject_id,
                         ep_id=e.ep_id,
                         reason=e.reason,
@@ -119,7 +118,6 @@ class RetryMixin:
                         f"ep={e.ep_id} reason={e.reason}"
                     )
                     self._enqueue_pending_sync(
-                        bgm_api=bgm_api,
                         subject_id=e.subject_id,
                         ep_id=e.ep_id,
                         reason=e.reason,
@@ -153,7 +151,6 @@ class RetryMixin:
 
     @staticmethod
     def _enqueue_pending_sync(
-        bgm_api: BangumiApi,
         subject_id: Any,
         ep_id: Any,
         reason: str,
@@ -165,8 +162,8 @@ class RetryMixin:
         from ...core.database import database_manager
 
         # user_name 必须用媒体库用户名（payload 里的），与 _get_bangumi_api_for_user
-        # 和 WebUI 用户过滤一致；bgm_api.username 是 Bangumi 账号名，多用户模式下
-        # 会与 [bangumi-*] 映射 key 不匹配，导致补发找不到配置、队列对用户不可见
+        # 和 WebUI 用户过滤一致；不能用 Bangumi 账号名，多用户模式下会与
+        # [bangumi-*] 映射 key 不匹配，导致补发找不到配置、队列对用户不可见
         user_name = str(payload.get("user_name", "") or "")
         title = str(payload.get("title", ""))
         season = int(payload.get("season", 1) or 1)
