@@ -799,9 +799,11 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
     )
 
     assistant_msg = next(m for m in calls[1] if m.role == "assistant")
-    types = [b.type for b in assistant_msg.content]
+    content = assistant_msg.content
+    assert isinstance(content, list)  # 富内容路径：assistant 消息为块列表
+    types = [b.type for b in content]
     assert types == ["text", "thinking", "tool_use"]
-    thinking_block = next(b for b in assistant_msg.content if b.type == "thinking")
+    thinking_block = next(b for b in content if isinstance(b, ThinkingBlock))
     assert thinking_block.signature == "sig-1"
 
 
@@ -1363,7 +1365,9 @@ async def test_stream_path_backfills_ordered_tool_results_and_blocks():
 
     assert result.stop_reason == "end_turn"
     assistant = next(m for m in calls[1] if m.role == "assistant")
-    assert [b.type for b in assistant.content] == [
+    assistant_content = assistant.content
+    assert isinstance(assistant_content, list)  # 富内容路径：assistant 消息为块列表
+    assert [b.type for b in assistant_content] == [
         "thinking",
         "text",
         "tool_use",

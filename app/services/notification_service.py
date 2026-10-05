@@ -463,13 +463,17 @@ class NotificationService:
             else:
                 rendered = self.template_mgr.render_email(type_data)
             # 如果配置了自定义 subject 则覆盖
+            subject = rendered["subject"]
             custom_subject = channel.config.get("email_subject", "").strip()
             if custom_subject:
-                rendered["subject"] = self.template_mgr.render_string(
-                    custom_subject, type_data
-                )
-            rendered["payload"] = type_data
-            return rendered
+                subject = self.template_mgr.render_string(custom_subject, type_data)
+            # payload 直接承载原始 data（含 meta 注入），body/html 来自模板渲染
+            return {
+                "subject": subject,
+                "body": rendered["body"],
+                "html": rendered["html"],
+                "payload": type_data,
+            }
 
         # 默认回退：直接把 data 当 payload
         return {"payload": type_data}

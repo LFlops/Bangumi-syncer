@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -32,11 +33,12 @@ from app.services.llm.models import (
 
 
 @pytest.fixture
-def dbm(tmp_path: Path) -> DatabaseManager:
+def dbm(tmp_path: Path) -> Iterator[DatabaseManager]:
     instance = DatabaseManager(str(tmp_path / "trace_enc.db"))
     set_database_manager(instance)
     yield instance
-    instance._connection._conn.close()
+    if instance._connection._conn is not None:
+        instance._connection._conn.close()
     set_database_manager(None)
 
 
@@ -188,10 +190,8 @@ class TestRecorderPersistsFullBlocks:
     旧数据（无 blocks）读取方走回退逻辑。
     """
 
-    def test_wrap_chat_fn_persists_full_blocks_with_thinking(self, dbm):
-        """含 thinking 的响应 → response 追加全量 blocks（顺序保持），旧字段不变。"""
-        import asyncio
-
+    async def test_wrap_chat_fn_persists_full_blocks_with_thinking(self, dbm):
+        """wrap_chat_fn 落库含全量 blocks（thinking/text/tool_use 顺序保持）。"""
         _ensure_run(dbm, "run-blocks-rec")
         recorder = TraceRecorder("run-blocks-rec", start_iteration=0)
         resp = ChatResponse(
@@ -209,7 +209,7 @@ class TestRecorderPersistsFullBlocks:
             return resp
 
         wrapped = recorder.wrap_chat_fn(chat)
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        await wrapped([Message(role="user", content="hi")], tools=[])
 
         step = next(
             s
@@ -229,10 +229,8 @@ class TestRecorderPersistsFullBlocks:
             "tool_use",
         ]
 
-    def test_wrap_chat_fn_persists_empty_blocks(self, dbm):
+    async def test_wrap_chat_fn_persists_empty_blocks(self, dbm):
         """无 blocks 的响应（end_turn）→ response["blocks"] 存空列表。"""
-        import asyncio
-
         _ensure_run(dbm, "run-blocks-empty")
         recorder = TraceRecorder("run-blocks-empty", start_iteration=0)
         resp = ChatResponse(
@@ -243,7 +241,7 @@ class TestRecorderPersistsFullBlocks:
             return resp
 
         wrapped = recorder.wrap_chat_fn(chat)
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        await wrapped([Message(role="user", content="hi")], tools=[])
 
         step = next(
             s
@@ -253,10 +251,10 @@ class TestRecorderPersistsFullBlocks:
         response = json.loads(step["replay_delta"])["response"]
         assert response["blocks"] == []
 
-    def test_large_thinking_blocks_round_trip_through_encryption(self, dbm, crypto_on):
+    async def test_large_thinking_blocks_round_trip_through_encryption(
+        self, dbm, crypto_on
+    ):
         """加密管道对更大 JSON 无影响：超长 thinking 块往返完整、不截断。"""
-        import asyncio
-
         _ensure_run(dbm, "run-blocks-big")
         big_thinking = "t" * 60_000
         recorder = TraceRecorder("run-blocks-big", start_iteration=0)
@@ -274,7 +272,7 @@ class TestRecorderPersistsFullBlocks:
             return resp
 
         wrapped = recorder.wrap_chat_fn(chat)
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        await wrapped([Message(role="user", content="hi")], tools=[])
 
         # crypto_on 下 get_steps 透明解密；往返完整
         step = next(

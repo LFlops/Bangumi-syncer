@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,11 +28,12 @@ from app.services.llm.models import (
 
 
 @pytest.fixture
-def dbm(tmp_path: Path) -> DatabaseManager:
+def dbm(tmp_path: Path) -> Iterator[DatabaseManager]:
     instance = DatabaseManager(str(tmp_path / "replay.db"))
     set_database_manager(instance)
     yield instance
-    instance._connection._conn.close()
+    if instance._connection._conn is not None:
+        instance._connection._conn.close()
     set_database_manager(None)
 
 
@@ -353,7 +355,8 @@ class TestReplayRebuildsFullBlocks:
             for i, tc in enumerate(tool_calls):
                 span_id = recorder.start_tool(tc, sequence=i + 1)
                 result = ToolResultBlock(tool_use_id=tc.id, content=f"res-{tc.id}")
-                recorder.end_tool(span_id, result=result)
+                if span_id is not None:
+                    recorder.end_tool(span_id, result=result)
                 results[tc.id] = result
             return results
 

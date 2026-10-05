@@ -47,8 +47,8 @@ class ConfigManager:
         self.platform = platform.system()
         self.cwd = Path(__file__).parent.parent.parent
 
-        # 配置文件路径
-        self.config_paths = self._get_config_paths()
+        # 配置文件路径（env 可能为 None/str，其余键为 Path）
+        self.config_paths: dict[str, Path | str | None] = self._get_config_paths()
         self.active_config_path = self._find_active_config()
         # 首次运行：active 是 default 路径但文件不存在时，从 config.example.ini 自动复制
         self._ensure_default_config()
@@ -79,8 +79,8 @@ class ConfigManager:
         startup_info.print_banner()
         startup_info.print_system_info(self.active_config_path)
 
-    def _get_config_paths(self) -> dict[str, Path]:
-        """获取可能的配置文件路径"""
+    def _get_config_paths(self) -> dict[str, Path | str | None]:
+        """获取可能的配置文件路径（env 为 None/str，其余为 Path）"""
         return {
             "env": os.environ.get("CONFIG_FILE"),
             "mounted": Path("/app/config/config.ini"),
@@ -91,19 +91,26 @@ class ConfigManager:
     def _find_active_config(self) -> Path:
         """查找活动的配置文件"""
         # 1. 环境变量指定的配置文件
-        if self.config_paths["env"] and Path(self.config_paths["env"]).exists():
-            return Path(self.config_paths["env"])
+        env_path = self.config_paths["env"]
+        if env_path and Path(env_path).exists():
+            return Path(env_path)
 
-        # 2. Docker挂载的配置文件
-        if self.config_paths["mounted"].exists():
-            return self.config_paths["mounted"]
+        # 2/3. 显式路径候选（mounted / dev），构造时恒为 Path
+        for key in ("mounted", "dev"):
+            candidate = self.config_paths[key]
+            if isinstance(candidate, Path) and candidate.exists():
+                return candidate
 
-        # 3. 开发配置文件
-        if self.config_paths["dev"].exists():
-            return self.config_paths["dev"]
+        # 4. 默认配置文件（可能尚不存在，由 _ensure_default_config 兜底创建）
+        default_path = self.config_paths["default"]
+        if isinstance(default_path, Path):
+            return default_path
 
-        # 4. 默认配置文件
-        return self.config_paths["default"]
+        # config_paths 被外部注入非法值（正常构造不会走到）→ 显式告警并回退
+        logger.warning(
+            "config_paths['default'] 非 Path，回退 cwd/config.ini: %r", default_path
+        )
+        return self.cwd / "config.ini"
 
     def _ensure_default_config(self) -> None:
         """首次运行时从 config.example.ini 复制到 config.ini。
@@ -112,6 +119,12 @@ class ConfigManager:
         且 default 文件不存在时触发，避免在测试或自定义配置环境下产生副作用。
         """
         default_path = self.config_paths["default"]
+        if not isinstance(default_path, Path):
+            # config_paths 被外部注入非法值（正常构造不会走到）→ 跳过并告警
+            logger.warning(
+                "config_paths['default'] 非 Path，跳过默认配置生成: %r", default_path
+            )
+            return
         # active 不是 default 路径时，说明用户通过 env/mounted/dev 指定了配置，无需复制
         if self.active_config_path != default_path:
             return
@@ -188,6 +201,7 @@ class ConfigManager:
         """获取配置对象（内部调用，需已持有锁或单线程上下文）"""
         if self._check_config_updated():
             self._load_config()
+        assert self._config_cache is not None  # _load_config 已保证
         return self._config_cache
 
     def get_config_parser(self) -> ConfigParser:
@@ -260,7 +274,7 @@ class ConfigManager:
         return str(config.get("auth", "secret_key", fallback="") or "")
 
     def get_section(
-        self, section: str, fallback: dict[str, Any] = None
+        self, section: str, fallback: dict[str, Any] | None = None
     ) -> dict[str, Any]:
         """获取配置段"""
         config = self.get_config_parser()

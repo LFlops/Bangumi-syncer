@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -17,11 +18,12 @@ from app.core.database import DatabaseManager, set_database_manager
 
 
 @pytest.fixture
-def dbm(tmp_path: Path) -> DatabaseManager:
+def dbm(tmp_path: Path) -> Iterator[DatabaseManager]:
     instance = DatabaseManager(str(tmp_path / "schema.db"))
     set_database_manager(instance)
     yield instance
-    instance._connection._conn.close()
+    if instance._connection._conn is not None:
+        instance._connection._conn.close()
     set_database_manager(None)
 
 

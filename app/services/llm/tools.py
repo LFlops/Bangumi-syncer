@@ -113,7 +113,7 @@ class ToolDefinition:
         }
 
 
-class BatchResults(UserDict):
+class BatchResults(UserDict[str, ToolResultBlock]):
     """批量执行结果：``ordered`` 独立槽位 + 兼容的 ``dict[tool_use_id, result]`` 视图。
 
     - ``ordered``：``[(tool_use_id, result), ...]``，与传入 ``tool_calls`` 一一对应
@@ -131,14 +131,14 @@ class BatchResults(UserDict):
         for tool_use_id, result in self.ordered:
             self.setdefault(tool_use_id, result)
 
-    def __setitem__(self, key: str, value: Any) -> None:
+    def __setitem__(self, key: str, item: Any) -> None:
         # first-wins：已存在的 tool_use_id 拒绝覆盖，并打 warning 暴露该非预期路径
         if key in self:
             logger.warning(
                 "BatchResults 试图覆盖已存在的 tool_use_id=%r，保留首个结果", key
             )
             return
-        super().__setitem__(key, value)
+        super().__setitem__(key, item)
 
 
 @runtime_checkable
@@ -425,7 +425,7 @@ class ToolRegistry:
                 is_error=True,
             )
         finally:
-            if span_id is not None:
+            if recorder is not None and span_id is not None:
                 recorder.end_tool(
                     span_id,
                     result=result_for_recorder,

@@ -41,6 +41,7 @@ def parse_suggestion(text: "str | None") -> "tuple[LLMSuggestion | None, str]":
     obj, err = _extract_json_object(stripped)
     if err is not None:
         return None, err
+    assert obj is not None  # err is None 时 _extract_json_object 保证 obj 非空
 
     # 校验 subject_id（缺失 / 非纯数字 / 类型错误）
     raw_id = obj.get("subject_id")

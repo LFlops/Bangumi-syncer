@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 
 from app.core.logging import logger
 from app.services.llm.models import (
@@ -492,9 +492,20 @@ class OpenAICompatProvider(BaseProvider):
                 result.append(Message(role="user", content=tool_blocks))
                 continue
 
+            # 收窄 wire role 为 Message 允许的 Literal（tool 已在上面分流）
+            wire_role: Literal["system", "user", "assistant"]
+            if role == "system":
+                wire_role = "system"
+            elif role == "user":
+                wire_role = "user"
+            elif role == "assistant":
+                wire_role = "assistant"
+            else:
+                raise ValueError(f"非法 wire role: {role!r}")
+
             content = msg.get("content")
             if isinstance(content, str):
-                result.append(Message(role=role, content=content))
+                result.append(Message(role=wire_role, content=content))
             elif isinstance(content, list):
                 # 多模态/列表内容：仅取 text 部分还原为 TextBlock
                 blocks: list[ContentBlock] = [
@@ -502,9 +513,9 @@ class OpenAICompatProvider(BaseProvider):
                     for part in content
                     if isinstance(part, dict) and part.get("type") == "text"
                 ]
-                result.append(Message(role=role, content=blocks))
+                result.append(Message(role=wire_role, content=blocks))
             else:
                 # content 为 None（如纯 tool_call 的 assistant 消息）→ 空文本
-                result.append(Message(role=role, content=""))
+                result.append(Message(role=wire_role, content=""))
             i += 1
         return result

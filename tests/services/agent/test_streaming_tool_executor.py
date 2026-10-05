@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import Any
 
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.models import StreamChunk, ToolResultBlock
@@ -54,7 +55,7 @@ def _make_executor(**overrides):
     async def default_execute(tool_use):
         return {"echo": tool_use.name, "input": tool_use.input}
 
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "execute_fn": default_execute,
         "is_idempotent": lambda name: name.startswith("read"),
         "is_terminal": lambda name: name == "submit_suggestion",

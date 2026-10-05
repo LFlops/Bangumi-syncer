@@ -956,7 +956,13 @@ async def _dispatch_media_server_webhook(
 
 async def _parse_plex_body(request: Request) -> dict:
     json_str = await request.body()
-    return json.loads(extract_plex_json(json_str))
+    extracted = extract_plex_json(json_str)
+    if extracted is None:
+        # Plex 报文未包含可切片的 JSON 块：显式失败（由上层统一包装为 error 响应），
+        # 避免 json.loads(None) 抛出的 TypeError 语义不明。
+        logger.warning("Plex webhook 报文未提取到 JSON 块，拒绝解析")
+        raise ValueError("Plex 报文未包含可解析的 JSON")
+    return json.loads(extracted)
 
 
 async def _handle_plex_sync(

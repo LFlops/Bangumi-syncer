@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator
 
 import httpx
 
@@ -130,8 +130,13 @@ def _is_stream_rejection(e: Exception) -> bool:
 _TERMINAL_STATUSES = (400, 401, 403, 404, 422)
 
 
-def _is_terminal_error(e: Exception) -> bool:
-    """refusal（ValueError）与确定性 4xx 不重试；其余（429/5xx/超时）可重试。"""
+def _is_terminal_error(e: Exception | None) -> bool:
+    """refusal（ValueError）与确定性 4xx 不重试；其余（429/5xx/超时）可重试。
+
+    ``None``（尚未捕获到任何异常）视为可重试，与调用方语义一致。
+    """
+    if e is None:
+        return False
     if isinstance(e, ValueError):
         return True  # 解析失败/refusal，重试结果不变
     if isinstance(e, httpx.HTTPStatusError):
@@ -219,7 +224,7 @@ class LLMClient:
         job_id: int | None = None,
         job_name: str | None = None,
         **kwargs,
-    ) -> AsyncIterator[StreamChunk]:
+    ) -> AsyncGenerator[StreamChunk, None]:
         """流式聊天入口：逐条产出归一化事件，正常耗尽后落库一次。
 
         轻量元数据跟踪（不聚合 blocks，聚合交由调用方 models.collect()）：

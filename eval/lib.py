@@ -570,8 +570,8 @@ async def run_case(
             "schema_version": CASSETTE_SCHEMA_VERSION,
             "case_id": case_id,
             "meta": {
-                "model": llm_cfg.get("model", ""),
-                "provider": llm_cfg.get("provider", ""),
+                "model": (llm_cfg or {}).get("model", ""),
+                "provider": (llm_cfg or {}).get("provider", ""),
                 "thinking_level": thinking_level,
                 "golden_note": case.get("note", ""),
             },
@@ -587,6 +587,7 @@ async def run_case(
         result["cassette_written"] = str(cassette_path)
         result["rounds_recorded"] = len(sink)
     elif mode == "replay":
+        assert cassette is not None  # 回放分支已在前面 load_cassette 加载
         exp = cassette.get("expected_outcome") or {}
         assertions = [
             ("run_status", outcome["run_status"], exp.get("run_status")),

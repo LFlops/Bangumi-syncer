@@ -15,6 +15,7 @@ import pytest
 
 from app.services.agent.budget import (
     _ITERATION_STRATEGIES,
+    IterationStrategy,
     MatchIterationStrategy,
     compute_match_run_timeout,
     get_max_iterations,
@@ -31,15 +32,15 @@ def _isolate_registry():
     _ITERATION_STRATEGIES.update(saved)
 
 
-class _DummyStrategy:
-    """用于验证注册表行为的简单策略。"""
+class _DummyStrategy(IterationStrategy):
+    """用于验证注册表行为的简单策略（对齐 IterationStrategy 协议签名）。"""
 
     def __init__(self, preset: dict[str, int], fallback: int = 3) -> None:
         self.PRESET = preset
         self._fallback = fallback
 
-    def max_iterations(self, level: str) -> int:
-        return self.PRESET.get(level, self._fallback)
+    def max_iterations(self, thinking_level: str) -> int:
+        return self.PRESET.get(thinking_level, self._fallback)
 
 
 # --- MatchIterationStrategy 预设 ---
