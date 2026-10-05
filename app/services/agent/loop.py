@@ -356,7 +356,7 @@ async def run(
                 stop_reason="end_turn", text=resp.content, last_response=resp
             )
 
-        # ③ 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加（F1 修正）。
+        # ③ 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加。
         # 同时保留响应中的非工具块（Text/Thinking）：思考模型的 thinking 块必须随
         # tool_use 一并回传（Anthropic/DeepSeek 约束，否则真实端点 400：
         # "content[].thinking ... must be passed back"）；OpenAI 兼容层在 provider

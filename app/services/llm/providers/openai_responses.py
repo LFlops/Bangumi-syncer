@@ -426,7 +426,7 @@ class OpenAIResponsesProvider(BaseProvider):
                                 f"{item.get('type')!r}"
                             )
                     elif name in ("response.completed", "response.incomplete"):
-                        # M2：incomplete（截断）与 completed 同路径产出 usage + stop，
+                        # incomplete（截断）与 completed 同路径产出 usage + stop，
                         # stop_reason 由 _stop_reason_of 依 status 判定
                         usage = self._usage_from(response_data.get("usage"))
                         if usage is not None:

@@ -314,7 +314,7 @@ class LlmMatchScheduler(BaseScheduler):
     async def _recover_run(self, run: AgentRunRecord) -> None:
         """恢复单条崩溃遗留的 processing run。
 
-        0. sync_record_id 尚未回填（T6 前移窗口）→ 跳过本轮，不占用执行权
+        0. sync_record_id 尚未回填 → 跳过本轮，不占用执行权
         1. 取得本进程执行权（防并发恢复双跑；未取得直接跳过）
         2. 以**统一时间戳**对 started_at 做 CAS 刷新（expected=扫描到的值），
            防跨进程重复恢复：未抢到（值已被他人刷新/状态已变）则释放执行权返回
@@ -380,7 +380,7 @@ class LlmMatchScheduler(BaseScheduler):
     async def _process_run(self, run: AgentRunRecord) -> None:
         """处理单条 pending run：查 sync_record → 场景运行入口 run → 异常重试。
 
-        入口取得本进程执行权，防止恢复扫描误捞正在处理的 run（T7 并发化后尤为关键）；
+        入口取得本进程执行权，防止恢复扫描误捞正在处理的 run（并发化后尤为关键）；
         未取得执行权（本进程已有协程在处理）直接跳过，且不释放他人持有的执行权。
         """
         run_id = run.run_id
@@ -405,7 +405,7 @@ class LlmMatchScheduler(BaseScheduler):
 
             bgm = self._build_bgm(sync_record)
             try:
-                # F5：thinking_level 统一从集中配置读取并透传给场景运行入口
+                # thinking_level 统一从集中配置读取并透传给场景运行入口
                 # （config_override 由场景运行入口内部从同一配置读取）。
                 match_cfg = config_manager.get_sync_llm_match_config()
                 thinking_level = match_cfg["llm_match_thinking_level"]

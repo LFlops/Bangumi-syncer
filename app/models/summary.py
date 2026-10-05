@@ -102,7 +102,7 @@ class SummaryJobResponse(BaseModel):
         """从 config_manager.get_summary_configs() 字典构建"""
 
         def _int(key: str, default: int) -> int:
-            """H2 同源：非法值回落默认——单个坏配置不得拖垮列表接口。"""
+            """同源：非法值回落默认——单个坏配置不得拖垮列表接口。"""
             v = data.get(key, default)
             if v == "" or v is None:
                 return default

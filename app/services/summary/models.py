@@ -43,7 +43,7 @@ class SummaryJobConfig:
                 return 0
 
         def _int(key: str, default: int) -> int:
-            """H2：非法值回落默认——单个坏配置不得拖垮调度注册（与 _limit 同款保护）。"""
+            """非法值回落默认——单个坏配置不得拖垮调度注册（与 _limit 同款保护）。"""
             try:
                 return int(data.get(key, default))
             except (TypeError, ValueError):

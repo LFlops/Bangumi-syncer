@@ -56,7 +56,7 @@ def _format_error_detail(e: Exception) -> str:
 # 网关变体: "unrecognized parameter '<param>' is not supported" → "unrecognized parameter"。
 # thinking/reasoning 类: "does not support thinking" / "does not support reasoning"。
 # 其余（unknown parameter / unexpected keyword / invalid request argument / extra fields not permitted）保持裸短语。
-# M8：状态码放行 400/422（pydantic 网关）。
+# 状态码放行 400/422（pydantic 网关）。
 _PARAM_REJECTION_PATTERNS = (
     "unrecognized request argument",
     "unrecognized parameter",
@@ -104,7 +104,7 @@ _STREAM_REJECTION_PATTERNS = (
     "unsupported parameter: stream",
     "unknown parameter: stream",
     "stream: not supported",
-    # M1：网关文案 "unrecognized parameter 'stream' is not supported"
+    # 网关文案 "unrecognized parameter 'stream' is not supported"
     # 注意保留闭合引号，避免误伤 stream_options 等同前缀参数
     "unrecognized parameter 'stream'",
     'unrecognized parameter "stream"',
@@ -126,7 +126,7 @@ def _is_stream_rejection(e: Exception) -> bool:
     return any(p in text for p in _STREAM_REJECTION_PATTERNS)
 
 
-# M7/M9：确定性错误 —— 重试无意义（refusal / 鉴权 / 参数类 / 不存在）
+# 确定性错误 —— 重试无意义（refusal / 鉴权 / 参数类 / 不存在）
 _TERMINAL_STATUSES = (400, 401, 403, 404, 422)
 
 
@@ -329,7 +329,7 @@ class LLMClient:
             except Exception as e:  # noqa: BLE001 - 统一按重试/终态策略处理
                 last_error = e
                 if isinstance(e, LLMCallError):
-                    # S1：确定性 LLMCallError 不套用重试策略，保留 retryable 原样抛出
+                    # 确定性 LLMCallError 不套用重试策略，保留 retryable 原样抛出
                     logger.debug(
                         "LLM stream 收到 LLMCallError，直接透传（不重试）: "
                         f"{_format_error_detail(e)}"
@@ -390,7 +390,7 @@ class LLMClient:
                 t_attempt = time.time()
             finally:
                 # 显式关闭上游生成器，避免 GeneratorExit/中断时 httpx 流泄漏。
-                # S2：防御 source 非 async generator（无 aclose）时 AttributeError。
+                # 防御 source 非 async generator（无 aclose）时 AttributeError。
                 aclose = getattr(source, "aclose", None)
                 if aclose is not None:
                     await aclose()

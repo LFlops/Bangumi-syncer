@@ -62,7 +62,7 @@ def _build_error_detail(exc: Exception) -> dict[str, Any]:
 def _extract_infobox_aliases(cand: dict) -> list[str]:
     """从候选条目的 infobox 中提取别名列表（兼容多种历史数据格式）
 
-    用于 P2 infobox_aliases 字段，帮助理解 title_diff_ratio 为何给出该分数。
+    用于 infobox_aliases 字段，帮助理解 title_diff_ratio 为何给出该分数。
     """
     aliases: list[str] = []
     infobox = cand.get("infobox")
@@ -85,7 +85,7 @@ def _extract_infobox_aliases(cand: dict) -> list[str]:
 
 
 def _detect_candidate_media_type(cand: dict) -> str:
-    """检测候选条目的媒体类型（用于 P0 media_type 字段）
+    """检测候选条目的媒体类型（用于 media_type 字段）
 
     优先用 Bangumi 条目 ``type`` 字段判定三次元：
     - type=6 (SUBJECT_TYPE_REAL) → "real_action"
@@ -128,7 +128,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         self._tasks_lock = threading.Lock()
         self._sync_tasks = {}
         self._task_counter = 0
-        # 阶段四：同步编排器，接管 sync_custom_item 完整流程
+        # 同步编排器，接管 sync_custom_item 完整流程
         # （请求处理 → 匹配 → 集数解析 → 标记 → 持久化）
         from .orchestrator import SyncOrchestrator
 
@@ -1034,13 +1034,13 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
         return None
 
-    # 阶段四：_find_matching_subject 已迁入 SyncOrchestrator._match_subject
+    # _find_matching_subject 已迁入 SyncOrchestrator._match_subject
     # （请求处理 → 匹配 → 集数解析 → 标记 → 持久化 统一编排）
     # 保留委托方法供 sync_movie_watching 和测试调用
     def _find_matching_subject(
         self, item: CustomItem, actual_source: str
     ) -> tuple[str | None, bool, SyncResponse | None, MatchTrace]:
-        """委托给编排器的匹配阶段（阶段四）"""
+        """委托给编排器的匹配阶段"""
         return self._orchestrator._match_subject(item, actual_source)
 
     @staticmethod
@@ -1080,7 +1080,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
         2. 标题含"第N季"声明（明确是季番条目）
         3. 兜底取第一个候选
 
-        历史变更：删除了原 step 3「eps/total_episodes 最大的候选」（2026-09-08）。
+        历史变更：已移除「按 eps/total_episodes 最大选择候选」的旧策略（2026-09-08）。
         根因：跨季场景下该规则不安全。`凡人修仙传`（81 集）会盖过
         `凡人修仙传 新年番`（48 集）——实际查询带「新年番」字样时本意是后者。
         实测 240 条 L2 黄金集 NFKC 修复后此类误判占新增错配 7 条。
@@ -1491,10 +1491,10 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
     def sync_custom_item(
         self, item: CustomItem, source: str = "custom"
     ) -> SyncResponse:
-        """同步自定义项目（阶段四：委托给 SyncOrchestrator）"""
+        """同步自定义项目（委托给 SyncOrchestrator）"""
         return self._orchestrator.sync_custom_item(item, source)
 
-    # 阶段四：_sync_custom_item_impl / _sync_custom_item_body 已迁入
+    # _sync_custom_item_impl / _sync_custom_item_body 已迁入
     # SyncOrchestrator._sync_impl / _body，统一编排请求→匹配→标记→持久化。
 
     def _check_user_permission(
@@ -1640,7 +1640,7 @@ class SyncService(TaskManagerMixin, RetryMixin, SeasonInfoMixin, TitleNormalizeM
 
         当传入 trace 时，会记录每个匹配阶段的详细过程。
 
-        阶段三：通过 MatchPipeline 编排 4 个 step（Normalize/CustomMapping/
+        通过 MatchPipeline 编排 4 个 step（Normalize/CustomMapping/
         BangumiData/APISearch），trace 填充收敛到 _record_trace 单一入口。
         """
         # 构建管道上下文

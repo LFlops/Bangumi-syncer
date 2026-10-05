@@ -105,7 +105,7 @@ _sync_service_instance: SyncService | None = None
 def _get_sync_service() -> SyncService:
     """惰性获取 SyncService 单例（仅成功路径调用一次）。
 
-    ``SyncService`` 类已在模块头部导入（无导入环，见 P2-2 AST 守卫测试），
+    ``SyncService`` 类已在模块头部导入（无导入环，见 AST 守卫测试），
     此处仅延迟**实例化**：构造较重且仅校验成功路径需要。
     """
     global _sync_service_instance
@@ -261,9 +261,9 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         ),
     ]
     for d in defns:
-        # G1：必须**始终覆盖**注册。handler 是捕获本次 ``bgm`` 的闭包，若幂等跳过
+        # 必须**始终覆盖**注册。handler 是捕获本次 ``bgm`` 的闭包，若幂等跳过
         # 已存在的定义，则会钉死首个 bgm（及其 access_token），导致多用户 / 跨 run
-        # 复用错误账号。quiet=True：覆盖属预期语义，只打 debug 不刷 warning（F7）。
+        # 复用错误账号。quiet=True：覆盖属预期语义，只打 debug 不刷 warning。
         registry.register(d, quiet=True)
     return defns
 
@@ -368,7 +368,7 @@ def build_seed_messages(
 # 落库（单一事务）
 # ---------------------------------------------------------------------------
 def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
-    """事务外预取 Bangumi 条目名称（F8：避免事务内发起 HTTP 调用）。
+    """事务外预取 Bangumi 条目名称（避免事务内发起 HTTP 调用）。
 
     失败（网络/类型）时返回空串，由调用方仅存 id。
     """
@@ -426,20 +426,20 @@ def _persist_llm_candidate(
     反复重跑 LLM + 重复通知。既有行若为历史空键则在同一事务内回填。
 
     ``bgm_title`` 必须在事务外预取（见 ``_prefetch_bgm_name`` / ``_persist_and_notify``），
-    事务内只做纯 DB 操作（F8：将外部 HTTP 调用移出事务，保持原子性语义不变）。
+    事务内只做纯 DB 操作（将外部 HTTP 调用移出事务，保持原子性语义不变）。
 
-    **竞态守卫（评论#3）**：若同 sync_record 的既有候选已被用户处理
+    **竞态守卫**：若同 sync_record 的既有候选已被用户处理
     （status != 'pending'），或带守卫 UPDATE 时被并发处理（rowcount=0），
     则不复活该行，改为把本 run 标 ``cancelled``（``stop_reason='user_resolved'``）
     并返回 ``None``（跳过信号，调用方不得发送通知）。
 
     返回 pending_candidates 行 id（正常路径）；跳过时返回 ``None``。
-    异常时整体回滚（F6）。
+    异常时整体回滚。
     """
 
     def _write(conn):
-        # 取既有行：按 id 倒序取最新一条（不区分状态；历史注释曾称「优先 pending」
-        # 但实现从未按状态过滤，此处一并修正）
+        # 取既有行：按 id 倒序取最新一条（不区分状态；历史注释曾称「优先 pending」，
+        # 但实现从未按状态过滤）
         row = conn.execute(
             "SELECT id, candidates_json, status, business_key FROM pending_candidates "
             "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
@@ -552,7 +552,7 @@ def _persist_llm_candidate(
             )
             candidate_id = cur.lastrowid
 
-        # 同一事务内更新 agent_runs 为 succeeded（F6 原子）
+        # 同一事务内更新 agent_runs 为 succeeded（原子）
         # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致。
         # **源状态守卫**：仅 pending/processing 活性态可转 succeeded；
         # run 已被并发路径终态化（cancelled/failed/no_suggestion/...）时命中 0 行，
@@ -653,7 +653,7 @@ def _send_notification(
 
 
 def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None:
-    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（F5 / G3）。
+    """解析 ``[sync] llm_match_max_iterations`` 覆盖值。
 
     返回 ``None`` 表示不覆盖（交由 thinking_level 策略与默认兜底）：
     - 空值（None / 空串）→ None（静默，属默认配置）
@@ -745,9 +745,9 @@ def _match_resolve_thinking_level() -> str:
 
 
 def _match_resolve_max_iterations(thinking_level: str) -> int:
-    """F5：config_override 优先（[sync] llm_match_max_iterations 显式整体覆盖
+    """config_override 优先（[sync] llm_match_max_iterations 显式整体覆盖
     > thinking_level 策略映射 > 默认兜底）。配置覆盖值由本层从集中配置读取，
-    保证单一来源；G3：非法/非正数覆盖值统一告警并回退 None。"""
+    保证单一来源；非法/非正数覆盖值统一告警并回退 None。"""
     match_cfg = config_manager.get_sync_llm_match_config()
     config_override = resolve_max_iterations_override(
         match_cfg.get("llm_match_max_iterations")

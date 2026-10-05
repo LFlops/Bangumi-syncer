@@ -161,7 +161,7 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
     usage = result.get("usage")
 
     if not summary_text:
-        # H1-API 修正：空内容即失败（usage 存在但空 choices 仍可能是失败调用）
+        # 空内容即失败（usage 存在但空 choices 仍可能是失败调用）
         return SummaryJobTestResponse(
             success=False,
             job_name=job_config.name,
@@ -288,14 +288,14 @@ async def summary_job_memory_stats(name: str, _=Depends(get_current_user_flexibl
     - total_count / total_chars / avg_chars：任务已积累的摘要规模（热层）
     - memory_limit / related_limit：当前配置
     - injected_estimate_tokens：按配置估算的注入量（估算口径：
-      字符数 × 0.7 粗略中文 token 系数，见 closeout §评测；仅展示参考）
+      字符数 × 0.7 粗略中文 token 系数，仅展示参考）
     """
     decoded = unquote(name)
     _find_config(decoded)  # 任务不存在 404
     task_id = f"summary-{decoded}"
 
     rows = database_manager.memory.get_recent("summary", task_id, limit=1000)
-    # 摘要失败占位行（summary=""）只承载消费标记，不计入统计与注入估算（B1 读取侧适配）
+    # 摘要失败占位行（summary=""）只承载消费标记，不计入统计与注入估算（读取侧适配）
     rows = [e for e in rows if e.summary]
     total_count = len(rows)
     total_chars = sum(len(e.summary) for e in rows)

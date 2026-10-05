@@ -83,7 +83,7 @@ class SummaryStreamResult:
 
     纯业务 DTO：全部字段由 SummaryService 在消费事件流过程中自行收集
     （model 取事件真实值/回退配置、usage 取 usage 事件、latency 业务计时），
-    任何 LLM client 侧代码都不得引用或回填本类型（R1 后 client 已无
+    任何 LLM client 侧代码都不得引用或回填本类型（client 已无
     私有状态容器协议）。
     """
 
@@ -242,7 +242,7 @@ class SummaryService:
         lines = []
         for e, is_related in merged:
             # 摘要失败占位行（summary=""）不注入：它只用于承载消费标记，
-            # 注入会产生裸 "- " 空条目（B1 读取侧适配）
+            # 注入会产生裸 "- " 空条目（读取侧适配）
             if not e.summary:
                 continue
             prefix = "[同剧历史] " if is_related else ""
@@ -399,7 +399,7 @@ class SummaryService:
                 records = [r for r in records if not (r.consumed_run_ids & my_run_ids)]
 
             # 注入历史上下文：recent（memory_limit>0）与 related（related_limit>0）
-            # 各自独立生效（M1：related 不受 memory_limit 门控）；两者皆 0 时短路
+            # 各自独立生效（related 不受 memory_limit 门控）；两者皆 0 时短路
             memory_context = ""
             if job_config.memory_limit > 0 or job_config.related_limit > 0:
                 memory_context = self._build_memory_context(
@@ -474,7 +474,7 @@ class SummaryService:
         date_to: str,
     ) -> None:
         """空内容→失败通知 / 正常→成功通知（保持既有失败语义）。"""
-        # H1 修正：provider 空内容时 model 可能仍非空，仅以 content 判定失败
+        # provider 空内容时 model 可能仍非空，仅以 content 判定失败
         # （空 choices + model 名 会误走成功分支、吞掉失败通知）
         if not response.content:
             summary_text = (
@@ -510,7 +510,7 @@ class SummaryService:
     ) -> None:
         """发送成功通知（webhook + 邮件）。
 
-        P5：通过 notification_service.notify() 统一入口发送，仅走 webhook/email 渠道，
+        通过 notification_service.notify() 统一入口发送，仅走 webhook/email 渠道，
         不写站内信（write_in_app=False）。
         """
         user_name = job_config.user_name.strip() if job_config.user_name else ""
@@ -541,7 +541,7 @@ class SummaryService:
     ) -> None:
         """发送失败通知（webhook + 邮件 + 收件箱）。
 
-        P4.7：通过 notification_service.notify() 统一入口发送，替代原先的
+        通过 notification_service.notify() 统一入口发送，替代原先的
         get_notifier().send_notification_by_type() + database_manager.insert_notification()
         显式双调用。webhook/email 类型为 watching_summary_{name}（按 job 配置段），
         站内信 type 由 inbox_type 显式指定（按失败原因），两者解耦。

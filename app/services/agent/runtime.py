@@ -67,11 +67,11 @@ async def run(
     """
     dbm = get_database_manager()
 
-    # 原子抢占（F3）：失败表示已被其它调度器处理
+    # 原子抢占：失败表示已被其它调度器处理
     if not dbm.agent_runs.atomic_claim(run_id):
         return "skipped"
 
-    # per-run ToolRegistry（评论#7）：每个 run 独立实例，handler 闭包只绑定本次
+    # per-run ToolRegistry：每个 run 独立实例，handler 闭包只绑定本次
     # ctx（含访问凭据），避免并发入口下互相覆盖导致串账号。
     registry = ToolRegistry()
     defns = hooks.register_tools(registry, ctx)
@@ -246,7 +246,7 @@ async def continue_run(
     repo = dbm.agent_runs
 
     try:
-        # 思考强度与轮次预算统一由场景从集中配置读取（G3：非法/非正数覆盖值
+        # 思考强度与轮次预算统一由场景从集中配置读取（非法/非正数覆盖值
         # 由场景配置解析统一告警并回退）
         thinking_level = hooks.resolve_thinking_level()
         max_iterations = hooks.resolve_max_iterations(thinking_level)
@@ -279,7 +279,7 @@ async def continue_run(
             )
             return
 
-        # F2：终局响应直接分派（**先于**预算耗尽判定），避免无谓重调 LLM 与
+        # 终局响应直接分派（**先于**预算耗尽判定），避免无谓重调 LLM 与
         # 末轮已 submit 却被误判 exhausted 丢失提交。
         stop = last_response.get("stop_reason")
         tcs = last_response.get("tool_calls") or []
@@ -317,7 +317,7 @@ async def continue_run(
             return
 
         # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
-        # 该轮 LLM 已发生过，计入预算（F2：remaining 已减）
+        # 该轮 LLM 已发生过，计入预算（remaining 已减）
         remaining = max(0, remaining - 1)
         if remaining <= 0:
             _mark_exhausted(
@@ -348,7 +348,7 @@ async def continue_run(
             logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
             repo.increment_attempts(run_id, last_error=str(e))
     except Exception as e:
-        # P2-3：附带当前 run 状态，便于区分「处理中异常」与「已终态后的异常」
+        # 附带当前 run 状态，便于区分「处理中异常」与「已终态后的异常」
         logger.error(
             f"🤖 恢复续跑 {run_id} 异常（当前 run 状态="
             f"{_current_run_status(repo, run_id)}）: {e}"
@@ -359,7 +359,7 @@ async def continue_run(
 def _mark_exhausted(repo, run_id: str, *, note: str, total_tokens: int = 0) -> None:
     """预算耗尽且无终局语义 → 落终态 no_suggestion/exhausted。
 
-    G4：不能直接 return（否则 run 永久滞留 processing，下一轮恢复扫描又会重复捞起）。
+    不能直接 return（否则 run 永久滞留 processing，下一轮恢复扫描又会重复捞起）。
     ``total_tokens`` 为 replay 累计的历史轮次用量，透传至终态记录（口径与其它终态一致）。
     """
     logger.warning(
@@ -405,7 +405,7 @@ async def _execute_continuation(
     recorder 需锚定到已发生的轮次（补执行 tool span 与既有 chat span 同轮），
     并让续跑 chat 从 ``executed_iterations + 1`` 开始。
     """
-    # per-run ToolRegistry（评论#7）：续跑同样使用独立实例
+    # per-run ToolRegistry：续跑同样使用独立实例
     registry = ToolRegistry()
     defns = hooks.register_tools(registry, ctx)
     tools_schemas = [d.to_schema() for d in defns]
@@ -462,11 +462,11 @@ async def _replay_missing_tool(
 ) -> None:
     """补执行单条缺失的无副作用工具调用（readonly 门控）。
 
-    F4：执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
+    执行结果作为 ``Message(role="user", content=[ToolResultBlock(...)])``
     追加到 ``messages``，保证 assistant(tool_use) 后存在对应的 tool_result，
     符合会话协议（每条 tool_use 有且仅有一条 tool_result）。
 
-    G5：非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
+    非只读（write/terminal）与未注册工具**不重放副作用**，但仍回填占位
     tool_result 闭合协议（否则 assistant 的 tool_use 悬空，provider 报协议错误）；
     真实调用留给续跑 loop 自然触发。
 
@@ -508,7 +508,7 @@ async def _replay_missing_tool(
 
     try:
         result = await registry.execute(name, args)
-        # 与 execute_batch 统一协议契约：工具结果 JSON 序列化（评论#6b）
+        # 与 execute_batch 统一协议契约：工具结果 JSON 序列化
         content = serialize_tool_result(result)
         is_error = False
     except Exception as e:
@@ -528,7 +528,7 @@ async def _replay_missing_tool(
 def _append_tool_result(
     messages: list[Message], tool_use_id: str, content: str, *, is_error: bool
 ) -> None:
-    """追加一条 tool_result 消息（闭合 assistant 的 tool_use，F4/G5）。"""
+    """追加一条 tool_result 消息（闭合 assistant 的 tool_use）。"""
     messages.append(
         Message(
             role="user",

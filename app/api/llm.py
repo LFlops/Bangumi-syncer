@@ -65,7 +65,7 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
     反而迷惑）；只返回 成功/模型/延迟。max_tokens=8 让模型在第 8 个 token
     处被 API 截停——服务端不会"生成后丢弃"，只是限制生成长度。
 
-    T10 起改走 ``stream_chat()``：收到**首个 text_delta** 即视为连通并主动
+    改走 ``stream_chat()``：收到**首个 text_delta** 即视为连通并主动
     ``aclose()``，无需等待全量响应生成完毕，延迟显著低于 ``chat()``（后者需
     消费完整流才能聚合出 ChatResponse）。副作用：提前关闭走 client 的
     "未正常耗尽 → 跳过成功落库" 路径，连接测试 ping 不计入用量统计（合理：

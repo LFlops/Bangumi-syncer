@@ -1,4 +1,4 @@
-"""同步编排器（阶段四）
+"""同步编排器
 
 统一编排：请求处理 → 匹配 → 集数解析 → 标记 → 持久化。
 
@@ -272,7 +272,7 @@ class SyncOrchestrator:
         if unreachable_resp is not None:
             return None, False, unreachable_resp, trace
 
-        # 运行匹配管道（阶段三：Normalize → CustomMapping → BangumiData → APISearch）
+        # 运行匹配管道（Normalize → CustomMapping → BangumiData → APISearch）
         subject_id, is_season_matched_id, subject_find_error = (
             self._sync._find_subject_id(item, trace=trace)
         )
