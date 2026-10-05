@@ -166,7 +166,7 @@ class SearchMixin:
         return res
 
     def get_related_subjects(
-        self, subject_id: int
+        self, subject_id: int | str
     ) -> list[dict[str, Any]] | dict[str, Any]:
         # 使用实例缓存避免内存泄漏
         if subject_id in self._cache["get_related_subjects"]:

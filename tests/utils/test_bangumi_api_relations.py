@@ -415,3 +415,21 @@ class TestFindFranchiseClosureStore:
         monkeypatch.setattr(archive_store, "_get_connection", lambda: MagicMock())
         closure = archive_store.find_franchise_closure(1, relation_types=())
         assert closure == []
+
+
+class TestCollectRelatedSubjectsCycleTypeNormalization:
+    """跨季链 visited 去重需 str 归一化（起始 id 为 str、API 返回 int）。"""
+
+    def test_cycle_with_int_sequel_id_is_not_revisited(self) -> None:
+        """续集链 123(str) → 456(int) → 123(int) 成环：回到起始即终止，不重复收录。"""
+        api = _make_api()
+        api._archive.try_find_sequel_chain.return_value = _miss()
+        api.search_previous_subjects = MagicMock(return_value=[])
+        id_map = {"123": 456, "456": 123}
+        api._find_related_id_by_relation = MagicMock(
+            side_effect=lambda sid, rel: id_map.get(str(sid))
+        )
+
+        chain = api._collect_related_subjects("123", max_depth=10)
+
+        assert chain == ["123", 456]

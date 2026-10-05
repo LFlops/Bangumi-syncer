@@ -88,8 +88,8 @@ class RetryMixin:
                         f"标记剧集失败，已达到最大重试次数 {max_retries}: {str(e)}"
                     )
                     raise e
-        # This line should never be reached due to the loop logic
-        return 0  # pragma: no cover
+        # 循环内所有路径均已 return/raise，此分支不可达；保留安全网避免静默返回误导值
+        raise RuntimeError("unreachable: retry loop exited without return/raise")
 
     async def _retry_mark_episode_async(
         self,
@@ -144,8 +144,8 @@ class RetryMixin:
                         f"异步标记剧集失败，已达到最大重试次数 {max_retries}: {str(e)}"
                     )
                     raise e
-        # This line should never be reached due to the loop logic
-        return 0  # pragma: no cover
+        # 循环内所有路径均已 return/raise，此分支不可达；保留安全网避免静默返回误导值
+        raise RuntimeError("unreachable: retry loop exited without return/raise")
 
     # ------------------------------------------------------------------
     # 待同步队列入队辅助（延迟 import 避免循环依赖）

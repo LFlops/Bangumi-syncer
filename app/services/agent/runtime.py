@@ -297,8 +297,8 @@ async def continue_run(
         submit_tc = next(
             (tc for tc in tcs if tc.get("name") == hooks.terminal_tool), None
         )
-        if stop == hooks.terminal_tool or submit_tc is not None:
-            sug = (submit_tc or {}).get("input") or {}
+        if submit_tc is not None:
+            sug = submit_tc.get("input") or {}
             result = RunResult(
                 stop_reason=hooks.terminal_tool,
                 suggestion=sug,
@@ -313,6 +313,22 @@ async def continue_run(
                 # agent_steps 的 llm_chat span 累计回传（口径见 ReplayResult.total_tokens）。
                 total_tokens=replay_result.total_tokens,
                 notification_service=notification_service,
+            )
+            return
+
+        if stop == hooks.terminal_tool:
+            # 防御：stop_reason 声称终局，但 tool_calls 中无匹配的终止工具调用，
+            # 无真实提交可消费。不得把空 dict 当作有效建议落库（假阳性），
+            # 降级为与预算耗尽一致的 exhausted 终态。
+            logger.warning(
+                f"🤖 恢复续跑 {run_id} stop_reason={stop} 但 tool_calls 无 "
+                f"{hooks.terminal_tool} 调用，无有效终局，降级 exhausted"
+            )
+            _mark_exhausted(
+                repo,
+                run_id,
+                note="终局工具缺失",
+                total_tokens=replay_result.total_tokens,
             )
             return
 

@@ -119,6 +119,22 @@ def _validate_subject_id(subject_id: str) -> tuple[bool, str]:
     return _get_sync_service()._validate_subject_id(subject_id)
 
 
+def _parse_subject_id(raw: Any) -> int | None:
+    """把 LLM 传入的 subject_id 安全转 int；非法（非数字/空串/非字符串数值）返回 None。
+
+    ``ToolRegistry._validate`` 已按 JSON Schema（type=string、pattern ``^\\d+$``）
+    拦截非法值，正常执行路径不会到达这里；本函数为 handler 级防御，避免直接调用
+    （或未来 schema 放宽）时 ``int()`` 抛 ValueError 冒泡中断工具循环。
+    """
+    if isinstance(raw, bool):  # bool 是 int 子类，显式排除
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip().isdigit():
+        return int(raw.strip())
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 工具注册（捕获调用时传入的 bgm 实例）
 # ---------------------------------------------------------------------------
@@ -137,14 +153,28 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
         return bgm.search(title=title, subject_types=subject_types)
 
     def _get_detail(args: dict) -> Any:
-        return bgm.get_subject(int(args["subject_id"]))
+        sid = _parse_subject_id(args.get("subject_id"))
+        if sid is None:
+            logger.warning(
+                f"[llm_assist] get_subject_detail 收到非法 subject_id: "
+                f"{args.get('subject_id')!r}"
+            )
+            return {"error": "invalid subject_id"}
+        return bgm.get_subject(sid)
 
     def _check(args: dict) -> Any:
         ok, reason = _validate_subject_id(str(args["subject_id"]))
         return {"valid": ok, "reason": reason}
 
     def _related(args: dict) -> Any:
-        return bgm.get_related_subjects(int(args["subject_id"]))
+        sid = _parse_subject_id(args.get("subject_id"))
+        if sid is None:
+            logger.warning(
+                f"[llm_assist] get_related_subjects 收到非法 subject_id: "
+                f"{args.get('subject_id')!r}"
+            )
+            return {"error": "invalid subject_id"}
+        return bgm.get_related_subjects(sid)
 
     def _noop(_args: dict) -> Any:  # terminal 工具不会真正执行 handler
         return {}

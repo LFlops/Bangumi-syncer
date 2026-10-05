@@ -295,7 +295,10 @@ class CollectionMixin:
         self, ep_id: int | str, state: int = COLLECTION_TYPE_DONE
     ) -> None:
         res = self.put(f"users/-/collections/-/episodes/{ep_id}", _json={"type": state})
-        if 333 < res.status_code < 444:
+        # 任何 4xx/5xx 都表示标记未成功，必须抛出触发上层失败/重试，
+        # 否则调用方会把未落库的标记当作成功（假阳性）。
+        # 旧实现 ``333 < status < 444`` 会漏掉 444-499（如 451/444）等失败码。
+        if res.status_code >= 400:
             raise ValueError(f"{res.status_code=} {res.text}")
         return res
 

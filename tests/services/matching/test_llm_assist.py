@@ -5189,3 +5189,36 @@ async def test_run_stream_fn_end_to_end_early_execution_and_submit(monkeypatch):
     assert status == "succeeded"
     _assert_candidate_written(sr_id, subject_id="123", reason="跨季匹配")
     assert calls["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# 工具 handler 级防御：非数字 subject_id 不得让 int() 抛 ValueError 冒泡
+# ---------------------------------------------------------------------------
+
+
+class TestSubjectIdCoercionDefense:
+    """``get_subject_detail`` / ``get_related_subjects`` 对非法 subject_id 返回结构化错误。
+
+    正常执行路径已由 ToolRegistry._validate（type=string + pattern ^\\d+$）拦截，
+    此处覆盖 handler 直接调用时的防御，避免 int() ValueError 冒泡中断工具循环。
+    """
+
+    @staticmethod
+    def _handler(name: str):
+        defns = llm_assist.register_match_tools(ToolRegistry(), _make_bgm())
+        return next(d.handler for d in defns if d.name == name)
+
+    @pytest.mark.parametrize("bad", ["abc", "", "12x", "  ", None, []])
+    def test_get_subject_detail_invalid_returns_error(self, bad):
+        result = self._handler("get_subject_detail")({"subject_id": bad})
+        assert result == {"error": "invalid subject_id"}
+
+    @pytest.mark.parametrize("bad", ["abc", "", "12x", None])
+    def test_get_related_subjects_invalid_returns_error(self, bad):
+        result = self._handler("get_related_subjects")({"subject_id": bad})
+        assert result == {"error": "invalid subject_id"}
+
+    def test_get_subject_detail_valid_still_calls_bgm(self):
+        result = self._handler("get_subject_detail")({"subject_id": "123"})
+        assert result["name"] == "subject-123"
+        assert result["name_cn"] == "条目-123"

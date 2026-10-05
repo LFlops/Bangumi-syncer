@@ -901,11 +901,27 @@ class TestChangeEpisodeState:
             result = api.change_episode_state("ep1", state=2)
             assert result == mock_resp
 
-    def test_334_raises(self):
+    def test_400_raises(self):
+        """400（如无效 episode_id 等业务错误）必须抛 ValueError，不得静默当成功。
+
+        旧实现 ``333 < status < 444`` 恰好排除 400，导致标记请求被当成功（假阳性）。
+        """
         api = BangumiApi()
         mock_resp = MagicMock()
-        mock_resp.status_code = 334
-        mock_resp.text = "error"
+        mock_resp.status_code = 400
+        mock_resp.text = "invalid episode_id"
+        with (
+            patch.object(api, "put", return_value=mock_resp),
+            pytest.raises(ValueError),
+        ):
+            api.change_episode_state("ep1")
+
+    def test_499_raises(self):
+        """4xx 上界（444-499）同样属失败，必须抛出。"""
+        api = BangumiApi()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 499
+        mock_resp.text = "client error"
         with (
             patch.object(api, "put", return_value=mock_resp),
             pytest.raises(ValueError),

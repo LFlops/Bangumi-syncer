@@ -150,7 +150,7 @@ class ArchiveShortcut:
             logger.warning(f"bangumi_archive 短路 get_episodes 异常: {e}")
             return ShortcutResult(False, None, "archive_error")
 
-    def try_get_related_subjects(self, subject_id: int) -> ShortcutResult:
+    def try_get_related_subjects(self, subject_id: int | str) -> ShortcutResult:
         """短路 get_related_subjects
 
         Returns:
