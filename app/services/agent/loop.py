@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from app.services.llm.models import (
     ChatResponse,
+    ContentBlock,
     Message,
     StreamAggregator,
     StreamChunk,
@@ -361,7 +362,7 @@ async def run(
         # tool_use 一并回传（Anthropic/DeepSeek 约束，否则真实端点 400：
         # "content[].thinking ... must be passed back"）；OpenAI 兼容层在 provider
         # 侧按各自协议处理（thinking 块跳过）。
-        assistant_blocks: list = list(resp.blocks) or [
+        assistant_blocks: list[ContentBlock] = list(resp.blocks) or [
             ToolUseBlock(id=tc.id, name=tc.name, input=tc.input) for tc in tool_calls
         ]
         messages.append(Message(role="assistant", content=assistant_blocks))
@@ -400,6 +401,9 @@ async def run(
         # ⑤ 执行本轮工具：
         #    - 流式路径：finalize 保序返回与 tool_calls 对齐的 ToolResultBlock 列表
         #    - 旧路径：整批交给 tool_calls_fn（execute_batch 内部分段并行），按槽位对齐
+        # aligned 元素含 None（旧契约按 id 取值可能缺槽位），故用联合元素类型；用
+        # Sequence 承接各分支的不同具体列表（list 不变性下无法统一到同一 list 注解）。
+        aligned: Sequence[ToolResultBlock | None]
         if executor is not None:
             aligned = await executor.finalize()
             if len(aligned) != len(tool_calls):

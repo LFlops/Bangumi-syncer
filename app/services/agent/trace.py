@@ -232,9 +232,9 @@ class ReplayResult:
       llm_chat span 就累计。供恢复路径写回 ``total_tokens``（历史轮次已消耗的用量）。
     """
 
-    messages: list = field(default_factory=list)
+    messages: list[Message] = field(default_factory=list)
     executed_iterations: int = 0
-    missing_tool_calls: list = field(default_factory=list)
+    missing_tool_calls: list[dict] = field(default_factory=list)
     last_response: dict | None = None
     total_tokens: int = 0
 
@@ -267,10 +267,10 @@ def _extract_budget_message(step: dict) -> str | None:
     return bm if isinstance(bm, str) else None
 
 
-_CONTENT_BLOCK_ADAPTER = TypeAdapter(ContentBlock)
+_CONTENT_BLOCK_ADAPTER: TypeAdapter[ContentBlock] = TypeAdapter(ContentBlock)
 
 
-def _restore_response_blocks(response: dict) -> list | None:
+def _restore_response_blocks(response: dict) -> list[ContentBlock] | None:
     """从 llm_chat ``response.blocks`` 还原内容块列表（保持原顺序）。
 
     返回 ``None`` 表示应回退 ``tool_calls`` 重建逻辑：
@@ -352,7 +352,7 @@ def replay(run_id: str) -> ReplayResult:
         if s["name"] == "llm_chat":
             total_tokens += int(s.get("tokens") or 0)
 
-    steps_by_iter: dict[int, list] = {}
+    steps_by_iter: dict[int, list[dict]] = {}
     seed_messages: list[Message] = []
     for s in steps:
         if s["name"] == "seed":
@@ -361,9 +361,9 @@ def replay(run_id: str) -> ReplayResult:
             continue
         steps_by_iter.setdefault(s["iteration"], []).append(s)
 
-    messages: list = list(seed_messages)
+    messages: list[Message] = list(seed_messages)
     executed_iterations = 0
-    missing_tool_calls: list = []
+    missing_tool_calls: list[dict] = []
     last_response: dict | None = None
 
     for it in sorted(steps_by_iter.keys()):
@@ -391,7 +391,7 @@ def replay(run_id: str) -> ReplayResult:
         # （旧数据兼容）。thinking 块必须随 tool_use 回传，否则续跑请求会 400。
         blocks = _restore_response_blocks(response)
         if blocks is not None:
-            assistant_content: list = blocks
+            assistant_content: list[ContentBlock] = blocks
         else:
             assistant_content = [
                 ToolUseBlock(
@@ -405,6 +405,8 @@ def replay(run_id: str) -> ReplayResult:
 
         if tool_calls:
             messages.append(assistant_msg)
+            # recorded_ids 元素来自 response.tool_calls 的 Any 值（可能含 None），
+            # 保持裸 set（set[Any]）以免为纯注解任务引入运行时收窄。
             recorded_ids: set = set()
             budget_message: str | None = None
             for t in sorted(isteps, key=lambda x: (x["sequence"], x["id"])):

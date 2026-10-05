@@ -473,7 +473,10 @@ class OpenAICompatProvider(BaseProvider):
             role = msg.get("role")
             if role == "tool":
                 # 收集连续 role=tool 块，合并为单条 user 消息
-                tool_blocks: list[ToolResultBlock] = []
+                # 元素类型用 ContentBlock 联合而非 ToolResultBlock：list 不变性下
+                # 精确的 list[ToolResultBlock] 不可赋给 Message.content 的
+                # list[ContentBlock]；运行时元素仍全是 ToolResultBlock。
+                tool_blocks: list[ContentBlock] = []
                 while i < n and wire_messages[i].get("role") == "tool":
                     tm = wire_messages[i]
                     raw = tm.get("content", "")
