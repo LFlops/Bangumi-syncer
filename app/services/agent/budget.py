@@ -39,7 +39,7 @@ class _LogLike(Protocol):
     """极小日志协议：仅需 ``warning(message)``。
 
     兼容 ``logging.Logger``（其 ``warning(msg, *args, **kwargs)`` 可接受单参调用），
-    也兼容测试注入的替身；用于收窄 ``_resolve_match_iterations_override`` 的 ``log``。
+    也兼容测试注入的替身；用于收窄 ``resolve_match_iterations_override`` 的 ``log``。
     """
 
     def warning(self, message: str) -> None: ...
@@ -89,17 +89,23 @@ def register_defaults() -> None:
     register_iteration_strategy("match", MatchIterationStrategy())
 
 
-def _resolve_match_iterations_override(
-    raw_max: object, log: _LogLike | None = None
+def resolve_match_iterations_override(
+    raw_max: object,
+    log: _LogLike | None = None,
+    *,
+    log_prefix: str = "[budget]",
 ) -> int | None:
-    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（自包含实现）。
+    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（本模块为唯一实现）。
 
-    语义与 ``app/services/matching/llm_assist.py::resolve_max_iterations_override``
-    保持一致（该函数为场景内实现，而调度器源码有 AST 守卫禁止引用场景私有符号，
-    故此处独立复刻、不 import 复用）：
+    本函数是预算覆盖解析的**单一实现**（agent 骨架侧）；场景侧
+    ``app/services/matching/llm_assist.py::resolve_max_iterations_override``
+    仅做薄委托（传入 ``log_prefix="[llm_assist]"``），不再各自复刻、避免漂移。
+
     - 空值（None / 空串 / 纯空白）→ None（静默，属默认配置）
     - 非法整数 → None + 告警
     - 非正数（<=0）→ None + 告警（否则 max_iterations<=0 会让循环空跑）
+
+    ``log_prefix`` 参数化告警前缀（默认 ``[budget]``），其余文案不变。
     """
     _log = log if log is not None else logger
     if raw_max is None:
@@ -111,13 +117,13 @@ def _resolve_match_iterations_override(
         value = int(text)
     except (TypeError, ValueError):
         _log.warning(
-            f"[budget] llm_match_max_iterations={raw_max!r} 非法整数，"
+            f"{log_prefix} llm_match_max_iterations={raw_max!r} 非法整数，"
             f"已忽略该覆盖（回退思考强度策略默认）"
         )
         return None
     if value <= 0:
         _log.warning(
-            f"[budget] llm_match_max_iterations={value} 必须为正整数，"
+            f"{log_prefix} llm_match_max_iterations={value} 必须为正整数，"
             f"已忽略该覆盖（回退思考强度策略默认）"
         )
         return None
@@ -135,7 +141,7 @@ def compute_match_run_timeout(match_cfg: dict, llm_timeout: float) -> float:
     - ``BUFFER=120s``：覆盖兜底收尾调用 / 恢复补执行 / 落库开销
     """
     thinking_level = match_cfg.get("llm_match_thinking_level", "medium")
-    override = _resolve_match_iterations_override(
+    override = resolve_match_iterations_override(
         match_cfg.get("llm_match_max_iterations")
     )
     max_iterations = get_max_iterations(

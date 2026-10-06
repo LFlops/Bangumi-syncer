@@ -19,6 +19,19 @@
 ``source='llm_assist'`` 与 ``reason``）；``llm_subject_id`` / ``llm_reason``
 两列仅为旧数据兼容保留，本服务层不再写入，读取时由 pending_candidates 仓储
 层从 JSON 投影（见 ``_project_llm_fields``）。
+
+文件结构导航（按出现顺序）：
+
+1. Prompt 常量（注入防护）——注入防护声明 / system 后缀 / 默认模板 / 用户分隔符
+2. 校验（委托 ``SyncService._validate_subject_id``）——subject_id 存在性校验与安全解析
+3. 工具注册（``register_match_tools``）——4 个 read + 1 个 terminal 工具定义（闭包捕获 bgm）
+4. 上下文构建——从 sync_records 提取候选 + 构建被 ``---`` 隔离的 seed 消息
+5. 落库（单一事务）——bgm 名称事务外预取 / 候选合并 / ``_persist_llm_candidate``（含 CAS 竞态守卫）
+6. 通知（事务提交后 best-effort）——``_ItemView`` 视图 + ``_send_notification`` 适配
+7. 预算解析——``resolve_max_iterations_override`` 薄委托 agent 骨架单一实现
+8. 默认 stream 函数——``_build_default_stream_fn`` 包装 ``LLMClient.stream_chat``
+9. 场景适配——``_MATCH_HOOKS``（ScenarioHooks 回调）与 ``get_scenario_runtime`` 工厂（含 veto 软护栏）
+10. 终局处理——``_handle_result_async`` / ``_handle_result`` 结果分派 + ``_persist_and_notify`` + 落库错误兜底
 """
 
 from __future__ import annotations
@@ -35,7 +48,10 @@ from typing import Any
 from app.core.config import config_manager
 from app.core.database.agent_runs import apply_cancelled
 from app.core.logging import logger
-from app.services.agent.budget import get_max_iterations
+from app.services.agent.budget import (
+    get_max_iterations,
+    resolve_match_iterations_override,
+)
 from app.services.agent.loop import RunResult
 from app.services.agent.recorder import (
     TraceRecorder as TraceRecorder,  # re-export（测试/兼容）
@@ -678,42 +694,38 @@ def _send_notification(
 
 
 # ---------------------------------------------------------------------------
-# 主入口
+# 预算解析（委托 agent 骨架单一实现）
 # ---------------------------------------------------------------------------
 
 
 def resolve_max_iterations_override(raw_max: Any, log: Any = None) -> int | None:
-    """解析 ``[sync] llm_match_max_iterations`` 覆盖值。
+    """解析 ``[sync] llm_match_max_iterations`` 覆盖值（委托 agent 骨架单一实现）。
 
-    返回 ``None`` 表示不覆盖（交由 thinking_level 策略与默认兜底）：
-    - 空值（None / 空串）→ None（静默，属默认配置）
+    本函数为场景侧**薄委托**：解析逻辑的唯一实现位于
+    ``app/services/agent/budget.py::resolve_match_iterations_override``（骨架侧），
+    此处仅绑定场景告警前缀 ``[llm_assist]``，避免两处复刻产生语义漂移。
+    返回语义见该实现：
+
+    - 空值（None / 空串 / 纯空白）→ None（静默，属默认配置）
     - 非法整数 → None + 告警
     - 非正数（<=0）→ None + 告警（否则 max_iterations<=0 会让循环空跑，
       run 无 LLM 调用即耗尽，容易滞留/误判）
 
     ``log`` 可注入调用方 logger（如调度器），默认使用本模块 logger。
     """
-    _log = log if log is not None else logger
-    if raw_max is None:
-        return None
-    text = str(raw_max).strip()
-    if text == "":
-        return None
-    try:
-        value = int(text)
-    except (TypeError, ValueError):
-        _log.warning(
-            f"[llm_assist] llm_match_max_iterations={raw_max!r} 非法整数，"
-            f"已忽略该覆盖（回退思考强度策略默认）"
-        )
-        return None
-    if value <= 0:
-        _log.warning(
-            f"[llm_assist] llm_match_max_iterations={value} 必须为正整数，"
-            f"已忽略该覆盖（回退思考强度策略默认）"
-        )
-        return None
-    return value
+    # 显式 Any 局部变量：避免 ``log``（Any）经 ``is not None`` 收窄为
+    # ``Any & ~None`` 联合类型后被骨架侧 ``_LogLike`` 参数判定为不兼容。
+    _log: Any = log if log is not None else logger
+    return resolve_match_iterations_override(
+        raw_max,
+        _log,
+        log_prefix="[llm_assist]",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 默认 stream 函数
+# ---------------------------------------------------------------------------
 
 
 def _build_default_stream_fn(thinking_level: str):
@@ -868,6 +880,11 @@ def get_scenario_runtime() -> ScenarioRuntime:
             sync_record=sync_record, bgm=bgm
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# 终局处理（结果分派 / 落库 / 通知 / 错误兜底）
+# ---------------------------------------------------------------------------
 
 
 async def _handle_result_async(

@@ -1938,6 +1938,41 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# resolve_max_iterations_override：场景侧薄委托 agent 骨架单一实现
+# （解析逻辑唯一实现于 app.services.agent.budget，此处只验证委托与场景前缀）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_resolve_max_iterations_override_blank_returns_none_silently(blank):
+    from unittest.mock import MagicMock
+
+    log = MagicMock()
+    assert llm_assist.resolve_max_iterations_override(blank, log) is None
+    log.warning.assert_not_called()
+
+
+def test_resolve_max_iterations_override_invalid_uses_llm_assist_prefix():
+    """非法值告警由 budget 单一实现产出，但前缀绑定场景 [llm_assist]。"""
+    from unittest.mock import MagicMock
+
+    log = MagicMock()
+    assert llm_assist.resolve_max_iterations_override("abc", log) is None
+    log.warning.assert_called_once()
+    message = log.warning.call_args[0][0]
+    assert message.startswith("[llm_assist]")
+    assert "[budget]" not in message
+
+
+def test_resolve_max_iterations_override_positive_returns_value():
+    from unittest.mock import MagicMock
+
+    log = MagicMock()
+    assert llm_assist.resolve_max_iterations_override("5", log) == 5
+    log.warning.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # 事务内不应发起 HTTP（bgm.get_subject 在事务外预取一次）
 # ---------------------------------------------------------------------------
 

@@ -20,6 +20,7 @@ from app.services.agent.budget import (
     compute_match_run_timeout,
     get_max_iterations,
     register_iteration_strategy,
+    resolve_match_iterations_override,
 )
 
 
@@ -226,3 +227,59 @@ def test_compute_match_run_timeout_non_positive_override_warns_and_falls_back(ba
         result = compute_match_run_timeout(_match_cfg("off", bad), 60)
     assert result == 210.0
     log.warning.assert_called_once()
+
+
+# --- 预算覆盖解析单一实现（resolve_match_iterations_override） ---
+#
+# 该函数是覆盖解析的唯一实现：场景侧 llm_assist.resolve_max_iterations_override
+# 仅做薄委托并传 log_prefix="[llm_assist]"，故此处直接锁定解析语义与告警前缀。
+
+
+@pytest.mark.parametrize("blank", [None, "", "   "])
+def test_resolve_match_iterations_override_blank_silently_returns_none(blank):
+    """空值（None/空串/纯空白）→ None 且不告警（属默认配置）。"""
+    log = MagicMock()
+    assert resolve_match_iterations_override(blank, log) is None
+    log.warning.assert_not_called()
+
+
+def test_resolve_match_iterations_override_invalid_warns_and_returns_none():
+    """非法整数 → None + 告警，默认前缀为 [budget]。"""
+    log = MagicMock()
+    assert resolve_match_iterations_override("abc", log) is None
+    log.warning.assert_called_once()
+    message = log.warning.call_args[0][0]
+    assert message.startswith("[budget] llm_match_max_iterations='abc' 非法整数")
+    assert "已忽略该覆盖（回退思考强度策略默认）" in message
+
+
+@pytest.mark.parametrize("bad", ["0", "-2"])
+def test_resolve_match_iterations_override_non_positive_warns_and_returns_none(bad):
+    """非正数（<=0）→ None + 告警（否则 max_iterations<=0 会让循环空跑）。"""
+    log = MagicMock()
+    assert resolve_match_iterations_override(bad, log) is None
+    log.warning.assert_called_once()
+    message = log.warning.call_args[0][0]
+    assert message.startswith(
+        f"[budget] llm_match_max_iterations={int(bad)} 必须为正整数"
+    )
+    assert "已忽略该覆盖（回退思考强度策略默认）" in message
+
+
+def test_resolve_match_iterations_override_positive_returns_value():
+    """正整数（含前后空白）→ 返回解析后的 int，不告警。"""
+    log = MagicMock()
+    assert resolve_match_iterations_override("7", log) == 7
+    assert resolve_match_iterations_override(" 10 ", log) == 10
+    log.warning.assert_not_called()
+
+
+def test_resolve_match_iterations_override_custom_log_prefix_in_message():
+    """log_prefix 参数化告警前缀：场景侧传 [llm_assist] 时文案前缀随之外显。"""
+    log = MagicMock()
+    assert (
+        resolve_match_iterations_override("abc", log, log_prefix="[llm_assist]") is None
+    )
+    message = log.warning.call_args[0][0]
+    assert message.startswith("[llm_assist]")
+    assert "[budget]" not in message
