@@ -310,7 +310,9 @@ class ToolRegistry:
           ``None`` 时行为与现在完全一致（零回归）。
         """
         n = len(tool_calls)
-        slots: list[Any] = [None] * n
+        # 用列表推导初始化（而非 ``[None] * n``）：旧版类型检查器会把乘法结果
+        # 窄化为 ``list[None]`` 并误报后续赋值/取值，推导写法新旧版本均通过。
+        slots: list[Any] = [None for _ in range(n)]
         seen_ids: set[str] = set()
         i = 0
         while i < n:
