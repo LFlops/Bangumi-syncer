@@ -907,6 +907,11 @@ class EpisodesMixin:
         if shortcut.hit:
             chain = shortcut.data or []
             if chain:
+                # 类型口径**有意**比链遍历（_walk_chain_for_episode /
+                # _find_episode_in_chain 默认仅 ANIME）更宽：franchise 是链式全部
+                # miss 后的最后兜底，闭包含「改编」等跨媒体边，需覆盖动画↔真人
+                # 改编条目（如凡人修仙传动画 ↔ 真人网剧，type=REAL）。此处放行
+                # (ANIME, REAL) 属于兜底语义，与链遍历的保守口径不冲突。
                 result = self._find_episode_in_chain(
                     chain,
                     target_ep,
@@ -1070,7 +1075,13 @@ class EpisodesMixin:
             visited.add(str(next_id))
             current_id = next_id
 
-            # 类型过滤：只看动画（SUBJECT_TYPE_ANIME），跳过书籍/音乐等
+            # 类型过滤：链遍历**保守**限定动画（SUBJECT_TYPE_ANIME），跳过书籍/
+            # 音乐等，也跳过真人（SUBJECT_TYPE_REAL）。链遍历沿 sequel/prequel 找
+            # 「同一作品连续性」的季集归属，限定 ANIME 是为避免真人同名/改编作品
+            # 被误配（虽有 season/ep 校验兜底，真人链误配风险仍高于收益）。更宽的
+            # 真人改编场景交由 franchise 兜底（见 _try_find_episode_in_franchise，
+            # 该处有意放行 REAL）。扩展点：若产品确认需覆盖「真人改编链」，只需把
+            # 此处判断与 _find_episode_in_chain 默认 allowed_types 一并放行 REAL。
             info = self.get_subject(current_id)
             if not info:
                 continue
@@ -1119,9 +1130,13 @@ class EpisodesMixin:
             target_ep: 目标集数
             visited: 已访问的 subject_id 集合（会被本方法更新）
             deadline: 整体 deadline
-            allowed_types: 允许的 subject type 集合。默认仅动画（2）；
-                同 IP 改编链（动画↔网剧）场景放行 (SUBJECT_TYPE_ANIME,
-                SUBJECT_TYPE_REAL)。
+            allowed_types: 允许的 subject type 集合。默认仅动画（2），与
+                _walk_chain_for_episode 逐跳路径口径一致：sequel/prequel 链按
+                「同一作品连续性」定位季集归属，保守限定 ANIME 以避免真人同名/
+                改编作品被误配。仅 franchise 兜底（_try_find_episode_in_franchise）
+                显式放行 (SUBJECT_TYPE_ANIME, SUBJECT_TYPE_REAL)，覆盖动画↔真人
+                改编场景；两处口径**有意**不同。扩展点：若未来产品确认需覆盖
+                「真人改编链」，把默认值一并放行 REAL 即可切换。
         """
         for current_id in chain:
             if str(current_id) in visited:

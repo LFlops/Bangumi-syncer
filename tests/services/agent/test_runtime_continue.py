@@ -83,12 +83,19 @@ class _FakeHooks:
 
     def __init__(self) -> None:
         self.terminal_calls: list[tuple[tuple, dict]] = []
+        # 恢复路径不应触发 veto 软护栏（见 runtime.continue_run submit 分支注释）
+        self.veto_calls: list[dict] = []
 
     def resolve_thinking_level(self) -> str:
         return "medium"
 
     def resolve_max_iterations(self, level: str) -> int:
         return 10
+
+    def veto_terminal(self, suggestion: dict) -> str | None:
+        """live 路径的终止提交软护栏；恢复路径不应调用。"""
+        self.veto_calls.append(suggestion)
+        return "请先核对候选再提交"
 
     async def handle_terminal(self, *args, **kwargs):
         self.terminal_calls.append((args, kwargs))
@@ -175,6 +182,34 @@ def test_continue_run_with_matching_terminal_tool_call_dispatches_normally(
     result = args[2]
     assert result.suggestion == submit_input
     assert result.stop_reason == "submit_suggestion"
+
+
+def test_continue_run_submit_terminal_does_not_replay_veto(
+    dbm: DatabaseManager,
+):
+    """恢复路径的 submit 终局直接 handle_terminal，不重放 veto 软护栏。
+
+    守卫当前**有意**设计：veto 是 live 会话的 best-effort 软护栏（防模型未核对
+    即提交），crash 恢复 replay 到已记录的 submit 终局时直接落库，不重放 veto
+    （会话内「已拦一次/剩余轮次」状态在崩溃中不可靠）。终局仍统一经
+    normalize_stop_reason + handle_terminal 归一化落库。
+    """
+    run_id = "run-term-no-veto"
+    _write_seed(dbm, run_id)
+    submit_input = {"subject_id": "2", "reason": "best match"}
+    _write_llm_chat(
+        dbm,
+        run_id,
+        0,
+        [{"id": "t9", "name": "submit_suggestion", "input": submit_input}],
+        stop_reason="tool_use",
+    )
+    hooks = _FakeHooks()
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1
+    assert hooks.veto_calls == [], "恢复路径不重放 veto 软护栏"
 
 
 # ---------------------------------------------------------------------------

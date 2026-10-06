@@ -311,6 +311,15 @@ async def continue_run(
                 suggestion=sug,
                 last_response=None,
             )
+            # 恢复路径不重放 veto（软护栏）——**有意**与 live 路径不同：
+            # live 会话在 loop.run 命中终止工具时经 veto_terminal 软护栏（remaining>1
+            # 且本 run 未拦过才拦一次），防止模型未核对即提交；但 crash 恢复 replay 到
+            # 已记录的 submit 终局时直接落库，不重放该护栏。原因：
+            # (a) veto 依赖「已拦一次 / 剩余轮次」会话内状态，该状态在崩溃中不可靠，
+            #     重放会引入额外的状态机复杂度与歧义（拦或不拦难有确定依据）；
+            # (b) 恢复路径 replay + 续跑成本高，而软护栏本身是 best-effort，重放收益边际；
+            # (c) 终局仍统一走 normalize_stop_reason + handle_terminal 归一化落库，
+            #     与 live 放行路径的落点一致，保证落库口径不因恢复路径而分叉。
             await hooks.handle_terminal(
                 dbm,
                 run_id,
