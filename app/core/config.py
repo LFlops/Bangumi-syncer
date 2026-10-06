@@ -632,6 +632,9 @@ class ConfigManager:
             "max_tokens": 2000,
             "temperature": 0.7,
             "timeout": 60,
+            # LLM 调用记录保留天数：DB 启动时按此清理 llm_usage 旧记录
+            # （见 app/core/database/__init__.py）；属活配置而非死键。
+            "retention_days": 365,
         }
         raw = self.get_section(LLM_SECTION, {})
         merged: dict[str, Any] = {**defaults, **raw}

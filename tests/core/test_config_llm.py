@@ -101,6 +101,17 @@ temperature = 0.0
         assert cfg["max_tokens"] == 2000
         assert cfg["timeout"] == 60
 
+    def test_retention_days_default_365(self, tmp_path):
+        """[llm].retention_days 是活配置（llm_usage 清理读取），缺省应回退 365。"""
+        cm = _cm_from_ini(tmp_path, "[bangumi]\nusername = u\n")
+        cfg = cm.get_llm_config()
+        assert cfg["retention_days"] == 365
+
+    def test_retention_days_from_config(self, tmp_path):
+        """config.ini 显式配置 retention_days 时应覆盖默认值。"""
+        cm = _cm_from_ini(tmp_path, "[llm]\nretention_days = 30\n")
+        assert cm.get_llm_config()["retention_days"] == 30
+
     def test_api_key_encryption_roundtrip(self, tmp_path):
         """当 auth.secret_key 已设置时，通过 set_config 存储的 api_key 以 BGS1:
         前缀加密，并在通过 get_llm_config 读取时解密。"""
