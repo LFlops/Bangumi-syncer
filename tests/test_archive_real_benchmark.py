@@ -1837,7 +1837,7 @@ def setup_archive(db_path: Path) -> tuple[ArchiveShortcut, int]:
 
     # 初始化 ArchiveShortcut
     shortcut = ArchiveShortcut()
-    shortcut._enabled = True  # 直接启用，绕过 config
+    shortcut.set_enabled(True)  # 直接启用，绕过 config
 
     if not shortcut.enabled:
         print("错误: ArchiveShortcut 启用失败")

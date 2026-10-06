@@ -584,7 +584,7 @@ def _isolate_archive_shortcut(monkeypatch):
     """
     from app.utils.bangumi_api._archive_shortcut import archive_shortcut
 
-    archive_shortcut._enabled = False
+    archive_shortcut.set_enabled(False)
     # mock reload_config 为 noop，防止 BangumiApi.init() 重新读取 config 启用
     monkeypatch.setattr(archive_shortcut, "reload_config", lambda: None)
     yield

@@ -1192,11 +1192,11 @@ class TestGetTargetSeasonEpisodeId:
         orig = (
             _arch_mod.bangumi_archive.db_a_path,
             _arch_mod.bangumi_archive._meta.active,
-            api._archive._enabled,
+            api._archive.enabled,
         )
         _arch_mod.bangumi_archive.db_a_path = db_path
         _arch_mod.bangumi_archive._meta.active = "a"
-        api._archive._enabled = True
+        api._archive.set_enabled(True)
         return orig
 
     def _restore_archive(self, api, orig):
@@ -1204,7 +1204,7 @@ class TestGetTargetSeasonEpisodeId:
 
         _arch_mod.bangumi_archive.db_a_path = orig[0]
         _arch_mod.bangumi_archive._meta.active = orig[1]
-        api._archive._enabled = orig[2]
+        api._archive.set_enabled(orig[2])
 
     def test_archive_synthesized_ep_resolves_season_local(self, archive_517106_db):
         """Archive 补全 ep 后，is_season_subject_id 按季内话数定位章节

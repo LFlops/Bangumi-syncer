@@ -478,7 +478,7 @@ class TestTrySearchLazyBuild:
     def test_try_search_returns_miss_when_not_ready(self) -> None:
         """索引未就绪时 try_search 返回 archive_miss"""
         shortcut = ArchiveShortcut()
-        shortcut._enabled = True
+        shortcut.set_enabled(True)
 
         with patch(
             "app.utils.bangumi_api._archive_shortcut.archive_title_index"
@@ -496,7 +496,7 @@ class TestTrySearchLazyBuild:
     def test_try_search_skips_lazy_build_when_ready(self) -> None:
         """索引就绪时 try_search 不触发后台构建"""
         shortcut = ArchiveShortcut()
-        shortcut._enabled = True
+        shortcut.set_enabled(True)
 
         with (
             patch(

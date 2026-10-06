@@ -29,7 +29,7 @@ class TestArchiveShortcutDisabled:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = False
+        self.shortcut.set_enabled(False)
 
     def test_try_get_subject_disabled(self) -> None:
         r = self.shortcut.try_get_subject(1)
@@ -63,7 +63,7 @@ class TestArchiveShortcutHit:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     @patch("app.utils.bangumi_api._archive_shortcut.archive_store")
     def test_try_get_subject_hit(self, mock_store: MagicMock) -> None:
@@ -247,7 +247,7 @@ class TestArchiveShortcutError:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     @patch("app.utils.bangumi_api._archive_shortcut.archive_store")
     def test_try_get_subject_error(self, mock_store: MagicMock) -> None:
@@ -279,22 +279,59 @@ class TestArchiveShortcutReloadConfig:
         # 构造时返回 False（未启用）
         mock_cfg.get.return_value = False
         shortcut = ArchiveShortcut()
-        assert shortcut._enabled is False
+        assert shortcut.enabled is False
         # 配置变更后 reload_config 应重新加载为 True
         mock_cfg.get.return_value = True
         shortcut.reload_config()
-        assert shortcut._enabled is True
+        assert shortcut.enabled is True
 
     @patch("app.utils.bangumi_api._archive_shortcut.config_manager")
     def test_reload_disables(self, mock_cfg: MagicMock) -> None:
         mock_cfg.get.return_value = True
         shortcut = ArchiveShortcut()
         shortcut.reload_config()
-        assert shortcut._enabled is True
+        assert shortcut.enabled is True
         # 修改配置返回值
         mock_cfg.get.return_value = False
         shortcut.reload_config()
-        assert shortcut._enabled is False
+        assert shortcut.enabled is False
+
+
+class TestArchiveShortcutSetEnabled:
+    """set_enabled 公开控制 API（供测试隔离与运行时切换）"""
+
+    def test_set_enabled_false_disables_and_short_circuits(self) -> None:
+        """set_enabled(False) 后 enabled 为 False 且 try_get_subject 短路 miss"""
+        shortcut = ArchiveShortcut()
+        shortcut.set_enabled(False)
+        assert shortcut.enabled is False
+        with patch(
+            "app.utils.bangumi_api._archive_shortcut.archive_store"
+        ) as mock_store:
+            r = shortcut.try_get_subject(1)
+        assert r.hit is False
+        assert r.data is None
+        assert r.reason == "archive_disabled"
+        # 禁用时不应触及底层 store（真正短路）
+        mock_store.get_subject.assert_not_called()
+
+    def test_set_enabled_true_enables(self) -> None:
+        """set_enabled(True) 后 enabled 为 True"""
+        shortcut = ArchiveShortcut()
+        shortcut.set_enabled(True)
+        assert shortcut.enabled is True
+
+    @patch("app.utils.bangumi_api._archive_shortcut.config_manager")
+    def test_reload_config_overrides_manual_set(self, mock_cfg: MagicMock) -> None:
+        """reload_config 会按配置覆盖 set_enabled 的手动设置"""
+        mock_cfg.get.return_value = False
+        shortcut = ArchiveShortcut()
+        shortcut.set_enabled(True)
+        assert shortcut.enabled is True
+        # 配置仍为 False，reload 后手动设置被覆盖
+        mock_cfg.get.return_value = False
+        shortcut.reload_config()
+        assert shortcut.enabled is False
 
 
 # ===== BangumiApi 接入短路集成测试 =====
@@ -601,11 +638,11 @@ class TestArchiveShortcutTrySearch:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     def test_disabled_returns_archive_disabled(self) -> None:
         """禁用时返回 archive_disabled"""
-        self.shortcut._enabled = False
+        self.shortcut.set_enabled(False)
         r = self.shortcut.try_search("Test")
         assert r.hit is False
         assert r.reason == "archive_disabled"
@@ -914,7 +951,7 @@ class TestArchiveShortcutTrySearchIdsLimit:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     @patch("app.utils.bangumi_api._archive_shortcut.archive_store")
     @patch("app.utils.bangumi_api._archive_shortcut.archive_title_index")
@@ -1210,7 +1247,7 @@ class TestTrySearchSuffixStripping:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     @patch("app.utils.bangumi_api._archive_shortcut.archive_store")
     @patch("app.utils.bangumi_api._archive_shortcut.archive_title_index")
@@ -1397,7 +1434,7 @@ class TestTrySearchTitleSplitting:
 
     def setup_method(self) -> None:
         self.shortcut = ArchiveShortcut()
-        self.shortcut._enabled = True
+        self.shortcut.set_enabled(True)
 
     @patch("app.utils.bangumi_api._archive_shortcut.archive_store")
     @patch("app.utils.bangumi_api._archive_shortcut.archive_title_index")

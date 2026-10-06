@@ -2637,7 +2637,7 @@ class TestBangumiDataDateOptimalTamayura:
         # _archive 由运行期注入（非类声明属性），用 cast(Any) 赋值避免静态类型误报
         archive_mock = MagicMock()
         cast(Any, data)._archive = archive_mock
-        archive_mock._enabled = True
+        archive_mock.enabled = True
         with patch.object(data, "_title_index", {}):
             result = data._find_bangumi_id_optimized(
                 title="玉响", ori_title=" ", release_date=self.RELEASE, season=1
