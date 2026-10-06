@@ -92,6 +92,7 @@ class TestDateExactSearchStep:
         ctx.bgm.search = lambda **kw: [{"id": 1, "name": "斗破苍穹年番"}]
         outcome = DateExactSearchStep().execute(ctx)
         assert outcome.status == "hit"
+        assert ctx.bgm_data is not None
         assert ctx.bgm_data[0]["id"] == 1
         assert ctx.start_date_str == "2024-01-13"
         assert ctx.end_date_str == "2024-01-17"
@@ -175,6 +176,7 @@ class TestVariantFallbackSearchStep:
         ctx.bgm.title_diff_ratio = lambda *a, **kw: 0.9
         outcome = VariantFallbackSearchStep().execute(ctx)
         assert outcome.status == "hit"
+        assert ctx.bgm_data is not None
         assert ctx.bgm_data[0]["id"] == 10
 
     def test_runs_when_low_confidence(self):

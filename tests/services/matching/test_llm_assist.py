@@ -8,9 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import threading
 import time
+from collections.abc import Coroutine
 from contextlib import suppress
+from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -52,6 +55,25 @@ def _align_db_singleton():
     set_database_manager(database_manager)
     yield
     set_database_manager(None)
+
+
+def _db_conn() -> sqlite3.Connection:
+    """返回底层 sqlite3 连接并显式收窄（测试初始化后必然非 None）。"""
+    conn = database_manager._connection._conn
+    assert conn is not None, "测试数据库连接未初始化"
+    return conn
+
+
+def _run_row(run_id: str) -> dict:
+    """读取 agent_runs 行并显式收窄（测试前提：run 已落库）。"""
+    row = database_manager.agent_runs.get_run(run_id)
+    assert row is not None, f"agent_run {run_id} 未落库"
+    return row
+
+
+def _as_coroutine(awaitable) -> Coroutine[Any, Any, ChatResponse]:
+    """wrap_chat_fn 声明返回 Awaitable；asyncio.run 需要 Coroutine（运行时即协程）。"""
+    return cast("Coroutine[Any, Any, ChatResponse]", awaitable)
 
 
 def _make_sync_record(with_candidates=False, sync_record_id=1):
@@ -130,7 +152,7 @@ def _read_candidate(sync_record_id):
 
 def _read_raw_llm_columns(sync_record_id):
     """直读 DB 的 llm 两列（验证写入侧不再写列，仅写 candidates_json）。"""
-    conn = database_manager._connection._conn
+    conn = _db_conn()
     row = conn.execute(
         "SELECT llm_subject_id, llm_reason FROM pending_candidates "
         "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
@@ -143,7 +165,7 @@ def _read_raw_llm_columns(sync_record_id):
 
 def _read_candidate_business_key(sync_record_id):
     """直读 pending_candidates.business_key（验证写入侧业务键口径）。"""
-    conn = database_manager._connection._conn
+    conn = _db_conn()
     row = conn.execute(
         "SELECT business_key FROM pending_candidates "
         "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
@@ -154,7 +176,7 @@ def _read_candidate_business_key(sync_record_id):
 
 def _read_full_candidate(candidate_id):
     """读取候选行全部关注列（用于断言是否被复活改写）。"""
-    conn = database_manager._connection._conn
+    conn = _db_conn()
     row = conn.execute(
         "SELECT id, status, confirmed_subject_id, resolved_at, candidates_json, "
         "llm_subject_id, llm_reason FROM pending_candidates WHERE id=?",
@@ -263,7 +285,7 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
     )
 
     assert status == "succeeded"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "submit_suggestion"
 
@@ -557,7 +579,7 @@ async def test_run_submit_skips_reviving_resolved_candidate(
 
     # 跳过信号：非 succeeded
     assert status == ""
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     assert run_row["ended_at"] > 0
@@ -616,7 +638,7 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
     )
 
     assert returned is None, "并发处理时不应返回候选 id（跳过信号）"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     # 候选行未被改写（原 pending 行保持原状）
@@ -703,7 +725,7 @@ def test_persist_content_cas_skips_when_json_concurrently_modified(monkeypatch):
     )
 
     assert result is False, "内容 CAS 失配应返回 False（跳过通知）"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     # 并发写入的 candidates_json 未被本 run 覆盖
@@ -729,7 +751,7 @@ def test_persist_content_cas_matches_null_or_empty_json(raw_value):
     )
     assert cid
     # 预置为 NULL / 空串（历史脏数据 / 手工沉淀）
-    conn = database_manager._connection._conn
+    conn = _db_conn()
     conn.execute(
         "UPDATE pending_candidates SET candidates_json=? WHERE id=?", (raw_value, cid)
     )
@@ -750,7 +772,7 @@ def test_persist_content_cas_matches_null_or_empty_json(raw_value):
     )
 
     assert returned == cid, "COALESCE 应把 NULL/空串归一并命中内容 CAS"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "succeeded"
     cands = json.loads(_read_full_candidate(cid)["candidates_json"])
     assert any(str(c.get("subject_id")) == "123" for c in cands), (
@@ -788,7 +810,7 @@ def test_persist_llm_candidate_succeeded_guard_skips_when_run_terminal(log_recor
     )
 
     assert returned is None, "run 已被并发终态化时应返回 None（跳过通知）"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "cancelled", "终态不得被 succeeded 守卫漏过而翻回"
     assert run_row["stop_reason"] == "user_resolved"
     # 必须留痕：warning 含 run_id 与当前状态
@@ -843,7 +865,7 @@ def test_persist_and_notify_persist_error_marks_failed_no_raise(monkeypatch):
     )
 
     assert result is False, "落库失败应返回 False（跳过通知）"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "persist_error"
     assert "disk I/O error" in (run_row["last_error"] or "")
@@ -895,7 +917,7 @@ def test_persist_and_notify_transient_lock_error_keeps_run_retryable(monkeypatch
     )
 
     assert result is False, "瞬时落库失败应返回 False（本次跳过通知）"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "processing", "瞬时锁抖动不得终态化（应保持活性待重试）"
     assert run_row["attempts"] == 1, "瞬时失败必须累计 attempts 供上限判定"
     assert run_row["stop_reason"] in ("", None)
@@ -944,7 +966,7 @@ def test_persist_and_notify_non_transient_error_still_marks_failed(monkeypatch):
     )
 
     assert result is False
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "persist_error"
     assert "boom" in (run_row["last_error"] or "")
@@ -1025,7 +1047,7 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
     )
 
     assert status == "no_suggestion"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "submit_suggestion"
     assert "非法" in (run_row["last_error"] or "")
@@ -1085,7 +1107,7 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
     )
 
     assert status == "no_suggestion"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "exhausted"
     # 既有候选行未被 LLM 改写
@@ -1139,7 +1161,7 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
 
     assert status == "succeeded"
     _assert_candidate_written(sr_id, subject_id="321", reason="兜底")
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["stop_reason"] == "exhausted"
 
 
@@ -1178,7 +1200,7 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
     )
 
     assert status == "no_suggestion"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["stop_reason"] == "exhausted"
 
 
@@ -1199,6 +1221,7 @@ def test_build_seed_messages_injection_guard_and_isolation():
     assert "不可信" in system.content
     assert user.role == "user"
     # 用户输入被 --- 分隔符隔离
+    assert isinstance(user.content, str)
     assert user.content.count("---") >= 2
     # 用户提供的标题出现在隔离区内
     assert "标题1" in user.content
@@ -1262,7 +1285,7 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
         )
 
     # 回滚验证：agent_runs 未 succeeded，pending_candidates 未被改写
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "pending"  # 原始状态，未 succeeded
     row = _read_candidate(sr_id)
     assert row["llm_subject_id"] == ""  # 候选写入被回滚
@@ -1467,15 +1490,16 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
 
 
 def _chat_side_effect(responses):
+    state = {"idx": 0}
+
     async def _chat(messages, *, tools=None, tool_choice=None):
-        idx = _chat.idx
-        _chat.idx += 1
+        idx = state["idx"]
+        state["idx"] += 1
         if idx < len(responses):
             return responses[idx]
         # 超出则返回 end_turn 兜底
         return ChatResponse(content="done", stop_reason="end_turn")
 
-    _chat.idx = 0
     return _chat
 
 
@@ -2235,7 +2259,7 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
     )
 
     assert status == "succeeded"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "submit_suggestion"
 
@@ -2274,7 +2298,9 @@ def test_trace_recorder_wrap_chat_fn_tracks_iteration():
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+        )
 
     # 应有一条 llm_chat start + end
     assert len(starts) == 1
@@ -2404,13 +2430,17 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         # 第一轮
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+        )
         # 模拟工具执行（与 chat 同轮）
         tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
         recorder.start_tool(tc, sequence=0)
 
         # 第二轮
-        asyncio.run(wrapped([Message(role="user", content="hi2")], tools=[]))
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi2")], tools=[]))
+        )
         tc2 = ToolUseBlock(
             id="t2", name="get_subject_detail", input={"subject_id": "1"}
         )
@@ -2472,7 +2502,9 @@ def test_wrap_chat_fn_exception_propagates_original():
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         with pytest.raises(ValueError, match="boom"):
-            asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+            asyncio.run(
+                _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+            )
 
     # 不应写 ok span（允许写 error span，但 status 不得为 "ok"）
     ok_ends = [e for e in ends if e.get("status") == "ok"]
@@ -2486,8 +2518,9 @@ def test_wrap_chat_fn_exception_propagates_original():
 
 def test_build_default_chat_fn_requires_thinking_level():
     """_build_default_stream_fn 不传 thinking_level 应抛 TypeError。"""
+    fn = cast("Any", llm_assist._build_default_stream_fn)
     with pytest.raises(TypeError):
-        llm_assist._build_default_stream_fn()
+        fn()
 
 
 # ---------------------------------------------------------------------------
@@ -2533,7 +2566,9 @@ def test_trace_recorder_start_iteration_affects_first_chat_iteration():
     wrapped = recorder.wrap_chat_fn(dummy_chat)
 
     with patch.object(agent_recorder, "trace_start_span", side_effect=fake_start):
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+        )
 
     chat_starts = [s for s in starts if s["name"] == "llm_chat"]
     assert len(chat_starts) == 1
@@ -2603,7 +2638,7 @@ async def test_run_llm_call_error_retryable_true_increments_attempts(
     )
 
     assert status == "processing"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["attempts"] == 1
 
 
@@ -2630,7 +2665,7 @@ async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch
     )
 
     assert status == "failed"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "llm_error"
     assert "401" in (run_row["last_error"] or "")
@@ -2686,7 +2721,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
         span_recorder=None,
     )
     assert status3 == "failed"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "failed"
     # 终态由 increment_attempts 单点事务写入（stop_reason='failed'），外层不再二次 mark_failed
     assert run_row["stop_reason"] == "failed"
@@ -2887,7 +2922,7 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
     )
     after = int(time.time())
 
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     ended_at = run_row["ended_at"]
     # 断言 ended_at 为 int 且 > 0
     assert isinstance(ended_at, int), f"ended_at 应为 int，实际 {type(ended_at)}"
@@ -2903,7 +2938,7 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
     assert iso is not None, "_iso_from_epoch(ended_at) 应返回非 None"
 
     # 断言 SQLite typeof(ended_at)='integer'
-    conn = database_manager._connection._conn
+    conn = _db_conn()
     cur = conn.execute(
         "SELECT typeof(ended_at) FROM agent_runs WHERE run_id=?", (run_id,)
     )
@@ -3134,9 +3169,11 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
 
     # 缺失工具补执行一次，并锚定同轮 span（sequence=0）
     backfill.assert_awaited_once()
-    assert backfill.await_args.args[0] == ReplayToolCall.model_validate(missing)
-    assert backfill.await_args.kwargs.get("sequence") == 0
-    assert backfill.await_args.kwargs.get("span_recorder") is not None
+    backfill_call = backfill.await_args
+    assert backfill_call is not None
+    assert backfill_call.args[0] == ReplayToolCall.model_validate(missing)
+    assert backfill_call.kwargs.get("sequence") == 0
+    assert backfill_call.kwargs.get("span_recorder") is not None
     # 回填后进入下一轮 loop_run 续跑（1 次 LLM 调用）
     loop.assert_awaited_once()
 
@@ -3169,11 +3206,15 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
         )
 
     loop.assert_awaited_once()
-    assert loop.await_args.kwargs["seed_messages"] is seed
+    loop_call = loop.await_args
+    assert loop_call is not None
+    assert loop_call.kwargs["seed_messages"] is seed
     # medium=5，executed=4 → 剩余 1 轮
-    assert loop.await_args.kwargs["max_iterations"] == 1
+    assert loop_call.kwargs["max_iterations"] == 1
     handle.assert_called_once()
-    assert handle.call_args[0][2].stop_reason == "end_turn"
+    handle_call = handle.call_args
+    assert handle_call is not None
+    assert handle_call[0][2].stop_reason == "end_turn"
 
 
 def test_continue_run_continuation_sums_replay_and_new_round_tokens():
@@ -3683,7 +3724,7 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
     after = _count_tool_results(messages)
     assert after == before + 1 == 2  # t1（已记录）+ t2（补执行）
     trs = [
-        m.content[0]
+        cast("ToolResultBlock", m.content[0])
         for m in messages
         if m.role == "user"
         and isinstance(m.content, list)
@@ -3706,7 +3747,9 @@ def _last_tool_result(messages: list) -> ToolResultBlock | None:
     return None
 
 
-def _registry_with(name: str, access: str, called: list) -> ToolRegistry:
+def _registry_with(
+    name: str, access: Literal["read", "write", "terminal"], called: list
+) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -4046,7 +4089,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     assert response_fn.call_count == 2, (
         f"期望累计 2 次 LLM 调用，实际 {response_fn.call_count}"
     )
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "no_suggestion"
 
 
@@ -4311,6 +4354,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
             blk = ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
             results[tc.id] = blk
             if sid is not None:
+                assert recorder is not None
                 recorder.end_tool(sid, result=blk)
         return results
 
@@ -4446,8 +4490,12 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
         patch.object(agent_recorder, "trace_start_span", return_value="span-x"),
         patch.object(agent_recorder, "trace_end_span"),
     ):
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
-        asyncio.run(wrapped([Message(role="user", content="hi")], tools=[]))
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+        )
+        asyncio.run(
+            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
+        )
 
     assert recorder.total_tokens == 200, (
         f"应累计 2 轮 tokens=200，实际 {recorder.total_tokens}"
@@ -4480,7 +4528,7 @@ async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
     )
 
     assert status == "succeeded"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["total_tokens"] == 200, (
         f"应累计全部轮次 tokens=200，实际 {run_row['total_tokens']}"
     )
@@ -4508,7 +4556,7 @@ async def test_total_tokens_zero_when_no_usage():
         )
 
     assert status == "succeeded"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["total_tokens"] == 0, (
         f"无 usage 应记 0，实际 {run_row['total_tokens']}"
     )
@@ -4848,7 +4896,7 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
     assert read_row is not None and read_row["run_id"] == run_id
     assert new_cid, "并发写入应成功返回候选 id"
     assert status == "succeeded"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "succeeded"
     _assert_candidate_written(sr_id)
     ns.notify.assert_called_once()
@@ -5142,7 +5190,7 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
     )
 
     assert status == "no_suggestion"
-    run_row = database_manager.agent_runs.get_run(run_id)
+    run_row = _run_row(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "give_up"
     ns.notify.assert_not_called()

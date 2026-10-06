@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import pytest
 
 from app.services.matching.arbiter import (
@@ -168,7 +170,10 @@ class TestCrossSourceAggregation:
 
     def test_non_numeric_score_treated_as_zero(self):
         """mock / 脏数据的非数值分数不应让排序抛异常"""
-        bad = MatchCandidate(subject_id="1", score=None, source=SOURCE_ARCHIVE)
+        # 故意注入 None 模拟脏数据（MatchCandidate.score 声明为 float）
+        bad = MatchCandidate(
+            subject_id="1", score=cast("float", None), source=SOURCE_ARCHIVE
+        )
         d = Arbiter().decide(
             [bad, cand("2", 0.95)], MatchPolicy(min_score=0.5, min_margin=0.0)
         )
