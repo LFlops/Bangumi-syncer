@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from app.core.logging import logger
@@ -31,6 +32,18 @@ from app.services.llm.models import (
 from app.services.llm.providers.base import BaseProvider
 from app.services.llm.sse import iter_sse_events
 from app.utils.http_client import create_async_client
+
+
+@dataclass
+class _CompatStreamState:
+    """openai_compat 流式的跨事件状态（模块私有）。
+
+    - ``model_seen``：真实模型名仅首个带 model 的事件填一次；
+    - ``stopped``：已补发 tool_use_stop 的 tool_call index，避免重复补发。
+    """
+
+    model_seen: bool = False
+    stopped: set[int] = field(default_factory=set)
 
 
 class OpenAICompatProvider(BaseProvider):
@@ -135,7 +148,7 @@ class OpenAICompatProvider(BaseProvider):
         tool_index: dict[int, tuple[str, str]] = {}
         # 跨事件状态：model_seen（真实模型名仅首个带 model 的事件填一次）、
         # stopped（已补发 tool_use_stop 的 tool_call index，避免重复补发）。
-        state: dict[str, Any] = {"model_seen": False, "stopped": set()}
+        state = _CompatStreamState()
 
         async with create_async_client(
             proxy=self.proxy,
@@ -165,7 +178,10 @@ class OpenAICompatProvider(BaseProvider):
                         yield chunk
 
     def _map_stream_event(
-        self, raw: str, tool_index: dict[int, tuple[str, str]], state: dict[str, Any]
+        self,
+        raw: str,
+        tool_index: dict[int, tuple[str, str]],
+        state: _CompatStreamState,
     ) -> list[StreamChunk]:
         """单个 OpenAI chat.completion.chunk → 零或多个 StreamChunk。
 
@@ -221,18 +237,18 @@ class OpenAICompatProvider(BaseProvider):
             )
 
         model = data.get("model") or ""
-        if model and not state.get("model_seen") and chunks:
+        if model and not state.model_seen and chunks:
             # 真实模型名：首个带 model 的事件内首个产出事件填一次即可
             chunks[0].model = model
-            state["model_seen"] = True
+            state.model_seen = True
         return chunks
 
     @staticmethod
     def _emit_tool_stops(
-        tool_index: dict[int, tuple[str, str]], state: dict[str, Any]
+        tool_index: dict[int, tuple[str, str]], state: _CompatStreamState
     ) -> list[StreamChunk]:
         """为所有已收到但尚未补发停点的 tool_calls 补发 tool_use_stop。"""
-        stopped: set = state.setdefault("stopped", set())
+        stopped = state.stopped
         chunks: list[StreamChunk] = []
         for index in sorted(tool_index):
             if index in stopped:

@@ -271,8 +271,8 @@ class TestGenerateSummaryRegression:
         with _patch_db_and_llm(client):
             result = await svc.generate_summary(config)
 
-        assert result["summary_text"] == "聚合正文"
-        assert result["model"] == "gpt-4"
-        assert result["usage"] is usage
-        assert result["record_count"] == 2
+        assert result.summary_text == "聚合正文"
+        assert result.model == "gpt-4"
+        assert result.usage is usage
+        assert result.record_count == 2
         client.stream_chat.assert_called_once()

@@ -17,7 +17,7 @@ from ..llm import ChatResponse, Message, collect, get_llm_client
 from ..llm.models import StreamAggregator, StreamChunk, Usage
 from ..memory.service import MemoryService
 from ..notification_service import notification_service
-from .models import SummaryJobConfig, SummaryRecord
+from .models import SummaryJobConfig, SummaryRecord, SummaryResult
 
 # 内部常量 —— 用户可自定义的 prompt 结构，不暴露到 config.ini
 _USER_PROMPT_TEMPLATE = (
@@ -289,11 +289,11 @@ class SummaryService:
         response.latency = int((time.monotonic() - t0) * 1000)
         return response
 
-    async def generate_summary(self, job_config: SummaryJobConfig) -> dict:
+    async def generate_summary(self, job_config: SummaryJobConfig) -> SummaryResult:
         """查询数据库，格式化记录，调用 LLM（预览用，不含记忆注入）。
 
-        返回字典，包含以下键：summary_text、model、usage、record_count、
-        date_from、date_to。
+        返回 :class:`SummaryResult`（summary_text、model、usage、latency_ms、
+        record_count、date_from、date_to）。
         """
         messages, record_count, date_from, date_to = self._build_preview_context(
             job_config
@@ -301,15 +301,15 @@ class SummaryService:
 
         response = await self._call_llm(messages, job_config)
 
-        return {
-            "summary_text": response.content,
-            "model": response.model,
-            "usage": response.usage,
-            "latency_ms": response.latency,
-            "record_count": record_count,
-            "date_from": date_from,
-            "date_to": date_to,
-        }
+        return SummaryResult(
+            summary_text=response.content,
+            model=response.model,
+            usage=response.usage,
+            latency_ms=response.latency,
+            record_count=record_count,
+            date_from=date_from,
+            date_to=date_to,
+        )
 
     async def generate_summary_stream(
         self,
@@ -494,19 +494,19 @@ class SummaryService:
             )
             return
 
-        result = {
-            "summary_text": response.content,
-            "model": response.model,
-            "usage": response.usage,
-            "latency_ms": response.latency,
-            "record_count": len(records),
-            "date_from": date_from,
-            "date_to": date_to,
-        }
+        result = SummaryResult(
+            summary_text=response.content,
+            model=response.model,
+            usage=response.usage,
+            latency_ms=response.latency,
+            record_count=len(records),
+            date_from=date_from,
+            date_to=date_to,
+        )
         self._send_success_notification(job_config, result)
 
     def _send_success_notification(
-        self, job_config: SummaryJobConfig, result: dict
+        self, job_config: SummaryJobConfig, result: SummaryResult
     ) -> None:
         """发送成功通知（webhook + 邮件）。
 
@@ -514,7 +514,7 @@ class SummaryService:
         不写站内信（write_in_app=False）。
         """
         user_name = job_config.user_name.strip() if job_config.user_name else ""
-        usage = result["usage"]
+        usage = result.usage
         notification_service.notify(
             f"watching_summary_{job_config.name}",
             source="summary",
@@ -522,11 +522,11 @@ class SummaryService:
             write_in_app=False,
             job_name=job_config.name,
             user_name=user_name,
-            summary_text=result["summary_text"],
-            date_range=f"{result['date_from']} ~ {result['date_to']}",
-            record_count=result["record_count"],
+            summary_text=result.summary_text,
+            date_range=f"{result.date_from} ~ {result.date_to}",
+            record_count=result.record_count,
             lookback_days=job_config.lookback_days,
-            model=result["model"],
+            model=result.model,
             tokens_used=usage.total_tokens if usage else 0,
         )
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.services.llm.models import Usage
+
 
 @dataclass
 class SummaryJobConfig:
@@ -88,3 +90,20 @@ class SummaryRecord:
     consumed_run_ids: set[str] = field(
         default_factory=set
     )  # 消费标记（多对多，空集=未消费）
+
+
+@dataclass
+class SummaryResult:
+    """``generate_summary`` / 成功通知链路的聚合结果 DTO。
+
+    字段与旧结果 dict 的键集一一对应
+    （summary_text/model/usage/latency_ms/record_count/date_from/date_to）。
+    """
+
+    summary_text: str = ""
+    model: str = ""
+    usage: Usage | None = None
+    latency_ms: int = 0
+    record_count: int = 0
+    date_from: str = ""
+    date_to: str = ""

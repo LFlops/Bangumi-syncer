@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import logger
@@ -30,6 +31,21 @@ from app.services.llm.models import (
 from app.services.llm.providers.base import BaseProvider
 from app.services.llm.sse import SSEEvent, iter_sse_events
 from app.utils.http_client import create_async_client
+
+
+@dataclass
+class _AnthropicStreamState:
+    """Anthropic 流式的跨事件状态（模块私有）。
+
+    - ``tool_index``：content block index → (tool_use_id, tool_name)
+      （input_json_delta 只带 index，需据此回填 tool_use_id）；
+    - ``input_tokens``：message_start 的输入用量，待 message_delta 合并；
+    - ``stopped``：已补发 tool_use_stop 的 index，避免重复补发。
+    """
+
+    tool_index: dict[int, tuple[str, str]] = field(default_factory=dict)
+    input_tokens: int = 0
+    stopped: set[int] = field(default_factory=set)
 
 
 class AnthropicProvider(BaseProvider):
@@ -156,9 +172,7 @@ class AnthropicProvider(BaseProvider):
         ``input_tokens`` 暂存 message_start 的输入用量，待 message_delta 合并；
         ``pending_model`` 暂存 message_start 的真实模型名，附到首个产出事件上。
         """
-        tool_index: dict[int, tuple[str, str]] = {}
-        stopped: set[int] = set()
-        input_tokens = 0
+        state = _AnthropicStreamState()
         pending_model = ""
         model_sent = False
 
@@ -176,22 +190,22 @@ class AnthropicProvider(BaseProvider):
             etype = event.event or payload.get("type")
 
             if etype == "message_start":
-                input_tokens = self._extract_input_tokens(payload)
+                state.input_tokens = self._extract_input_tokens(payload)
                 pending_model = self._extract_model(payload)
             elif etype == "content_block_start":
-                chunk = self._map_content_block_start(payload, tool_index)
+                chunk = self._map_content_block_start(payload, state)
                 if chunk is not None:
                     yield _attach_model(chunk)
             elif etype == "content_block_delta":
-                chunk = self._map_content_block_delta(payload, tool_index)
+                chunk = self._map_content_block_delta(payload, state)
                 if chunk is not None:
                     yield _attach_model(chunk)
             elif etype == "content_block_stop":
-                chunk = self._map_content_block_stop(payload, tool_index, stopped)
+                chunk = self._map_content_block_stop(payload, state)
                 if chunk is not None:
                     yield _attach_model(chunk)
             elif etype == "message_delta":
-                usage_chunk, stop_chunk = self._map_message_delta(payload, input_tokens)
+                usage_chunk, stop_chunk = self._map_message_delta(payload, state)
                 yield _attach_model(usage_chunk)
                 yield _attach_model(stop_chunk)
             elif etype == "message_stop":
@@ -227,7 +241,7 @@ class AnthropicProvider(BaseProvider):
 
     @staticmethod
     def _map_content_block_start(
-        payload: dict, tool_index: dict[int, tuple[str, str]]
+        payload: dict, state: _AnthropicStreamState
     ) -> StreamChunk | None:
         """content_block_start → tool_use_start；text/thinking 无需立即产出。"""
         block = payload.get("content_block") or {}
@@ -236,7 +250,7 @@ class AnthropicProvider(BaseProvider):
         index = payload.get("index", 0)
         tool_use_id = block.get("id", "")
         tool_name = block.get("name", "")
-        tool_index[index] = (tool_use_id, tool_name)
+        state.tool_index[index] = (tool_use_id, tool_name)
         return StreamChunk(
             type="tool_use_start",
             tool_use_id=tool_use_id,
@@ -245,9 +259,7 @@ class AnthropicProvider(BaseProvider):
 
     @staticmethod
     def _map_content_block_stop(
-        payload: dict,
-        tool_index: dict[int, tuple[str, str]],
-        stopped: set[int],
+        payload: dict, state: _AnthropicStreamState
     ) -> StreamChunk | None:
         """content_block_stop → tool_use_stop（仅对 tool_use 块，且不重复补发）。
 
@@ -255,14 +267,14 @@ class AnthropicProvider(BaseProvider):
         块即意味着其 input_json 已完整、可校验——映射为停点事件。
         """
         index = payload.get("index", 0)
-        if index not in tool_index or index in stopped:
+        if index not in state.tool_index or index in state.stopped:
             return None
-        stopped.add(index)
-        return StreamChunk(type="tool_use_stop", tool_use_id=tool_index[index][0])
+        state.stopped.add(index)
+        return StreamChunk(type="tool_use_stop", tool_use_id=state.tool_index[index][0])
 
     @staticmethod
     def _map_content_block_delta(
-        payload: dict, tool_index: dict[int, tuple[str, str]]
+        payload: dict, state: _AnthropicStreamState
     ) -> StreamChunk | None:
         """content_block_delta → 对应增量事件；未知 delta 类型返回 None。"""
         delta = payload.get("delta") or {}
@@ -281,7 +293,7 @@ class AnthropicProvider(BaseProvider):
             )
         if dtype == "input_json_delta":
             index = payload.get("index", 0)
-            tool_use_id = tool_index.get(index, ("", ""))[0]
+            tool_use_id = state.tool_index.get(index, ("", ""))[0]
             if not tool_use_id:
                 logger.warning(
                     "input_json_delta 缺少 content_block_start 映射，index=%r", index
@@ -296,7 +308,7 @@ class AnthropicProvider(BaseProvider):
 
     @staticmethod
     def _map_message_delta(
-        payload: dict, input_tokens: int
+        payload: dict, state: _AnthropicStreamState
     ) -> tuple[StreamChunk, StreamChunk]:
         """message_delta → (usage 事件, stop 事件)。
 
@@ -306,9 +318,9 @@ class AnthropicProvider(BaseProvider):
         usage_data = payload.get("usage") or {}
         output_tokens = int(usage_data.get("output_tokens", 0) or 0)
         usage = Usage(
-            prompt_tokens=input_tokens,
+            prompt_tokens=state.input_tokens,
             completion_tokens=output_tokens,
-            total_tokens=input_tokens + output_tokens,
+            total_tokens=state.input_tokens + output_tokens,
         )
         stop_reason = (payload.get("delta") or {}).get("stop_reason")
         return (

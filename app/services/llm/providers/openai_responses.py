@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import logger
@@ -35,6 +36,21 @@ from app.services.llm.models import (
 from app.services.llm.providers.base import BaseProvider
 from app.services.llm.sse import SSEEvent, iter_sse_events
 from app.utils.http_client import create_async_client
+
+
+@dataclass
+class _ResponsesStreamState:
+    """Responses 流式的跨事件状态（模块私有）。
+
+    - ``item_call_ids``：item.id → call_id 映射（function_call_arguments.delta
+      只带 item_id）；
+    - ``stopped``：已补发 tool_use_stop 的 call_id，避免重复补发；
+    - ``model_sent``：真实模型名是否已附到首个产出事件上。
+    """
+
+    item_call_ids: dict[str, str] = field(default_factory=dict)
+    stopped: set[str] = field(default_factory=set)
+    model_sent: bool = False
 
 
 class OpenAIResponsesProvider(BaseProvider):
@@ -325,18 +341,15 @@ class OpenAIResponsesProvider(BaseProvider):
         body = self._build_request(messages, **kwargs)
         body["stream"] = True
 
-        # item.id → call_id 映射（function_call_arguments.delta 只带 item_id）
-        item_call_ids: dict[str, str] = {}
-        stopped: set[str] = set()
-        model_sent = False
+        # 跨事件状态：item.id → call_id 映射 + 已补发停点集合 + 模型名是否已附
+        state = _ResponsesStreamState()
 
         def _attach_model(chunk: StreamChunk, response_data: dict) -> StreamChunk:
-            nonlocal model_sent
-            if not model_sent:
+            if not state.model_sent:
                 model = response_data.get("model") or ""
                 if model:
                     chunk.model = model
-                    model_sent = True
+                    state.model_sent = True
             return chunk
 
         async with create_async_client(
@@ -366,7 +379,9 @@ class OpenAIResponsesProvider(BaseProvider):
                     if name == "response.output_item.added":
                         item = payload.get("item") or {}
                         if item.get("type") == "function_call":
-                            item_call_ids[item.get("id", "")] = item.get("call_id", "")
+                            state.item_call_ids[item.get("id", "")] = item.get(
+                                "call_id", ""
+                            )
                             yield _attach_model(
                                 StreamChunk(
                                     type="tool_use_start",
@@ -389,7 +404,7 @@ class OpenAIResponsesProvider(BaseProvider):
                         )
                     elif name == "response.function_call_arguments.delta":
                         item_id = payload.get("item_id", "")
-                        tool_use_id = payload.get("call_id") or item_call_ids.get(
+                        tool_use_id = payload.get("call_id") or state.item_call_ids.get(
                             item_id, item_id
                         )
                         yield _attach_model(
@@ -412,8 +427,8 @@ class OpenAIResponsesProvider(BaseProvider):
                         item = payload.get("item") or {}
                         if item.get("type") == "function_call":
                             call_id = item.get("call_id", "")
-                            if call_id not in stopped:
-                                stopped.add(call_id)
+                            if call_id not in state.stopped:
+                                state.stopped.add(call_id)
                                 yield _attach_model(
                                     StreamChunk(
                                         type="tool_use_stop", tool_use_id=call_id

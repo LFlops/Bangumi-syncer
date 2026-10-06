@@ -157,8 +157,8 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
     target = _find_config(decoded)
     job_config = SummaryJobConfig.from_config_dict(target)
     result = await summary_service.generate_summary(job_config)
-    summary_text = result["summary_text"]
-    usage = result.get("usage")
+    summary_text = result.summary_text
+    usage = result.usage
 
     if not summary_text:
         # 空内容即失败（usage 存在但空 choices 仍可能是失败调用）
@@ -166,19 +166,19 @@ async def test_summary_job(name: str, _=Depends(get_current_user_flexible)):
             success=False,
             job_name=job_config.name,
             error_message="LLM 调用失败：所有重试均已耗尽",
-            record_count=result["record_count"],
+            record_count=result.record_count,
         )
 
     return SummaryJobTestResponse(
         success=True,
         job_name=job_config.name,
         summary_text=summary_text,
-        model=result["model"],
+        model=result.model,
         prompt_tokens=usage.prompt_tokens if usage else 0,
         completion_tokens=usage.completion_tokens if usage else 0,
         total_tokens=usage.total_tokens if usage else 0,
-        latency_ms=result.get("latency_ms", 0),
-        record_count=result["record_count"],
+        latency_ms=result.latency_ms,
+        record_count=result.record_count,
     )
 
 

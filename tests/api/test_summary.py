@@ -17,6 +17,7 @@ from app.models.summary import (
     SummaryJobTestResponse,
     SummaryJobUpdate,
 )
+from app.services.summary.models import SummaryResult
 
 # ========== LLMConfigResponse ==========
 
@@ -1414,16 +1415,16 @@ class TestTestSummaryJob:
                 },
             ]
             mock_service.generate_summary = AsyncMock(
-                return_value={
-                    "summary_text": "Today you watched 3 episodes.",
-                    "model": "gpt-4o-mini",
-                    "usage": Usage(
+                return_value=SummaryResult(
+                    summary_text="Today you watched 3 episodes.",
+                    model="gpt-4o-mini",
+                    usage=Usage(
                         prompt_tokens=100, completion_tokens=50, total_tokens=150
                     ),
-                    "record_count": 3,
-                    "date_from": "2024-01-01",
-                    "date_to": "2024-01-02",
-                }
+                    record_count=3,
+                    date_from="2024-01-01",
+                    date_to="2024-01-02",
+                )
             )
 
             async with AsyncClient(
@@ -1515,16 +1516,16 @@ class TestTestSummaryJob:
                 },
             ]
             mock_service.generate_summary = AsyncMock(
-                return_value={
-                    "summary_text": "",  # 空正文（如重试耗尽）
-                    "model": "gpt-4o-mini",
-                    "usage": Usage(
+                return_value=SummaryResult(
+                    summary_text="",  # 空正文（如重试耗尽）
+                    model="gpt-4o-mini",
+                    usage=Usage(
                         prompt_tokens=100, completion_tokens=0, total_tokens=100
                     ),
-                    "record_count": 3,
-                    "date_from": "2024-01-01",
-                    "date_to": "2024-01-02",
-                }
+                    record_count=3,
+                    date_from="2024-01-01",
+                    date_to="2024-01-02",
+                )
             )
 
             async with AsyncClient(
@@ -2619,16 +2620,16 @@ class TestTestSummaryJobStream:
             ):
                 mock_cm.get_summary_configs.return_value = [_job_config_dict()]
                 mock_service.generate_summary = AsyncMock(
-                    return_value={
-                        "summary_text": "聚合结果",
-                        "model": "gpt-4o-mini",
-                        "usage": Usage(
+                    return_value=SummaryResult(
+                        summary_text="聚合结果",
+                        model="gpt-4o-mini",
+                        usage=Usage(
                             prompt_tokens=10, completion_tokens=5, total_tokens=15
                         ),
-                        "record_count": 3,
-                        "date_from": "2024-01-01",
-                        "date_to": "2024-01-02",
-                    }
+                        record_count=3,
+                        date_from="2024-01-01",
+                        date_to="2024-01-02",
+                    )
                 )
 
                 response = await client.post("/api/summary/jobs/Test%20Job/test")

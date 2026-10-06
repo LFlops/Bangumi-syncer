@@ -198,8 +198,8 @@ class TestGenerateSummary:
         now = datetime.now()
         expected_date_to = now.strftime("%Y-%m-%d")
         expected_date_from = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-        assert result["date_from"] == expected_date_from
-        assert result["date_to"] == expected_date_to
+        assert result.date_from == expected_date_from
+        assert result.date_to == expected_date_to
 
     @pytest.mark.asyncio
     async def test_user_name_filter_passed_to_db(self):
@@ -430,7 +430,7 @@ class TestGenerateSummary:
 
             result = await svc.generate_summary(config)
 
-        assert result["record_count"] == 0
+        assert result.record_count == 0
         # 验证用户提示中包含"（无记录）"
         args, _ = mock_llm_client.stream_chat.call_args
         user_content = args[0][1].content
@@ -459,12 +459,12 @@ class TestGenerateSummary:
 
             result = await svc.generate_summary(config)
 
-        assert result["summary_text"] == "summary here"
-        assert result["model"] == "gpt-4"
-        assert result["usage"] is expected_usage
-        assert result["record_count"] == 2
-        assert result["date_from"] is not None
-        assert result["date_to"] is not None
+        assert result.summary_text == "summary here"
+        assert result.model == "gpt-4"
+        assert result.usage is expected_usage
+        assert result.record_count == 2
+        assert result.date_from is not None
+        assert result.date_to is not None
 
 
 # ── execute_job ─────────────────────────────────────────────────────────
