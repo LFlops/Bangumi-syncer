@@ -290,8 +290,8 @@ async def continue_run(
 
         # 终局响应直接分派（**先于**预算耗尽判定），避免无谓重调 LLM 与
         # 末轮已 submit 却被误判 exhausted 丢失提交。
-        stop: str = last_response.get("stop_reason") or ""
-        tcs = last_response.get("tool_calls") or []
+        stop: str = last_response.stop_reason or ""
+        tcs = last_response.tool_calls
 
         if stop == "end_turn":
             # 无建议：直接标记，不调 LLM（透传 replay 累计 tokens，口径同其它终态）
@@ -303,11 +303,9 @@ async def continue_run(
             return
 
         # 捕获终止工具调用（终局）→ 走场景校验落库路径
-        submit_tc = next(
-            (tc for tc in tcs if tc.get("name") == hooks.terminal_tool), None
-        )
+        submit_tc = next((tc for tc in tcs if tc.name == hooks.terminal_tool), None)
         if submit_tc is not None:
-            sug = submit_tc.get("input") or {}
+            sug = submit_tc.input or {}
             result = RunResult(
                 stop_reason=hooks.terminal_tool,
                 suggestion=sug,
@@ -349,8 +347,8 @@ async def continue_run(
         terminal_reason = normalize_stop_reason(
             stop,
             has_tool_calls=bool(tcs),
-            blocks=last_response.get("blocks"),
-            content=last_response.get("content") or "",
+            blocks=last_response.blocks,
+            content=last_response.content or "",
         )
 
         if terminal_reason in ("llm_error", "max_tokens"):
@@ -515,7 +513,7 @@ async def _execute_continuation(
 
 
 async def _replay_missing_tool(
-    tool_call: dict,
+    tool_call: trace.ReplayToolCall,
     registry: ToolRegistry,
     messages: list[Message],
     *,
@@ -539,11 +537,13 @@ async def _replay_missing_tool(
     （iteration 由调用方通过 ``begin_replayed_round`` 锚定），保证二次 replay
     不再判缺失（replay 自包含）。
     """
-    name = (tool_call or {}).get("name")
+    name = tool_call.name
     if not name:
+        # 防御分支：缺失工具无 name 无法执行/登记，跳过并留日志（不静默）
+        logger.debug("🤖 恢复补执行：缺失工具无 name，跳过")
         return
-    args = (tool_call or {}).get("input") or {}
-    tool_use_id = (tool_call or {}).get("id", "")
+    args = tool_call.input or {}
+    tool_use_id = tool_call.id
     defn = registry.get(name)
 
     # 落 tool_execute span（如果提供了 recorder）

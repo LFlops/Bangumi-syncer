@@ -42,7 +42,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from app.core.config_secret_crypto import decrypt, encrypt
 from app.core.database import get_database_manager
@@ -221,6 +221,37 @@ def record_budget_message(span_id: str, budget_message: str) -> None:
 # ----------------------------------------------------------------------
 
 
+class ReplayToolCall(BaseModel):
+    """``response.tool_calls`` 单项的类型化视图（写侧 schema 见模块 docstring）。
+
+    宽容解析：缺字段取默认值、忽略额外字段（兼容旧/新数据）；单个元素无法模型化
+    时由解析层 **丢弃并 warning**（见 :func:`_parse_tool_calls`），不中断重放。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = ""
+    name: str = ""
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class ReplayResponse(BaseModel):
+    """``llm_chat.replay_delta.response`` 的类型化视图（写侧 schema 见模块 docstring）。
+
+    - 缺字段取默认值、忽略额外字段（宽容，兼容旧/新数据）。
+    - ``blocks`` 保持**原始值**（通常为 list）：内容块恢复/逐元素非法校验统一由
+      :func:`_restore_response_blocks` 承担（含非列表回退），此处不重复校验，避免
+      损坏的 ``blocks`` 直接触发 ValidationError 而丢掉整轮重放。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    stop_reason: str = ""
+    content: str = ""
+    tool_calls: list[ReplayToolCall] = Field(default_factory=list)
+    blocks: Any = None
+
+
 @dataclass
 class ReplayResult:
     """断点重放结果。
@@ -239,8 +270,8 @@ class ReplayResult:
 
     messages: list[Message] = field(default_factory=list)
     executed_iterations: int = 0
-    missing_tool_calls: list[dict] = field(default_factory=list)
-    last_response: dict | None = None
+    missing_tool_calls: list[ReplayToolCall] = field(default_factory=list)
+    last_response: ReplayResponse | None = None
     total_tokens: int = 0
 
 
@@ -251,9 +282,64 @@ def _parse_json(raw: str | None, default: Any = None) -> Any:
         return default
 
 
-def _parse_response(chat_step: dict) -> dict:
+def _coerce_str(value: Any) -> str:
+    """把任意标量宽容归一为字符串（缺失 → 空串），避免脏类型触发模型校验失败。"""
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _parse_tool_calls(raw_tool_calls: Any) -> list[ReplayToolCall]:
+    """宽容解析 ``response.tool_calls``：逐元素丢弃非法项并 warning，绝不中断重放。
+
+    - ``None`` → 空列表（字段缺失）。
+    - 非列表 → 记 warning 后按空处理（损坏数据，回退 blocks 推导）。
+    - 元素无法模型化（非 dict / 字段类型非法）→ 丢弃该元素并记 warning，保留合法项。
+    """
+    if raw_tool_calls is None:
+        return []
+    if not isinstance(raw_tool_calls, list):
+        logger.warning(
+            f"[trace] replay response.tool_calls 非列表"
+            f"（type={type(raw_tool_calls).__name__}），按空处理"
+        )
+        return []
+    valid: list[ReplayToolCall] = []
+    dropped: list[str] = []
+    for tc in raw_tool_calls:
+        try:
+            valid.append(ReplayToolCall.model_validate(tc))
+        except Exception:
+            dropped.append(type(tc).__name__)
+    if dropped:
+        logger.warning(
+            f"[trace] replay response.tool_calls 丢弃非法元素 {len(dropped)}/"
+            f"{len(raw_tool_calls)}（类型={dropped}），保留合法项"
+        )
+    return valid
+
+
+def _parse_response(chat_step: dict) -> ReplayResponse | None:
+    """解析 ``llm_chat`` 的 ``replay_delta.response`` 为 :class:`ReplayResponse`。
+
+    返回 ``None`` 与旧实现的「空 response」语义一致：delta 缺失/非 dict、无
+    ``response`` 字段、或 ``response`` 为空 dict → 调用方在该轮 break（从该轮重新
+    chat）。坏 ``tool_calls`` 元素由 :func:`_parse_tool_calls` 丢弃并 warning。
+    """
     obj = _parse_json(chat_step.get("replay_delta"), {})
-    return obj.get("response", {}) if isinstance(obj, dict) else {}
+    if not isinstance(obj, dict):
+        return None
+    raw = obj.get("response")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    return ReplayResponse(
+        stop_reason=_coerce_str(raw.get("stop_reason")),
+        content=_coerce_str(raw.get("content")),
+        tool_calls=_parse_tool_calls(raw.get("tool_calls")),
+        blocks=raw.get("blocks"),
+    )
 
 
 def _parse_tool_result(step: dict) -> dict | None:
@@ -275,7 +361,7 @@ def _extract_budget_message(step: dict) -> str | None:
 _CONTENT_BLOCK_ADAPTER: TypeAdapter[ContentBlock] = TypeAdapter(ContentBlock)
 
 
-def _restore_response_blocks(response: dict) -> list[ContentBlock] | None:
+def _restore_response_blocks(response: ReplayResponse) -> list[ContentBlock] | None:
     """从 llm_chat ``response.blocks`` 还原内容块列表（保持原顺序）。
 
     返回 ``None`` 表示应回退 ``tool_calls`` 重建逻辑：
@@ -286,7 +372,7 @@ def _restore_response_blocks(response: dict) -> list[ContentBlock] | None:
       丢弃数量与类型）；避免任一坏元素导致整体回退而**丢失 thinking**（续跑被拒）。
     - 全部元素非法 → 无合法块可保留，记 warning 后回退 ``tool_calls`` 重建。
     """
-    raw_blocks = response.get("blocks")
+    raw_blocks = response.blocks
     if raw_blocks is None or raw_blocks == []:
         return None
     if not isinstance(raw_blocks, list):
@@ -381,8 +467,8 @@ def replay(run_id: str) -> ReplayResult:
 
     messages: list[Message] = list(seed_messages)
     executed_iterations = 0
-    missing_tool_calls: list[dict] = []
-    last_response: dict | None = None
+    missing_tool_calls: list[ReplayToolCall] = []
+    last_response: ReplayResponse | None = None
 
     for it in sorted(steps_by_iter.keys()):
         isteps = steps_by_iter[it]
@@ -395,7 +481,7 @@ def replay(run_id: str) -> ReplayResult:
             break
 
         response = _parse_response(chat)
-        if not response:
+        if response is None:
             # 空 delta（异常数据）：在该轮 break，交回调用方从该轮重新 chat
             logger.info(
                 f"[trace] replay iteration={it} llm_chat replay_delta 为空"
@@ -403,7 +489,7 @@ def replay(run_id: str) -> ReplayResult:
             )
             break
 
-        tool_calls: list[dict[str, Any]] = response.get("tool_calls") or []
+        tool_calls: list[ReplayToolCall] = list(response.tool_calls)
         # 重建 assistant 消息：优先消费全量 blocks（含 thinking，与 live
         # ``list(resp.blocks)`` 逐条一致）；blocks 缺失/非法时回退 tool_calls
         # （旧数据兼容）。thinking 块必须随 tool_use 回传，否则续跑请求会 400。
@@ -414,10 +500,9 @@ def replay(run_id: str) -> ReplayResult:
         if not tool_calls and blocks is not None:
             derived = [b for b in blocks if isinstance(b, ToolUseBlock)]
             if derived:
-                derived_calls: list[dict[str, Any]] = [
-                    {"id": b.id, "name": b.name, "input": b.input} for b in derived
+                tool_calls = [
+                    ReplayToolCall(id=b.id, name=b.name, input=b.input) for b in derived
                 ]
-                tool_calls = derived_calls
                 logger.warning(
                     f"[trace] replay iteration={it} tool_calls 缺失/为空但 blocks 含 "
                     f"{len(derived)} 个 tool_use，已从 blocks 推导"
@@ -430,9 +515,9 @@ def replay(run_id: str) -> ReplayResult:
         else:
             assistant_content.extend(
                 ToolUseBlock(
-                    id=tc.get("id", ""),
-                    name=tc.get("name", ""),
-                    input=tc.get("input", {}) or {},
+                    id=tc.id,
+                    name=tc.name,
+                    input=tc.input or {},
                 )
                 for tc in tool_calls
             )
@@ -477,7 +562,7 @@ def replay(run_id: str) -> ReplayResult:
                 if bm is not None:
                     budget_message = bm
 
-            missing = [tc for tc in tool_calls if tc.get("id") not in recorded_ids]
+            missing = [tc for tc in tool_calls if tc.id not in recorded_ids]
             if missing:
                 # 最后一轮工具未全部执行完：返回缺失项供调用方补执行；
                 # 该轮未完整，不追加预算消息、不计入 executed_iterations

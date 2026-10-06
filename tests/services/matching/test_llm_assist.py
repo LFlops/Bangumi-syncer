@@ -18,7 +18,11 @@ import pytest
 from app.core.database import database_manager, set_database_manager
 from app.services.agent import recorder as agent_recorder, runtime as agent_runtime
 from app.services.agent.loop import RunResult
-from app.services.agent.trace import ReplayResult
+from app.services.agent.trace import (
+    ReplayResponse,
+    ReplayResult,
+    ReplayToolCall,
+)
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -2930,15 +2934,23 @@ def _make_replay_result(
     *,
     executed: int = 0,
     missing: list | None = None,
-    last_response: dict | None = None,
+    last_response: dict | ReplayResponse | None = None,
     messages: list | None = None,
     total_tokens: int = 0,
 ) -> ReplayResult:
+    # 测试便捷构造：dict → 类型化模型（与生产 replay 解析后的类型一致）
+    resp = (
+        ReplayResponse.model_validate(last_response)
+        if isinstance(last_response, dict)
+        else last_response
+    )
     return ReplayResult(
         messages=messages or [Message(role="system", content="s")],
         executed_iterations=executed,
-        missing_tool_calls=missing or [],
-        last_response=last_response,
+        missing_tool_calls=[
+            ReplayToolCall.model_validate(tc) for tc in (missing or [])
+        ],
+        last_response=resp,
         total_tokens=total_tokens,
     )
 
@@ -3122,7 +3134,7 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
 
     # 缺失工具补执行一次，并锚定同轮 span（sequence=0）
     backfill.assert_awaited_once()
-    assert backfill.await_args.args[0] == missing
+    assert backfill.await_args.args[0] == ReplayToolCall.model_validate(missing)
     assert backfill.await_args.kwargs.get("sequence") == 0
     assert backfill.await_args.kwargs.get("span_recorder") is not None
     # 回填后进入下一轮 loop_run 续跑（1 次 LLM 调用）
@@ -3660,7 +3672,9 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
     before = _count_tool_results(messages)
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "t2", "name": "get_subject_detail", "input": {"subject_id": "2"}},
+            ReplayToolCall(
+                id="t2", name="get_subject_detail", input={"subject_id": "2"}
+            ),
             registry,
             messages,
         )
@@ -3719,7 +3733,9 @@ def test_replay_missing_write_tool_appends_placeholder_tool_result():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "w1", "name": "write_mapping", "input": {}}, registry, messages
+            ReplayToolCall(id="w1", name="write_mapping", input={}),
+            registry,
+            messages,
         )
     )
 
@@ -3739,7 +3755,9 @@ def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "s1", "name": "submit_suggestion", "input": {"subject_id": "1"}},
+            ReplayToolCall(
+                id="s1", name="submit_suggestion", input={"subject_id": "1"}
+            ),
             registry,
             messages,
         )
@@ -3760,7 +3778,9 @@ def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "u1", "name": "ghost_tool", "input": {}}, registry, messages
+            ReplayToolCall(id="u1", name="ghost_tool", input={}),
+            registry,
+            messages,
         )
     )
 
@@ -3790,7 +3810,7 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "t9", "name": "get_subject_detail", "input": {}},
+            ReplayToolCall(id="t9", name="get_subject_detail", input={}),
             registry,
             messages,
         )
@@ -3824,7 +3844,9 @@ def test_replay_missing_non_idempotent_read_tool_still_replayed():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "r1", "name": "read_non_idem", "input": {}}, registry, messages
+            ReplayToolCall(id="r1", name="read_non_idem", input={}),
+            registry,
+            messages,
         )
     )
 
@@ -3854,7 +3876,9 @@ def test_replay_missing_idempotent_write_tool_appends_placeholder():
 
     asyncio.run(
         agent_runtime._replay_missing_tool(
-            {"id": "w1", "name": "write_idem", "input": {}}, registry, messages
+            ReplayToolCall(id="w1", name="write_idem", input={}),
+            registry,
+            messages,
         )
     )
 

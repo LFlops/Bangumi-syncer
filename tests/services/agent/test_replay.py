@@ -228,7 +228,7 @@ class TestReplayReconstructsFullRun:
         ]
         assert result.messages == expected
         assert result.last_response is not None
-        assert result.last_response["stop_reason"] == "end_turn"
+        assert result.last_response.stop_reason == "end_turn"
         assert result.executed_iterations == 1
         assert result.missing_tool_calls == []
 
@@ -538,14 +538,21 @@ class TestReplayRebuildsFullBlocks:
         """全部元素非法 → 返回 None（交由既有 tool_calls 回退）。"""
         assert (
             trace._restore_response_blocks(
-                {"blocks": [{"type": "bad-1"}, {"type": "bad-2"}]}
+                trace.ReplayResponse.model_validate(
+                    {"blocks": [{"type": "bad-1"}, {"type": "bad-2"}]}
+                )
             )
             is None
         )
 
     def test_restore_blocks_non_list_returns_none(self, log_records):
         """输入非列表 → 返回 None。"""
-        assert trace._restore_response_blocks({"blocks": {"not": "a list"}}) is None
+        assert (
+            trace._restore_response_blocks(
+                trace.ReplayResponse.model_validate({"blocks": {"not": "a list"}})
+            )
+            is None
+        )
 
     def test_derives_tool_calls_from_blocks_when_field_missing(self, dbm, log_records):
         """``tool_calls`` 字段缺失但 blocks 含 tool_use → 从 blocks 推导（不丢工具调用）。
@@ -578,7 +585,7 @@ class TestReplayRebuildsFullBlocks:
         assert [type(b) for b in assistant.content] == [ToolUseBlock]
         assert assistant.content[0].id == "t1"
         # 未执行 → missing 基于推导出的 tool_calls 生效
-        assert [tc["id"] for tc in result.missing_tool_calls] == ["t1"]
+        assert [tc.id for tc in result.missing_tool_calls] == ["t1"]
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("blocks" in line and "推导" in line for line in warns)
 
@@ -627,12 +634,12 @@ class TestReplayRebuildsFullBlocks:
         result = trace.replay("run-term-th")
 
         assert result.last_response is not None
-        assert result.last_response["stop_reason"] == "tool_use"
-        tcs = result.last_response["tool_calls"]
-        assert [tc["name"] for tc in tcs] == ["submit_suggestion"]
-        assert tcs[0]["input"] == submit_input
+        assert result.last_response.stop_reason == "tool_use"
+        tcs = result.last_response.tool_calls
+        assert [tc.name for tc in tcs] == ["submit_suggestion"]
+        assert tcs[0].input == submit_input
         # 终止工具未执行 → 计入缺失供 runtime 分派（语义不变）
-        assert [tc["id"] for tc in result.missing_tool_calls] == ["t9"]
+        assert [tc.id for tc in result.missing_tool_calls] == ["t9"]
 
 
 class TestReplayTotalTokens:
@@ -696,7 +703,7 @@ class TestReplayCheckpointResume:
         # t2 故意不写
 
         result = trace.replay("run-miss")
-        missing_ids = [tc["id"] for tc in result.missing_tool_calls]
+        missing_ids = [tc.id for tc in result.missing_tool_calls]
         assert missing_ids == ["t2"]
         assert result.executed_iterations == 0
         # 已成功的不重跑：t1 的 tool_result 在 messages 中
@@ -753,7 +760,7 @@ class TestReplayCheckpointResume:
 
         result = trace.replay("run-comp")
         assert result.executed_iterations == 1
-        missing_ids = [tc["id"] for tc in result.missing_tool_calls]
+        missing_ids = [tc.id for tc in result.missing_tool_calls]
         assert missing_ids == ["c"]
 
 
@@ -767,8 +774,8 @@ class TestReplayTerminalDispatch:
 
         result = trace.replay("run-end")
         assert result.last_response is not None
-        assert result.last_response["stop_reason"] == "end_turn"
-        assert result.last_response["content"] == "no suggestion"
+        assert result.last_response.stop_reason == "end_turn"
+        assert result.last_response.content == "no suggestion"
         assert result.executed_iterations == 0
 
     def test_break_on_empty_delta_no_exception(self, dbm):
@@ -920,7 +927,7 @@ class TestReplayAbnormalBranchLogging:
         result = trace.replay("run-tr-bad")
 
         # 该工具未记录 → 计入 missing_tool_calls
-        assert [tc["id"] for tc in result.missing_tool_calls] == ["t1"]
+        assert [tc.id for tc in result.missing_tool_calls] == ["t1"]
         # 不追加任何 tool_result 消息
         tr_msgs = [
             m
@@ -930,3 +937,108 @@ class TestReplayAbnormalBranchLogging:
         assert tr_msgs == []
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("tool_result" in line for line in warns)
+
+
+class TestReplayResponseTolerantModel:
+    """批次2：response/tool_calls 模型化（ReplayResponse/ReplayToolCall）后的宽容解析。"""
+
+    def test_parse_response_returns_none_on_empty_delta_and_empty_response(self):
+        """空 delta / 空 response → None（与旧实现「空 response 判假 break」语义一致）。"""
+        assert trace._parse_response({"replay_delta": ""}) is None
+        assert trace._parse_response({"replay_delta": {"response": {}}}) is None
+        assert trace._parse_response({"replay_delta": None}) is None
+
+    def test_parse_response_missing_fields_uses_defaults(self, dbm):
+        """response 缺 content/tool_calls/blocks → 取默认值，不抛异常。"""
+        _write_seed(dbm, "run-tolerant", [])
+        span_id = trace.start_span("run-tolerant", "llm_chat", 0, 0)
+        trace.end_span(span_id, replay_delta={"response": {"stop_reason": "end_turn"}})
+
+        result = trace.replay("run-tolerant")
+
+        resp = result.last_response
+        assert isinstance(resp, trace.ReplayResponse)
+        assert resp.stop_reason == "end_turn"
+        assert resp.content == ""
+        assert resp.tool_calls == []
+        assert resp.blocks is None
+
+    def test_parse_response_extra_fields_ignored(self, dbm):
+        """response 含额外字段 → 忽略，不抛异常、不影响已知字段。"""
+        _write_seed(dbm, "run-extra", [])
+        span_id = trace.start_span("run-extra", "llm_chat", 0, 0)
+        trace.end_span(
+            span_id,
+            replay_delta={
+                "response": {
+                    "stop_reason": "end_turn",
+                    "content": "hi",
+                    "totally_unknown": {"nested": 1},
+                }
+            },
+        )
+
+        result = trace.replay("run-extra")
+
+        resp = result.last_response
+        assert isinstance(resp, trace.ReplayResponse)
+        assert resp.stop_reason == "end_turn"
+        assert resp.content == "hi"
+
+    def test_bad_tool_call_element_dropped_with_warning(self, dbm, log_records):
+        """坏 tool_calls 元素（非 dict）被丢弃并 warning，合法项保留，不中断重放。"""
+        _write_seed(dbm, "run-bad-tc", [])
+        _write_llm_chat(
+            dbm,
+            "run-bad-tc",
+            0,
+            [
+                {"id": "t1", "name": "x", "input": {}},
+                "not-a-dict",
+                123,
+            ],
+        )
+        _write_tool_exec(dbm, "run-bad-tc", 0, 1, "t1", "r1")
+
+        result = trace.replay("run-bad-tc")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        assert [b.id for b in assistant.content] == ["t1"]
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("tool_calls" in line and "丢弃" in line for line in warns)
+
+    def test_non_list_tool_calls_treated_as_empty_with_warning(self, dbm, log_records):
+        """tool_calls 非列表（损坏数据）→ 记 warning 后按空处理。"""
+        _write_seed(dbm, "run-tc-dict", [])
+        span_id = trace.start_span("run-tc-dict", "llm_chat", 0, 0)
+        trace.end_span(
+            span_id,
+            replay_delta={
+                "response": {
+                    "stop_reason": "end_turn",
+                    "content": "x",
+                    "tool_calls": {"not": "a list"},
+                }
+            },
+        )
+
+        result = trace.replay("run-tc-dict")
+
+        assert result.last_response is not None
+        assert result.last_response.tool_calls == []
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("tool_calls" in line and "非列表" in line for line in warns)
+
+    def test_missing_tool_calls_are_typed_models(self, dbm):
+        """missing_tool_calls 元素为 ReplayToolCall（类型化，下游按属性访问）。"""
+        _write_seed(dbm, "run-miss-model", [])
+        _write_llm_chat(
+            dbm, "run-miss-model", 0, [{"id": "t1", "name": "x", "input": {}}]
+        )
+
+        result = trace.replay("run-miss-model")
+
+        assert result.missing_tool_calls
+        assert all(
+            isinstance(tc, trace.ReplayToolCall) for tc in result.missing_tool_calls
+        )
