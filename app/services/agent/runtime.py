@@ -25,7 +25,13 @@ from typing import Any
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent import trace
-from app.services.agent.loop import ChatFn, RunResult, StreamFn, run as loop_run
+from app.services.agent.loop import (
+    ChatFn,
+    RunResult,
+    StreamFn,
+    normalize_stop_reason,
+    run as loop_run,
+)
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
@@ -225,10 +231,13 @@ async def continue_run(
     1. 场景钩子解析 thinking_level / max_iterations（集中配置单一来源）
     2. ``trace.replay`` 重建可续跑消息列表与终局响应
     3. ``last_response`` 终局优先分派（**先于**预算耗尽判定）：
-       - ``end_turn`` → 直接 mark_no_suggestion（不调 LLM）
-       - ``terminal_tool``（或 tool_calls 含终止工具）→ 走场景终局处理
+       - 匹配的 ``terminal_tool`` 调用 → 走场景终局处理
+       - ``stop_reason == terminal_tool`` 但无匹配调用 → 防御降级 exhausted
+       - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run`` 共用判据）：
+         ``end_turn`` → mark_no_suggestion；``max_tokens`` / 空壳 ``llm_error``
+         → 交场景终态处理（llm_assist 落 failed）；``None``（含非终止工具调用）
+         → 补执行缺失只读工具 + 回填结果后续跑 loop
        - ``None``（全部轮次已完整记录）→ 若预算耗尽则落终态，否则续跑 loop
-       - 含 tool_use → 补执行缺失只读工具 + 回填结果后续跑 loop
     4. ``remaining <= 0`` 且非终局 → 落终态 no_suggestion/exhausted
        （否则 run 永久滞留 processing）
 
@@ -281,7 +290,7 @@ async def continue_run(
 
         # 终局响应直接分派（**先于**预算耗尽判定），避免无谓重调 LLM 与
         # 末轮已 submit 却被误判 exhausted 丢失提交。
-        stop = last_response.get("stop_reason")
+        stop: str = last_response.get("stop_reason") or ""
         tcs = last_response.get("tool_calls") or []
 
         if stop == "end_turn":
@@ -320,6 +329,8 @@ async def continue_run(
             # 防御：stop_reason 声称终局，但 tool_calls 中无匹配的终止工具调用，
             # 无真实提交可消费。不得把空 dict 当作有效建议落库（假阳性），
             # 降级为与预算耗尽一致的 exhausted 终态。
+            # 必须先于下方 normalize_stop_reason：其「未知有内容 → end_turn」兜底会把
+            # stop_reason=终止工具名的场景误判为 end_turn。
             logger.warning(
                 f"🤖 恢复续跑 {run_id} stop_reason={stop} 但 tool_calls 无 "
                 f"{hooks.terminal_tool} 调用，无有效终局，降级 exhausted"
@@ -332,7 +343,42 @@ async def continue_run(
             )
             return
 
-        # 含 tool_use（非终局，存在缺失工具）→ 补执行 + 回填后继续 loop
+        # 终局归一化（与 loop.run 共用判据）：max_tokens 超限、空壳 llm_error、
+        # 未知 stop_reason 有内容 → end_turn。置于 submit/终止工具分派之后，
+        # 保证真实工具语义优先；返回 None 表示含非终止工具调用，需续跑。
+        terminal_reason = normalize_stop_reason(
+            stop,
+            has_tool_calls=bool(tcs),
+            blocks=last_response.get("blocks"),
+            content=last_response.get("content") or "",
+        )
+
+        if terminal_reason in ("llm_error", "max_tokens"):
+            # 与 loop.run 一致：显式失败/超限终态，不再当作「待补执行工具轮」反复
+            # 续跑。交场景终态处理（llm_assist 按 stop_reason 落 failed）。
+            result = RunResult(stop_reason=terminal_reason, last_response=None)
+            await hooks.handle_terminal(
+                dbm,
+                run_id,
+                result,
+                ctx,
+                total_tokens=replay_result.total_tokens,
+                notification_service=notification_service,
+            )
+            return
+
+        if terminal_reason == "end_turn":
+            # 未知 stop_reason 但有内容（无工具调用）→ 兼容旧 provider，落 end_turn：
+            # 无建议，不调 LLM（透传 replay 累计 tokens，口径同其它终态）。
+            repo.mark_no_suggestion(
+                run_id,
+                stop_reason="end_turn",
+                total_tokens=replay_result.total_tokens,
+            )
+            return
+
+        # terminal_reason is None → 含 tool_use（非终局，存在缺失工具）
+        # → 补执行 + 回填后继续 loop
         # 该轮 LLM 已发生过，计入预算（remaining 已减）
         remaining = max(0, remaining - 1)
         if remaining <= 0:

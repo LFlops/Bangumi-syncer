@@ -1303,6 +1303,119 @@ async def test_veto_records_injected_tool_result_span_for_replay():
     assert ended_result.is_error is False
 
 
+async def test_veto_multi_tool_round_injects_paired_results_for_all_tool_uses():
+    """多工具轮 veto 暂缓：同轮每条 tool_use 均须有配对 tool_result。
+
+    terminal 工具注入 hint 文案，其余工具注入占位（不执行）；否则下一轮真实
+    OpenAI/Anthropic 端点会因悬空 tool_use 报 400。
+    """
+    search = _tool_use("t1", "search_bangumi", {"title": "foo"})
+    submit = _tool_use("t2", "submit_suggestion", {"subject_id": "1"})
+    second = _tool_use("t3", "submit_suggestion", {"subject_id": "2"})
+    calls: list[list[Message]] = []
+
+    def _side_effect(*args, **kwargs):
+        calls.append(list(args[0]))
+        return _resp("tool_use", [search, submit] if len(calls) == 1 else [second])
+
+    chat_fn = AsyncMock(side_effect=_side_effect)
+    tool_calls_fn = AsyncMock()
+
+    result = await run(
+        chat_fn=chat_fn,
+        tools_schemas=[],
+        tool_calls_fn=tool_calls_fn,
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+        veto_terminal=lambda args: "请再核对",
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    # 暂缓轮其他工具不执行
+    tool_calls_fn.assert_not_awaited()
+    # 第二轮请求前：assistant 同轮含两条 tool_use，二者都必须有配对 tool_result
+    _assistant, results = _last_assistant_tool_use_and_results(calls[1])
+    assert _assistant == ["t1", "t2"]
+    assert set(results) >= {"t1", "t2"}, (
+        f"同轮每条 tool_use 须有配对 tool_result，实际 {set(results)}"
+    )
+    assert results["t2"].content == "请再核对"
+    assert results["t2"].is_error is False
+    assert results["t1"].content == "skipped: deferred by veto"
+    assert results["t1"].is_error is False
+
+
+def _last_assistant_tool_use_and_results(
+    messages: list[Message],
+) -> tuple[list[str], dict[str, ToolResultBlock]]:
+    """取最后一条 assistant 消息的 tool_use id 列表 + 全部 tool_result（按 id）。"""
+    assistant_msg = next(m for m in reversed(messages) if m.role == "assistant")
+    tool_use_ids = [b.id for b in assistant_msg.content if isinstance(b, ToolUseBlock)]
+    results = {
+        b.tool_use_id: b
+        for m in messages
+        if isinstance(m.content, list)
+        for b in m.content
+        if isinstance(b, ToolResultBlock)
+    }
+    return tool_use_ids, results
+
+
+# ---------------------------------------------------------------------------
+# 16b. stop_reason 终局归一化（loop.run 与 runtime.continue_run 共用判据）
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_stop_reason_end_turn_is_terminal():
+    from app.services.agent.loop import normalize_stop_reason
+
+    assert (
+        normalize_stop_reason("end_turn", has_tool_calls=False, blocks=[], content="")
+        == "end_turn"
+    )
+
+
+def test_normalize_stop_reason_with_tool_calls_is_not_terminal():
+    from app.services.agent.loop import normalize_stop_reason
+
+    assert (
+        normalize_stop_reason("tool_use", has_tool_calls=True, blocks=[], content="")
+        is None
+    )
+
+
+def test_normalize_stop_reason_max_tokens_without_tools_is_terminal():
+    from app.services.agent.loop import normalize_stop_reason
+
+    assert (
+        normalize_stop_reason(
+            "max_tokens", has_tool_calls=False, blocks=[], content="partial"
+        )
+        == "max_tokens"
+    )
+
+
+def test_normalize_stop_reason_empty_shell_is_llm_error():
+    from app.services.agent.loop import normalize_stop_reason
+
+    assert (
+        normalize_stop_reason("", has_tool_calls=False, blocks=[], content="")
+        == "llm_error"
+    )
+
+
+def test_normalize_stop_reason_unknown_with_content_is_end_turn():
+    from app.services.agent.loop import normalize_stop_reason
+
+    assert (
+        normalize_stop_reason(
+            "stop_sequence", has_tool_calls=False, blocks=[], content="done"
+        )
+        == "end_turn"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 17. 流式路径（stream_fn + executor_factory）：提前执行 / 保序回填 / 终止语义
 # ---------------------------------------------------------------------------

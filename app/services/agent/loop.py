@@ -74,6 +74,10 @@ FINAL_RECOVERY_MESSAGE = (
     "若已确定则提交 subject_id 与理由；若确实无法确定也请调用并说明放弃理由。"
 )
 
+# veto 暂缓轮：同轮非 terminal 工具的配对 tool_result 占位文案。本轮不执行这些
+# 工具（暂缓），仅用于闭合会话协议，避免悬垂 tool_use 触发下一轮端点 400。
+VETO_DEFERRED_PLACEHOLDER = "skipped: deferred by veto"
+
 
 @dataclass
 class RunResult:
@@ -244,24 +248,33 @@ def _pad_aligned(
     return patched
 
 
-def _inject_veto_hint(
-    messages: list[Message], terminal_tc: ToolUseBlock, hint: str
+def _inject_veto_tool_results(
+    messages: list[Message],
+    tool_calls: Sequence[ToolUseBlock],
+    terminal_tc: ToolUseBlock,
+    hint: str,
 ) -> None:
-    """veto 暂缓：注入与 terminal tool_use 配对的 tool_result（闭合会话协议）。
+    """veto 暂缓：为同轮**全部** tool_use 注入配对 tool_result（闭合会话协议）。
 
-    OpenAI/Anthropic 协议要求 assistant 的 tool_use 后必须跟配对 tool_result，
-    不能只注入 user 文本。
+    OpenAI/Anthropic 协议要求 assistant 的每条 tool_use 后必须跟配对 tool_result，
+    不能只注入 user 文本，**也不能只注入 terminal 的**——同轮其余 tool_use 若无结果
+    即悬垂，下一轮真实端点会报 400。故：
+
+    - terminal 工具 → hint 文案（场景护栏提示）
+    - 其余工具 → 占位文案（本轮暂缓未执行；不重放副作用）
+
+    逐条独立成 ``Message``，与 ``execute_batch`` 的回填格式一致。
     """
-    messages.append(
-        Message(
-            role="user",
-            content=[
-                ToolResultBlock(
-                    tool_use_id=terminal_tc.id, content=hint, is_error=False
-                )
-            ],
+    for tc in tool_calls:
+        content = hint if tc.id == terminal_tc.id else VETO_DEFERRED_PLACEHOLDER
+        messages.append(
+            Message(
+                role="user",
+                content=[
+                    ToolResultBlock(tool_use_id=tc.id, content=content, is_error=False)
+                ],
+            )
         )
-    )
 
 
 def _record_veto_tool(
@@ -292,6 +305,37 @@ def _record_veto_tool(
             tool_use_id=terminal_tc.id, content=hint, is_error=False
         ),
     )
+
+
+def normalize_stop_reason(
+    stop_reason: str,
+    *,
+    has_tool_calls: bool,
+    blocks: Sequence[ContentBlock] | None,
+    content: str,
+) -> str | None:
+    """按 loop 终局判据归一化响应 ``stop_reason``（``run`` 与恢复续跑共用）。
+
+    返回 ``None`` 表示**非终局**（存在工具调用，应进入工具执行/续跑流程）；否则返回
+    归一化后的终局原因：
+
+    - ``end_turn``：显式 end_turn，或未知 stop_reason 但有内容/内容块（兼容旧 provider）
+    - ``max_tokens``：生成长度超限（特殊终态，非故障）
+    - ``llm_error``：空壳响应（``stop_reason == ""`` 且无内容块、无内容）——LLM 调用
+      失败被错误传递，或 provider 异常；不得伪装 end_turn，也不得反复重调 LLM
+
+    判据顺序与 ``run`` 内联逻辑一致：显式 end_turn 优先（即便同轮带工具也视为终态），
+    其次存在工具调用则非终局，最后按 stop_reason 细分。
+    """
+    if stop_reason == "end_turn":
+        return "end_turn"
+    if has_tool_calls:
+        return None
+    if stop_reason == "max_tokens":
+        return "max_tokens"
+    if stop_reason == "" and not blocks and not content:
+        return "llm_error"
+    return "end_turn"
 
 
 async def run(
@@ -374,41 +418,36 @@ async def run(
             assert chat_fn is not None
             resp = await chat_fn(messages, tools=tools_schemas, tool_choice=tool_choice)
 
-        # ① end_turn → 终止
-        if resp.stop_reason == "end_turn":
-            return RunResult(
-                stop_reason="end_turn", text=resp.content, last_response=resp
-            )
-
-        # ② 无 tool_calls → 按 stop_reason 细分终止原因
+        # ① 终局归一化（与恢复续跑 runtime.continue_run 共用同一判据）：
+        #    end_turn / max_tokens / 空壳 llm_error → 直接终止；含工具调用则继续执行。
         tool_calls = _extract_tool_calls(resp)
-        if not tool_calls:
-            if resp.stop_reason == "max_tokens":
-                # 生成长度超限（非故障，但属特殊终态）
-                return RunResult(
-                    stop_reason="max_tokens", text=resp.content, last_response=resp
-                )
-            if resp.stop_reason == "" and not resp.blocks and not resp.content:
+        terminal_reason = normalize_stop_reason(
+            resp.stop_reason,
+            has_tool_calls=bool(tool_calls),
+            blocks=resp.blocks,
+            content=resp.content,
+        )
+        if terminal_reason is not None:
+            if terminal_reason == "llm_error":
                 # 空壳响应（LLM 调用失败后被错误传递到 loop，或 provider 异常）
                 # → 显式标记 llm_error，不再伪装 end_turn
                 return RunResult(stop_reason="llm_error", last_response=resp)
-            # 其余（stop_sequence / stop_reason 未知但有 content 等）维持 end_turn 兼容
             return RunResult(
-                stop_reason="end_turn", text=resp.content, last_response=resp
+                stop_reason=terminal_reason, text=resp.content, last_response=resp
             )
 
-        # ③ 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加。
+        # ② 先将本轮全部 tool_use blocks 聚合为【一条】assistant 消息追加。
         # 同时保留响应中的非工具块（Text/Thinking）：思考模型的 thinking 块必须随
         # tool_use 一并回传（Anthropic/DeepSeek 约束，否则真实端点 400：
         # "content[].thinking ... must be passed back"）；OpenAI 兼容层在 provider
         # 侧按各自协议处理（thinking 块跳过）。
-        # 无需 ``or [ToolUseBlock(...)]`` 兜底：上方 ``if not tool_calls: return`` 已保证
-        # 本轮存在 ToolUseBlock，而 ``tool_calls`` 正是从 ``resp.blocks`` 提取，故
-        # ``resp.blocks`` 必非空，兜底分支不可达。
+        # 无需 ``or [ToolUseBlock(...)]`` 兜底：上方 ``terminal_reason is None`` 仅在
+        # ``has_tool_calls=True`` 时成立，即本轮存在 ToolUseBlock（由 ``resp.blocks``
+        # 提取），故 ``resp.blocks`` 必非空，兜底分支不可达。
         assistant_blocks: list[ContentBlock] = list(resp.blocks)
         messages.append(Message(role="assistant", content=assistant_blocks))
 
-        # ④ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
+        # ③ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
         terminal_tc: ToolUseBlock | None = None
         terminal_idx = -1
         for idx, tc in enumerate(tool_calls):
@@ -432,9 +471,10 @@ async def run(
                     suggestion=terminal_tc.input,
                     last_response=resp,
                 )
-            # 暂缓：不终止、不执行其他工具，注入配对 tool_result 后消耗一轮预算继续。
+            # 暂缓：不终止、不执行其他工具；为同轮**全部** tool_use 注入配对
+            # tool_result（terminal=hint、其余=占位）后消耗一轮预算继续。
             vetoed = True
-            _inject_veto_hint(messages, terminal_tc, hint)
+            _inject_veto_tool_results(messages, tool_calls, terminal_tc, hint)
             _record_veto_tool(recorder, terminal_tc, hint, sequence=terminal_idx)
             remaining -= 1
             continue
