@@ -404,17 +404,20 @@ def replay(run_id: str) -> ReplayResult:
                     f"[trace] replay iteration={it} tool_calls 缺失/为空但 blocks 含 "
                     f"{len(derived)} 个 tool_use，已从 blocks 推导"
                 )
+        # 变量在分支外单点声明：避免分支内注解在更严格的类型检查器下退化为
+        # list[ContentBlock] | list[ToolUseBlock] 联合（Message.content 拒绝该联合）。
+        assistant_content: list[ContentBlock] = []
         if blocks is not None:
-            assistant_content: list[ContentBlock] = blocks
+            assistant_content.extend(blocks)
         else:
-            assistant_content = [
+            assistant_content.extend(
                 ToolUseBlock(
                     id=tc.get("id", ""),
                     name=tc.get("name", ""),
                     input=tc.get("input", {}) or {},
                 )
                 for tc in tool_calls
-            ]
+            )
         assistant_msg = Message(role="assistant", content=assistant_content)
 
         if tool_calls:
