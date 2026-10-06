@@ -194,9 +194,8 @@ def _build_provider(
         "temperature": cfg["temperature"],
         "timeout": cfg["timeout"],
         "proxy": proxy,
-        # 各 provider 构造函数均接受 thinking_level
-        # （openai_compat / openai_responses 映射 reasoning_effort）
-        "thinking_level": cfg.get("thinking_level", "off"),
+        # 不再读取全局 [llm].thinking_level：provider 构造函数默认 "off"，
+        # 思考强度只由每任务 kwargs（stream/chat 的 thinking_level=...）覆盖。
     }
     return cls(**kwargs)
 

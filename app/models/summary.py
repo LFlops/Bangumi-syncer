@@ -17,15 +17,15 @@ class LLMConfigResponse(BaseModel):
     temperature: float = 0.7
     timeout: int = 60
     provider: str = "openai_compat"
-    thinking_level: str = "off"
 
 
 class LLMConfigUpdate(BaseModel):
     """PUT /llm 请求
 
-    provider / thinking_level 为受控枚举：在 API 边界用 Literal 收口，
-    非法值直接 422，避免脏值写入配置后在运行时才暴露（如未知 provider
-    延迟到客户端构建才抛错、未知 thinking_level 被静默降级为 off）。
+    provider 为受控枚举：在 API 边界用 Literal 收口，非法值直接 422，
+    避免脏值写入配置后在运行时才暴露（如未知 provider 延迟到客户端
+    构建才抛错）。全局 thinking_level 已移除——思考强度按任务在各自
+    配置处设置。
     """
 
     api_base: str | None = None
@@ -37,7 +37,6 @@ class LLMConfigUpdate(BaseModel):
     provider: (
         Literal["openai_compat", "anthropic_compat", "openai_responses"] | None
     ) = None
-    thinking_level: Literal["off", "low", "medium", "high"] | None = None
 
 
 class LLMTestResponse(BaseModel):

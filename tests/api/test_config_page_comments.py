@@ -1,7 +1,7 @@
 """
 配置页注释悬浮化改造测试
 
-目标：验证 config 页面中原本以 ``<small class="text-muted">`` 平铺的 8 处注释，
+目标：验证 config 页面中原本以 ``<small class="text-muted">`` 平铺的 7 处注释，
 全部改为 label/按钮旁的问号图标
 （``<i class="bi bi-question-circle ms-1 text-muted" data-bs-toggle="tooltip" title="...">``），
 弹窗内图标需带 ``data-bs-container="body"``。
@@ -106,18 +106,6 @@ def test_llm_api_base_comment_becomes_tooltip_icon():
     title = _find_tooltip_title(llm, "OpenAI 兼容接口请以 /v1 结尾填写完整地址")
     assert title is not None, (
         "LLM 卡片『API 地址』旁应出现问号图标，title 含『OpenAI 兼容接口请以 /v1 结尾填写完整地址』"
-    )
-
-
-def test_llm_thinking_level_comment_becomes_tooltip_icon():
-    """LLM 卡片 思考强度 label 旁应出现问号图标，title 同时覆盖双 provider 映射。"""
-    _, llm, _ = _fetch_config_html()
-    title = _find_tooltip_title(llm, "reasoning_effort")
-    assert title is not None, (
-        "LLM 卡片『思考强度』旁应出现问号图标，title 含『reasoning_effort』"
-    )
-    assert "budget_tokens" in title, (
-        "思考强度图标 title 需同时含『budget_tokens』，实际 title={title!r}"
     )
 
 

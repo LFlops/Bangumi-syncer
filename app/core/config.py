@@ -632,16 +632,12 @@ class ConfigManager:
             "max_tokens": 2000,
             "temperature": 0.7,
             "timeout": 60,
-            "thinking_level": "off",
-            "retention_days": 365,
         }
         raw = self.get_section(LLM_SECTION, {})
         merged: dict[str, Any] = {**defaults, **raw}
         # 空字符串会覆盖默认值（{**defaults, **raw} 语义），对关键枚举字段兜底
         if not merged.get("provider"):
             merged["provider"] = "openai_compat"
-        if not merged.get("thinking_level"):
-            merged["thinking_level"] = "off"
         # 确保类型正确（使用 is not None 以允许 0 等 falsy 值）
         if merged.get("max_tokens") is not None:
             merged["max_tokens"] = int(merged["max_tokens"])
