@@ -4,6 +4,7 @@
 """
 
 import sqlite3
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -24,7 +25,7 @@ def _make_db(temp_dir, name="memory.db"):
 
 
 def _entry(run_id: str, summary: str = "昨日看了芙莉莲", **overrides) -> MemoryEntry:
-    defaults = {
+    defaults: dict[str, Any] = {
         "task_type": "summary",
         "task_id": "summary-daily",
         "run_id": run_id,

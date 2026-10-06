@@ -1,6 +1,7 @@
 """config_secret_crypto 单元测试。"""
 
 from configparser import ConfigParser
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 from app.core import config_secret_crypto as csc
@@ -47,7 +48,7 @@ def test_encrypt_empty():
 
 
 def test_encrypt_none_returns_empty():
-    assert csc.encrypt(None) == ""
+    assert csc.encrypt(cast(Any, None)) == ""
 
 
 def test_decrypt_prefixed_without_master_logs_warning():

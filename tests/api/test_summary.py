@@ -2,6 +2,7 @@
 Summary API 模型验证测试与端点集成测试。
 """
 
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -113,14 +114,14 @@ class TestLLMConfigUpdate:
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
-            LLMConfigUpdate(provider="banana")
+            LLMConfigUpdate(provider=cast(Any, "banana"))  # 故意传入非法枚举值
 
     def test_invalid_thinking_level_rejected(self):
         """非法 thinking_level 在模型层抛 ValidationError（不静默兜底为 off）。"""
         from pydantic import ValidationError
 
         with pytest.raises(ValidationError):
-            LLMConfigUpdate(thinking_level="banana")
+            LLMConfigUpdate(thinking_level=cast(Any, "banana"))  # 故意传入非法枚举值
 
 
 # ========== LLMTestResponse ==========
@@ -289,7 +290,6 @@ class TestSummaryJobResponse:
     def test_creation_with_all_fields(self):
         """验证使用所有字段创建模型。"""
         model = SummaryJobResponse(
-            id=1,
             name="Test Job",
             cron="0 21 * * *",
             lookback_days=1,
@@ -305,7 +305,6 @@ class TestSummaryJobResponse:
     def test_notification_type_empty_by_default(self):
         """验证 notification_type 默认为空字符串。"""
         model = SummaryJobResponse(
-            id=1,
             name="Test Job",
             cron="0 21 * * *",
             lookback_days=1,
@@ -2450,7 +2449,7 @@ class TestSummaryThinkingLevelAPIFlow:
         assert SummaryJobCreate().thinking_level == "off"
         assert SummaryJobCreate(thinking_level="low").thinking_level == "low"
         with pytest.raises(ValidationError):
-            SummaryJobCreate(thinking_level="ultra")
+            SummaryJobCreate(thinking_level=cast(Any, "ultra"))  # 故意传入非法枚举值
 
     def test_update_model_accepts_thinking_level(self):
         """SummaryJobUpdate：可选字段（None 表示不更新）。"""

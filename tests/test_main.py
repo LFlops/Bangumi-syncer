@@ -3,6 +3,7 @@ FastAPI 主应用测试
 """
 
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -66,11 +67,11 @@ class TestMainApp:
 
 
 @contextmanager
-def _main_lifespan_mocks(**replace: object):
+def _main_lifespan_mocks(**replace: Any):
     """为 TestClient 进入/退出触发的 startup/shutdown 打桩；replace 为 patch 目标 -> patch 的 kwargs 字典。"""
     from contextlib import ExitStack
 
-    defaults: dict[str, dict] = {
+    defaults: dict[str, dict[str, Any]] = {
         "app.main.startup_info.print_info": {},
         "app.main.startup_info.print_separator": {},
         "app.main.startup_info.print_success": {},
