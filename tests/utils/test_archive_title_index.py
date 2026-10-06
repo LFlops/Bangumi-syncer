@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -132,7 +133,8 @@ class TestNormalizeKey:
         assert _normalize_key("") == ""
 
     def test_non_string(self) -> None:
-        assert _normalize_key(None) == ""  # type: ignore[arg-type]
+        # None 属刻意覆盖的非法输入；cast(Any) 绕过静态类型
+        assert _normalize_key(cast(Any, None)) == ""
 
     def test_nfkc_normalization(self) -> None:
         """NFKC 标准化：全角→半角"""

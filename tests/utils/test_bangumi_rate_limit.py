@@ -17,6 +17,7 @@ import asyncio
 import threading
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -104,6 +105,11 @@ class RecordingLimiter:
 
     def notify_success(self) -> None:
         self.success_calls += 1
+
+
+def _install_limiter(limiter: RateLimiter | RecordingLimiter) -> None:
+    """RecordingLimiter 等鸭子类型测试替身一并兼容，cast 以满足签名。"""
+    reset_bgm_rate_limiter(cast(RateLimiter, limiter))
 
 
 def _mock_response(status_code: int = 200, headers: dict | None = None) -> MagicMock:
@@ -632,7 +638,10 @@ def test_req_not_auth_session_shares_same_bucket():
         api.get("me")  # 经 self.req 消耗唯一令牌
         assert sleeper.calls == []
 
-        api._request_with_retry("GET", api._req_not_auth, "https://api.bgm.tv/v0/me")
+        # _req_not_auth 链式返回基类 HttpClientBase，实际为 SyncHttpClient；cast 以传入
+        api._request_with_retry(
+            "GET", cast(Any, api._req_not_auth), "https://api.bgm.tv/v0/me"
+        )
 
     assert len(sleeper.calls) == 1
     assert sleeper.calls[0] == pytest.approx(1.0)
@@ -648,7 +657,7 @@ def test_direct_connection_waits_when_tokens_exhausted():
     clock = FakeClock()
     sleeper = FakeSleeper(clock)
     limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
     limiter.acquire()  # 耗尽唯一令牌
 
     api = BangumiApi(access_token="t")
@@ -666,7 +675,7 @@ def test_direct_connection_acquires_before_sending_request():
     """acquire 必须发生在实际发送直连请求之前"""
     events: list[str] = []
     limiter = RecordingLimiter(events)
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_resp = _mock_response(200)
@@ -686,7 +695,7 @@ def test_request_with_retry_acquires_before_sending_request():
     """主路径 acquire 必须发生在 session.request 之前"""
     events: list[str] = []
     limiter = RecordingLimiter(events)
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_resp = _mock_response(200)
@@ -705,7 +714,7 @@ def test_request_with_retry_acquires_before_sending_request():
 def test_direct_connection_error_warning_includes_status_code():
     """直连回退遇 >=400 时 warning 带 status_code，便于排查"""
     limiter = RecordingLimiter()
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_resp = _mock_response(503)
@@ -820,7 +829,7 @@ def test_rate_limit_hint_capped_at_max_cooldown():
 def test_notify_success_not_called_for_5xx():
     """500 响应不重置 429 升级计数：429→500→429 的冻结应为 120s 而非 60s"""
     limiter, sleeper = _make_limiter()
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
     api = BangumiApi(access_token="t")
 
     api._apply_rate_limit_notification(_mock_response(429, {}))
@@ -900,7 +909,7 @@ def test_parse_retry_after_absent_returns_none():
 def test_request_with_retry_notifies_limiter_on_429():
     """主路径收到 429 时把 Retry-After 交给令牌桶"""
     limiter = RecordingLimiter()
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_session = MagicMock()
@@ -919,7 +928,7 @@ def test_request_with_retry_notifies_limiter_on_429():
 def test_request_with_retry_notifies_limiter_on_429_without_header():
     """无 Retry-After 头时传 None，由令牌桶走默认冷却"""
     limiter = RecordingLimiter()
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_session = MagicMock()
@@ -938,7 +947,7 @@ def test_request_with_retry_notifies_limiter_on_429_without_header():
 def test_request_with_retry_notifies_success_on_ok():
     """非 429 响应通知令牌桶重置升级计数"""
     limiter = RecordingLimiter()
-    reset_bgm_rate_limiter(limiter)
+    _install_limiter(limiter)
 
     api = BangumiApi(access_token="t")
     mock_session = MagicMock()

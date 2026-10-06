@@ -3,6 +3,7 @@ Bangumi API 工具测试
 """
 
 import sqlite3
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -57,8 +58,10 @@ class TestBangumiApi:
 
     def test_init_sets_headers(self):
         api = BangumiApi(access_token="test_token")
-        assert "Accept" in api.req.client.headers
-        assert "User-Agent" in api.req.client.headers
+        # req 链式调用返回基类 HttpClientBase，实际为 SyncHttpClient；cast 以访问 client
+        headers = cast(Any, api.req).client.headers
+        assert "Accept" in headers
+        assert "User-Agent" in headers
 
     def test_init_proxy_sets_proxies(self):
         api = BangumiApi(http_proxy="http://proxy:8080")
@@ -68,9 +71,9 @@ class TestBangumiApi:
     def test_init_no_auth_header_on_not_auth_session(self):
         api = BangumiApi(access_token="test_token")
         # httpx Headers 大小写不敏感，用 lower 比较
-        assert "authorization" not in {
-            k.lower() for k in api._req_not_auth.client.headers
-        }
+        # _req_not_auth 链式返回基类，实际为 SyncHttpClient；cast 以访问 client
+        headers = cast(Any, api._req_not_auth).client.headers
+        assert "authorization" not in {k.lower() for k in headers}
 
     def test_cache_clear(self):
         api = BangumiApi()
@@ -703,7 +706,7 @@ class TestGetEpisodes:
         with patch.object(
             api, "_fetch_episodes_page", side_effect=[page1, page2]
         ) as mock_fetch:
-            result = api.get_episodes("899", fetch_all=True)
+            result = cast(dict[str, Any], api.get_episodes("899", fetch_all=True))
 
         assert mock_fetch.call_count == 2
         assert result["total"] == 250
@@ -1562,12 +1565,12 @@ class TestBgmSearch:
         """
         api = BangumiApi()
         with (
-            patch.object(api, "search", return_value=[{"id": 1}]),
+            patch.object(api, "search", return_value=[{"id": 1}]) as mock_search,
             patch.object(api, "title_diff_ratio", return_value=0.2),
         ):
             result = api.bgm_search("title", "", "2024-01-15")
             # 兜底被触发（search 被多次调用：日期精确 + 多个变体）
-            assert api.search.call_count > 1
+            assert mock_search.call_count > 1
             # 修复后保留低相似度候选供沉淀
             assert result is not None
             assert len(result) > 0
@@ -1681,12 +1684,15 @@ class TestParseIsoDateYmd:
 
     def test_bangumi_unpadded_month_day(self):
         d = BangumiApi._parse_iso_date_ymd("1996-01-8")
+        assert d is not None
         assert d.year == 1996 and d.month == 1 and d.day == 8
         d2 = BangumiApi._parse_iso_date_ymd("2008-3-17")
+        assert d2 is not None
         assert d2.year == 2008 and d2.month == 3 and d2.day == 17
 
     def test_iso_datetime_prefix(self):
         d = BangumiApi._parse_iso_date_ymd("2024-06-15T12:00:00")
+        assert d is not None
         assert d.year == 2024 and d.month == 6 and d.day == 15
 
 
@@ -1956,13 +1962,14 @@ class TestRequestWithRetryInternals:
         from app.utils.bangumi_api import BangumiApi
 
         api = BangumiApi()
+        req = cast(Any, api.req)
         bad = _session_resp_internals(500)
-        api.req.request = MagicMock(return_value=bad)
+        req.request = MagicMock(return_value=bad)
         with (
             pytest.raises(httpx.HTTPStatusError),
             patch("app.services.notification_service.notification_service") as _notify,
         ):
-            api._request_with_retry("GET", api.req, "https://bgm.test/r")
+            api._request_with_retry("GET", req, "https://bgm.test/r")
         _notify.notify.assert_called_once()
 
     def test_get_me_client_403_raises(self):
@@ -2008,4 +2015,5 @@ class TestSearchJsonBranchesInternals:
         assert BangumiApi._parse_iso_date_ymd("2020-01") is None
         assert BangumiApi._parse_iso_date_ymd("2020-13-40") is None
         d = BangumiApi._parse_iso_date_ymd("2024-06-15T12:00:00")
+        assert d is not None
         assert d.year == 2024 and d.month == 6 and d.day == 15

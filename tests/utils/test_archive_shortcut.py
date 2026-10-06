@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 from app.utils.bangumi_api import BangumiApi
@@ -1330,7 +1331,8 @@ class TestSplitTitleSegments:
         from app.utils.bangumi_api._archive_shortcut import _split_title_segments
 
         assert _split_title_segments("") == []
-        assert _split_title_segments(None) == []  # type: ignore[arg-type]
+        # None 属刻意覆盖的非法输入；cast(Any) 绕过静态类型
+        assert _split_title_segments(cast(Any, None)) == []
 
     def test_short_main_segment_skipped(self) -> None:
         from app.utils.bangumi_api._archive_shortcut import _split_title_segments
