@@ -1,5 +1,7 @@
 """app.services.llm.models 测试。"""
 
+from typing import Any, cast
+
 import pytest
 from pydantic import ValidationError
 
@@ -43,9 +45,9 @@ class TestContentBlock:
     def test_invalid_type_raises(self):
         """type 字段被 Literal 强约束。"""
         with pytest.raises(ValidationError):
-            TextBlock(type="thinking", text="hi")  # type: ignore[arg-type]
+            TextBlock(type=cast("Any", "thinking"), text="hi")
         with pytest.raises(ValidationError):
-            ThinkingBlock(type="text", thinking="x")  # type: ignore[arg-type]
+            ThinkingBlock(type=cast("Any", "text"), thinking="x")
 
     def test_unknown_block_type_not_in_union(self):
         """Union 仅接受已知 block 类型。
@@ -104,7 +106,7 @@ class TestMessage:
 
     def test_message_invalid_role_raises(self):
         with pytest.raises(ValueError):
-            Message(role="invalid", content="test")  # type: ignore[invalid-argument-type]
+            Message(role=cast("Any", "invalid"), content="test")
 
     def test_message_serialization(self):
         msg = Message(role="user", content="What is AI?")

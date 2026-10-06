@@ -19,15 +19,24 @@
     title='无职转生：到了异世界就拿出真本事' ori_title=' ' season=3 source='plex'）
 """
 
+from typing import Any
 from unittest.mock import patch
 
 from app.services.emby.extractor import extract_emby_data
 from app.services.fongmi.client import media_to_record
-from app.services.fongmi.models import FongmiDevice
+from app.services.fongmi.models import FongmiDevice, FongmiWatchRecord
 from app.services.jellyfin.extractor import extract_jellyfin_data
 from app.services.plex.extractor import extract_plex_data
 from app.services.trakt.models import TraktHistoryItem
 from app.services.trakt.sync_service import TraktSyncService
+
+
+def _fongmi_record(device: FongmiDevice, media: dict) -> FongmiWatchRecord:
+    """显式收窄 media_to_record 返回值（测试前提：媒体标题非空，必然生成记录）"""
+    record = media_to_record(device, media)
+    assert record is not None, "media_to_record 对非空标题应返回记录"
+    return record
+
 
 # ===== Plex =====
 
@@ -250,7 +259,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/anime/kimetsu/ep01.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.media_type == "episode"
         assert rec.is_movie is False
 
@@ -262,7 +271,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/剧场版/mugen_train.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.media_type == "movie"
         assert rec.is_movie is True
 
@@ -274,7 +283,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/OVA/special.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.media_type == "ova"
 
     def test_fongmi_oad_from_url(self):
@@ -285,7 +294,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/OAD/bonus.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.media_type == "oad"
 
     def test_fongmi_real_action_from_title(self):
@@ -296,7 +305,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/drama/ep01.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.media_type == "real_action"
 
     def test_fongmi_ova_sets_season_episode_to_1(self):
@@ -307,7 +316,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/ova/special.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         assert rec.season == 1
         assert rec.episode == 1
 
@@ -322,7 +331,7 @@ class TestFongmiMediaTypeDetection:
             "url": "/storage/OAD/bonus.mp4",
             "artist": None,
         }
-        rec = media_to_record(device, media)
+        rec = _fongmi_record(device, media)
         item = svc._record_to_custom_item(rec)
         assert item.media_type == "oad"
 
@@ -359,7 +368,7 @@ class TestFeiniuMediaTypeDetection:
     def _make_record(self, **kwargs):
         from app.services.feiniu.models import FeiniuWatchRecord
 
-        base = dict(
+        base: dict[str, Any] = dict(
             item_guid="it1",
             user_guid="u1",
             username="viewer",

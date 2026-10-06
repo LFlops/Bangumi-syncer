@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from typing import cast
 from unittest.mock import MagicMock
 
 from app.models.memory import MemoryEntry
@@ -96,7 +97,9 @@ class TestRetrieve:
         retriever, repo = _make_retriever(get_recent=[], search_fts=[])
 
         result = retriever.retrieve(
-            "summary", "summary-daily", keywords=["", None, "  "]
+            "summary",
+            "summary-daily",
+            keywords=cast("list[str]", ["", None, "  "]),
         )
 
         assert result == []

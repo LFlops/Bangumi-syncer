@@ -7,6 +7,7 @@ BDD 场景与测试一一对应。
 from __future__ import annotations
 
 import json
+from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
@@ -23,7 +24,10 @@ from app.services.llm.providers.openai_responses import OpenAIResponsesProvider
 
 
 def _provider(**kwargs) -> OpenAIResponsesProvider:
-    params = {"api_base": "https://api.openai.com/v1", "api_key": "sk-test"}
+    params: dict[str, Any] = {
+        "api_base": "https://api.openai.com/v1",
+        "api_key": "sk-test",
+    }
     params.update(kwargs)
     return OpenAIResponsesProvider(**params)
 

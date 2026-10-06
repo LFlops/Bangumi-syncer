@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -1197,7 +1198,7 @@ def test_agent_run_record_aligns_schema_allows_extra_and_null_sync_record():
     assert rec.run_id == "r1"
     assert rec.task_type == "match"
     assert rec.sync_record_id is None
-    assert rec.future_column == "x", "extra='allow' 应保留未来新增列"
+    assert cast("Any", rec).future_column == "x", "extra='allow' 应保留未来新增列"
 
 
 def test_run_sync_job_converts_rows_to_agent_run_record():

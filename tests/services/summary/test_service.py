@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from functools import partial
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -20,7 +21,7 @@ from app.services.summary.service import SummaryService, _utc_to_local_date
 
 def _make_config(**overrides) -> SummaryJobConfig:
     """使用默认测试值构建最小 SummaryJobConfig。"""
-    defaults = {
+    defaults: dict[str, Any] = {
         "name": "test_job",
         "enabled": True,
         "cron": "0 21 * * *",
@@ -477,7 +478,8 @@ class TestExecuteJob:
     def _make_svc() -> SummaryService:
         return SummaryService()
 
-    def _patch_llm(self, response: ChatResponse):
+    @staticmethod
+    def _patch_llm(response: ChatResponse):
         mock_client = _mock_stream_client(response)
         return patch(
             "app.services.summary.service.get_llm_client",
@@ -496,7 +498,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -517,7 +519,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -570,7 +572,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -671,7 +673,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -704,7 +706,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -727,7 +729,7 @@ class TestExecuteJob:
             patch.object(
                 svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
             ),
-            TestExecuteJob._patch_llm(svc, empty)[0],
+            TestExecuteJob._patch_llm(empty)[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -867,7 +869,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
             patch.object(svc, "memory") as mock_memory,
         ):
@@ -893,7 +895,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
             patch("app.services.summary.service.logger") as mock_logger,
         ):
@@ -1178,7 +1180,7 @@ class TestExecuteJob:
                 "_query_records",
                 return_value=(records, "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
             patch.object(svc, "memory") as mock_memory,
         ):
@@ -1651,7 +1653,7 @@ class TestIncrementalWindow:
         """wiring：execute_job 调用 _query_records 时必须传 incremental=True。"""
         svc, db = TestExecuteJob._svc_with_real_memory(temp_dir)
         config = _make_config(memory_limit=5, lookback_days=7)
-        _llm_patch, mock_client = TestExecuteJob._patch_llm(svc, _mock_chat_response())
+        _llm_patch, mock_client = TestExecuteJob._patch_llm(_mock_chat_response())
 
         with (
             patch.object(
@@ -1701,7 +1703,7 @@ class TestEmptyContentWithModel:
             patch.object(
                 svc, "_query_records", return_value=([], "2026-07-14", "2026-07-15")
             ),
-            TestExecuteJob._patch_llm(svc, empty)[0],
+            TestExecuteJob._patch_llm(empty)[0],
             patch("app.services.summary.service.notification_service") as mock_ns,
         ):
             await svc.execute_job(config)
@@ -1728,7 +1730,7 @@ class TestRelatedIndependentOfMemoryLimit:
                 "_query_records",
                 return_value=(records, "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
             patch.object(svc, "memory") as mock_memory,
         ):
@@ -1875,7 +1877,7 @@ class TestConcurrentExecutionGuard:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
         ):
             second = await svc.execute_job(config)
@@ -1917,7 +1919,7 @@ class TestConcurrentExecutionGuard:
                 "_query_records",
                 return_value=(_records(), "2026-07-14", "2026-07-15"),
             ),
-            TestExecuteJob._patch_llm(svc, _mock_chat_response())[0],
+            TestExecuteJob._patch_llm(_mock_chat_response())[0],
             patch("app.services.summary.service.notification_service"),
         ):
             assert await svc.execute_job(config) is True

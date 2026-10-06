@@ -6,6 +6,7 @@ LLMClient 以 ``stream_chat`` 为唯一调用入口（流式形态唯一）；�
 """
 
 import json
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -16,6 +17,8 @@ from app.services.llm.models import (
     Message,
     StreamChunk,
     TextBlock,
+    ThinkingBlock,
+    ToolUseBlock,
     Usage,
     collect,
 )
@@ -115,10 +118,9 @@ def _response_chunks(resp: ChatResponse) -> list[StreamChunk]:
     if not blocks and resp.content:
         blocks = [TextBlock(text=resp.content)]
     for block in blocks:
-        btype = getattr(block, "type", None)
-        if btype == "text":
+        if isinstance(block, TextBlock):
             chunks.append(StreamChunk(type="text_delta", text=block.text))
-        elif btype == "thinking":
+        elif isinstance(block, ThinkingBlock):
             chunks.append(
                 StreamChunk(
                     type="thinking_delta",
@@ -126,7 +128,7 @@ def _response_chunks(resp: ChatResponse) -> list[StreamChunk]:
                     signature=block.signature or "",
                 )
             )
-        elif btype == "tool_use":
+        elif isinstance(block, ToolUseBlock):
             chunks.append(
                 StreamChunk(
                     type="tool_use_start",
@@ -902,6 +904,7 @@ class TestTerminalErrorsNoRetry:
 
         assert resp.content == "ok"
         assert len(calls) == 2
+        assert mock_sleep.await_args is not None
         assert mock_sleep.await_args.args[0] == 5  # Retry-After 优先
 
     @pytest.mark.asyncio
@@ -936,6 +939,7 @@ class TestTerminalErrorsNoRetry:
 
         assert resp.content == "ok"
         assert len(calls) == 2
+        assert mock_sleep.await_args is not None
         assert mock_sleep.await_args.args[0] == 60  # 钳制到 60s 上限
 
 
@@ -1216,7 +1220,9 @@ class TestStreamChat:
         assert resp.content == "Hello"
         assert resp.stop_reason == "tool_use"
         assert [b.type for b in resp.blocks] == ["thinking", "text", "tool_use"]
-        assert resp.blocks[2].input == {"q": "x"}
+        tool_block = resp.blocks[2]
+        assert isinstance(tool_block, ToolUseBlock)
+        assert tool_block.input == {"q": "x"}
         assert resp.usage is not None
         assert resp.usage.total_tokens == 7
         mock_log_usage.assert_called_once()
@@ -1296,6 +1302,7 @@ class TestStreamChat:
 
         assert resp.content == "ok"
         assert len(calls) == 2
+        assert mock_sleep.await_args is not None
         assert mock_sleep.await_args.args[0] == 7
 
     @pytest.mark.asyncio
@@ -1613,4 +1620,4 @@ class TestOpenAIResponsesProviderFactory:
         from app.models.summary import LLMConfigUpdate
 
         with pytest.raises(ValidationError):
-            LLMConfigUpdate(provider="banana")
+            LLMConfigUpdate(provider=cast("Any", "banana"))

@@ -129,7 +129,9 @@ def test_register_duplicate_warns_and_overwrites(caplog):
     # 告警覆盖
     assert any("dup" in r.message and "覆盖" in r.message for r in caplog.records)
     # 取回的是后者（覆盖生效）
-    assert reg.get("dup").description == "b"
+    got = reg.get("dup")
+    assert got is not None
+    assert got.description == "b"
     assert len(reg._tools) == 1
 
 
@@ -156,7 +158,9 @@ def test_register_quiet_overwrite_logs_info_not_warning(caplog):
     # 不再刷 warning
     assert not any(r.levelno >= logging.WARNING for r in caplog.records)
     # 覆盖仍然生效
-    assert reg.get("q").description == "new"
+    got = reg.get("q")
+    assert got is not None
+    assert got.description == "new"
 
 
 # ---------------------------------------------------------------------------

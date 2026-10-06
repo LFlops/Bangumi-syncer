@@ -12,11 +12,13 @@ import asyncio
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent import runtime, trace
+from app.services.agent.scenario import ScenarioHooks
 
 
 @pytest.fixture
@@ -101,6 +103,11 @@ class _FakeHooks:
         return "succeeded"
 
 
+def _hooks_of(fake: _FakeHooks) -> ScenarioHooks:
+    """显式收窄：_FakeHooks 结构上满足 runtime 所需钩子字段（测试替身）。"""
+    return cast("ScenarioHooks", fake)
+
+
 def test_continue_run_terminal_stop_without_tool_call_degrades_to_exhausted(
     dbm: DatabaseManager, log_records
 ):
@@ -110,7 +117,7 @@ def test_continue_run_terminal_stop_without_tool_call_degrades_to_exhausted(
     _write_llm_chat(dbm, run_id, 0, [], stop_reason="submit_suggestion")
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
@@ -136,7 +143,7 @@ def test_continue_run_terminal_stop_without_matching_tool_call_degrades_to_exhau
     )
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
@@ -161,7 +168,7 @@ def test_continue_run_with_matching_terminal_tool_call_dispatches_normally(
     )
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     assert len(hooks.terminal_calls) == 1
     args, _kwargs = hooks.terminal_calls[0]
@@ -195,7 +202,7 @@ def test_continue_run_empty_shell_response_marks_failed_llm_error(
     _write_llm_chat(dbm, run_id, 0, [], stop_reason="", content="")
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     assert len(hooks.terminal_calls) == 1
     result = hooks.terminal_calls[0][0][2]
@@ -212,7 +219,7 @@ def test_continue_run_max_tokens_response_marks_failed_max_tokens(
     _write_llm_chat(dbm, run_id, 0, [], stop_reason="max_tokens", content="partial")
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     assert len(hooks.terminal_calls) == 1
     result = hooks.terminal_calls[0][0][2]
@@ -231,7 +238,7 @@ def test_continue_run_unknown_stop_reason_with_content_is_end_turn(
     )
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
@@ -250,7 +257,7 @@ def test_continue_run_end_turn_still_marks_no_suggestion(
     _write_llm_chat(dbm, run_id, 0, [], stop_reason="end_turn", content="无建议")
     hooks = _FakeHooks()
 
-    asyncio.run(runtime.continue_run(run_id, hooks=hooks, ctx=None))
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None

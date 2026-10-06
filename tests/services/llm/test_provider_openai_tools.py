@@ -263,12 +263,15 @@ class TestOpenAICompatWireToMessages:
         assert len(tool_msgs) == 1
         blocks: list[ContentBlock] = tool_msgs[0].content
         assert len(blocks) == 2
-        assert blocks[0].tool_use_id == "call_1"
-        assert blocks[0].content == "结果A"
-        assert blocks[0].is_error is False
-        assert blocks[1].tool_use_id == "call_2"
-        assert blocks[1].content == "结果B"
-        assert blocks[1].is_error is True
+        rb0, rb1 = blocks[0], blocks[1]
+        assert isinstance(rb0, ToolResultBlock)
+        assert isinstance(rb1, ToolResultBlock)
+        assert rb0.tool_use_id == "call_1"
+        assert rb0.content == "结果A"
+        assert rb0.is_error is False
+        assert rb1.tool_use_id == "call_2"
+        assert rb1.content == "结果B"
+        assert rb1.is_error is True
 
         # 普通文本 user 消息原样保留
         assert any(m.role == "user" and m.content == "请查" for m in messages)

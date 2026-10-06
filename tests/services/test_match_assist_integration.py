@@ -366,6 +366,7 @@ def test_run_link_and_pointer_written_after_persist(mock_cfg, mock_notify, tmp_p
             orch._handle_match_failure(item, "plex", trace, "err", [""])
 
         conn = dbm._connection._conn
+        assert conn is not None
         rows = conn.execute(
             "SELECT run_id, sync_record_id, decision FROM agent_run_sync_records"
         ).fetchall()
@@ -377,7 +378,9 @@ def test_run_link_and_pointer_written_after_persist(mock_cfg, mock_notify, tmp_p
         assert run is not None
         assert run["sync_record_id"] == 777
     finally:
-        dbm._connection._conn.close()
+        final_conn = dbm._connection._conn
+        assert final_conn is not None
+        final_conn.close()
 
 
 @patch("app.services.sync_service.notification_service")

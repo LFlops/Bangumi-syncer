@@ -76,6 +76,20 @@ def _assert_final_round_message(content: str) -> None:
     )
 
 
+def _message_text(message: Message) -> str:
+    """显式收窄消息 content 为纯文本（测试前提：末轮强化提示为字符串）。"""
+    content = message.content
+    assert isinstance(content, str), "末轮强化提示应为纯文本"
+    return content
+
+
+def _message_blocks(message: Message) -> list:
+    """显式收窄消息 content 为块列表（测试前提：assistant 重建为块列表）。"""
+    content = message.content
+    assert isinstance(content, list), "assistant content 应为块列表"
+    return content
+
+
 def _assert_final_recovery_message(content: str) -> None:
     """断言收尾提示语义（预算耗尽 + 立即给出结论）。"""
     assert all(kw in content for kw in _FINAL_RECOVERY_KEYWORDS), (
@@ -335,7 +349,7 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    _assert_final_round_message(last_msg.content)
+    _assert_final_round_message(_message_text(last_msg))
 
 
 # ---------------------------------------------------------------------------
@@ -618,7 +632,7 @@ async def test_budget_appended_to_messages_even_without_recorder():
     second_messages = calls[1][0]
     last_msg = second_messages[-1]
     assert last_msg.role == "user"
-    _assert_final_round_message(last_msg.content)
+    _assert_final_round_message(_message_text(last_msg))
 
 
 async def test_budget_no_phantom_message_on_final_round():
@@ -1651,7 +1665,7 @@ async def test_stream_path_pads_missing_slots_to_close_protocol(caplog):
 
     assert result.stop_reason == "end_turn"
     assistant = next(m for m in calls[1] if m.role == "assistant")
-    tool_use_ids = [b.id for b in assistant.content if b.type == "tool_use"]
+    tool_use_ids = [b.id for b in _message_blocks(assistant) if b.type == "tool_use"]
     assert tool_use_ids == ["a", "b"]
 
     blocks = _collect_tool_results(calls[1])

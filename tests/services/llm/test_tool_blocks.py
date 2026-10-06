@@ -7,6 +7,8 @@
 - 向后兼容：现有 Text/Thinking/Redacted 行为不变
 """
 
+from typing import Any, cast
+
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
@@ -47,7 +49,7 @@ class TestToolUseBlock:
     def test_tool_use_block_type_fixed(self):
         """type 字段被 Literal 强约束，不可改写。"""
         with pytest.raises(ValidationError):
-            ToolUseBlock(type="text", id="tu_1", name="x")  # type: ignore[arg-type]
+            ToolUseBlock(type=cast("Any", "text"), id="tu_1", name="x")
 
 
 class TestToolResultBlock:
@@ -81,9 +83,7 @@ class TestToolResultBlock:
 
     def test_tool_result_block_type_fixed(self):
         with pytest.raises(ValidationError):
-            ToolResultBlock(  # type: ignore[arg-type]
-                type="text", tool_use_id="tu_1", content="x"
-            )
+            ToolResultBlock(type=cast("Any", "text"), tool_use_id="tu_1", content="x")
 
 
 class TestContentBlockUnion:
@@ -159,10 +159,15 @@ class TestChatResponseToolRoundTrip:
             ToolResultBlock,
             ThinkingBlock,
         ]
-        assert restored.blocks[0].text == "let me look"
-        assert restored.blocks[1].name == "search_bangumi"
-        assert restored.blocks[2].content == "found"
-        assert restored.blocks[3].thinking == "hmm"
+        b0, b1, b2, b3 = restored.blocks
+        assert isinstance(b0, TextBlock)
+        assert isinstance(b1, ToolUseBlock)
+        assert isinstance(b2, ToolResultBlock)
+        assert isinstance(b3, ThinkingBlock)
+        assert b0.text == "let me look"
+        assert b1.name == "search_bangumi"
+        assert b2.content == "found"
+        assert b3.thinking == "hmm"
 
 
 class TestBackwardCompatibility:

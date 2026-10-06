@@ -1,5 +1,7 @@
 """app.services.llm.providers.base 测试。"""
 
+from typing import Any, cast
+
 import pytest
 
 from app.services.llm.models import Message, StreamChunk
@@ -15,7 +17,7 @@ class TestBaseProvider:
     def test_cannot_instantiate_abstract(self):
         """BaseProvider 无法直接实例化。"""
         with pytest.raises(TypeError):
-            BaseProvider()  # type: ignore[abstract]
+            cast("Any", BaseProvider)()
 
     def test_subclass_without_stream_raises(self):
         """未实现 stream() 的子类无法实例化。"""
@@ -24,7 +26,7 @@ class TestBaseProvider:
             class IncompleteProvider(BaseProvider):
                 pass
 
-            IncompleteProvider()  # type: ignore[abstract]
+            cast("Any", IncompleteProvider)()
 
     @pytest.mark.asyncio
     async def test_properly_implemented_subclass_works(self):

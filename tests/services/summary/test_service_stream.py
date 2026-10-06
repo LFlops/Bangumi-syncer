@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,7 +24,7 @@ from app.services.summary.service import SummaryService, SummaryStreamResult
 
 
 def _make_config(**overrides) -> SummaryJobConfig:
-    defaults = {
+    defaults: dict[str, Any] = {
         "name": "stream_job",
         "enabled": True,
         "cron": "0 21 * * *",

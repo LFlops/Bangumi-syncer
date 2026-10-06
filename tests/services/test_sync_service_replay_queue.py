@@ -8,6 +8,7 @@
 """
 
 import time
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -552,6 +553,7 @@ class TestFindMatchingSubjectQuickDegrade:
 
         assert subject_id is None
         assert is_season is False
+        assert err_resp is not None
         assert err_resp.status == "ignored"
         assert "不可达" in err_resp.message
         mock_find.assert_not_called()
@@ -632,6 +634,7 @@ class TestFindMatchingSubjectQuickDegrade:
             )
 
         assert subject_id is None
+        assert err_resp is not None
         assert err_resp.status == "ignored"
         mock_find.assert_not_called()
 
@@ -660,7 +663,7 @@ class TestResetAllApiUnreachableFlags:
         svc = SyncService()
         api = MagicMock()
         api.is_api_unreachable.return_value = False
-        svc._bangumi_api_cache = {"u1": (api, None)}
+        svc._bangumi_api_cache = cast("Any", {"u1": (api, None)})
 
         count = svc.reset_all_api_unreachable_flags()
 
