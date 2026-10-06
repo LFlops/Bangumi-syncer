@@ -926,6 +926,97 @@ class TestTestLLMConnection:
                 assert fake_stream.aclose_called is True
 
     @pytest.mark.asyncio
+    async def test_connection_succeeds_on_thinking_delta_first(self):
+        """首个内容事件为 thinking_delta（无 text）→ 判定连通成功。
+
+        anthropic_compat 开思考后 ``thinking_delta`` 先行，若只认 text_delta
+        会在长思考期间超时/误报失败。
+        """
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+        from app.services.llm.models import StreamChunk
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        fake_stream = _FakeLLMStream(
+            [
+                StreamChunk(
+                    type="thinking_delta",
+                    thinking="思考中",
+                    model="claude-thinking-1",
+                ),
+            ]
+        )
+        mock_client = MagicMock()
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
+
+        with (
+            patch("app.api.llm.get_llm_client", return_value=mock_client),
+            patch(
+                "app.api.llm.config_manager.get_llm_config",
+                return_value={"model": "cfg-fallback"},
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/llm/test")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["model"] == "claude-thinking-1"
+        # 首个内容事件后立即 break 并关闭流（不等待 text）
+        assert fake_stream.aclose_called is True
+
+    @pytest.mark.asyncio
+    async def test_connection_empty_thinking_delta_still_fails(self):
+        """thinking_delta 但 thinking 为空 → 不计入连通判定（保持失败语义）。"""
+        from fastapi import FastAPI
+        from httpx import ASGITransport, AsyncClient
+
+        from app.api.deps import get_current_user_flexible
+        from app.api.llm import router
+        from app.services.llm.models import StreamChunk
+
+        app = FastAPI()
+        app.include_router(router)
+
+        async def mock_auth(request=None, credentials=None):
+            return {"username": "testuser"}
+
+        app.dependency_overrides[get_current_user_flexible] = mock_auth
+
+        fake_stream = _FakeLLMStream(
+            [
+                StreamChunk(type="thinking_delta", thinking=""),
+                StreamChunk(type="stop", stop_reason="max_tokens"),
+            ]
+        )
+        mock_client = MagicMock()
+        mock_client.stream_chat = MagicMock(return_value=fake_stream)
+
+        with patch("app.api.llm.get_llm_client", return_value=mock_client):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post("/api/llm/test")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert fake_stream.aclose_called is True
+
+    @pytest.mark.asyncio
     async def test_llm_connection_empty_content_with_model_fails(self):
         """流中无 text_delta（如仅 stop）→ 仍视为失败（与旧 not content 语义一致）。"""
         from fastapi import FastAPI

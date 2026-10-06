@@ -503,6 +503,50 @@ class TestReplayRebuildsFullBlocks:
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("blocks" in line for line in warns)
 
+    def test_partial_invalid_blocks_preserves_valid_thinking(self, dbm, log_records):
+        """部分元素非法 → 逐元素丢弃坏块、保留合法块（含 thinking），不整体回退。"""
+        _write_seed(dbm, "run-partial-bad", [])
+        _write_llm_chat_with_blocks(
+            dbm,
+            "run-partial-bad",
+            0,
+            [{"id": "t1", "name": "x", "input": {}}],
+            [
+                ThinkingBlock(thinking="keepme", signature="s1").model_dump(),
+                {"type": "unknown_block", "foo": "bar"},
+                TextBlock(text="plan").model_dump(),
+                ToolUseBlock(id="t1", name="x", input={}).model_dump(),
+            ],
+        )
+        _write_tool_exec(dbm, "run-partial-bad", 0, 1, "t1", "res1")
+
+        result = trace.replay("run-partial-bad")
+
+        assistant = next(m for m in result.messages if m.role == "assistant")
+        # 保留 thinking/text/tool_use（原顺序），丢弃中间非法元素
+        assert [type(b) for b in assistant.content] == [
+            ThinkingBlock,
+            TextBlock,
+            ToolUseBlock,
+        ]
+        assert assistant.content[0].thinking == "keepme"
+        warns = [line for level, line in log_records if level == "WARNING"]
+        # warning 含丢弃数量与类型
+        assert any("丢弃" in line and "unknown_block" in line for line in warns)
+
+    def test_restore_blocks_all_invalid_returns_none(self, log_records):
+        """全部元素非法 → 返回 None（交由既有 tool_calls 回退）。"""
+        assert (
+            trace._restore_response_blocks(
+                {"blocks": [{"type": "bad-1"}, {"type": "bad-2"}]}
+            )
+            is None
+        )
+
+    def test_restore_blocks_non_list_returns_none(self, log_records):
+        """输入非列表 → 返回 None。"""
+        assert trace._restore_response_blocks({"blocks": {"not": "a list"}}) is None
+
     def test_derives_tool_calls_from_blocks_when_field_missing(self, dbm, log_records):
         """``tool_calls`` 字段缺失但 blocks 含 tool_use → 从 blocks 推导（不丢工具调用）。
 

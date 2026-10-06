@@ -65,7 +65,8 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
     反而迷惑）；只返回 成功/模型/延迟。max_tokens=8 让模型在第 8 个 token
     处被 API 截停——服务端不会"生成后丢弃"，只是限制生成长度。
 
-    改走 ``stream_chat()``：收到**首个 text_delta** 即视为连通并主动
+    改走 ``stream_chat()``：收到**首个内容事件**（``text_delta`` 或非空
+    ``thinking_delta``——覆盖思考模型 thinking 先行的场景）即视为连通并主动
     ``aclose()``，无需等待全量响应生成完毕，延迟显著低于 ``chat()``（后者需
     消费完整流才能聚合出 ChatResponse）。副作用：提前关闭走 client 的
     "未正常耗尽 → 跳过成功落库" 路径，连接测试 ping 不计入用量统计（合理：
@@ -86,7 +87,12 @@ async def test_llm_connection(_=Depends(get_current_user_flexible)):
             async for chunk in stream:
                 if chunk.model and not stream_model:
                     stream_model = chunk.model
-                if chunk.type == "text_delta" and chunk.text:
+                # 内容事件即判定连通：text_delta 或 thinking_delta（思考模型开启思考后
+                # thinking_delta 先行，若只认 text_delta 会在长思考期间超时/误报失败）。
+                # 空内容事件（text/thinking 均为空）不计入，保持「无内容 → 失败」语义。
+                if (chunk.type == "text_delta" and chunk.text) or (
+                    chunk.type == "thinking_delta" and chunk.thinking
+                ):
                     connected = True
                     break
         finally:

@@ -52,6 +52,21 @@ def crypto_on():
         yield
 
 
+@pytest.fixture
+def log_records():
+    """捕获自定义 Logger（非 stdlib logging）的日志行，产出 ``[(level, line)]``。"""
+    from app.core.logging import logger as app_logger
+
+    records: list[tuple[str, str]] = []
+
+    def _listener(line: str, level: str) -> None:
+        records.append((level, line))
+
+    app_logger.add_listener(_listener)
+    yield records
+    app_logger.remove_listener(_listener)
+
+
 def _chat_replay_delta(stop_reason, content, tool_calls):
     return {
         "response": {
@@ -404,6 +419,46 @@ class TestRecordBudgetMessage:
         ).fetchone()[0]
         # 原值未被覆盖
         assert raw_after == "this-is-not-valid-json-or-ciphertext"
+
+
+class TestRecordBudgetMessageEncryptFailure:
+    """加密失败契约：绝不以明文回写 replay_delta（保留原 raw）。"""
+
+    def test_encrypt_failure_keeps_raw_and_logs_warning(
+        self, dbm, crypto_on, log_records
+    ):
+        """encrypt 抛错 → DB 中 replay_delta 与修改前一致（未明文回写）+ warning。"""
+        _ensure_run(dbm, "run-bud-enc-fail")
+        sid = trace.start_span("run-bud-enc-fail", "tool_execute", 0, 1)
+        trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "secret-result"))
+        conn = dbm._connection._get_connection()
+        raw_before = conn.execute(
+            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
+        ).fetchone()[0]
+        # 前置：本行确实为密文
+        assert raw_before.startswith("BGS1:")
+
+        with patch(
+            "app.services.agent.trace.encrypt",
+            side_effect=RuntimeError("key unavailable"),
+        ):
+            trace.record_budget_message(sid, "[剩余轮次：2]")
+
+        raw_after = conn.execute(
+            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
+        ).fetchone()[0]
+        # 原 raw 未被覆盖（未把含完整对话的明文写库）
+        assert raw_after == raw_before
+
+        from app.core.config_secret_crypto import decrypt
+
+        decrypted = decrypt(raw_after)
+        assert "budget_message" not in decrypted
+        # 密文行仍可正常解密还原原始载荷
+        assert json.loads(decrypted)["tool_result"]["tool_use_id"] == "t1"
+
+        warns = [line for level, line in log_records if level == "WARNING"]
+        assert any("加密失败" in line for line in warns)
 
 
 class TestRecorderWrapStreamFn:

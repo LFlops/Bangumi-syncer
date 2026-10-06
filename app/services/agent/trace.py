@@ -197,8 +197,13 @@ def record_budget_message(span_id: str, budget_message: str) -> None:
             obj["budget_message"] = budget_message
             try:
                 new_delta = encrypt(json.dumps(obj, ensure_ascii=False))
-            except Exception:
-                new_delta = json.dumps(obj, ensure_ascii=False)
+            except Exception as e:
+                # 加密失败绝不明文回写（违反 replay_delta 完整加密契约），保留原 raw
+                logger.warning(
+                    "[trace] record_budget_message 加密失败，保留原 raw 不写库"
+                    f"（{type(e).__name__}: {e}）"
+                )
+                return
             conn.execute(
                 "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
                 (new_delta, span_id),
@@ -276,7 +281,10 @@ def _restore_response_blocks(response: dict) -> list[ContentBlock] | None:
     返回 ``None`` 表示应回退 ``tool_calls`` 重建逻辑：
 
     - ``blocks`` 字段缺失 / 为 None / 空列表（旧数据或本轮无内容块）→ 静默回退（向后兼容）。
-    - ``blocks`` 非列表 / 元素结构非法（类型未知）→ 记 warning 后回退（不静默、不抛断）。
+    - ``blocks`` 非列表 → 记 warning 后回退（不静默、不抛断）。
+    - 元素结构非法 → **逐元素**丢弃非法块、保留合法块（按原顺序），记 warning（含
+      丢弃数量与类型）；避免任一坏元素导致整体回退而**丢失 thinking**（续跑被拒）。
+    - 全部元素非法 → 无合法块可保留，记 warning 后回退 ``tool_calls`` 重建。
     """
     raw_blocks = response.get("blocks")
     if raw_blocks is None or raw_blocks == []:
@@ -287,14 +295,24 @@ def _restore_response_blocks(response: dict) -> list[ContentBlock] | None:
             f"（type={type(raw_blocks).__name__}），回退 tool_calls 重建"
         )
         return None
-    try:
-        return [_CONTENT_BLOCK_ADAPTER.validate_python(b) for b in raw_blocks]
-    except Exception as e:  # 异常数据：整体回退，不部分重建
+
+    valid: list[ContentBlock] = []
+    dropped: list[str] = []
+    for b in raw_blocks:
+        try:
+            valid.append(_CONTENT_BLOCK_ADAPTER.validate_python(b))
+        except Exception:
+            btype = b.get("type") if isinstance(b, dict) else type(b).__name__
+            dropped.append(str(btype))
+    if dropped:
         logger.warning(
-            f"[trace] replay response.blocks 反序列化失败"
-            f"（{type(e).__name__}: {e}），回退 tool_calls 重建"
+            f"[trace] replay response.blocks 丢弃非法元素 {len(dropped)}/{len(raw_blocks)}"
+            f"（类型={dropped}），保留合法块"
         )
+    if not valid:
+        logger.warning("[trace] replay response.blocks 全部非法，回退 tool_calls 重建")
         return None
+    return valid
 
 
 def _restore_seed_messages(seed_step: dict, out: list[Message]) -> None:
