@@ -13,7 +13,10 @@
 10. 失败累计：每个 failed run 使 total_attempts += 1（同键 SUM 为累计失败次数）
 """
 
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -30,6 +33,27 @@ def _make_db(tmp_path: Path) -> DatabaseManager:
     """创建指向临时路径的 DatabaseManager 实例"""
     db_path = str(tmp_path / "test_agent_runs.db")
     return DatabaseManager(db_path)
+
+
+def _db_conn(dbm: DatabaseManager) -> sqlite3.Connection:
+    """返回底层 sqlite3 连接。
+
+    测试构造后连接必然非 None；显式收窄以通过静态类型检查。
+    """
+    conn = dbm._connection._conn
+    assert conn is not None, "测试数据库连接未初始化"
+    return conn
+
+
+def _present(obj: dict | None, what: str) -> dict:
+    """显式收窄 Optional 查询结果（测试前提：目标记录必存在）"""
+    assert obj is not None, f"{what} 不存在"
+    return obj
+
+
+def _run(dbm: DatabaseManager, run_id: str) -> dict:
+    """读取 run 并显式收窄（测试前提：记录存在）"""
+    return _present(dbm.agent_runs.get_run(run_id), f"run {run_id}")
 
 
 def _enqueue(
@@ -58,7 +82,7 @@ def _set_status(dbm, run_id: str, status: str, ended_at: int | None = None) -> N
 
     ``ended_at`` 为 epoch 秒整数（与当前 schema 一致）。
     """
-    conn = dbm._connection._conn
+    conn = _db_conn(dbm)
     if ended_at is not None:
         conn.execute(
             "UPDATE agent_runs SET status=?, ended_at=? WHERE run_id=?",
@@ -75,7 +99,7 @@ class TestAgentRunsSchema:
     def test_tables_and_indexes_created(self, tmp_path):
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             cur = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name IN ('agent_runs', 'agent_steps', 'agent_run_sync_records')"
@@ -101,23 +125,23 @@ class TestAgentRunsSchema:
             link_idx = {r[1] for r in cur.fetchall()}
             assert "idx_agent_run_sync_records_record" in link_idx
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_agent_run_sync_records_columns(self, tmp_path):
         """关联表列：run_id/sync_record_id/decision/created_at，主键 (run_id, sync_record_id)"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             cur = conn.execute("PRAGMA table_info('agent_run_sync_records')")
             cols = {r[1] for r in cur.fetchall()}
             assert {"run_id", "sync_record_id", "decision", "created_at"} <= cols
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_agent_steps_columns_present(self, tmp_path):
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             cur = conn.execute("PRAGMA table_info('agent_steps')")
             cols = {r[1] for r in cur.fetchall()}
             for c in (
@@ -142,7 +166,7 @@ class TestAgentRunsSchema:
             # payload_json 列已删除（观测摘要不再存储；截断仅存在于读取/展示侧）
             assert "payload_json" not in cols
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestCreatePendingAndClaim:
@@ -153,13 +177,13 @@ class TestCreatePendingAndClaim:
         try:
             row_id = dbm.agent_runs.create_pending("run-1", "match", 1)
             assert isinstance(row_id, int) and row_id > 0
-            run = dbm.agent_runs.get_run("run-1")
+            run = _run(dbm, "run-1")
             assert run is not None
             assert run["status"] == "pending"
             assert run["task_type"] == "match"
             assert run["sync_record_id"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_atomic_claim_competition(self, tmp_path):
         """先 claim 成功，再次 claim 同 run 返回 False（模拟双调度器）"""
@@ -168,7 +192,7 @@ class TestCreatePendingAndClaim:
             dbm.agent_runs.create_pending("run-compete", "match", 1)
             # 第一个调度器抢占成功
             assert dbm.agent_runs.atomic_claim("run-compete") is True
-            assert dbm.agent_runs.get_run("run-compete")["status"] == "processing"
+            assert _run(dbm, "run-compete")["status"] == "processing"
             # 第二个调度器重复抢占失败
             assert dbm.agent_runs.atomic_claim("run-compete") is False
 
@@ -177,7 +201,7 @@ class TestCreatePendingAndClaim:
             assert dbm.agent_runs.atomic_claim("run-other") is True
             assert dbm.agent_runs.atomic_claim("run-other") is False
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestStatusTransitions:
@@ -195,7 +219,7 @@ class TestStatusTransitions:
         try:
             dbm.agent_runs.create_pending("rf", "match", 1)
             assert dbm.agent_runs.mark_failed("rf", "failed", "boom", 42) is True
-            run = dbm.agent_runs.get_run("rf")
+            run = _run(dbm, "rf")
             assert run["status"] == "failed"
             assert run["stop_reason"] == "failed"
             assert run["last_error"] == "boom"
@@ -203,7 +227,7 @@ class TestStatusTransitions:
             assert run["ended_at"]  # 终态时间已记录
             assert run["total_attempts"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_failed_idempotent_when_already_failed(self, tmp_path):
         """已 failed 的 run 再次 mark_failed 被状态守卫拒绝（返回 False，不重复累计）"""
@@ -211,12 +235,12 @@ class TestStatusTransitions:
         try:
             dbm.agent_runs.create_pending("rf2", "match", 1)
             assert dbm.agent_runs.mark_failed("rf2", "failed", "boom") is True
-            assert dbm.agent_runs.get_run("rf2")["total_attempts"] == 1
+            assert _run(dbm, "rf2")["total_attempts"] == 1
             # 重复调用（如 llm_assist 重试耗尽后又 mark_failed）→ 守卫拒绝
             assert dbm.agent_runs.mark_failed("rf2", "failed", "boom-again") is False
-            assert dbm.agent_runs.get_run("rf2")["total_attempts"] == 1
+            assert _run(dbm, "rf2")["total_attempts"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @pytest.mark.parametrize("terminal", ["succeeded", "no_suggestion", "cancelled"])
     def test_mark_failed_guard_rejects_terminal_states(self, tmp_path, terminal):
@@ -233,11 +257,11 @@ class TestStatusTransitions:
                 dbm.agent_runs.update_run_status("guard", "cancelled")
 
             assert dbm.agent_runs.mark_failed("guard", "failed", "boom") is False
-            run = dbm.agent_runs.get_run("guard")
+            run = _run(dbm, "guard")
             assert run["status"] == terminal
             assert run["total_attempts"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_cancelled_from_processing_sets_terminal_and_ended_at(self, tmp_path):
         """processing → cancelled 成功，写 stop_reason 与 ended_at（epoch 秒）。"""
@@ -249,12 +273,12 @@ class TestStatusTransitions:
             assert (
                 dbm.agent_runs.mark_cancelled("rc", stop_reason="user_resolved") is True
             )
-            run = dbm.agent_runs.get_run("rc")
+            run = _run(dbm, "rc")
             assert run["status"] == "cancelled"
             assert run["stop_reason"] == "user_resolved"
             assert run["ended_at"] > 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_cancelled_guard_rejects_terminal_states(self, tmp_path):
         """状态守卫：succeeded 等非活性态不被 mark_cancelled 改写（返回 False）。"""
@@ -268,11 +292,11 @@ class TestStatusTransitions:
                 dbm.agent_runs.mark_cancelled("rc2", stop_reason="user_resolved")
                 is False
             )
-            run = dbm.agent_runs.get_run("rc2")
+            run = _run(dbm, "rc2")
             assert run["status"] == "succeeded"
             assert run["stop_reason"] == ""
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_apply_cancelled_matches_mark_cancelled_semantics(self, tmp_path):
         """apply_cancelled 与 mark_cancelled 语义一致：守卫/stop_reason/ended_at。
@@ -283,13 +307,13 @@ class TestStatusTransitions:
 
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
 
             # 活性态（processing）→ 守卫放行，写 stop_reason 与 ended_at
             dbm.agent_runs.create_pending("ac-live", "match", 1)
             assert dbm.agent_runs.atomic_claim("ac-live") is True
             assert apply_cancelled(conn, "ac-live", stop_reason="user_resolved") is True
-            run = dbm.agent_runs.get_run("ac-live")
+            run = _run(dbm, "ac-live")
             assert run["status"] == "cancelled"
             assert run["stop_reason"] == "user_resolved"
             assert run["ended_at"] > 0
@@ -301,11 +325,11 @@ class TestStatusTransitions:
             assert (
                 apply_cancelled(conn, "ac-done", stop_reason="user_resolved") is False
             )
-            run = dbm.agent_runs.get_run("ac-done")
+            run = _run(dbm, "ac-done")
             assert run["status"] == "succeeded"
             assert run["stop_reason"] == ""
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_same_key_two_failed_runs_sum_is_two(self, tmp_path):
         """同键两条 failed run → SUM(total_attempts)=2（累计失败次数）"""
@@ -317,7 +341,7 @@ class TestStatusTransitions:
             dbm.agent_runs.create_pending("f2", "match", 2, business_key=bk)
             dbm.agent_runs.mark_failed("f2", "failed", "e2")
 
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             total = conn.execute(
                 "SELECT SUM(total_attempts) FROM agent_runs "
                 "WHERE business_key=? AND status='failed'",
@@ -325,7 +349,7 @@ class TestStatusTransitions:
             ).fetchone()[0]
             assert total == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestSucceededNoSuggestionTerminalGuard:
@@ -349,13 +373,13 @@ class TestSucceededNoSuggestionTerminalGuard:
                 )
                 is True
             )
-            run = dbm.agent_runs.get_run("sg1")
+            run = _run(dbm, "sg1")
             assert run["status"] == "succeeded"
             assert run["stop_reason"] == "submit_suggestion"
             assert run["total_tokens"] == 123
             assert run["ended_at"] > 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_succeeded_from_pending_sets_terminal(self, tmp_path):
         """pending 亦为活性态：未抢占直接 mark_succeeded 仍成功（向后兼容）。"""
@@ -363,9 +387,9 @@ class TestSucceededNoSuggestionTerminalGuard:
         try:
             dbm.agent_runs.create_pending("sg2", "match", 1)
             assert dbm.agent_runs.mark_succeeded("sg2", stop_reason="end_turn") is True
-            assert dbm.agent_runs.get_run("sg2")["status"] == "succeeded"
+            assert _run(dbm, "sg2")["status"] == "succeeded"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_no_suggestion_from_processing_sets_terminal_fields(self, tmp_path):
         """processing → no_suggestion 成功，写 stop_reason/last_error/total_tokens。"""
@@ -383,14 +407,14 @@ class TestSucceededNoSuggestionTerminalGuard:
                 )
                 is True
             )
-            run = dbm.agent_runs.get_run("nsg1")
+            run = _run(dbm, "nsg1")
             assert run["status"] == "no_suggestion"
             assert run["stop_reason"] == "exhausted"
             assert run["last_error"] == "无建议"
             assert run["total_tokens"] == 55
             assert run["ended_at"] > 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @staticmethod
     def _to_terminal(dbm, run_id: str, terminal: str) -> None:
@@ -426,7 +450,7 @@ class TestSucceededNoSuggestionTerminalGuard:
         dbm = _make_db(tmp_path)
         try:
             self._to_terminal(dbm, "sg-guard", terminal)
-            before = dbm.agent_runs.get_run("sg-guard")
+            before = _run(dbm, "sg-guard")
 
             assert (
                 dbm.agent_runs.mark_succeeded(
@@ -434,11 +458,11 @@ class TestSucceededNoSuggestionTerminalGuard:
                 )
                 is False
             )
-            after = dbm.agent_runs.get_run("sg-guard")
+            after = _run(dbm, "sg-guard")
             assert after == before
             assert after["status"] == terminal
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @pytest.mark.parametrize(
         "terminal", ["succeeded", "no_suggestion", "failed", "cancelled"]
@@ -448,7 +472,7 @@ class TestSucceededNoSuggestionTerminalGuard:
         dbm = _make_db(tmp_path)
         try:
             self._to_terminal(dbm, "ns-guard", terminal)
-            before = dbm.agent_runs.get_run("ns-guard")
+            before = _run(dbm, "ns-guard")
 
             assert (
                 dbm.agent_runs.mark_no_suggestion(
@@ -459,11 +483,11 @@ class TestSucceededNoSuggestionTerminalGuard:
                 )
                 is False
             )
-            after = dbm.agent_runs.get_run("ns-guard")
+            after = _run(dbm, "ns-guard")
             assert after == before
             assert after["status"] == terminal
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestIncrementAttempts:
@@ -479,12 +503,12 @@ class TestIncrementAttempts:
             dbm.agent_runs.atomic_claim("r3")  # → processing
             assert dbm.agent_runs.increment_attempts("r3") == 1
             assert dbm.agent_runs.increment_attempts("r3") == 2
-            assert dbm.agent_runs.get_run("r3")["status"] == "processing"
+            assert _run(dbm, "r3")["status"] == "processing"
 
             # 第二次已达上限，单点调用直接置终态并携带 last_error
             a3 = dbm.agent_runs.increment_attempts("r3", last_error="boom")
             assert a3 == 3
-            run = dbm.agent_runs.get_run("r3")
+            run = _run(dbm, "r3")
             assert run["attempts"] == 3
             assert run["status"] == "failed"
             assert run["stop_reason"] == "failed"
@@ -493,7 +517,7 @@ class TestIncrementAttempts:
             # 达上限置终态同一次调用累计 total_attempts
             assert run["total_attempts"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_increment_attempts_below_limit_only_counts(self, tmp_path):
         """未达上限仅计数：attempts=1 → 返回 2，状态仍 processing 且不覆盖 last_error。"""
@@ -503,14 +527,14 @@ class TestIncrementAttempts:
             dbm.agent_runs.atomic_claim("r2")  # → processing
             assert dbm.agent_runs.increment_attempts("r2") == 1
             # 预置一个哨兵值，验证未达上限时不写 last_error
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "UPDATE agent_runs SET last_error='prev' WHERE run_id=?", ("r2",)
             )
             conn.commit()
 
             assert dbm.agent_runs.increment_attempts("r2", last_error="temp") == 2
-            run = dbm.agent_runs.get_run("r2")
+            run = _run(dbm, "r2")
             assert run["attempts"] == 2
             assert run["status"] == "processing"
             # 未达上限不落终态、不覆盖 last_error、不累计 total_attempts
@@ -518,7 +542,7 @@ class TestIncrementAttempts:
             assert run["last_error"] == "prev"
             assert run["total_attempts"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_increment_attempts_non_processing_returns_zero_and_unchanged(
         self, tmp_path
@@ -529,19 +553,19 @@ class TestIncrementAttempts:
             dbm.agent_runs.create_pending("rs", "match", 1)
             dbm.agent_runs.atomic_claim("rs")
             dbm.agent_runs.mark_succeeded("rs")  # → succeeded
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "UPDATE agent_runs SET last_error='prev' WHERE run_id=?", ("rs",)
             )
             conn.commit()
 
             assert dbm.agent_runs.increment_attempts("rs", last_error="boom") == 0
-            run = dbm.agent_runs.get_run("rs")
+            run = _run(dbm, "rs")
             assert run["status"] == "succeeded"
             assert run["attempts"] == 0
             assert run["last_error"] == "prev"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestLastErrorRedaction:
@@ -564,7 +588,7 @@ class TestLastErrorRedaction:
                 )
                 is True
             )
-            run = dbm.agent_runs.get_run("rd1")
+            run = _run(dbm, "rd1")
             assert "sk-secret-123" not in run["last_error"]
             assert "Bearer ***" in run["last_error"]
             assert "鉴权被拒" in run["last_error"]  # 正常信息保留
@@ -574,7 +598,7 @@ class TestLastErrorRedaction:
             assert run["total_tokens"] == 7
             assert run["total_attempts"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @pytest.mark.parametrize(
         ("last_error", "leaked"),
@@ -590,11 +614,11 @@ class TestLastErrorRedaction:
         try:
             dbm.agent_runs.create_pending("rd2", "match", 1)
             assert dbm.agent_runs.mark_failed("rd2", "error", last_error) is True
-            stored = dbm.agent_runs.get_run("rd2")["last_error"]
+            stored = _run(dbm, "rd2")["last_error"]
             assert leaked not in stored
             assert stored != last_error  # 确实发生遮蔽
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_no_suggestion_redacts_secret(self, tmp_path):
         dbm = _make_db(tmp_path)
@@ -606,13 +630,13 @@ class TestLastErrorRedaction:
                 )
                 is True
             )
-            run = dbm.agent_runs.get_run("rn1")
+            run = _run(dbm, "rn1")
             assert "tok-999" not in run["last_error"]
             assert "access_token=***" in run["last_error"]
             assert run["status"] == "no_suggestion"
             assert run["stop_reason"] == "budget_exhausted"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_no_suggestion_records_total_tokens(self, tmp_path):
         """mark_no_suggestion 写入 total_tokens（终态口径与 succeeded/failed 一致）。"""
@@ -623,9 +647,9 @@ class TestLastErrorRedaction:
                 dbm.agent_runs.mark_no_suggestion("rnt1", "exhausted", total_tokens=77)
                 is True
             )
-            assert dbm.agent_runs.get_run("rnt1")["total_tokens"] == 77
+            assert _run(dbm, "rnt1")["total_tokens"] == 77
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_mark_no_suggestion_defaults_total_tokens_to_zero(self, tmp_path):
         """未传 total_tokens → 默认 0（向后兼容既有调用）。"""
@@ -633,9 +657,9 @@ class TestLastErrorRedaction:
         try:
             dbm.agent_runs.create_pending("rnt2", "match", 1)
             assert dbm.agent_runs.mark_no_suggestion("rnt2", "end_turn") is True
-            assert dbm.agent_runs.get_run("rnt2")["total_tokens"] == 0
+            assert _run(dbm, "rnt2")["total_tokens"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @pytest.mark.parametrize(
         ("last_error", "leaked"),
@@ -656,13 +680,13 @@ class TestLastErrorRedaction:
             assert dbm.agent_runs.increment_attempts("ri1") == 2
             assert dbm.agent_runs.increment_attempts("ri1", last_error=last_error) == 3
 
-            run = dbm.agent_runs.get_run("ri1")
+            run = _run(dbm, "ri1")
             assert run["status"] == "failed"
             assert run["stop_reason"] == "failed"
             assert leaked not in run["last_error"]
             assert run["total_attempts"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_last_error_redacted_before_truncation_across_500_boundary(self, tmp_path):
         """敏感值横跨第 500 字符边界：必须先在完整文本脱敏、后截断（≤500）。
@@ -704,7 +728,7 @@ class TestLastErrorRedaction:
             assert "TAIL-MARKER" in stored  # 先脱敏才能在截断窗口内保留结尾标记
             assert len(stored) == 500  # 脱敏后仍 >500，按上限截断
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestRefreshStartedAt:
@@ -718,9 +742,9 @@ class TestRefreshStartedAt:
             dbm.agent_runs.atomic_claim("rf-ts")  # → processing
 
             assert dbm.agent_runs.refresh_started_at("rf-ts", 1000) is True
-            assert dbm.agent_runs.get_run("rf-ts")["started_at"] == 1000
+            assert _run(dbm, "rf-ts")["started_at"] == 1000
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_refresh_started_at_none_falls_back_to_now(self, tmp_path):
         """ts=None → 取当前 epoch 秒。"""
@@ -734,10 +758,10 @@ class TestRefreshStartedAt:
             before = int(time.time())
             assert dbm.agent_runs.refresh_started_at("rf-now") is True
             after = int(time.time())
-            started_at = dbm.agent_runs.get_run("rf-now")["started_at"]
+            started_at = _run(dbm, "rf-now")["started_at"]
             assert before <= started_at <= after
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     @pytest.mark.parametrize("bad_ts", [0, -100])
     def test_refresh_started_at_non_positive_ts_falls_back_to_now(
@@ -754,11 +778,11 @@ class TestRefreshStartedAt:
             before = int(time.time())
             assert dbm.agent_runs.refresh_started_at("rf-bad", bad_ts) is True
             after = int(time.time())
-            started_at = dbm.agent_runs.get_run("rf-bad")["started_at"]
+            started_at = _run(dbm, "rf-bad")["started_at"]
             assert started_at > 0
             assert before <= started_at <= after
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_refresh_started_at_non_processing_returns_false(self, tmp_path):
         """非 processing 态不刷新：返回 False，started_at 不变。"""
@@ -766,9 +790,9 @@ class TestRefreshStartedAt:
         try:
             dbm.agent_runs.create_pending("rf-term", "match", 1)
             assert dbm.agent_runs.refresh_started_at("rf-term", 1000) is False
-            assert dbm.agent_runs.get_run("rf-term")["started_at"] == 0
+            assert _run(dbm, "rf-term")["started_at"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_refresh_started_at_cas_matching_expected_updates_and_returns_true(
         self, tmp_path
@@ -778,7 +802,7 @@ class TestRefreshStartedAt:
         try:
             dbm.agent_runs.create_pending("cas-ok", "match", 1)
             dbm.agent_runs.atomic_claim("cas-ok")  # → processing
-            current = dbm.agent_runs.get_run("cas-ok")["started_at"]
+            current = _run(dbm, "cas-ok")["started_at"]
             assert current > 0
 
             assert (
@@ -787,9 +811,9 @@ class TestRefreshStartedAt:
                 )
                 is True
             )
-            assert dbm.agent_runs.get_run("cas-ok")["started_at"] == 2000
+            assert _run(dbm, "cas-ok")["started_at"] == 2000
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_refresh_started_at_cas_mismatch_returns_false_and_keeps_value(
         self, tmp_path
@@ -799,7 +823,7 @@ class TestRefreshStartedAt:
         try:
             dbm.agent_runs.create_pending("cas-bad", "match", 1)
             dbm.agent_runs.atomic_claim("cas-bad")
-            current = dbm.agent_runs.get_run("cas-bad")["started_at"]
+            current = _run(dbm, "cas-bad")["started_at"]
 
             assert (
                 dbm.agent_runs.refresh_started_at(
@@ -807,9 +831,9 @@ class TestRefreshStartedAt:
                 )
                 is False
             )
-            assert dbm.agent_runs.get_run("cas-bad")["started_at"] == current
+            assert _run(dbm, "cas-bad")["started_at"] == current
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_refresh_started_at_cas_non_processing_returns_false(self, tmp_path):
         """CAS 同时要求 status='processing'，非活性态不生效。"""
@@ -820,9 +844,9 @@ class TestRefreshStartedAt:
                 dbm.agent_runs.refresh_started_at("cas-p", 2000, expected_started_at=0)
                 is False
             )
-            assert dbm.agent_runs.get_run("cas-p")["started_at"] == 0
+            assert _run(dbm, "cas-p")["started_at"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestRunSyncRecordLinks:
@@ -847,13 +871,13 @@ class TestRunSyncRecordLinks:
                 assert run["run_id"] == "run-1"
 
             # 关联行共 3 条（多对一）
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             count = conn.execute(
                 "SELECT COUNT(*) FROM agent_run_sync_records WHERE run_id='run-1'"
             ).fetchone()[0]
             assert count == 3
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_add_link_insert_or_ignore_returns_zero_on_duplicate(self, tmp_path):
         """重复关联同一 (run, record) 幂等：第二次返回 0，不新增行"""
@@ -863,7 +887,7 @@ class TestRunSyncRecordLinks:
             assert dbm.agent_runs.add_run_sync_record_link("run-1", 101) == 1
             assert dbm.agent_runs.add_run_sync_record_link("run-1", 101) == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_find_latest_prefers_link_table_over_legacy_pointer(self, tmp_path):
         """有关联行时优先返回关联表指向的 run（而非旧 sync_record_id 主指针）"""
@@ -875,10 +899,12 @@ class TestRunSyncRecordLinks:
             dbm.agent_runs.create_pending("newer-run", "match", None)
             dbm.agent_runs.add_run_sync_record_link("newer-run", 500)
 
-            run = dbm.agent_runs.find_latest_by_sync_record(500)
+            run = _present(
+                dbm.agent_runs.find_latest_by_sync_record(500), "sync_record 500"
+            )
             assert run["run_id"] == "newer-run"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_find_latest_falls_back_to_legacy_pointer_when_no_link(self, tmp_path):
         """无关联行时回退旧路径（按 agent_runs.sync_record_id 主指针）"""
@@ -889,7 +915,7 @@ class TestRunSyncRecordLinks:
             assert run is not None
             assert run["run_id"] == "legacy-run"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_find_latest_returns_none_when_no_match(self, tmp_path):
         """既无关联行也无旧指针命中 → None"""
@@ -897,7 +923,7 @@ class TestRunSyncRecordLinks:
         try:
             assert dbm.agent_runs.find_latest_by_sync_record(999) is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_update_run_sync_record_id_refreshes_pointer(self, tmp_path):
         """update_run_sync_record_id 刷新调度主指针，返回 True；未知 run 返回 False"""
@@ -905,10 +931,10 @@ class TestRunSyncRecordLinks:
         try:
             dbm.agent_runs.create_pending("run-1", "match", 1)
             assert dbm.agent_runs.update_run_sync_record_id("run-1", 700) is True
-            assert dbm.agent_runs.get_run("run-1")["sync_record_id"] == 700
+            assert _run(dbm, "run-1")["sync_record_id"] == 700
             assert dbm.agent_runs.update_run_sync_record_id("missing", 1) is False
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestCleanupExpired:
@@ -945,7 +971,7 @@ class TestCleanupExpired:
                     "sequence": 1,
                 }
             )
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             # 把 ended_at 改到远早于保留期（epoch 秒整数，2000-01-01）
             conn.execute(
                 "UPDATE agent_runs SET ended_at=? WHERE run_id=?",
@@ -978,7 +1004,7 @@ class TestCleanupExpired:
             # B 的 steps 保留
             assert len(dbm.agent_runs.get_steps("cleanup-b")) == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_cleanup_expired_deletes_over_window_pending_and_processing(self, tmp_path):
         """pending/processing 超窗被删（含 steps 级联）。"""
@@ -1010,7 +1036,7 @@ class TestCleanupExpired:
             # run F：fresh pending（不应被删）
             dbm.agent_runs.create_pending("fresh-pending", "match", 12)
 
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             # 把活性超窗 run 的 created_at 改到远早于保留期
             conn.execute(
                 "UPDATE agent_runs SET created_at=? WHERE run_id IN (?, ?)",
@@ -1029,7 +1055,7 @@ class TestCleanupExpired:
             # fresh pending 保留
             assert dbm.agent_runs.get_run("fresh-pending") is not None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_cleanup_expired_keeps_in_window_any_status(self, tmp_path):
         """窗内（<30 天）任何状态不删；窗内 processing 不删（防回归）。"""
@@ -1065,7 +1091,7 @@ class TestCleanupExpired:
             assert dbm.agent_runs.get_run("cancelled") is not None
             assert dbm.agent_runs.get_run("proc-in-window") is not None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_cleanup_expired_zero_or_negative_returns_0(self, tmp_path):
         """retention_days=0/负数不删、返回 0（永不清理语义）。"""
@@ -1075,7 +1101,7 @@ class TestCleanupExpired:
             dbm.agent_runs.create_pending("zero-test", "match", 1)
             dbm.agent_runs.atomic_claim("zero-test")
             dbm.agent_runs.mark_succeeded("zero-test")
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "UPDATE agent_runs SET ended_at=? WHERE run_id=?",
                 (946684800, "zero-test"),
@@ -1087,7 +1113,7 @@ class TestCleanupExpired:
             # 记录仍在
             assert dbm.agent_runs.get_run("zero-test") is not None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestStepsOrdering:
@@ -1140,7 +1166,7 @@ class TestStepsOrdering:
             assert steps[0]["span_id"] == "z"
             assert steps[-1]["span_id"] == "x"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_steps_tie_break_by_id(self, tmp_path):
         """get_steps SQL 末级按 id 排序（同 (iteration, sequence) 稳定，replay 承诺）"""
@@ -1181,8 +1207,9 @@ class TestStepsOrdering:
                         "sequence": 0,
                     }
                 )
-            recorder = _RecordingConn(dbm._connection._conn)
-            dbm._connection._conn = recorder
+            recorder = _RecordingConn(_db_conn(dbm))
+            # 代理连接仅用于观测 SQL；与真实连接鸭子类型等价，故显式转换
+            dbm._connection._conn = cast(sqlite3.Connection, recorder)
 
             steps = dbm.agent_runs.get_steps("sort-tie")
             assert [s["span_id"] for s in steps] == ["t1", "t2", "t3"]
@@ -1193,7 +1220,7 @@ class TestStepsOrdering:
             # 防回归（末级 id 排序是 replay 稳定承诺），仅在确需改写 SQL 时同步更新。
             assert normalized.endswith("ORDER BY iteration ASC, sequence ASC, id ASC")
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestSchedulerHelpers:
@@ -1208,14 +1235,14 @@ class TestSchedulerHelpers:
             assert len(pending) == 2
             assert {r["run_id"] for r in pending} == {"lp1", "lp2"}
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_list_stale_processing(self, tmp_path):
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("stale", "match", 3)
             dbm.agent_runs.atomic_claim("stale")  # started_at = now
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             # 把 started_at 改到远早于超时阈值（epoch 秒整数，2000-01-01）
             conn.execute(
                 "UPDATE agent_runs SET started_at=? WHERE run_id=?",
@@ -1232,7 +1259,7 @@ class TestSchedulerHelpers:
             stale2 = dbm.agent_runs.list_stale_processing(120)
             assert not any(r["run_id"] == "fresh" for r in stale2)
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 # ---------------------------------------------------------------------------
@@ -1266,7 +1293,7 @@ def _set_candidate_status(
     dbm, candidate_id: int, status: str, resolved_at=None
 ) -> None:
     """测试辅助：直接改写候选状态与 resolved_at（构造窗口/已处理场景）"""
-    conn = dbm._connection._conn
+    conn = _db_conn(dbm)
     conn.execute(
         "UPDATE pending_candidates SET status=?, resolved_at=? WHERE id=?",
         (status, resolved_at, candidate_id),
@@ -1298,14 +1325,14 @@ class TestEnqueueMatchRun:
                 dbm, run_id="new-run", business_key=self.BK, sync_record_id=100
             )
             assert res == {"decision": "created", "run_id": "new-run"}
-            run = dbm.agent_runs.get_run("new-run")
+            run = _run(dbm, "new-run")
             assert run is not None
             assert run["status"] == "pending"
             assert run["business_key"] == self.BK
             assert run["sync_record_id"] == 100
             assert run["total_attempts"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_processing_in_flight_returns_existing_and_refreshes(self, tmp_path):
         """同键在途 processing → in_flight，返回已有 run_id，不新建并刷新主指针"""
@@ -1319,11 +1346,11 @@ class TestEnqueueMatchRun:
             )
             assert res == {"decision": "in_flight", "run_id": "run-b"}
             assert dbm.agent_runs.get_run("run-c") is None
-            run = dbm.agent_runs.get_run("run-b")
+            run = _run(dbm, "run-b")
             assert run["status"] == "processing"
             assert run["sync_record_id"] == 200
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_pending_in_flight_returns_existing(self, tmp_path):
         """同键 pending → in_flight，返回已有 run_id，不新建"""
@@ -1335,13 +1362,13 @@ class TestEnqueueMatchRun:
             )
             assert res == {"decision": "in_flight", "run_id": "run-a"}
             assert dbm.agent_runs.get_run("run-a2") is None
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             count = conn.execute(
                 "SELECT COUNT(*) FROM agent_runs WHERE business_key=?", (self.BK,)
             ).fetchone()[0]
             assert count == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_failed_below_limit_creates_new_run(self, tmp_path):
         """同键 failed 累计 2（<10）→ created，返回新 run_id，不复用旧行"""
@@ -1353,19 +1380,19 @@ class TestEnqueueMatchRun:
 
             res = _enqueue(dbm, run_id="f3", business_key=self.BK, sync_record_id=300)
             assert res == {"decision": "created", "run_id": "f3"}
-            new_run = dbm.agent_runs.get_run("f3")
+            new_run = _run(dbm, "f3")
             assert new_run["status"] == "pending"
             assert new_run["sync_record_id"] == 300
             # 旧 failed 行不被复用/改写
-            assert dbm.agent_runs.get_run("f1")["status"] == "failed"
-            assert dbm.agent_runs.get_run("f2")["status"] == "failed"
-            conn = dbm._connection._conn
+            assert _run(dbm, "f1")["status"] == "failed"
+            assert _run(dbm, "f2")["status"] == "failed"
+            conn = _db_conn(dbm)
             count = conn.execute(
                 "SELECT COUNT(*) FROM agent_runs WHERE business_key=?", (self.BK,)
             ).fetchone()[0]
             assert count == 3
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_failed_at_limit_exhausted_no_new_run(self, tmp_path):
         """同键 failed 累计达上限（10）→ exhausted，不写库"""
@@ -1381,13 +1408,13 @@ class TestEnqueueMatchRun:
             )
             assert res == {"decision": "exhausted", "run_id": "f9"}
             assert dbm.agent_runs.get_run("f-new") is None
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             count = conn.execute(
                 "SELECT COUNT(*) FROM agent_runs WHERE business_key=?", (self.BK,)
             ).fetchone()[0]
             assert count == 10
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_pending_candidate_reuses_holding_forever(self, tmp_path):
         """succeeded + 候选 pending → reuse_holding（无限期，不复用窗口限制）"""
@@ -1401,9 +1428,9 @@ class TestEnqueueMatchRun:
             res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "reuse_holding", "run_id": "r1"}
             assert dbm.agent_runs.get_run("r2") is None
-            assert dbm.agent_runs.get_run("r1")["sync_record_id"] == 200
+            assert _run(dbm, "r1")["sync_record_id"] == 200
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_rejected_candidate_within_window_reuses(self, tmp_path):
         """rejected 且 resolved_at 20 天前（<30 天）→ reuse_holding"""
@@ -1417,7 +1444,7 @@ class TestEnqueueMatchRun:
             assert res == {"decision": "reuse_holding", "run_id": "r1"}
             assert dbm.agent_runs.get_run("r2") is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_rejected_candidate_outside_window_creates(self, tmp_path):
         """rejected 且 resolved_at 40 天前（>30 天）→ created 重新评估"""
@@ -1429,9 +1456,9 @@ class TestEnqueueMatchRun:
 
             res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
-            assert dbm.agent_runs.get_run("r2")["status"] == "pending"
+            assert _run(dbm, "r2")["status"] == "pending"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_confirmed_candidate_valid_mapping_reuses_accepted(
         self, tmp_path
@@ -1455,7 +1482,7 @@ class TestEnqueueMatchRun:
             assert res == {"decision": "reuse_accepted", "run_id": "r1"}
             assert dbm.agent_runs.get_run("r2") is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_confirmed_candidate_invalid_mapping_creates(self, tmp_path):
         """confirmed + accepted_mapping_valid=False（映射已删除）→ created"""
@@ -1473,9 +1500,9 @@ class TestEnqueueMatchRun:
                 accepted_mapping_valid=False,
             )
             assert res == {"decision": "created", "run_id": "r2"}
-            assert dbm.agent_runs.get_run("r2")["status"] == "pending"
+            assert _run(dbm, "r2")["status"] == "pending"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_without_candidate_creates(self, tmp_path):
         """succeeded 终态但无候选行 → created"""
@@ -1485,7 +1512,7 @@ class TestEnqueueMatchRun:
             res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_succeeded_with_distant_candidate_creates(self, tmp_path):
         """同键候选存在但 business_key 不同 → 不影响决策（无候选 → created）"""
@@ -1496,7 +1523,7 @@ class TestEnqueueMatchRun:
             res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_cancelled_creates(self, tmp_path):
         """cancelled / 其他终态 → created"""
@@ -1508,7 +1535,7 @@ class TestEnqueueMatchRun:
             res = _enqueue(dbm, run_id="r2", business_key=self.BK, sync_record_id=200)
             assert res == {"decision": "created", "run_id": "r2"}
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_empty_business_key_creates_each_time(self, tmp_path):
         """business_key 为空（去重禁用）→ 每次 created，不去重"""
@@ -1518,11 +1545,11 @@ class TestEnqueueMatchRun:
             res2 = _enqueue(dbm, run_id="r2", business_key="", sync_record_id=200)
             assert res1 == {"decision": "created", "run_id": "r1"}
             assert res2 == {"decision": "created", "run_id": "r2"}
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             count = conn.execute("SELECT COUNT(*) FROM agent_runs").fetchone()[0]
             assert count == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_in_flight_none_sync_record_keeps_pointer(self, tmp_path):
         """in_flight 且 sync_record_id=None（前移场景）→ 主指针不变"""
@@ -1533,32 +1560,34 @@ class TestEnqueueMatchRun:
                 dbm, run_id="run-a2", business_key=self.BK, sync_record_id=None
             )
             assert res == {"decision": "in_flight", "run_id": "run-a"}
-            assert dbm.agent_runs.get_run("run-a")["sync_record_id"] == 100
+            assert _run(dbm, "run-a")["sync_record_id"] == 100
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_policy_params_are_required_keywords(self, tmp_path):
         """决策策略参数必填（禁默认值兜底）：任一缺失 → TypeError"""
         dbm = _make_db(tmp_path)
         try:
+            # 故意以缺失策略参数调用：断言的是运行时必填校验，故绕过静态签名检查
+            enqueue = cast(Callable[..., dict], dbm.agent_runs.enqueue_match_run)
             with pytest.raises(TypeError):
-                dbm.agent_runs.enqueue_match_run(run_id="r", business_key=self.BK)
+                enqueue(run_id="r", business_key=self.BK)
             with pytest.raises(TypeError):
-                dbm.agent_runs.enqueue_match_run(
+                enqueue(
                     run_id="r",
                     business_key=self.BK,
                     reuse_window_days=_REUSE_WINDOW_DAYS,
                     max_total_attempts=_MAX_TOTAL_ATTEMPTS,
                 )
             with pytest.raises(TypeError):
-                dbm.agent_runs.enqueue_match_run(
+                enqueue(
                     run_id="r",
                     business_key=self.BK,
                     reuse_window_days=_REUSE_WINDOW_DAYS,
                     accepted_mapping_valid=True,
                 )
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_internal_exception_propagates_not_fake_created(
         self, tmp_path, monkeypatch
@@ -1579,13 +1608,13 @@ class TestEnqueueMatchRun:
                 _enqueue(dbm, run_id="r", business_key=self.BK)
             assert dbm.agent_runs.get_run("r") is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_integrity_error_falls_back_to_in_flight(self, tmp_path, monkeypatch):
         """并发唯一索引冲突（IntegrityError）→ 兜底复用已在途 run，不抛出"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "INSERT INTO agent_runs "
                 "(run_id, task_type, sync_record_id, business_key, status, "
@@ -1605,7 +1634,7 @@ class TestEnqueueMatchRun:
             assert res == {"decision": "in_flight", "run_id": "concurrent-run"}
             assert dbm.agent_runs.get_run("new-run") is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 # ---------------------------------------------------------------------------
