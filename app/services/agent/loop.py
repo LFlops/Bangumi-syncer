@@ -192,16 +192,26 @@ def _align_results(
     - 执行器返回 ``BatchResults``（带 ``ordered`` 槽位）→ 按槽位取，重复 tool_use_id
       的每条 tool_use 各取自身结果（首个真实结果不被 duplicate 错误块覆盖）
     - 普通 ``dict[tool_use_id, result]``（旧契约 / 注入的简易执行器）→ 回退按 id 取值
+    - 逐元素归一化：仅接受 ``ToolResultBlock``，其余（缺失 / 异常泄漏值）归一为
+      ``None``；返回元素类型为具体联合，避免 ``list[None]`` / ``list[Unknown]``
+      在不变性位置被更严格的类型检查器拒绝
     """
+    aligned: list[ToolResultBlock | None] = []
     ordered = getattr(results, "ordered", None)
     if isinstance(ordered, list) and len(ordered) == len(tool_calls):
         if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls, strict=True)):
-            return [result for _, result in ordered]
+            for _, result in ordered:
+                aligned.append(result if isinstance(result, ToolResultBlock) else None)
+            return aligned
         logger.debug("ordered 槽位与 tool_calls 不一致，回退 dict 取值")
     getter = getattr(results, "get", None)
     if getter is None:
-        return [None] * len(tool_calls)
-    return [getter(tc.id) for tc in tool_calls]
+        aligned.extend([None] * len(tool_calls))
+        return aligned
+    for tc in tool_calls:
+        item = getter(tc.id)
+        aligned.append(item if isinstance(item, ToolResultBlock) else None)
+    return aligned
 
 
 def _pad_aligned(
