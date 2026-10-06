@@ -9,9 +9,30 @@
 5. 唯一索引兜底：同 business_key 重复 pending INSERT 冲突不炸主流程。
 """
 
+import sqlite3
 from pathlib import Path
 
 from app.core.database import DatabaseManager
+
+
+def _db_conn(dbm: DatabaseManager) -> sqlite3.Connection:
+    """返回底层 sqlite3 连接（测试构造后必然非 None，显式收窄）"""
+    conn = dbm._connection._conn
+    assert conn is not None, "测试数据库连接未初始化"
+    return conn
+
+
+def _row_id(value: int | None) -> int:
+    """显式收窄沉淀返回的行 id（测试前提：沉淀成功）"""
+    assert value is not None, "沉淀应返回行 id"
+    return value
+
+
+def _record(dbm: DatabaseManager, candidate_id: int | None) -> dict:
+    """读取待确认候选记录并显式收窄（测试前提：记录存在）"""
+    record = dbm.get_pending_candidate_by_id(_row_id(candidate_id))
+    assert record is not None, "待确认候选记录应存在"
+    return record
 
 
 def _make_db(tmp_path: Path) -> DatabaseManager:
@@ -71,13 +92,13 @@ class TestBusinessKeyDedup:
             assert result["total"] == 1
 
             # sync_record_id 刷新为最新
-            record = dbm.get_pending_candidate_by_id(id1)
+            record = _record(dbm, id1)
             assert record["sync_record_id"] == 200
             # 展示字段刷新
             assert "333" in record["candidates_json"]
             assert "custom_mapping" in record["trace_json"]
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_different_season_independent_rows(self, tmp_path):
         """不同 season → 独立行"""
@@ -103,7 +124,7 @@ class TestBusinessKeyDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_different_user_independent_rows(self, tmp_path):
         """不同 user → 独立行"""
@@ -129,7 +150,7 @@ class TestBusinessKeyDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_normalized_title_matches(self, tmp_path):
         """归一化后标题相同 → 同一 business_key → 仅一行
@@ -160,7 +181,7 @@ class TestBusinessKeyDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestBusinessKeyBackwardCompat:
@@ -191,7 +212,7 @@ class TestBusinessKeyBackwardCompat:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_empty_business_key_different_source_independent(self, tmp_path):
         """business_key 为空 + 不同 source → 独立行（旧行为）"""
@@ -217,7 +238,7 @@ class TestBusinessKeyBackwardCompat:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestResolveSimilarByBusinessKey:
@@ -227,7 +248,7 @@ class TestResolveSimilarByBusinessKey:
         """按 business_key 批量更新同键 pending 行"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             # 直接插入 3 条同 business_key 的 pending 行（绕过唯一索引）
             conn.execute(
                 "DROP INDEX IF EXISTS idx_pending_candidates_business_key_active"
@@ -267,13 +288,13 @@ class TestResolveSimilarByBusinessKey:
             remaining = dbm.get_pending_candidates(status="pending")["total"]
             assert remaining == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_resolve_by_business_key_no_exclude(self, tmp_path):
         """business_key 匹配 + exclude_id=None → 更新所有"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "DROP INDEX IF EXISTS idx_pending_candidates_business_key_active"
             )
@@ -300,13 +321,13 @@ class TestResolveSimilarByBusinessKey:
             assert affected == 3
             assert dbm.get_pending_candidates(status="pending")["total"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_resolve_empty_business_key_falls_back(self, tmp_path):
         """business_key 为空时按 4 元组批量更新（旧行为）"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "DROP INDEX IF EXISTS idx_pending_candidates_business_key_active"
             )
@@ -331,7 +352,7 @@ class TestResolveSimilarByBusinessKey:
             )
             assert affected == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestUniqueIndexGuard:
@@ -353,7 +374,7 @@ class TestUniqueIndexGuard:
 
             # 第二次直接 INSERT（绕过 upsert 查询）应触发唯一约束冲突
             # 验证索引存在且生效
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             try:
                 conn.execute(
                     """
@@ -373,7 +394,7 @@ class TestUniqueIndexGuard:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_empty_business_key_bypasses_unique_index(self, tmp_path):
         """business_key 为空时不参与唯一约束（空 key 历史行兼容）"""
@@ -400,7 +421,7 @@ class TestUniqueIndexGuard:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 2
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestFindLatestByBusinessKey:
@@ -410,7 +431,7 @@ class TestFindLatestByBusinessKey:
         """同键多条候选 → 返回 id 最大的一条（含 status / resolved_at）"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 "DROP INDEX IF EXISTS idx_pending_candidates_business_key_active"
             )
@@ -439,7 +460,7 @@ class TestFindLatestByBusinessKey:
             assert row["status"] == "pending"
             assert row["business_key"] == "match|user1|测试番剧|1"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_returns_none_for_unknown_or_empty_key(self, tmp_path):
         """未知 business_key / 空 key → None"""
@@ -448,13 +469,13 @@ class TestFindLatestByBusinessKey:
             assert dbm._pending.find_latest_by_business_key("match|nobody|无|1") is None
             assert dbm._pending.find_latest_by_business_key("") is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_ignores_status_outside_pending_confirmed_rejected(self, tmp_path):
         """已被物理删除状态之外的行不参与复用判定"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute(
                 """
                 INSERT INTO pending_candidates
@@ -470,4 +491,4 @@ class TestFindLatestByBusinessKey:
                 is None
             )
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()

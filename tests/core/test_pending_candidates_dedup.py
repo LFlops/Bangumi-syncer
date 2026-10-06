@@ -8,9 +8,30 @@
 """
 
 import json
+import sqlite3
 from pathlib import Path
 
 from app.core.database import DatabaseManager
+
+
+def _db_conn(dbm: DatabaseManager) -> sqlite3.Connection:
+    """返回底层 sqlite3 连接（测试构造后必然非 None，显式收窄）"""
+    conn = dbm._connection._conn
+    assert conn is not None, "测试数据库连接未初始化"
+    return conn
+
+
+def _row_id(value: int | None) -> int:
+    """显式收窄沉淀返回的行 id（测试前提：沉淀成功）"""
+    assert value is not None, "沉淀应返回行 id"
+    return value
+
+
+def _record(dbm: DatabaseManager, candidate_id: int | None) -> dict:
+    """读取待确认候选记录并显式收窄（测试前提：记录存在）"""
+    record = dbm.get_pending_candidate_by_id(_row_id(candidate_id))
+    assert record is not None, "待确认候选记录应存在"
+    return record
 
 
 def _make_db(tmp_path: Path) -> DatabaseManager:
@@ -46,7 +67,7 @@ class TestPendingCandidatesDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_upserts_on_duplicate_key(self, tmp_path):
         """同 key 重复沉淀时更新而非插入新行"""
@@ -85,11 +106,11 @@ class TestPendingCandidatesDedup:
             assert result["total"] == 1
 
             # 候选已更新为新值
-            record = dbm.get_pending_candidate_by_id(id1)
+            record = _record(dbm, id1)
             assert "333" in record["candidates_json"]
             assert "custom_mapping" in record["trace_json"]
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_inserts_different_keys_independently(self, tmp_path):
         """不同 key 各自独立插入"""
@@ -119,7 +140,7 @@ class TestPendingCandidatesDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 3
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_upsert_does_not_touch_resolved_rows(self, tmp_path):
         """已确认/拒绝的行不影响 upsert（部分唯一索引仅覆盖 pending）"""
@@ -134,7 +155,7 @@ class TestPendingCandidatesDedup:
                 candidates=_make_candidates(),
             )
             dbm.update_pending_candidate_status(
-                row_id, "confirmed", confirmed_subject_id="111"
+                _row_id(row_id), "confirmed", confirmed_subject_id="111"
             )
 
             # 同 key 再次沉淀（应插入新行，因为旧行已非 pending）
@@ -151,7 +172,7 @@ class TestPendingCandidatesDedup:
             result = dbm.get_pending_candidates(status="pending")
             assert result["total"] == 1
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestResolveSimilarPendingCandidates:
@@ -170,7 +191,7 @@ class TestResolveSimilarPendingCandidates:
                 candidates=_make_candidates(),
             )
             # 模拟去重前的历史数据：临时删除部分唯一索引后直接插入额外 pending 行
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute("DROP INDEX IF EXISTS idx_pending_candidates_dedup")
             conn.execute(
                 "INSERT INTO pending_candidates (request_title, request_season, user_name, source, status, candidates_json, trace_json) "
@@ -205,13 +226,13 @@ class TestResolveSimilarPendingCandidates:
             remaining = dbm.get_pending_candidates(status="pending")["total"]
             assert remaining == 1  # 只剩 first_id 还是 pending
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_exclude_id_zero_means_all(self, tmp_path):
         """exclude_id=None 时更新所有匹配的 pending 行"""
         dbm = _make_db(tmp_path)
         try:
-            conn = dbm._connection._conn
+            conn = _db_conn(dbm)
             conn.execute("DROP INDEX IF EXISTS idx_pending_candidates_dedup")
             for _ in range(3):
                 conn.execute(
@@ -230,7 +251,7 @@ class TestResolveSimilarPendingCandidates:
             assert affected == 3
             assert dbm.get_pending_candidates(status="pending")["total"] == 0
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestPendingCandidatesSyncRecordId:
@@ -255,14 +276,14 @@ class TestPendingCandidatesSyncRecordId:
             )
             assert row_id is not None
 
-            record = dbm.get_pending_candidate_by_id(row_id)
+            record = _record(dbm, row_id)
             assert record["sync_record_id"] == 42
 
             # 列表接口也返回该字段
             result = dbm.get_pending_candidates(status="pending")
             assert result["records"][0]["sync_record_id"] == 42
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_insert_without_sync_record_id_defaults_null(self, tmp_path):
         """不传 sync_record_id 时默认 NULL"""
@@ -275,10 +296,10 @@ class TestPendingCandidatesSyncRecordId:
                 source="plex",
                 candidates=_make_candidates(),
             )
-            record = dbm.get_pending_candidate_by_id(row_id)
+            record = _record(dbm, row_id)
             assert record["sync_record_id"] is None
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_upsert_refreshes_sync_record_id(self, tmp_path):
         """同 key 重复沉淀时 sync_record_id 刷新为最新值"""
@@ -303,10 +324,10 @@ class TestPendingCandidatesSyncRecordId:
             )
             assert id1 == id2
 
-            record = dbm.get_pending_candidate_by_id(id1)
+            record = _record(dbm, id1)
             assert record["sync_record_id"] == 200
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
 
 class TestLlmFieldProjection:
@@ -324,7 +345,7 @@ class TestLlmFieldProjection:
         sync_record_id=None,
         business_key="",
     ):
-        conn = dbm._connection._conn
+        conn = _db_conn(dbm)
         cur = conn.execute(
             """
             INSERT INTO pending_candidates
@@ -368,11 +389,11 @@ class TestLlmFieldProjection:
                     ensure_ascii=False,
                 ),
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "333"
             assert rec["llm_reason"] == "新理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_falls_back_to_column_without_llm_entry(self, tmp_path):
         """candidates_json 无 llm 条目 → 保留列值（旧数据兼容）。"""
@@ -387,11 +408,11 @@ class TestLlmFieldProjection:
                 llm_subject_id="999",
                 llm_reason="列内旧理由",
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "999"
             assert rec["llm_reason"] == "列内旧理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_falls_back_to_column_when_llm_entry_missing_reason(self, tmp_path):
         """llm 条目缺 reason → reason 回退列值，subject_id 仍取 JSON。"""
@@ -403,11 +424,11 @@ class TestLlmFieldProjection:
                 llm_subject_id="999",
                 llm_reason="列内旧理由",
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "444"
             assert rec["llm_reason"] == "列内旧理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_invalid_candidates_json_keeps_columns(self, tmp_path):
         """非法 JSON → 原样保留列值（不抛错）。"""
@@ -416,11 +437,11 @@ class TestLlmFieldProjection:
             cid = self._insert(
                 dbm, "not-json", llm_subject_id="888", llm_reason="列内旧理由"
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "888"
             assert rec["llm_reason"] == "列内旧理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_projects_in_list_path(self, tmp_path):
         """列表读取路径同样投影。"""
@@ -443,7 +464,7 @@ class TestLlmFieldProjection:
             assert result["records"][0]["llm_subject_id"] == "555"
             assert result["records"][0]["llm_reason"] == "列表理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_projects_in_find_latest_by_business_key(self, tmp_path):
         """find_latest_by_business_key（SELECT * 路径）同样投影。"""
@@ -468,7 +489,7 @@ class TestLlmFieldProjection:
             assert row["llm_subject_id"] == "666"
             assert row["llm_reason"] == "bk理由"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_projects_non_str_subject_and_reason_without_raising(self, tmp_path):
         """混合脏类型（list subject_id / int reason / 非 dict 条目）→ 投影不抛。
@@ -491,11 +512,11 @@ class TestLlmFieldProjection:
                 llm_subject_id="999",
                 llm_reason="列内旧理由",
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "[111]"
             assert rec["llm_reason"] == "3"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
 
     def test_projects_dict_subject_id_as_string_repr(self, tmp_path):
         """dict 类型 subject_id → ``str(dict)`` 兜底；reason=0 也应投影（非空值语义）。"""
@@ -515,8 +536,8 @@ class TestLlmFieldProjection:
                 llm_subject_id="999",
                 llm_reason="列内旧理由",
             )
-            rec = dbm.get_pending_candidate_by_id(cid)
+            rec = _record(dbm, cid)
             assert rec["llm_subject_id"] == "{'id': 1}"
             assert rec["llm_reason"] == "0"
         finally:
-            dbm._connection._conn.close()
+            _db_conn(dbm).close()
