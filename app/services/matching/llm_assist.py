@@ -14,11 +14,12 @@
   （pending_candidates）/ 通知 / 业务键
 
 事务：候选写入（pending_candidates.candidates_json）与 agent_runs 状态更新在
-**单一数据库事务**内完成（``database_manager._execute_with_lock`` 包裹两条
-语句，异常即整体回滚）。``candidates_json`` 是 LLM 建议的唯一写入源（条目含
-``source='llm_assist'`` 与 ``reason``）；``llm_subject_id`` / ``llm_reason``
-两列仅为旧数据兼容保留，本服务层不再写入，读取时由 pending_candidates 仓储
-层从 JSON 投影（见 ``_project_llm_fields``）。
+**单一数据库事务**内完成（事务已下沉仓储
+``PendingCandidatesRepository.persist_llm_suggestion``，由 ``_run_write`` 取锁 +
+commit、异常整体回滚；服务层 ``_persist_llm_candidate`` 仅薄封装）。``candidates_json``
+是 LLM 建议的唯一写入源（条目含 ``source='llm_assist'`` 与 ``reason``）；
+``llm_subject_id`` / ``llm_reason`` 两列仅为旧数据兼容保留，本服务层不再写入，
+读取时由 pending_candidates 仓储层从 JSON 投影（见 ``_project_llm_fields``）。
 
 文件结构导航（按出现顺序）：
 
@@ -26,7 +27,8 @@
 2. 校验（委托 ``SyncService._validate_subject_id``）——subject_id 存在性校验与安全解析
 3. 工具注册（``register_match_tools``）——4 个 read + 1 个 terminal 工具定义（闭包捕获 bgm）
 4. 上下文构建——从 sync_records 提取候选 + 构建被 ``---`` 隔离的 seed 消息
-5. 落库（单一事务）——bgm 名称事务外预取 / 候选合并 / ``_persist_llm_candidate``（含 CAS 竞态守卫）
+5. 落库（委托仓储单一事务）——bgm 名称事务外预取 / ``_persist_llm_candidate``
+   （薄封装，CAS 竞态守卫与候选合并见 ``PendingCandidatesRepository``）
 6. 通知（事务提交后 best-effort）——``_ItemView`` 视图 + ``_send_notification`` 适配
 7. 预算解析——``resolve_max_iterations_override`` 薄委托 agent 骨架单一实现
 8. 默认 stream 函数——``_build_default_stream_fn`` 包装 ``LLMClient.stream_chat``
@@ -40,13 +42,10 @@ import asyncio
 import functools
 import json
 import sqlite3
-import time
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Any
 
 from app.core.config import config_manager
-from app.core.database.agent_runs import apply_cancelled
 from app.core.logging import logger
 from app.services.agent.budget import (
     get_max_iterations,
@@ -106,9 +105,6 @@ DEFAULT_SYSTEM_TEMPLATE = (
     "你是 Bangumi 番组计划的匹配助手，负责为匹配失败的媒体条目"
     "推荐正确的 Bangumi 条目 ID。请综合工具检索结果做出判断。"
 )
-
-# 候选已被用户处理（恢复续跑/迟到提交竞态）时 run 的取消原因
-_STOP_REASON_USER_RESOLVED = "user_resolved"
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +407,7 @@ def build_seed_messages(
 
 
 # ---------------------------------------------------------------------------
-# 落库（单一事务）
+# 落库（委托仓储单一事务）
 # ---------------------------------------------------------------------------
 def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
     """事务外预取 Bangumi 条目名称（避免事务内发起 HTTP 调用）。
@@ -432,22 +428,6 @@ def _prefetch_bgm_name(bgm: Any, subject_id: str) -> str:
     return ""
 
 
-def _merge_llm_candidate(existing: list, new_cand: dict) -> None:
-    """将 llm 建议并入候选列表（原地修改）。
-
-    保持「同 subject_id 不重复追加」去重语义；但 candidates_json 是唯一真相源，
-    命中去重时仍需把 ``source='llm_assist'`` 与最新 ``reason`` 写回既有条目，
-    否则读取投影（``_project_llm_fields``）会丢失本次 LLM 建议。
-    """
-    sid = str(new_cand.get("subject_id"))
-    for cand in reversed(existing):
-        if isinstance(cand, dict) and str(cand.get("subject_id")) == sid:
-            cand["source"] = "llm_assist"
-            cand["reason"] = new_cand.get("reason", "")
-            return
-    existing.append(new_cand)
-
-
 def _persist_llm_candidate(
     dbm,
     *,
@@ -462,6 +442,10 @@ def _persist_llm_candidate(
     bgm_title: str = "",
 ) -> int | None:
     """在单一事务内：写 pending_candidates（candidates_json 唯一写入源）+ 置 succeeded。
+
+    **DB 事务已下沉仓储**（``PendingCandidatesRepository.persist_llm_suggestion``）：
+    本函数为场景侧**薄封装**，仅转发参数，不再持有裸 SQL / 私有事务；下列语义
+    与竞态守卫由仓储逐字实现。
 
     ``candidates_json`` 追加/复用含 ``source='llm_assist'`` 与 ``reason`` 的条目；
     ``llm_subject_id`` / ``llm_reason`` 两列不再写入（读取时由仓储层投影）。
@@ -480,174 +464,19 @@ def _persist_llm_candidate(
     并返回 ``None``（跳过信号，调用方不得发送通知）。
 
     返回 pending_candidates 行 id（正常路径）；跳过时返回 ``None``。
-    异常时整体回滚。
+    异常时整体回滚（仓储 ``_run_write(reraise=True)`` 向上抛，由调用方降级处理）。
     """
-
-    def _write(conn):
-        # 取既有行：按 id 倒序取最新一条（不区分状态；历史注释曾称「优先 pending」，
-        # 但实现从未按状态过滤）
-        row = conn.execute(
-            "SELECT id, candidates_json, status, business_key FROM pending_candidates "
-            "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
-            (sync_record_id,),
-        ).fetchone()
-
-        if row is not None and row[2] != "pending":
-            # 用户已处理（confirmed/rejected）→ 不复活候选，run 标 cancelled 并跳过。
-            # 事务内直调 apply_cancelled（单一 SQL 入口，不二次取锁），
-            # SQL 与源状态守卫与 mark_cancelled 完全一致。
-            apply_cancelled(conn, run_id, stop_reason=_STOP_REASON_USER_RESOLVED)
-            logger.info(
-                f"[llm_assist] run {run_id} 候选(pending_candidates.id={row[0]}) "
-                f"状态={row[2]} 已被用户处理，跳过落库并标 run cancelled"
-            )
-            return None
-
-        name = bgm_title
-
-        new_cand = {
-            "subject_id": subject_id,
-            "name": name,
-            "name_cn": name,
-            "score": 1.0,
-            "source": "llm_assist",
-            "reason": reason,
-        }
-
-        if row:
-            existing_id = row[0]
-            existing_business_key = row[3] or ""
-            try:
-                existing = json.loads(row[1]) if row[1] else []
-            except (ValueError, TypeError):
-                existing = []
-            if not isinstance(existing, list):
-                existing = []
-            _merge_llm_candidate(existing, new_cand)
-            # CAS 乐观锁：除状态守卫外，追加**内容型**比对（SELECT 时的原始
-            # candidates_json），把幂等的 ``SET status='pending' WHERE
-            # status='pending'`` 升级为变更型 CAS。多进程下两个进程各自 SELECT
-            # 到同一旧值、各自 UPDATE 时，只有先提交者内容匹配，后提交者因
-            # candidates_json 已变而 rowcount=0 → 不双写、不双通知。
-            # COALESCE 兼容 NULL（历史行）/空串：SELECT 侧原始值统一由
-            # ``row[1] or ""`` 归一为空串，两侧口径一致。
-            original_json = row[1] or ""
-            # 历史行（无业务键）在同一事务内回填：否则后续 enqueue 复用判定
-            # 按 business_key 查询永远 miss，导致重复重跑 LLM。已在展示的候选行
-            # 不覆盖既有非空键（保持原身份，避免改写已被引用的业务身份）。
-            if not existing_business_key and business_key:
-                cursor = conn.execute(
-                    "UPDATE pending_candidates SET candidates_json=?, status='pending', "
-                    "business_key=? WHERE id=? AND status='pending' "
-                    "AND COALESCE(candidates_json, '') = ?",
-                    (
-                        json.dumps(existing, ensure_ascii=False),
-                        business_key,
-                        existing_id,
-                        original_json,
-                    ),
-                )
-            else:
-                cursor = conn.execute(
-                    "UPDATE pending_candidates SET candidates_json=?, status='pending' "
-                    "WHERE id=? AND status='pending' "
-                    "AND COALESCE(candidates_json, '') = ?",
-                    (
-                        json.dumps(existing, ensure_ascii=False),
-                        existing_id,
-                        original_json,
-                    ),
-                )
-            if cursor.rowcount == 0:
-                # SELECT 后行被并发处理或内容被并发修改：带守卫 + 内容 CAS 的
-                # UPDATE 未命中，同样不复活。事务内直调 apply_cancelled
-                # （单一 SQL 入口，不二次取锁）。
-                apply_cancelled(conn, run_id, stop_reason=_STOP_REASON_USER_RESOLVED)
-                logger.info(
-                    f"[llm_assist] run {run_id} 候选(pending_candidates.id="
-                    f"{existing_id}) 在落库瞬间状态变更/内容被并发修改，"
-                    f"跳过落库并标 run cancelled"
-                )
-                return None
-            candidate_id = existing_id
-        else:
-            # 无候选场景：新建行，candidates_json 仅含 LLM 推荐
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cur = conn.execute(
-                """
-                INSERT INTO pending_candidates
-                (created_at, request_title, request_ori_title, request_season,
-                 request_episode, user_name, source, candidates_json, trace_json,
-                 status, confirmed_subject_id, resolved_at, sync_record_id,
-                 business_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', NULL, ?, ?)
-                """,
-                (
-                    now,
-                    sync_record.get("title", ""),
-                    sync_record.get("ori_title") or "",
-                    int(sync_record.get("season", 1) or 1),
-                    int(sync_record.get("episode", 0) or 0),
-                    sync_record.get("user_name", ""),
-                    sync_record.get("source", ""),
-                    json.dumps([new_cand], ensure_ascii=False),
-                    "{}",
-                    sync_record_id,
-                    business_key,
-                ),
-            )
-            candidate_id = cur.lastrowid
-
-        # 同一事务内更新 agent_runs 为 succeeded（原子）
-        # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致。
-        # **源状态守卫**：仅 pending/processing 活性态可转 succeeded；
-        # run 已被并发路径终态化（cancelled/failed/no_suggestion/...）时命中 0 行，
-        # 不翻回 succeeded（否则通知与 DB 终态矛盾），跳过通知但保留候选写入。
-        cursor = conn.execute(
-            "UPDATE agent_runs SET status='succeeded', stop_reason=?, "
-            "total_tokens=?, ended_at=? WHERE run_id=? "
-            "AND status IN ('pending','processing')",
-            (
-                stop_reason,
-                total_tokens,
-                int(time.time()),
-                run_id,
-            ),
-        )
-        if cursor.rowcount == 0:
-            # 并发终态化：读当前状态供日志定位（best-effort，读失败不遮蔽主流程）
-            try:
-                current = conn.execute(
-                    "SELECT status FROM agent_runs WHERE run_id=?", (run_id,)
-                ).fetchone()
-                current_status = current[0] if current else "missing"
-            except Exception as e:  # 读状态失败仅降级日志，不影响返回契约
-                current_status = "unknown"
-                logger.warning(
-                    f"[llm_assist] run {run_id} succeeded 守卫命中 0 行后"
-                    f"读当前状态失败: {e}"
-                )
-            logger.warning(
-                f"[llm_assist] run {run_id} succeeded 守卫命中 0 行"
-                f"（当前状态={current_status}），跳过通知"
-            )
-            return None
-        return candidate_id
-
-    def _write_committed(conn):
-        """包一层显式提交：``_execute_with_lock`` 正常路径不会 commit。
-
-        ``_write`` 有多个返回路径（正常 candidate_id / 竞态跳过 None /
-        succeeded 守卫命中 None），全部都要先落库再返回，否则事务悬挂在连接上，
-        仅靠后续其他写操作的 commit 或连接关闭（回滚）才生效——独立连接读不到
-        已"完成"的落库结果。异常路径不在此 commit，交由
-        ``_execute_with_lock`` 统一 rollback。
-        """
-        result = _write(conn)
-        conn.commit()
-        return result
-
-    return dbm._execute_with_lock(_write_committed)
+    return dbm.persist_llm_suggestion(
+        run_id=run_id,
+        sync_record_id=sync_record_id,
+        sync_record=sync_record,
+        business_key=business_key,
+        subject_id=subject_id,
+        reason=reason,
+        stop_reason=stop_reason,
+        total_tokens=total_tokens,
+        bgm_title=bgm_title,
+    )
 
 
 # ---------------------------------------------------------------------------

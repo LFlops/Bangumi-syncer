@@ -275,6 +275,37 @@ class DatabaseManager:
             business_key=business_key,
         )
 
+    def persist_llm_suggestion(
+        self,
+        *,
+        run_id: str,
+        sync_record_id: int | None,
+        sync_record: dict,
+        business_key: str,
+        subject_id: str,
+        reason: str,
+        stop_reason: str,
+        total_tokens: int = 0,
+        bgm_title: str = "",
+    ) -> int | None:
+        """单一事务落库 LLM 建议候选并置 run succeeded（含 CAS 竞态守卫）。
+
+        场景侧（``llm_assist._persist_llm_candidate``）经此转发到
+        ``PendingCandidatesRepository.persist_llm_suggestion``；返回候选行 id，
+        竞态跳过返回 ``None``，异常由仓储 ``reraise=True`` 向上抛。
+        """
+        return self._pending.persist_llm_suggestion(
+            run_id=run_id,
+            sync_record_id=sync_record_id,
+            sync_record=sync_record,
+            business_key=business_key,
+            subject_id=subject_id,
+            reason=reason,
+            stop_reason=stop_reason,
+            total_tokens=total_tokens,
+            bgm_title=bgm_title,
+        )
+
     def get_pending_candidates(
         self,
         limit: int = 50,

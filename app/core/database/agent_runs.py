@@ -28,6 +28,7 @@
 import json
 import sqlite3
 import time
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -119,6 +120,40 @@ def apply_cancelled(conn, run_id: str, *, stop_reason: str) -> bool:
         WHERE run_id=? AND status IN ('pending','processing')
         """,
         (stop_reason, _now(), run_id),
+    )
+    return cursor.rowcount > 0
+
+
+def apply_succeeded(
+    conn,
+    run_id: str,
+    *,
+    stop_reason: str,
+    total_tokens: int,
+    ended_at: int | None = None,
+) -> bool:
+    """事务内 succeeded 写入口：SQL 与源状态守卫与 mark_succeeded 完全相同。
+
+    供已持有写锁/在事务内执行的调用方直接调用（**不二次取锁**，避免
+    ``_run_write`` 嵌套写锁）。守卫为活性态 ``pending`` / ``processing``，
+    非活性态（no_suggestion / failed / cancelled / 已 succeeded）返回 False，
+    原值不变；``ended_at`` 缺省取 ``_now()``（epoch 秒，与其它终态口径一致），
+    显式传入时按调用方时钟写入（供与候选写入同事务的场景统一时间基准）。
+
+    返回是否真正改写（受影响行数 > 0）。
+    """
+    cursor = conn.execute(
+        """
+        UPDATE agent_runs
+        SET status='succeeded', stop_reason=?, total_tokens=?, ended_at=?
+        WHERE run_id=? AND status IN ('pending','processing')
+        """,
+        (
+            stop_reason,
+            total_tokens,
+            _now() if ended_at is None else ended_at,
+            run_id,
+        ),
     )
     return cursor.rowcount > 0
 
@@ -419,18 +454,15 @@ class AgentRunsRepository(BaseRepository):
 
         守卫为 first-wins：双跑 / 超时取消后恢复续跑与原执行者竞态时，
         后到者的落库不覆盖先到终态。
+
+        SQL 与源状态守卫收敛到模块级 :func:`apply_succeeded`（单一入口），
+        本方法在其外层保留 ``_run_write`` 取锁与错误消息。
         """
 
         def _write(conn):
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='succeeded', stop_reason=?, total_tokens=?, ended_at=?
-                WHERE run_id=? AND status IN ('pending','processing')
-                """,
-                (stop_reason, total_tokens, _now(), run_id),
+            return apply_succeeded(
+                conn, run_id, stop_reason=stop_reason, total_tokens=total_tokens
             )
-            return cursor.rowcount > 0
 
         return self._run_write(
             _write, error_msg="标记 agent_run succeeded 失败", default=False
@@ -870,6 +902,46 @@ class AgentRunsRepository(BaseRepository):
             return cursor.rowcount > 0
 
         return self._run_write(_write, error_msg="更新 agent_step 失败", default=False)
+
+    def record_budget_message(
+        self,
+        span_id: str,
+        transform: Callable[[str], str | None],
+    ) -> None:
+        """将预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
+
+        **读改写事务在仓储内**：SELECT 当前 ``replay_delta`` → 调 ``transform``
+        得到写回值 → UPDATE（``_run_write`` 取锁 + commit；异常 rollback + 日志）。
+        SELECT 无行时不调用 ``transform``、不写入。
+
+        ``transform`` 接收当前 raw ``replay_delta``，返回应写回的新 raw；
+        返回 ``None`` 表示**跳过写入**（解密/解析/加密失败等由 transform 内部判定
+        并留痕，保持「失败保留原 raw」契约）。加密/解密逻辑保留在 trace 侧
+        （``config_secret_crypto.decrypt/encrypt``）：仓储既有
+        ``_encrypt_replay_delta`` 在加密失败时降级存明文，与 replay_delta
+        的「失败不落明文」契约不等价，故不在此复用。
+
+        独立 best-effort 事务：失败仅日志（由 ``_run_write`` 的 ``error_msg`` 承载），
+        不向调用方抛出。
+        """
+
+        def _write(conn):
+            row = conn.execute(
+                "SELECT replay_delta FROM agent_steps WHERE span_id=?", (span_id,)
+            ).fetchone()
+            if not row:
+                return
+            new_delta = transform(row[0] or "")
+            if new_delta is None:
+                return
+            conn.execute(
+                "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
+                (new_delta, span_id),
+            )
+
+        self._run_write(
+            _write, error_msg="[trace] record_budget_message 失败（已忽略）"
+        )
 
     def get_steps(self, run_id: str) -> list:
         """按 run_id 查询 span 列表，按 (iteration, sequence, id) 排序。

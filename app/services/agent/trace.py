@@ -165,53 +165,44 @@ def record_budget_message(span_id: str, budget_message: str) -> None:
     """将透明预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
 
     在现有 replay_delta 上追加 ``budget_message`` 字段。独立 best-effort 事务。
-    读改写路径：SELECT → 解密 → 改 → 加密写回（加密由仓储层 decrypt/encrypt 处理）。
+    读改写路径（SELECT → 解密 → 改 → 加密写回）的**事务与 SQL 已下沉仓储**
+    （``AgentRunsRepository.record_budget_message``），本函数仅提供纯数据整形
+    transform（解密/解析/合并/加密），由仓储在锁内 SELECT 后调用。
 
     安全约束：任何解密/解析失败路径都**保留原 raw 不变**（不写库），仅记 warning 日志。
-    仅当成功解析为 dict 时才合并 budget_message 并写回。
+    仅当成功解析为 dict 时才合并 budget_message 并写回。加密失败绝不明文回写
+    （违反 replay_delta 完整加密契约），同样保留原 raw——transform 返回 ``None``
+    表示跳过写入。
     """
+
+    def _merge_budget(raw: str) -> str | None:
+        # 解密（容错无前缀明文）；解析失败保留原 raw，不写库
+        try:
+            obj = json.loads(decrypt(raw))
+        except Exception:
+            logger.warning(
+                "[trace] record_budget_message 解密/解析失败，保留原 raw 不写库"
+            )
+            return None
+        if not isinstance(obj, dict):
+            logger.warning(
+                "[trace] record_budget_message 解析结果非 dict，保留原 raw 不写库"
+            )
+            return None
+        obj["budget_message"] = budget_message
+        try:
+            return encrypt(json.dumps(obj, ensure_ascii=False))
+        except Exception as e:
+            # 加密失败绝不明文回写（违反 replay_delta 完整加密契约），保留原 raw
+            logger.warning(
+                "[trace] record_budget_message 加密失败，保留原 raw 不写库"
+                f"（{type(e).__name__}: {e}）"
+            )
+            return None
+
     try:
         dbm = get_database_manager()
-
-        def _write(conn):
-            cur = conn.execute(
-                "SELECT replay_delta FROM agent_steps WHERE span_id=?", (span_id,)
-            )
-            row = cur.fetchone()
-            if not row:
-                return
-            raw = row[0] or ""
-            # 解密（容错无前缀明文）；解析失败保留原 raw，不写库
-            try:
-                obj = json.loads(decrypt(raw))
-            except Exception:
-                logger.warning(
-                    "[trace] record_budget_message 解密/解析失败，保留原 raw 不写库"
-                )
-                return
-            if not isinstance(obj, dict):
-                logger.warning(
-                    "[trace] record_budget_message 解析结果非 dict，保留原 raw 不写库"
-                )
-                return
-            obj["budget_message"] = budget_message
-            try:
-                new_delta = encrypt(json.dumps(obj, ensure_ascii=False))
-            except Exception as e:
-                # 加密失败绝不明文回写（违反 replay_delta 完整加密契约），保留原 raw
-                logger.warning(
-                    "[trace] record_budget_message 加密失败，保留原 raw 不写库"
-                    f"（{type(e).__name__}: {e}）"
-                )
-                return
-            conn.execute(
-                "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
-                (new_delta, span_id),
-            )
-
-        dbm.agent_runs._run_write(
-            _write, error_msg="[trace] record_budget_message 失败（已忽略）"
-        )
+        dbm.agent_runs.record_budget_message(span_id, _merge_budget)
     except Exception as e:  # best-effort
         logger.error(f"[trace] record_budget_message 失败（已忽略）: {e}")
 

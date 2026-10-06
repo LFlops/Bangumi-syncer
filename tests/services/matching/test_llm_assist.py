@@ -1984,29 +1984,32 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
     bgm = MagicMock()
     bgm.get_subject.return_value = {"name": "N", "name_cn": "NC"}
 
-    conn = MagicMock()
-    # apply_cancelled 会读取 cursor.rowcount 做比较；真实连接该值为 int，
-    # 显式设为 0 避免 MagicMock 与非整型比较报错（此处不关心具体改写结果）。
-    conn.execute.return_value.rowcount = 0
+    run_id = "run-f8"
+    sr_id = 52
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+
+    real_conn = database_manager._connection._get_connection()
     captured = {}
-    real_get = bgm.get_subject
 
     def _exec_with_lock(fn):
-        before = real_get.call_count
-        # 运行事务回调：必须不在此处发起 HTTP 调用
-        fn(conn)
-        after = real_get.call_count
-        captured["in_tx_calls"] = after - before
-        return 1
+        before = bgm.get_subject.call_count
+        # 运行事务回调（经仓储 _run_write 的 _write 包装，含 commit）：
+        # 必须不在此处发起 HTTP 调用
+        result = fn(real_conn)
+        captured["in_tx_calls"] = bgm.get_subject.call_count - before
+        return result
 
-    dbm = MagicMock()
-    dbm._execute_with_lock.side_effect = _exec_with_lock
+    # 落库事务已下沉仓储，经 DatabaseConnection._execute_with_lock 取锁；
+    # 包装该层以观测事务回调内是否发起 HTTP。
+    monkeypatch.setattr(
+        database_manager._connection, "_execute_with_lock", _exec_with_lock
+    )
 
     llm_assist._persist_and_notify(
-        dbm,
-        "run-f8",
-        sync_record=_make_sync_record(sync_record_id=52),
-        sync_record_id=52,
+        database_manager,
+        run_id,
+        sync_record=_make_sync_record(sync_record_id=sr_id),
+        sync_record_id=sr_id,
         bgm=bgm,
         subject_id="5",
         reason="r",
