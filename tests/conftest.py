@@ -11,6 +11,17 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+
+def _set_attr(obj: object, name: str, value: object) -> None:
+    """运行时注入动态属性（测试替身 / 单例重置）。
+
+    这些属性（``_instance``、DatabaseManager 上的 trakt 测试替身、TraktClient
+    的旧 ``_client``）在类型注解中并未声明，直接属性赋值会触发静态检查；
+    用 ``object.__setattr__`` 保持原赋值语义，不改变 fixture 行为。
+    """
+    object.__setattr__(obj, name, value)
+
+
 # ===== 在导入 app 模块前重定向 CONFIG_FILE =====
 # 优先使用 git 跟踪的 config.example.ini 作为测试基线（安全、可复现），
 # 避免 config.ini 中的本地配置（token、enabled=True、proxy 等）污染测试。
@@ -338,11 +349,11 @@ def mock_database_manager(test_db):
 
             return {"records": records, "total": len(records)}
 
-        # 临时替换方法
-        database_manager.get_trakt_config = get_trakt_config
-        database_manager.save_trakt_config = save_trakt_config
-        database_manager.add_trakt_sync_history = add_trakt_sync_history
-        database_manager.get_trakt_sync_history = get_trakt_sync_history
+        # 临时替换方法（运行时注入的测试替身，DatabaseManager 上并无同名声明）
+        _set_attr(database_manager, "get_trakt_config", get_trakt_config)
+        _set_attr(database_manager, "save_trakt_config", save_trakt_config)
+        _set_attr(database_manager, "add_trakt_sync_history", add_trakt_sync_history)
+        _set_attr(database_manager, "get_trakt_sync_history", get_trakt_sync_history)
 
         yield database_manager
 
@@ -433,17 +444,17 @@ def reset_singletons():
     from app.core.database import database_manager
     from app.core.security import security_manager
 
-    # 重置单例
-    config_manager._instance = None
-    database_manager._instance = None
-    security_manager._instance = None
+    # 重置单例（_instance 为类外动态属性，静态注解未声明；保持原赋值语义）
+    _set_attr(config_manager, "_instance", None)
+    _set_attr(database_manager, "_instance", None)
+    _set_attr(security_manager, "_instance", None)
 
     yield
 
     # 清理
-    config_manager._instance = None
-    database_manager._instance = None
-    security_manager._instance = None
+    _set_attr(config_manager, "_instance", None)
+    _set_attr(database_manager, "_instance", None)
+    _set_attr(security_manager, "_instance", None)
 
 
 # 只有在没有安装 pytest-playwright 时才定义 event_loop
@@ -475,18 +486,19 @@ async def mock_trakt_client():
 
     client = TraktClient(access_token="test_token")
 
-    # 模拟内部客户端
-    client._client = AsyncMock()
+    # 模拟内部客户端（_client 为历史命名，当前实现实际使用 _http）
+    mock_client = AsyncMock()
+    _set_attr(client, "_client", mock_client)
     mock_response = AsyncMock()
     mock_response.status_code = 200
     mock_response.json = AsyncMock(return_value=[])
     mock_response.headers = {}
-    client._client.request = AsyncMock(return_value=mock_response)
+    mock_client.request = AsyncMock(return_value=mock_response)
 
     yield client
 
     # 清理
-    client._client = None
+    _set_attr(client, "_client", None)
 
 
 @pytest.fixture

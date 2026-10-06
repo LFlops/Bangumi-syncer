@@ -8,6 +8,12 @@ from unittest.mock import patch
 import pytest
 
 
+def _record(row: dict | None) -> dict:
+    """显式收窄可选查询结果（测试前提：目标记录存在）"""
+    assert row is not None, "查询记录应存在"
+    return row
+
+
 class TestDatabaseManager:
     """测试 DatabaseManager 类。"""
 
@@ -71,7 +77,7 @@ class TestDatabaseManager:
                 status="success",
                 media_type="movie",
             )
-            r = db.get_sync_record_by_id(1)
+            r = _record(db.get_sync_record_by_id(1))
             assert r["media_type"] == "movie"
 
     def test_log_sync_record_stores_account_results(self, temp_dir, reset_singletons):
@@ -109,7 +115,7 @@ class TestDatabaseManager:
                 source="custom",
                 account_results=outcomes,
             )
-            record = db.get_sync_record_by_id(1)
+            record = _record(db.get_sync_record_by_id(1))
             assert json.loads(record["account_results"]) == outcomes
 
     def test_log_sync_record_account_results_default_empty(
@@ -130,7 +136,7 @@ class TestDatabaseManager:
                 status="success",
                 source="custom",
             )
-            record = db.get_sync_record_by_id(1)
+            record = _record(db.get_sync_record_by_id(1))
             assert record["account_results"] == ""
 
     def test_migrate_adds_media_type_column(self, temp_dir, reset_singletons):
@@ -168,7 +174,7 @@ class TestDatabaseManager:
             from app.core.database import DatabaseManager
 
             db = DatabaseManager(str(db_path))
-        row = db.get_sync_record_by_id(1)
+        row = _record(db.get_sync_record_by_id(1))
         assert row["media_type"] == "episode"
 
     def test_migrate_adds_match_fields_columns(self, temp_dir, reset_singletons):
@@ -293,7 +299,7 @@ class TestDatabaseManager:
             )
         ]
         assert "account_results" in cols
-        record = db.get_sync_record_by_id(1)
+        record = _record(db.get_sync_record_by_id(1))
         assert record["title"] == "t"
         assert record["account_results"] == ""
 
@@ -315,7 +321,7 @@ class TestDatabaseManager:
                     season=1,
                     episode=1,
                 )
-        record = db.get_sync_record_by_id(1)
+        record = _record(db.get_sync_record_by_id(1))
         assert record["run_id"] == "sync_ctx_1"
         assert record["batch_id"] == "batch_ctx_1"
         listed = db.get_sync_records(limit=10)["records"][0]
@@ -338,7 +344,7 @@ class TestDatabaseManager:
                 season=1,
                 episode=1,
             )
-            record = db.get_sync_record_by_id(1)
+            record = _record(db.get_sync_record_by_id(1))
         assert record["run_id"] == ""
         assert record["batch_id"] == ""
 
@@ -538,7 +544,7 @@ class TestDatabaseManager:
             assert success is True
 
             # 验证更新
-            result = db.get_sync_record_by_id(1)
+            result = _record(db.get_sync_record_by_id(1))
             assert result["status"] == "success"
             assert result["message"] == "Updated message"
 
@@ -763,7 +769,7 @@ class TestDatabaseDockerAndTrakt:
                 )
                 is True
             )
-            assert db.get_trakt_config("u1")["access_token"] == "t2"
+            assert _record(db.get_trakt_config("u1"))["access_token"] == "t2"
             assert db.delete_trakt_config("u1") is True
             assert db.get_trakt_config("u1") is None
             assert db.delete_trakt_config("u1") is False
@@ -849,7 +855,7 @@ class TestDatabaseDockerAndTrakt:
                     }
                 )
                 # 仓储层读取：明文
-                row = db.get_trakt_config("u1")
+                row = _record(db.get_trakt_config("u1"))
                 assert row["access_token"] == "secret-at"
                 assert row["refresh_token"] == "secret-rt"
                 # 直接查 DB：密文
@@ -908,7 +914,7 @@ class TestDatabaseDockerAndTrakt:
                     )
                     is True
                 )
-                row = db.get_trakt_config("u1")
+                row = _record(db.get_trakt_config("u1"))
                 assert row["enabled"] is False
                 assert row["sync_interval"] == "0 */12 * * *"
                 assert row["auth_type"] == "bearer"
@@ -1106,6 +1112,7 @@ class TestDatabaseDockerAndTrakt:
             message="fail",
             source="test",
         )
+        assert record_id is not None
         # 显式创建站内信（关联 sync_records.id）
         db.insert_notification(
             "sync_failed",
@@ -1331,6 +1338,7 @@ class TestCleanupOldRecords:
             status="success",
             source="test",
         )
+        assert r1 is not None
         from app.models.memory import MemoryEntry
 
         db.memory.store_and_mark(
