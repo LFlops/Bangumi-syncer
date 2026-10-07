@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from unittest.mock import patch
@@ -17,21 +18,16 @@ import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent import trace
+from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
     ToolResultBlock,
     ToolUseBlock,
 )
-
-
-def _blocks(message: Message) -> list:
-    """显式收窄消息 content 为块列表（测试前提：replay 重建为块列表）"""
-    content = message.content
-    assert isinstance(content, list), "消息 content 应为块列表"
-    return content
 
 
 @pytest.fixture
@@ -159,6 +155,69 @@ def _write_tool_exec(dbm, run_id, iteration, sequence, tool_use_id, content):
     trace.end_span(span_id, replay_delta=_tool_rd(tool_use_id, content))
 
 
+def _scripted_stream(script):
+    """把 chat 风格脚本函数适配为流式 ``StreamFn``（含工具停点与 usage/stop 事件）。
+
+    每轮透传 ``(messages, tools, tool_choice)`` 调用 ``script`` 取得
+    ``ChatResponse`` 并展开为事件流；无块但有 content 时补文本块；
+    ``script`` 异常原样透传，返回 ``None``（脚本耗尽）时显式报错。
+    """
+
+    async def _stream(messages, *, tools=None, tool_choice=None):
+        resp = await script(messages, tools=tools, tool_choice=tool_choice)
+        if resp is None:
+            raise RuntimeError("_scripted_stream 脚本耗尽：未返回 ChatResponse")
+        blocks = list(resp.blocks)
+        if not blocks and resp.content:
+            blocks = [TextBlock(text=resp.content)]
+        for block in blocks:
+            if isinstance(block, TextBlock):
+                yield StreamChunk(type="text_delta", text=block.text)
+            elif isinstance(block, ThinkingBlock):
+                yield StreamChunk(
+                    type="thinking_delta",
+                    thinking=block.thinking,
+                    signature=block.signature or "",
+                )
+            elif isinstance(block, ToolUseBlock):
+                yield StreamChunk(
+                    type="tool_use_start",
+                    tool_use_id=block.id,
+                    tool_name=block.name,
+                )
+                yield StreamChunk(
+                    type="tool_use_delta",
+                    tool_use_id=block.id,
+                    partial_json=json.dumps(block.input, ensure_ascii=False),
+                )
+                yield StreamChunk(type="tool_use_stop", tool_use_id=block.id)
+        if resp.usage is not None:
+            yield StreamChunk(type="usage", usage=resp.usage)
+        yield StreamChunk(type="stop", stop_reason=resp.stop_reason, model=resp.model)
+
+    return _stream
+
+
+def _executor_factory(recorder, tools_fn):
+    """构造按轮新建的流式执行器：全部工具延迟到 ``finalize`` 复用 ``tools_fn``。
+
+    ``is_idempotent=False`` 使停点不提前执行，整批走 ``batch_execute_fn``——
+    与旧轮级整批执行路径的语义、span 记录完全等价；
+    ``submit_suggestion`` 标记为 terminal，由 loop 捕获、执行器不执行。
+    """
+
+    def factory():
+        return StreamingToolExecutor(
+            execute_fn=lambda tool_use: tools_fn([tool_use]),
+            is_idempotent=lambda name: False,
+            is_terminal=lambda name: name == "submit_suggestion",
+            on_recorder=recorder,
+            batch_execute_fn=lambda tool_calls: tools_fn(tool_calls),
+        )
+
+    return factory
+
+
 class TestReplayReconstructsFullRun:
     def test_replay_with_seed_prefix(self, dbm):
         """replay 从 seed 行还原种子消息作为 messages 前缀。"""
@@ -280,11 +339,10 @@ class TestReplayRebuildsFullBlocks:
             TextBlock,
             ToolUseBlock,
         ]
-        restored = _blocks(assistant)
-        assert restored[0].thinking == "let me think"
-        assert restored[0].signature == "sig-1"
-        assert restored[1].text == "here is my plan"
-        assert restored[2].id == "t1"
+        assert assistant.content[0].thinking == "let me think"
+        assert assistant.content[0].signature == "sig-1"
+        assert assistant.content[1].text == "here is my plan"
+        assert assistant.content[2].id == "t1"
 
     def test_rebuilt_assistant_matches_live_blocks_expression(self, dbm):
         """replay 重建与 live ``list(resp.blocks)`` 逐条一致（含 thinking）。"""
@@ -370,9 +428,9 @@ class TestReplayRebuildsFullBlocks:
 
         asyncio.run(
             loop_module.run(
-                chat_fn=recorder.wrap_chat_fn(chat),
+                stream_fn=recorder.wrap_stream_fn(_scripted_stream(chat)),
+                executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
-                tool_calls_fn=tools_fn,
                 max_iterations=2,
                 tool_choice_terminal="submit_suggestion",
                 seed_messages=seed,
@@ -429,9 +487,9 @@ class TestReplayRebuildsFullBlocks:
 
         asyncio.run(
             loop_module.run(
-                chat_fn=recorder.wrap_chat_fn(chat),
+                stream_fn=recorder.wrap_stream_fn(_scripted_stream(chat)),
+                executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
-                tool_calls_fn=tools_fn,
                 max_iterations=3,
                 tool_choice_terminal="submit_suggestion",
                 seed_messages=seed,
@@ -537,7 +595,7 @@ class TestReplayRebuildsFullBlocks:
             TextBlock,
             ToolUseBlock,
         ]
-        assert _blocks(assistant)[0].thinking == "keepme"
+        assert assistant.content[0].thinking == "keepme"
         warns = [line for level, line in log_records if level == "WARNING"]
         # warning 含丢弃数量与类型
         assert any("丢弃" in line and "unknown_block" in line for line in warns)
@@ -591,7 +649,7 @@ class TestReplayRebuildsFullBlocks:
 
         assistant = next(m for m in result.messages if m.role == "assistant")
         assert [type(b) for b in assistant.content] == [ToolUseBlock]
-        assert _blocks(assistant)[0].id == "t1"
+        assert assistant.content[0].id == "t1"
         # 未执行 → missing 基于推导出的 tool_calls 生效
         assert [tc.id for tc in result.missing_tool_calls] == ["t1"]
         warns = [line for level, line in log_records if level == "WARNING"]
@@ -716,7 +774,7 @@ class TestReplayCheckpointResume:
         assert result.executed_iterations == 0
         # 已成功的不重跑：t1 的 tool_result 在 messages 中
         tr_ids = [
-            _blocks(m)[0].tool_use_id
+            m.content[0].tool_use_id
             for m in result.messages
             if m.role == "user"
             and isinstance(m.content, list)
@@ -846,14 +904,14 @@ class TestReplayEncryptionTransparent:
         # 解密透明：能还原 assistant 消息
         assistant = result.messages[1]  # [0]=seed
         assert assistant.role == "assistant"
-        assert _blocks(assistant)[0].input["title"] == "secret-title"
+        assert assistant.content[0].input["title"] == "secret-title"
         # tool_result 也解密
         tr = [
             m
             for m in result.messages
             if m.role == "user" and isinstance(m.content, list)
         ]
-        assert _blocks(tr[0])[0].content == "secret-result"
+        assert tr[0].content[0].content == "secret-result"
 
 
 class TestReplayAbnormalBranchLogging:
@@ -1011,7 +1069,7 @@ class TestReplayResponseTolerantModel:
         result = trace.replay("run-bad-tc")
 
         assistant = next(m for m in result.messages if m.role == "assistant")
-        assert [b.id for b in _blocks(assistant)] == ["t1"]
+        assert [b.id for b in assistant.content] == ["t1"]
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("tool_calls" in line and "丢弃" in line for line in warns)
 

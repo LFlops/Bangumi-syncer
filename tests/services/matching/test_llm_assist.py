@@ -8,12 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import json
-import sqlite3
 import threading
 import time
-from collections.abc import Coroutine
 from contextlib import suppress
-from typing import Any, Literal, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -55,25 +52,6 @@ def _align_db_singleton():
     set_database_manager(database_manager)
     yield
     set_database_manager(None)
-
-
-def _db_conn() -> sqlite3.Connection:
-    """返回底层 sqlite3 连接并显式收窄（测试初始化后必然非 None）。"""
-    conn = database_manager._connection._conn
-    assert conn is not None, "测试数据库连接未初始化"
-    return conn
-
-
-def _run_row(run_id: str) -> dict:
-    """读取 agent_runs 行并显式收窄（测试前提：run 已落库）。"""
-    row = database_manager.agent_runs.get_run(run_id)
-    assert row is not None, f"agent_run {run_id} 未落库"
-    return row
-
-
-def _as_coroutine(awaitable) -> Coroutine[Any, Any, ChatResponse]:
-    """wrap_chat_fn 声明返回 Awaitable；asyncio.run 需要 Coroutine（运行时即协程）。"""
-    return cast("Coroutine[Any, Any, ChatResponse]", awaitable)
 
 
 def _make_sync_record(with_candidates=False, sync_record_id=1):
@@ -152,7 +130,7 @@ def _read_candidate(sync_record_id):
 
 def _read_raw_llm_columns(sync_record_id):
     """直读 DB 的 llm 两列（验证写入侧不再写列，仅写 candidates_json）。"""
-    conn = _db_conn()
+    conn = database_manager._connection._conn
     row = conn.execute(
         "SELECT llm_subject_id, llm_reason FROM pending_candidates "
         "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
@@ -165,7 +143,7 @@ def _read_raw_llm_columns(sync_record_id):
 
 def _read_candidate_business_key(sync_record_id):
     """直读 pending_candidates.business_key（验证写入侧业务键口径）。"""
-    conn = _db_conn()
+    conn = database_manager._connection._conn
     row = conn.execute(
         "SELECT business_key FROM pending_candidates "
         "WHERE sync_record_id=? ORDER BY id DESC LIMIT 1",
@@ -176,7 +154,7 @@ def _read_candidate_business_key(sync_record_id):
 
 def _read_full_candidate(candidate_id):
     """读取候选行全部关注列（用于断言是否被复活改写）。"""
-    conn = _db_conn()
+    conn = database_manager._connection._conn
     row = conn.execute(
         "SELECT id, status, confirmed_subject_id, resolved_at, candidates_json, "
         "llm_subject_id, llm_reason FROM pending_candidates WHERE id=?",
@@ -279,13 +257,13 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "succeeded"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "submit_suggestion"
 
@@ -327,7 +305,7 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
@@ -361,7 +339,7 @@ async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
@@ -390,7 +368,7 @@ async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch)
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
     assert status == "succeeded"
@@ -438,7 +416,7 @@ async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
@@ -470,7 +448,7 @@ async def test_run_submit_suggestion_projects_llm_fields_and_leaves_columns_empt
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
@@ -518,7 +496,7 @@ async def test_run_submit_suggestion_marks_existing_candidate_on_duplicate_subje
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
@@ -572,14 +550,14 @@ async def test_run_submit_skips_reviving_resolved_candidate(
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     # 跳过信号：非 succeeded
     assert status == ""
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     assert run_row["ended_at"] > 0
@@ -638,7 +616,7 @@ def test_persist_llm_candidate_concurrent_resolution_marks_cancelled(monkeypatch
     )
 
     assert returned is None, "并发处理时不应返回候选 id（跳过信号）"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     # 候选行未被改写（原 pending 行保持原状）
@@ -725,7 +703,7 @@ def test_persist_content_cas_skips_when_json_concurrently_modified(monkeypatch):
     )
 
     assert result is False, "内容 CAS 失配应返回 False（跳过通知）"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "cancelled"
     assert run_row["stop_reason"] == "user_resolved"
     # 并发写入的 candidates_json 未被本 run 覆盖
@@ -751,7 +729,7 @@ def test_persist_content_cas_matches_null_or_empty_json(raw_value):
     )
     assert cid
     # 预置为 NULL / 空串（历史脏数据 / 手工沉淀）
-    conn = _db_conn()
+    conn = database_manager._connection._conn
     conn.execute(
         "UPDATE pending_candidates SET candidates_json=? WHERE id=?", (raw_value, cid)
     )
@@ -772,7 +750,7 @@ def test_persist_content_cas_matches_null_or_empty_json(raw_value):
     )
 
     assert returned == cid, "COALESCE 应把 NULL/空串归一并命中内容 CAS"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "succeeded"
     cands = json.loads(_read_full_candidate(cid)["candidates_json"])
     assert any(str(c.get("subject_id")) == "123" for c in cands), (
@@ -810,7 +788,7 @@ def test_persist_llm_candidate_succeeded_guard_skips_when_run_terminal(log_recor
     )
 
     assert returned is None, "run 已被并发终态化时应返回 None（跳过通知）"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "cancelled", "终态不得被 succeeded 守卫漏过而翻回"
     assert run_row["stop_reason"] == "user_resolved"
     # 必须留痕：warning 含 run_id 与当前状态
@@ -865,7 +843,7 @@ def test_persist_and_notify_persist_error_marks_failed_no_raise(monkeypatch):
     )
 
     assert result is False, "落库失败应返回 False（跳过通知）"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "persist_error"
     assert "disk I/O error" in (run_row["last_error"] or "")
@@ -917,7 +895,7 @@ def test_persist_and_notify_transient_lock_error_keeps_run_retryable(monkeypatch
     )
 
     assert result is False, "瞬时落库失败应返回 False（本次跳过通知）"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "processing", "瞬时锁抖动不得终态化（应保持活性待重试）"
     assert run_row["attempts"] == 1, "瞬时失败必须累计 attempts 供上限判定"
     assert run_row["stop_reason"] in ("", None)
@@ -966,7 +944,7 @@ def test_persist_and_notify_non_transient_error_still_marks_failed(monkeypatch):
     )
 
     assert result is False
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "persist_error"
     assert "boom" in (run_row["last_error"] or "")
@@ -996,7 +974,7 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
@@ -1041,13 +1019,13 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "no_suggestion"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "submit_suggestion"
     assert "非法" in (run_row["last_error"] or "")
@@ -1101,13 +1079,13 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
         sync_record=sr,
         bgm=_Boom(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "no_suggestion"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "exhausted"
     # 既有候选行未被 LLM 改写
@@ -1154,14 +1132,14 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "succeeded"
     _assert_candidate_written(sr_id, subject_id="321", reason="兜底")
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["stop_reason"] == "exhausted"
 
 
@@ -1194,13 +1172,13 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "no_suggestion"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["stop_reason"] == "exhausted"
 
 
@@ -1221,7 +1199,6 @@ def test_build_seed_messages_injection_guard_and_isolation():
     assert "不可信" in system.content
     assert user.role == "user"
     # 用户输入被 --- 分隔符隔离
-    assert isinstance(user.content, str)
     assert user.content.count("---") >= 2
     # 用户提供的标题出现在隔离区内
     assert "标题1" in user.content
@@ -1285,7 +1262,7 @@ def test_persist_llm_candidate_atomic_rollback_on_failure(monkeypatch):
         )
 
     # 回滚验证：agent_runs 未 succeeded，pending_candidates 未被改写
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "pending"  # 原始状态，未 succeeded
     row = _read_candidate(sr_id)
     assert row["llm_subject_id"] == ""  # 候选写入被回滚
@@ -1314,7 +1291,9 @@ async def test_run_candidate_committed_and_visible_to_independent_connection(
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_chat_side_effect([_submit_response("888", "提交可见")]),
+        stream_fn=_scripted_stream(
+            _chat_side_effect([_submit_response("888", "提交可见")])
+        ),
         notification_service=None,
         span_recorder=None,
     )
@@ -1408,7 +1387,9 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
             sync_record=_make_sync_record(sync_record_id=sr_a),
             bgm=_make_bgm(),
             thinking_level="medium",
-            chat_fn=_chat_side_effect([_submit_response(sid_a, "并发A")]),
+            stream_fn=_scripted_stream(
+                _chat_side_effect([_submit_response(sid_a, "并发A")])
+            ),
             notification_service=ns,
             span_recorder=None,
         ),
@@ -1417,7 +1398,9 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
             sync_record=_make_sync_record(sync_record_id=sr_b),
             bgm=_make_bgm(),
             thinking_level="medium",
-            chat_fn=_chat_side_effect([_submit_response(sid_b, "并发B")]),
+            stream_fn=_scripted_stream(
+                _chat_side_effect([_submit_response(sid_b, "并发B")])
+            ),
             notification_service=ns,
             span_recorder=None,
         ),
@@ -1478,7 +1461,7 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
         sync_record=_make_sync_record(sync_record_id=sr_id),
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
     assert status == "skipped"
@@ -1490,16 +1473,15 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
 
 
 def _chat_side_effect(responses):
-    state = {"idx": 0}
-
     async def _chat(messages, *, tools=None, tool_choice=None):
-        idx = state["idx"]
-        state["idx"] += 1
+        idx = _chat.idx
+        _chat.idx += 1
         if idx < len(responses):
             return responses[idx]
         # 超出则返回 end_turn 兜底
         return ChatResponse(content="done", stop_reason="end_turn")
 
+    _chat.idx = 0
     return _chat
 
 
@@ -1564,6 +1546,67 @@ def _wire_stream_client(client, response_fn):
 
     client.stream_chat = _stream
     return client
+
+
+def _scripted_stream(script):
+    """把 chat 风格脚本函数适配为流式 ``StreamFn``（供流式注入路径使用）。
+
+    每轮透传 ``(messages, tools, tool_choice)`` 调用 ``script`` 取得
+    ``ChatResponse``，展开为与生产 provider 等价的事件流：
+
+    - ``ThinkingBlock`` → ``thinking_delta``（含 signature 增量）
+    - ``TextBlock`` → ``text_delta``；无任何块但有 ``content`` 时补一个文本块
+    - ``ToolUseBlock`` → ``tool_use_start`` + ``tool_use_delta`` + ``tool_use_stop``
+    - ``resp.usage`` → ``usage``；结尾 ``stop`` 携带 ``stop_reason`` / ``model``
+
+    ``script`` 抛出的异常（如 ``LLMCallError``）原样透传，不吞不兜底；
+    ``script`` 返回 ``None``（脚本耗尽）时显式报错，避免静默伪造响应。
+    """
+
+    async def _stream(messages, *, tools=None, tool_choice=None):
+        resp = await script(messages, tools=tools, tool_choice=tool_choice)
+        if resp is None:
+            raise RuntimeError("_scripted_stream 脚本耗尽：未返回 ChatResponse")
+        blocks = list(resp.blocks)
+        if not blocks and resp.content:
+            blocks = [TextBlock(text=resp.content)]
+        for block in blocks:
+            if isinstance(block, TextBlock):
+                yield StreamChunk(type="text_delta", text=block.text)
+            elif isinstance(block, ThinkingBlock):
+                yield StreamChunk(
+                    type="thinking_delta",
+                    thinking=block.thinking,
+                    signature=block.signature or "",
+                )
+            elif isinstance(block, ToolUseBlock):
+                yield StreamChunk(
+                    type="tool_use_start",
+                    tool_use_id=block.id,
+                    tool_name=block.name,
+                )
+                yield StreamChunk(
+                    type="tool_use_delta",
+                    tool_use_id=block.id,
+                    partial_json=json.dumps(block.input, ensure_ascii=False),
+                )
+                yield StreamChunk(type="tool_use_stop", tool_use_id=block.id)
+        if resp.usage is not None:
+            yield StreamChunk(type="usage", usage=resp.usage)
+        yield StreamChunk(type="stop", stop_reason=resp.stop_reason, model=resp.model)
+
+    return _stream
+
+
+def _drain_stream(wrapped, messages=None):
+    """把 ``wrap_stream_fn`` 返回的异步生成器消费至结束（同步包装）。"""
+    msgs = messages if messages is not None else [Message(role="user", content="hi")]
+
+    async def _run():
+        async for _chunk in wrapped(msgs, tools=[]):
+            pass
+
+    asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -1731,7 +1774,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
         sync_record=_make_sync_record(sync_record_id=sr_a),
         bgm=bgm1,
         thinking_level="medium",
-        chat_fn=_chat_side_effect([_search_response()]),
+        stream_fn=_scripted_stream(_chat_side_effect([_search_response()])),
         span_recorder=None,
     )
     assert used == ["bgm1"], "首个 run 应使用第一个 bgm"
@@ -1743,7 +1786,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
         sync_record=_make_sync_record(sync_record_id=sr_b),
         bgm=bgm2,
         thinking_level="medium",
-        chat_fn=_chat_side_effect([_search_response()]),
+        stream_fn=_scripted_stream(_chat_side_effect([_search_response()])),
         span_recorder=None,
     )
     assert used == ["bgm1", "bgm2"], (
@@ -1938,41 +1981,6 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# resolve_max_iterations_override：场景侧薄委托 agent 骨架单一实现
-# （解析逻辑唯一实现于 app.services.agent.budget，此处只验证委托与场景前缀）
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("blank", [None, "", "   "])
-def test_resolve_max_iterations_override_blank_returns_none_silently(blank):
-    from unittest.mock import MagicMock
-
-    log = MagicMock()
-    assert llm_assist.resolve_max_iterations_override(blank, log) is None
-    log.warning.assert_not_called()
-
-
-def test_resolve_max_iterations_override_invalid_uses_llm_assist_prefix():
-    """非法值告警由 budget 单一实现产出，但前缀绑定场景 [llm_assist]。"""
-    from unittest.mock import MagicMock
-
-    log = MagicMock()
-    assert llm_assist.resolve_max_iterations_override("abc", log) is None
-    log.warning.assert_called_once()
-    message = log.warning.call_args[0][0]
-    assert message.startswith("[llm_assist]")
-    assert "[budget]" not in message
-
-
-def test_resolve_max_iterations_override_positive_returns_value():
-    from unittest.mock import MagicMock
-
-    log = MagicMock()
-    assert llm_assist.resolve_max_iterations_override("5", log) == 5
-    log.warning.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
 # 事务内不应发起 HTTP（bgm.get_subject 在事务外预取一次）
 # ---------------------------------------------------------------------------
 
@@ -1984,32 +1992,29 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
     bgm = MagicMock()
     bgm.get_subject.return_value = {"name": "N", "name_cn": "NC"}
 
-    run_id = "run-f8"
-    sr_id = 52
-    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
-
-    real_conn = database_manager._connection._get_connection()
+    conn = MagicMock()
+    # apply_cancelled 会读取 cursor.rowcount 做比较；真实连接该值为 int，
+    # 显式设为 0 避免 MagicMock 与非整型比较报错（此处不关心具体改写结果）。
+    conn.execute.return_value.rowcount = 0
     captured = {}
+    real_get = bgm.get_subject
 
     def _exec_with_lock(fn):
-        before = bgm.get_subject.call_count
-        # 运行事务回调（经仓储 _run_write 的 _write 包装，含 commit）：
-        # 必须不在此处发起 HTTP 调用
-        result = fn(real_conn)
-        captured["in_tx_calls"] = bgm.get_subject.call_count - before
-        return result
+        before = real_get.call_count
+        # 运行事务回调：必须不在此处发起 HTTP 调用
+        fn(conn)
+        after = real_get.call_count
+        captured["in_tx_calls"] = after - before
+        return 1
 
-    # 落库事务已下沉仓储，经 DatabaseConnection._execute_with_lock 取锁；
-    # 包装该层以观测事务回调内是否发起 HTTP。
-    monkeypatch.setattr(
-        database_manager._connection, "_execute_with_lock", _exec_with_lock
-    )
+    dbm = MagicMock()
+    dbm._execute_with_lock.side_effect = _exec_with_lock
 
     llm_assist._persist_and_notify(
-        database_manager,
-        run_id,
-        sync_record=_make_sync_record(sync_record_id=sr_id),
-        sync_record_id=sr_id,
+        dbm,
+        "run-f8",
+        sync_record=_make_sync_record(sync_record_id=52),
+        sync_record_id=52,
         bgm=bgm,
         subject_id="5",
         reason="r",
@@ -2030,7 +2035,7 @@ async def test_persist_does_not_call_bgm_in_transaction(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_default_chat_fn_passes_thinking_level_medium(monkeypatch):
+async def test_run_default_stream_fn_passes_thinking_level_medium(monkeypatch):
     """场景1：run(thinking_level="medium") 使用默认 stream_fn 时，client 收到 thinking_level='medium'。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2105,7 +2110,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
+async def test_run_default_stream_fn_passes_thinking_level_off(monkeypatch):
     """场景3：run(thinking_level="off") → client.stream_chat 收到 thinking_level='off'。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -2136,8 +2141,8 @@ async def test_run_default_chat_fn_passes_thinking_level_off(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
-    """场景4：显式传入 chat_fn 时，不调用 get_llm_client，chat_fn 不被包装/改签名。"""
+async def test_run_custom_stream_fn_injection_unaffected(monkeypatch):
+    """场景4：显式传入 stream_fn 时，不调用 get_llm_client，stream_fn 不被改签名。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     mock_client = MagicMock()
@@ -2145,16 +2150,16 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
 
     custom_called = {}
 
-    async def custom_chat_fn(messages, *, tools=None, tool_choice=None):
+    async def custom_stream_fn(messages, *, tools=None, tool_choice=None):
         custom_called["invoked"] = True
         custom_called["tools"] = tools
         custom_called["tool_choice"] = tool_choice
-        return ChatResponse(content="", stop_reason="end_turn")
+        yield StreamChunk(type="stop", stop_reason="end_turn")
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
     ):
-        run_id = "run-custom-chatfn"
+        run_id = "run-custom-streamfn"
         sr_id = 83
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
         await llm_assist.get_scenario_runtime().run(
@@ -2162,14 +2167,14 @@ async def test_run_custom_chat_fn_injection_unaffected(monkeypatch):
             sync_record=_make_sync_record(sync_record_id=sr_id),
             bgm=_make_bgm(),
             thinking_level="medium",
-            chat_fn=custom_chat_fn,
+            stream_fn=custom_stream_fn,
         )
 
-    # 自定义 chat_fn 应被直接调用
-    assert custom_called.get("invoked") is True, "自定义 chat_fn 应被调用"
+    # 自定义 stream_fn 应被直接调用
+    assert custom_called.get("invoked") is True, "自定义 stream_fn 应被调用"
     # get_llm_client 不应被触发（默认 stream_fn 未构建）
     assert not mock_client.stream_chat.called, (
-        "注入自定义 chat_fn 时不应触发 get_llm_client().stream_chat"
+        "注入自定义 stream_fn 时不应触发 get_llm_client().stream_chat"
     )
     # 签名保持不变：tools / tool_choice 以关键字参数传入
     assert "tools" in custom_called
@@ -2236,7 +2241,7 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
@@ -2292,22 +2297,19 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
         sync_record=sr,
         bgm=bgm,
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         span_recorder=None,
     )
 
     assert status == "succeeded"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "submit_suggestion"
 
 
-def test_trace_recorder_wrap_chat_fn_tracks_iteration():
-    """wrap_chat_fn 每轮 start/end span，iteration 自增。"""
-    import asyncio
+def test_trace_recorder_wrap_stream_fn_tracks_iteration():
+    """wrap_stream_fn 每轮 start/end span，iteration 自增。"""
     from unittest.mock import patch
-
-    from app.services.llm.models import Message
 
     starts = []
     ends = []
@@ -2321,7 +2323,7 @@ def test_trace_recorder_wrap_chat_fn_tracks_iteration():
 
     recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
-    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+    async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(
             content="",
             stop_reason="end_turn",
@@ -2329,16 +2331,14 @@ def test_trace_recorder_wrap_chat_fn_tracks_iteration():
             model="test-model",
         )
 
-    wrapped = recorder.wrap_chat_fn(dummy_chat)
+    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
 
     # patch llm_assist 模块上的引用（闭包通过模块全局名字查找）
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-        )
+        _drain_stream(wrapped)
 
     # 应有一条 llm_chat start + end
     assert len(starts) == 1
@@ -2429,16 +2429,13 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
 
 
 # ---------------------------------------------------------------------------
-# wrap_chat_fn chat span 与 tool span 同轮 iteration 一致
+# wrap_stream_fn chat span 与 tool span 同轮 iteration 一致
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_chat_fn_chat_and_tool_same_iteration():
+def test_wrap_stream_fn_chat_and_tool_same_iteration():
     """同一轮内 chat span 与 tool span 的 iteration 必须一致；连续两轮时第二轮 iteration=1。"""
-    import asyncio
     from unittest.mock import patch
-
-    from app.services.llm.models import Message
 
     starts = []
     ends = []
@@ -2452,8 +2449,8 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
 
     recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
-    # chat_fn 返回含 tool_calls 的响应 → 模拟工具执行后调用 start_tool
-    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+    # 脚本返回含 tool_calls 的响应 → 模拟工具执行后调用 start_tool
+    async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(
             content="",
             stop_reason="tool_use",
@@ -2461,24 +2458,20 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
             model="test-model",
         )
 
-    wrapped = recorder.wrap_chat_fn(dummy_chat)
+    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
 
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         # 第一轮
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-        )
+        _drain_stream(wrapped)
         # 模拟工具执行（与 chat 同轮）
         tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
         recorder.start_tool(tc, sequence=0)
 
         # 第二轮
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi2")], tools=[]))
-        )
+        _drain_stream(wrapped)
         tc2 = ToolUseBlock(
             id="t2", name="get_subject_detail", input={"subject_id": "1"}
         )
@@ -2509,16 +2502,13 @@ def test_wrap_chat_fn_chat_and_tool_same_iteration():
 
 
 # ---------------------------------------------------------------------------
-# wrap_chat_fn 异常不得被 UnboundLocalError 遮蔽
+# wrap_stream_fn 异常不得被 UnboundLocalError 遮蔽
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_chat_fn_exception_propagates_original():
-    """chat_fn 抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
-    import asyncio
+def test_wrap_stream_fn_exception_propagates_original():
+    """脚本抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
     from unittest.mock import patch
-
-    from app.services.llm.models import Message
 
     ends = []
 
@@ -2530,19 +2520,17 @@ def test_wrap_chat_fn_exception_propagates_original():
 
     recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
 
-    async def exploding_chat(messages, *, tools=None, tool_choice=None):
+    async def exploding_script(messages, *, tools=None, tool_choice=None):
         raise ValueError("boom")
 
-    wrapped = recorder.wrap_chat_fn(exploding_chat)
+    wrapped = recorder.wrap_stream_fn(_scripted_stream(exploding_script))
 
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         with pytest.raises(ValueError, match="boom"):
-            asyncio.run(
-                _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-            )
+            _drain_stream(wrapped)
 
     # 不应写 ok span（允许写 error span，但 status 不得为 "ok"）
     ok_ends = [e for e in ends if e.get("status") == "ok"]
@@ -2550,15 +2538,14 @@ def test_wrap_chat_fn_exception_propagates_original():
 
 
 # ---------------------------------------------------------------------------
-# _build_default_chat_fn 必填 thinking_level
+# _build_default_stream_fn 必填 thinking_level
 # ---------------------------------------------------------------------------
 
 
-def test_build_default_chat_fn_requires_thinking_level():
+def test_build_default_stream_fn_requires_thinking_level():
     """_build_default_stream_fn 不传 thinking_level 应抛 TypeError。"""
-    fn = cast("Any", llm_assist._build_default_stream_fn)
     with pytest.raises(TypeError):
-        fn()
+        llm_assist._build_default_stream_fn()
 
 
 # ---------------------------------------------------------------------------
@@ -2583,12 +2570,9 @@ def test_trace_recorder_requires_start_iteration():
     )
 
 
-def test_trace_recorder_start_iteration_affects_first_chat_iteration():
+def test_trace_recorder_start_iteration_affects_first_stream_iteration():
     """start_iteration=N → 首轮 chat span iteration=N。"""
-    import asyncio
     from unittest.mock import patch
-
-    from app.services.llm.models import Message
 
     starts = []
 
@@ -2598,15 +2582,13 @@ def test_trace_recorder_start_iteration_affects_first_chat_iteration():
 
     recorder = llm_assist.TraceRecorder("run-test", start_iteration=5)
 
-    async def dummy_chat(messages, *, tools=None, tool_choice=None):
+    async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(content="", stop_reason="end_turn", blocks=[], model="m")
 
-    wrapped = recorder.wrap_chat_fn(dummy_chat)
+    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
 
     with patch.object(agent_recorder, "trace_start_span", side_effect=fake_start):
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-        )
+        _drain_stream(wrapped)
 
     chat_starts = [s for s in starts if s["name"] == "llm_chat"]
     assert len(chat_starts) == 1
@@ -2671,12 +2653,12 @@ async def test_run_llm_call_error_retryable_true_increments_attempts(
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_boom,
+        stream_fn=_scripted_stream(_boom),
         span_recorder=None,
     )
 
     assert status == "processing"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["attempts"] == 1
 
 
@@ -2698,12 +2680,12 @@ async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_boom,
+        stream_fn=_scripted_stream(_boom),
         span_recorder=None,
     )
 
     assert status == "failed"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "failed"
     assert run_row["stop_reason"] == "llm_error"
     assert "401" in (run_row["last_error"] or "")
@@ -2731,7 +2713,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_boom,
+        stream_fn=_scripted_stream(_boom),
         span_recorder=None,
     )
     assert status1 == "processing"
@@ -2743,7 +2725,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_boom,
+        stream_fn=_scripted_stream(_boom),
         span_recorder=None,
     )
     assert status2 == "processing"
@@ -2755,11 +2737,11 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=_boom,
+        stream_fn=_scripted_stream(_boom),
         span_recorder=None,
     )
     assert status3 == "failed"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "failed"
     # 终态由 increment_attempts 单点事务写入（stop_reason='failed'），外层不再二次 mark_failed
     assert run_row["stop_reason"] == "failed"
@@ -2960,7 +2942,7 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
     )
     after = int(time.time())
 
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     ended_at = run_row["ended_at"]
     # 断言 ended_at 为 int 且 > 0
     assert isinstance(ended_at, int), f"ended_at 应为 int，实际 {type(ended_at)}"
@@ -2976,7 +2958,7 @@ def test_persist_llm_candidate_ended_at_is_epoch_integer(monkeypatch):
     assert iso is not None, "_iso_from_epoch(ended_at) 应返回非 None"
 
     # 断言 SQLite typeof(ended_at)='integer'
-    conn = _db_conn()
+    conn = database_manager._connection._conn
     cur = conn.execute(
         "SELECT typeof(ended_at) FROM agent_runs WHERE run_id=?", (run_id,)
     )
@@ -3207,11 +3189,9 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
 
     # 缺失工具补执行一次，并锚定同轮 span（sequence=0）
     backfill.assert_awaited_once()
-    backfill_call = backfill.await_args
-    assert backfill_call is not None
-    assert backfill_call.args[0] == ReplayToolCall.model_validate(missing)
-    assert backfill_call.kwargs.get("sequence") == 0
-    assert backfill_call.kwargs.get("span_recorder") is not None
+    assert backfill.await_args.args[0] == ReplayToolCall.model_validate(missing)
+    assert backfill.await_args.kwargs.get("sequence") == 0
+    assert backfill.await_args.kwargs.get("span_recorder") is not None
     # 回填后进入下一轮 loop_run 续跑（1 次 LLM 调用）
     loop.assert_awaited_once()
 
@@ -3244,15 +3224,11 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
         )
 
     loop.assert_awaited_once()
-    loop_call = loop.await_args
-    assert loop_call is not None
-    assert loop_call.kwargs["seed_messages"] is seed
+    assert loop.await_args.kwargs["seed_messages"] is seed
     # medium=5，executed=4 → 剩余 1 轮
-    assert loop_call.kwargs["max_iterations"] == 1
+    assert loop.await_args.kwargs["max_iterations"] == 1
     handle.assert_called_once()
-    handle_call = handle.call_args
-    assert handle_call is not None
-    assert handle_call[0][2].stop_reason == "end_turn"
+    assert handle.call_args[0][2].stop_reason == "end_turn"
 
 
 def test_continue_run_continuation_sums_replay_and_new_round_tokens():
@@ -3670,8 +3646,8 @@ def test_continue_run_outer_exception_logs_current_run_status():
     rr = _make_replay_result(executed=0, missing=[], last_response=None)
     log = MagicMock()
 
-    async def _chat_fn(messages, *, tools=None, tool_choice=None):
-        return ChatResponse(content="done", stop_reason="end_turn")
+    async def _stream_fn(messages, *, tools=None, tool_choice=None):
+        yield StreamChunk(type="stop", stop_reason="end_turn")
 
     boom_loop = AsyncMock(side_effect=RuntimeError("kaboom"))
     with (
@@ -3683,7 +3659,7 @@ def test_continue_run_outer_exception_logs_current_run_status():
         ),
         patch(
             "app.services.matching.llm_assist._build_default_stream_fn",
-            return_value=_chat_fn,
+            return_value=_stream_fn,
         ),
         patch("app.services.agent.runtime.loop_run", boom_loop),
         patch("app.services.agent.runtime.logger", log),
@@ -3762,7 +3738,7 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
     after = _count_tool_results(messages)
     assert after == before + 1 == 2  # t1（已记录）+ t2（补执行）
     trs = [
-        cast("ToolResultBlock", m.content[0])
+        m.content[0]
         for m in messages
         if m.role == "user"
         and isinstance(m.content, list)
@@ -3785,9 +3761,7 @@ def _last_tool_result(messages: list) -> ToolResultBlock | None:
     return None
 
 
-def _registry_with(
-    name: str, access: Literal["read", "write", "terminal"], called: list
-) -> ToolRegistry:
+def _registry_with(name: str, access: str, called: list) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -4127,7 +4101,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
     assert response_fn.call_count == 2, (
         f"期望累计 2 次 LLM 调用，实际 {response_fn.call_count}"
     )
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
 
 
@@ -4178,7 +4152,7 @@ def test_continue_run_writes_chat_span(monkeypatch):
 
 
 def test_continue_run_respects_thinking_level(monkeypatch):
-    """配置 thinking_level='high' → _build_default_chat_fn 收到 'high'。"""
+    """配置 thinking_level='high' → _build_default_stream_fn 收到 'high'。"""
     repo = _make_continuation_repo()
     captured: dict = {}
 
@@ -4392,7 +4366,6 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
             blk = ToolResultBlock(tool_use_id=tc.id, content="ok", is_error=False)
             results[tc.id] = blk
             if sid is not None:
-                assert recorder is not None
                 recorder.end_tool(sid, result=blk)
         return results
 
@@ -4466,7 +4439,7 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
                 sync_record=_make_sync_record(sync_record_id=520),
                 bgm=MagicMock(),
                 thinking_level="medium",
-                chat_fn=_boom,
+                stream_fn=_scripted_stream(_boom),
             )
         )
 
@@ -4512,8 +4485,7 @@ def _submit_response_with_usage(tokens: int, subject_id="123", reason="跨季匹
 
 
 def test_trace_recorder_accumulates_total_tokens_across_rounds():
-    """wrap_chat_fn 逐轮累计 usage.total_tokens。"""
-    import asyncio
+    """wrap_stream_fn 逐轮累计 usage.total_tokens。"""
     from unittest.mock import patch
 
     recorder = llm_assist.TraceRecorder("run-tok-rec", start_iteration=0)
@@ -4522,18 +4494,14 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
         ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
     ]
     chat = _chat_side_effect(responses)
-    wrapped = recorder.wrap_chat_fn(chat)
+    wrapped = recorder.wrap_stream_fn(_scripted_stream(chat))
 
     with (
         patch.object(agent_recorder, "trace_start_span", return_value="span-x"),
         patch.object(agent_recorder, "trace_end_span"),
     ):
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-        )
-        asyncio.run(
-            _as_coroutine(wrapped([Message(role="user", content="hi")], tools=[]))
-        )
+        _drain_stream(wrapped)
+        _drain_stream(wrapped)
 
     assert recorder.total_tokens == 200, (
         f"应累计 2 轮 tokens=200，实际 {recorder.total_tokens}"
@@ -4561,12 +4529,12 @@ async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=None,
     )
 
     assert status == "succeeded"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["total_tokens"] == 200, (
         f"应累计全部轮次 tokens=200，实际 {run_row['total_tokens']}"
     )
@@ -4589,12 +4557,12 @@ async def test_total_tokens_zero_when_no_usage():
             sync_record=sr,
             bgm=_make_bgm(),
             thinking_level="medium",
-            chat_fn=chat,
+            stream_fn=_scripted_stream(chat),
             notification_service=None,
         )
 
     assert status == "succeeded"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["total_tokens"] == 0, (
         f"无 usage 应记 0，实际 {run_row['total_tokens']}"
     )
@@ -4820,7 +4788,9 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
             sync_record=sr,
             bgm=_SlowBgm(),
             thinking_level="medium",
-            chat_fn=_chat_side_effect([_search_response(), _submit_response()]),
+            stream_fn=_scripted_stream(
+                _chat_side_effect([_search_response(), _submit_response()])
+            ),
             notification_service=ns,
             span_recorder=None,
         )
@@ -4883,7 +4853,9 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
             sync_record=sr,
             bgm=_BlockingBgm(),
             thinking_level="medium",
-            chat_fn=_chat_side_effect([_search_response(), _submit_response()]),
+            stream_fn=_scripted_stream(
+                _chat_side_effect([_search_response(), _submit_response()])
+            ),
             notification_service=ns,
             span_recorder=None,
         )
@@ -4934,7 +4906,7 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
     assert read_row is not None and read_row["run_id"] == run_id
     assert new_cid, "并发写入应成功返回候选 id"
     assert status == "succeeded"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "succeeded"
     _assert_candidate_written(sr_id)
     ns.notify.assert_called_once()
@@ -5222,13 +5194,13 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
         sync_record=sr,
         bgm=_make_bgm(),
         thinking_level="medium",
-        chat_fn=chat,
+        stream_fn=_scripted_stream(chat),
         notification_service=ns,
         span_recorder=None,
     )
 
     assert status == "no_suggestion"
-    run_row = _run_row(run_id)
+    run_row = database_manager.agent_runs.get_run(run_id)
     assert run_row["status"] == "no_suggestion"
     assert run_row["stop_reason"] == "give_up"
     ns.notify.assert_not_called()

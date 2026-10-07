@@ -26,6 +26,7 @@ from app.services.agent.recorder import TraceRecorder
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    StreamChunk,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
@@ -90,6 +91,45 @@ def _tool_replay_delta(tool_use_id, content, is_error=False):
 def _ensure_run(dbm, run_id: str):
     """创建一条 pending run（FK 要求 run 先于 steps 存在，与生产流程一致）。"""
     dbm.agent_runs.create_pending(run_id, "match")
+
+
+def _stream_from_response(resp):
+    """把单个 ``ChatResponse`` 展开为事件流（含工具停点），供 ``wrap_stream_fn`` 消费。
+
+    与生产 provider 的事件序列对齐：thinking/text/tool_use（start+delta+stop）、
+    usage、结尾 stop（携带 stop_reason/model）；无块但有 content 时补一个文本块。
+    """
+
+    async def _stream(messages, *, tools=None, tool_choice=None):
+        blocks = list(resp.blocks)
+        if not blocks and resp.content:
+            blocks = [TextBlock(text=resp.content)]
+        for block in blocks:
+            if isinstance(block, TextBlock):
+                yield StreamChunk(type="text_delta", text=block.text)
+            elif isinstance(block, ThinkingBlock):
+                yield StreamChunk(
+                    type="thinking_delta",
+                    thinking=block.thinking,
+                    signature=block.signature or "",
+                )
+            elif isinstance(block, ToolUseBlock):
+                yield StreamChunk(
+                    type="tool_use_start",
+                    tool_use_id=block.id,
+                    tool_name=block.name,
+                )
+                yield StreamChunk(
+                    type="tool_use_delta",
+                    tool_use_id=block.id,
+                    partial_json=json.dumps(block.input, ensure_ascii=False),
+                )
+                yield StreamChunk(type="tool_use_stop", tool_use_id=block.id)
+        if resp.usage is not None:
+            yield StreamChunk(type="usage", usage=resp.usage)
+        yield StreamChunk(type="stop", stop_reason=resp.stop_reason, model=resp.model)
+
+    return _stream
 
 
 class TestEndSpanSignature:
@@ -205,34 +245,34 @@ class TestRecorderPersistsFullBlocks:
     旧数据（无 blocks）读取方走回退逻辑。
     """
 
-    async def test_wrap_chat_fn_persists_full_blocks_with_thinking(self, dbm):
-        """wrap_chat_fn 落库含全量 blocks（thinking/text/tool_use 顺序保持）。"""
+    async def test_wrap_stream_fn_persists_full_blocks_with_thinking(self, dbm):
+        """wrap_stream_fn 落库含全量 blocks（thinking/text/tool_use 顺序保持）。"""
         _ensure_run(dbm, "run-blocks-rec")
         recorder = TraceRecorder("run-blocks-rec", start_iteration=0)
         resp = ChatResponse(
             content="plan",
             blocks=[
                 ThinkingBlock(thinking="let me think", signature="sig-1"),
-                TextBlock(text="here is my plan"),
+                TextBlock(text="plan"),
                 ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"}),
             ],
             stop_reason="tool_use",
             model="m",
         )
 
-        async def chat(messages, *, tools=None, tool_choice=None):
-            return resp
-
-        wrapped = recorder.wrap_chat_fn(chat)
-        await wrapped([Message(role="user", content="hi")], tools=[])
+        wrapped = recorder.wrap_stream_fn(_stream_from_response(resp))
+        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
+            pass
 
         step = next(
             s
             for s in dbm.agent_runs.get_steps("run-blocks-rec")
             if s["name"] == "llm_chat"
         )
+        # iteration 跟踪：首轮 chat span iteration=0
+        assert step["iteration"] == 0
         response = json.loads(step["replay_delta"])["response"]
-        # 旧字段保持
+        # 旧字段保持（流式下 content 由文本块聚合而来）
         assert response["stop_reason"] == "tool_use"
         assert response["content"] == "plan"
         assert response["tool_calls"][0]["id"] == "t1"
@@ -244,19 +284,17 @@ class TestRecorderPersistsFullBlocks:
             "tool_use",
         ]
 
-    async def test_wrap_chat_fn_persists_empty_blocks(self, dbm):
-        """无 blocks 的响应（end_turn）→ response["blocks"] 存空列表。"""
+    async def test_wrap_stream_fn_persists_empty_blocks(self, dbm):
+        """无任何块事件的响应（end_turn）→ response["blocks"] 存空列表。"""
         _ensure_run(dbm, "run-blocks-empty")
         recorder = TraceRecorder("run-blocks-empty", start_iteration=0)
-        resp = ChatResponse(
-            content="done", blocks=[], stop_reason="end_turn", model="m"
-        )
 
-        async def chat(messages, *, tools=None, tool_choice=None):
-            return resp
+        async def stream_fn(messages, *, tools=None, tool_choice=None):
+            yield StreamChunk(type="stop", stop_reason="end_turn", model="m")
 
-        wrapped = recorder.wrap_chat_fn(chat)
-        await wrapped([Message(role="user", content="hi")], tools=[])
+        wrapped = recorder.wrap_stream_fn(stream_fn)
+        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
+            pass
 
         step = next(
             s
@@ -283,11 +321,9 @@ class TestRecorderPersistsFullBlocks:
             model="m",
         )
 
-        async def chat(messages, *, tools=None, tool_choice=None):
-            return resp
-
-        wrapped = recorder.wrap_chat_fn(chat)
-        await wrapped([Message(role="user", content="hi")], tools=[])
+        wrapped = recorder.wrap_stream_fn(_stream_from_response(resp))
+        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
+            pass
 
         # crypto_on 下 get_steps 透明解密；往返完整
         step = next(
