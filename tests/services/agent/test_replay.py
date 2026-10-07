@@ -30,6 +30,13 @@ from app.services.llm.models import (
 )
 
 
+def _blocks(message: Message) -> list:
+    """显式收窄消息 content 为块列表（测试前提：replay 重建为块列表）"""
+    content = message.content
+    assert isinstance(content, list), "消息 content 应为块列表"
+    return content
+
+
 @pytest.fixture
 def dbm(tmp_path: Path) -> Iterator[DatabaseManager]:
     instance = DatabaseManager(str(tmp_path / "replay.db"))
@@ -339,10 +346,11 @@ class TestReplayRebuildsFullBlocks:
             TextBlock,
             ToolUseBlock,
         ]
-        assert assistant.content[0].thinking == "let me think"
-        assert assistant.content[0].signature == "sig-1"
-        assert assistant.content[1].text == "here is my plan"
-        assert assistant.content[2].id == "t1"
+        restored = _blocks(assistant)
+        assert restored[0].thinking == "let me think"
+        assert restored[0].signature == "sig-1"
+        assert restored[1].text == "here is my plan"
+        assert restored[2].id == "t1"
 
     def test_rebuilt_assistant_matches_live_blocks_expression(self, dbm):
         """replay 重建与 live ``list(resp.blocks)`` 逐条一致（含 thinking）。"""
@@ -595,7 +603,7 @@ class TestReplayRebuildsFullBlocks:
             TextBlock,
             ToolUseBlock,
         ]
-        assert assistant.content[0].thinking == "keepme"
+        assert _blocks(assistant)[0].thinking == "keepme"
         warns = [line for level, line in log_records if level == "WARNING"]
         # warning 含丢弃数量与类型
         assert any("丢弃" in line and "unknown_block" in line for line in warns)
@@ -649,7 +657,7 @@ class TestReplayRebuildsFullBlocks:
 
         assistant = next(m for m in result.messages if m.role == "assistant")
         assert [type(b) for b in assistant.content] == [ToolUseBlock]
-        assert assistant.content[0].id == "t1"
+        assert _blocks(assistant)[0].id == "t1"
         # 未执行 → missing 基于推导出的 tool_calls 生效
         assert [tc.id for tc in result.missing_tool_calls] == ["t1"]
         warns = [line for level, line in log_records if level == "WARNING"]
@@ -774,7 +782,7 @@ class TestReplayCheckpointResume:
         assert result.executed_iterations == 0
         # 已成功的不重跑：t1 的 tool_result 在 messages 中
         tr_ids = [
-            m.content[0].tool_use_id
+            _blocks(m)[0].tool_use_id
             for m in result.messages
             if m.role == "user"
             and isinstance(m.content, list)
@@ -904,14 +912,14 @@ class TestReplayEncryptionTransparent:
         # 解密透明：能还原 assistant 消息
         assistant = result.messages[1]  # [0]=seed
         assert assistant.role == "assistant"
-        assert assistant.content[0].input["title"] == "secret-title"
+        assert _blocks(assistant)[0].input["title"] == "secret-title"
         # tool_result 也解密
         tr = [
             m
             for m in result.messages
             if m.role == "user" and isinstance(m.content, list)
         ]
-        assert tr[0].content[0].content == "secret-result"
+        assert _blocks(tr[0])[0].content == "secret-result"
 
 
 class TestReplayAbnormalBranchLogging:
@@ -1069,7 +1077,7 @@ class TestReplayResponseTolerantModel:
         result = trace.replay("run-bad-tc")
 
         assistant = next(m for m in result.messages if m.role == "assistant")
-        assert [b.id for b in assistant.content] == ["t1"]
+        assert [b.id for b in _blocks(assistant)] == ["t1"]
         warns = [line for level, line in log_records if level == "WARNING"]
         assert any("tool_calls" in line and "丢弃" in line for line in warns)
 
