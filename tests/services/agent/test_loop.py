@@ -1,23 +1,22 @@
-"""轻量循环 ``app/services/agent/loop.py`` 测试（分段并行 + 终止 + 预算）。
+"""轻量循环 ``app/services/agent/loop.py`` 测试（流式注入 + 终止 + 预算）。
 
-覆盖：
+覆盖（LLM 调用统一经生产主路径 ``stream_fn`` 注入，工具经 ``executor_factory``）：
 - end_turn / 空响应（无 tool_calls）→ stop_reason=end_turn
 - assistant 聚合消息先于 tool_result（协议顺序）
 - submit_suggestion 捕获即 break（stop_reason=submit_suggestion），同轮其他工具不执行（终止工具优先）
-- 分段并行：循环将整批 tool_calls 一次性交给注入的 tool_calls_fn（execute_batch 内部做 gather/串行）
+- 分段并行：整批 tool_use 经执行器按原顺序执行/回填（生产执行器内部分段并行）
 - 透明预算：仅当递减后 remaining>0 才追加 ``[剩余轮次：N]``；remaining==1 起手的末轮 tool_choice=terminal
-- 畸形 tool_use（execute_batch 返回 is_error 的 ToolResultBlock）→ 循环继续不崩溃
+- 畸形 tool_use（handler 抛 ToolError → is_error 的 ToolResultBlock）→ 循环继续不崩溃
 - max_iterations 耗尽 → stop_reason=exhausted + last_response
 - 预算钩子：recorder.record_budget 每个非末轮恰好调用一次且参数为 "[剩余轮次：N]"；None 时跳过；
   末轮（递减后 remaining==0）不注入、不记录（幻影消息修复）
 - 防御分支：result 非 ToolResultBlock 时记 warning
-- 不直接依赖 LLMClient：LLM 调用经注入的 chat_fn（可 mock）
+- 不直接依赖 LLMClient：LLM 调用经注入的 stream_fn（可脚本化 mock）
 """
 
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock
 
 from app.services.agent.loop import RunResult, run
 from app.services.llm.models import (
@@ -29,6 +28,8 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from app.services.llm.tools import ToolError
+from tests.services.agent.stream_script import scripted_executor, scripted_stream
 
 # ---------------------------------------------------------------------------
 # 测试辅助
@@ -55,10 +56,6 @@ def _seed() -> list[Message]:
     ]
 
 
-def _ok_result(tc: ToolUseBlock, content: str = "ok") -> ToolResultBlock:
-    return ToolResultBlock(tool_use_id=tc.id, content=content, is_error=False)
-
-
 # 末轮/收尾提示的独立语义锚点（刻意不引用 loop 模块常量，避免同源期望值：
 # 常量文案被改坏时关键词断言仍会红）。
 _FINAL_ROUND_KEYWORDS = ("最后一轮", "必须调用 submit_suggestion", "不得再调用")
@@ -76,20 +73,6 @@ def _assert_final_round_message(content: str) -> None:
     )
 
 
-def _message_text(message: Message) -> str:
-    """显式收窄消息 content 为纯文本（测试前提：末轮强化提示为字符串）。"""
-    content = message.content
-    assert isinstance(content, str), "末轮强化提示应为纯文本"
-    return content
-
-
-def _message_blocks(message: Message) -> list:
-    """显式收窄消息 content 为块列表（测试前提：assistant 重建为块列表）。"""
-    content = message.content
-    assert isinstance(content, list), "assistant content 应为块列表"
-    return content
-
-
 def _assert_final_recovery_message(content: str) -> None:
     """断言收尾提示语义（预算耗尽 + 立即给出结论）。"""
     assert all(kw in content for kw in _FINAL_RECOVERY_KEYWORDS), (
@@ -103,13 +86,13 @@ def _assert_final_recovery_message(content: str) -> None:
 
 
 async def test_run_end_turn_returns_end_turn_with_text():
-    chat_fn = AsyncMock(return_value=_resp("end_turn", None))
-    chat_fn.return_value.content = "已分析完毕，无建议"
+    end_turn = _resp("end_turn", None)
+    end_turn.content = "已分析完毕，无建议"
+    stream = scripted_stream([end_turn])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
         tools_schemas=[{"name": "search_bangumi"}],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -119,7 +102,7 @@ async def test_run_end_turn_returns_end_turn_with_text():
     assert result.stop_reason == "end_turn"
     assert result.text == "已分析完毕，无建议"
     assert result.last_response is not None
-    chat_fn.assert_awaited_once()
+    assert stream.count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -129,19 +112,18 @@ async def test_run_end_turn_returns_end_turn_with_text():
 
 async def test_run_no_tool_calls_falls_back_to_end_turn():
     # stop_reason=tool_use 但 blocks 里没有任何 ToolUseBlock
-    chat_fn = AsyncMock(return_value=_resp("tool_use", []))
+    stream = scripted_stream([_resp("tool_use", [])])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     assert result.stop_reason == "end_turn"
-    chat_fn.assert_awaited_once()
+    assert stream.count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -151,39 +133,30 @@ async def test_run_no_tool_calls_falls_back_to_end_turn():
 
 async def test_assistant_aggregate_message_precedes_tool_results():
     # 第一轮返回两个 read 工具调用，第二轮 end_turn
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))  # messages 是第一个位置参数
-        if len(calls) == 1:
-            return _resp(
+    stream = scripted_stream(
+        [
+            _resp(
                 "tool_use",
                 [
                     _tool_use("t1", "search_bangumi"),
                     _tool_use("t2", "get_subject_detail"),
                 ],
-            )
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={
-            "t1": _ok_result(_tool_use("t1", "search_bangumi")),
-            "t2": _ok_result(_tool_use("t2", "get_subject_detail")),
-        }
+            ),
+            _resp("end_turn", None),
+        ]
     )
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     # 第二轮调用时，messages 中应已含：assistant(聚合两个 tool_use) + 两条 tool_result
-    second_round_messages = calls[1]
+    second_round_messages = stream.calls[1][0]
     roles_contents = [
         (
             m.role,
@@ -224,13 +197,15 @@ async def test_submit_suggestion_breaks_and_captures_without_executing_others():
     )
     read = _tool_use("tr", "search_bangumi", {"title": "花开伊吕波"})
     # 同轮同时含 read 与 submit：终止工具优先，read 不应执行
-    chat_fn = AsyncMock(return_value=_resp("tool_use", [read, submit]))
-    tool_calls_fn = AsyncMock()
+    stream = scripted_stream([_resp("tool_use", [read, submit])])
+    executed: list[str] = []
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -238,12 +213,12 @@ async def test_submit_suggestion_breaks_and_captures_without_executing_others():
 
     assert result.stop_reason == "submit_suggestion"
     assert result.suggestion == {"subject_id": "49892", "reason": "标题语义相近"}
-    # 同轮其他工具不执行：execute_batch 不应被调用
-    tool_calls_fn.assert_not_awaited()
+    # 同轮其他工具不执行：执行器 handler 不应被调用
+    assert executed == []
 
 
 # ---------------------------------------------------------------------------
-# 5. 分段并行：整批交给 tool_calls_fn（顺序保留）
+# 5. 分段并行：整批经执行器按原顺序执行/回填（顺序保留）
 # ---------------------------------------------------------------------------
 
 
@@ -251,65 +226,47 @@ async def test_segmented_parallel_passes_full_batch_in_order():
     a = _tool_use("a", "search_bangumi")
     b = _tool_use("b", "get_subject_detail")
     c = _tool_use("c", "get_related_subjects")
-    chat_fn = AsyncMock(
-        side_effect=[_resp("tool_use", [a, b, c]), _resp("end_turn", None)]
-    )
-    tool_calls_fn = AsyncMock(
-        return_value={
-            "a": _ok_result(a),
-            "b": _ok_result(b),
-            "c": _ok_result(c),
-        }
-    )
+    stream = scripted_stream([_resp("tool_use", [a, b, c]), _resp("end_turn", None)])
+    executed: list[str] = []
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
-    # 循环把整批（含分段）一次性交给 tool_calls_fn，由 execute_batch 内部做 gather/串行
-    tool_calls_fn.assert_awaited_once()
-    passed = tool_calls_fn.call_args[0][0]
-    assert [tc.name for tc in passed] == [
-        "search_bangumi",
-        "get_subject_detail",
-        "get_related_subjects",
-    ]
-    assert [tc.id for tc in passed] == ["a", "b", "c"]
+    # 整批按原顺序执行；结果保序回填（生产执行器内部分段并行）
+    assert executed == ["a", "b", "c"]
+    blocks = _collect_tool_results(stream.calls[1][0])
+    assert [b.tool_use_id for b in blocks] == ["a", "b", "c"]
 
 
 async def test_segmented_parallel_preserves_mixed_read_write_order():
-    # 循环对 read/write 无感知（分段是 execute_batch 内部职责），这里仅验证整批顺序透传。
+    # 循环对 read/write 无感知（分段是执行器内部职责），这里仅验证整批顺序透传。
     # 注意：中间工具绝不能是 tool_choice_terminal（否则触发终止优先 break）。
     r = _tool_use("r", "search_bangumi")
     w = _tool_use("w", "check_subject")  # 代表非终止的写/读工具，仅用于验证顺序
     r2 = _tool_use("r2", "get_subject_detail")
-    chat_fn = AsyncMock(
-        side_effect=[_resp("tool_use", [r, w, r2]), _resp("end_turn", None)]
-    )
-    tool_calls_fn = AsyncMock(
-        return_value={
-            "r": _ok_result(r),
-            "w": _ok_result(w),
-            "r2": _ok_result(r2),
-        }
-    )
+    stream = scripted_stream([_resp("tool_use", [r, w, r2]), _resp("end_turn", None)])
+    executed: list[str] = []
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
-    passed = tool_calls_fn.call_args[0][0]
-    assert [tc.id for tc in passed] == ["r", "w", "r2"]
+    assert executed == ["r", "w", "r2"]
 
 
 # ---------------------------------------------------------------------------
@@ -318,22 +275,19 @@ async def test_segmented_parallel_preserves_mixed_read_write_order():
 
 
 async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_round():
-    calls: list[tuple[list[Message], dict]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append((list(args[0]), dict(kwargs)))
-        # 每轮都返回工具调用，迫使循环跑满 max_iterations=2
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    # 每轮都返回工具调用，迫使循环跑满 max_iterations=2（第 3 条供收尾调用）
+    stream = scripted_stream(
+        [
+            _resp("tool_use", [_tool_use("t", "search_bangumi")]),
+            _resp("tool_use", [_tool_use("t", "search_bangumi")]),
+            _resp("tool_use", [_tool_use("t", "search_bangumi")]),
+        ]
     )
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -342,14 +296,13 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
     assert result.stop_reason == "exhausted"
 
     # 首轮 tool_choice=None；末轮（remaining==1 起手）tool_choice=terminal
-    assert calls[0][1]["tool_choice"] is None
-    assert calls[1][1]["tool_choice"] == "submit_suggestion"
+    assert stream.calls[0][1]["tool_choice"] is None
+    assert stream.calls[1][1]["tool_choice"] == "submit_suggestion"
 
     # 第二轮请求收到的 messages 末尾应携带第一轮留下的末轮强化提示
-    second_messages = calls[1][0]
-    last_msg = second_messages[-1]
+    last_msg = stream.calls[1][0][-1]
     assert last_msg.role == "user"
-    _assert_final_round_message(_message_text(last_msg))
+    _assert_final_round_message(last_msg.content)
 
 
 # ---------------------------------------------------------------------------
@@ -359,28 +312,16 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
 
 async def test_malformed_tool_use_is_error_block_continues_loop():
     bad = _tool_use("bad", "unknown_tool", {"foo": "bar"})
-    calls: list[list[Message]] = []
+    stream = scripted_stream([_resp("tool_use", [bad]), _resp("end_turn", None)])
 
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        if len(calls) == 1:
-            return _resp("tool_use", [bad])
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    # execute_batch 对未知工具返回 is_error 的 ToolResultBlock
-    tool_calls_fn = AsyncMock(
-        return_value={
-            "bad": ToolResultBlock(
-                tool_use_id="bad", content="工具执行失败: ToolError", is_error=True
-            )
-        }
-    )
+    def _raise(_tc: ToolUseBlock):
+        # 未知工具：handler 抛 ToolError，执行器包装为 is_error 的 ToolResultBlock
+        raise ToolError("工具执行失败: ToolError")
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(_raise),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -389,7 +330,7 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
     # 不应崩溃，应继续到下一轮并正常 end_turn
     assert result.stop_reason == "end_turn"
     # 错误块应被作为 tool_result 追加进 messages（第二轮可见）
-    second_messages = calls[1]
+    second_messages = stream.calls[1][0]
     error_blocks = [
         b
         for m in second_messages
@@ -398,93 +339,7 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
         if isinstance(b, ToolResultBlock) and b.is_error
     ]
     assert error_blocks, "is_error 的 ToolResultBlock 应被追加"
-
-
-# ---------------------------------------------------------------------------
-# 7b. 重复 tool_use_id → 循环按独立槽位（ordered）逐条回填，
-#     首个 tool_result 为真实结果，第二个为 duplicate 错误块
-# ---------------------------------------------------------------------------
-
-
-async def test_duplicate_tool_use_ids_backfill_each_slot_independently():
-    from app.services.llm.tools import BatchResults
-
-    dup_a = _tool_use("same", "search_bangumi")
-    dup_b = _tool_use("same", "search_bangumi")
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        if len(calls) == 1:
-            return _resp("tool_use", [dup_a, dup_b])
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    ok = ToolResultBlock(tool_use_id="same", content="real", is_error=False)
-    dup = ToolResultBlock(
-        tool_use_id="same", content="duplicate tool_use_id", is_error=True
-    )
-    tool_calls_fn = AsyncMock(return_value=BatchResults([("same", ok), ("same", dup)]))
-
-    result = await run(
-        chat_fn=chat_fn,
-        tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
-        max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
-        seed_messages=_seed(),
-    )
-
-    assert result.stop_reason == "end_turn"
-    second_messages = calls[1]
-    blocks = [
-        b
-        for m in second_messages
-        if isinstance(m.content, list)
-        for b in m.content
-        if isinstance(b, ToolResultBlock)
-    ]
-    # 每个 tool_use 各有一条 tool_result（协议闭合），且首个保留真实结果
-    assert len(blocks) == 2
-    assert blocks[0].content == "real"
-    assert blocks[0].is_error is False
-    assert blocks[1].content == "duplicate tool_use_id"
-    assert blocks[1].is_error is True
-
-
-async def test_plain_dict_tool_results_still_supported():
-    """向后兼容：tool_calls_fn 返回普通 dict（无 ordered）时按 id 取值。"""
-    a = _tool_use("t1", "search_bangumi")
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        if len(calls) == 1:
-            return _resp("tool_use", [a])
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(return_value={"t1": _ok_result(a, content="plain")})
-
-    result = await run(
-        chat_fn=chat_fn,
-        tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
-        max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
-        seed_messages=_seed(),
-    )
-
-    assert result.stop_reason == "end_turn"
-    blocks = [
-        b
-        for m in calls[1]
-        if isinstance(m.content, list)
-        for b in m.content
-        if isinstance(b, ToolResultBlock)
-    ]
-    assert len(blocks) == 1
-    assert blocks[0].content == "plain"
+    assert error_blocks[0].content == "工具执行失败: ToolError"
 
 
 # ---------------------------------------------------------------------------
@@ -493,17 +348,14 @@ async def test_plain_dict_tool_results_still_supported():
 
 
 async def test_max_iterations_exhausted_returns_last_response():
-    chat_fn = AsyncMock(
-        return_value=_resp("tool_use", [_tool_use("t", "search_bangumi")])
-    )
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    # 2 轮循环 + 1 次兜底收尾调用
+    stream = scripted_stream([always_tool, always_tool, always_tool])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -512,8 +364,7 @@ async def test_max_iterations_exhausted_returns_last_response():
     assert result.stop_reason == "exhausted"
     assert result.last_response is not None
     assert result.last_response.stop_reason == "tool_use"
-    # 2 轮循环 + 1 次兜底收尾调用
-    assert chat_fn.await_count == 3
+    assert stream.count == 3
 
 
 # ---------------------------------------------------------------------------
@@ -552,17 +403,14 @@ async def test_budget_record_budget_called_per_non_final_round_with_remaining():
     """非末轮记录 "[剩余轮次：N]"，末轮记录强化文案；收尾再记录一次收尾提示。"""
     recorder = _FakeBudgetRecorder()
 
-    chat_fn = AsyncMock(
-        return_value=_resp("tool_use", [_tool_use("t", "search_bangumi")])
-    )
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    # 3 轮循环 + 1 次兜底收尾调用
+    stream = scripted_stream([always_tool, always_tool, always_tool, always_tool])
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -584,17 +432,14 @@ async def test_budget_recorder_none_runs_exhausted_path_without_error():
     覆盖两处 ``if recorder is not None`` 守卫（循环内预算记录 + `_final_recovery` 收尾
     记录）：守卫被删/失效时对 None 调 ``record_budget`` 会抛 AttributeError。
     """
-    chat_fn = AsyncMock(
-        return_value=_resp("tool_use", [_tool_use("t", "search_bangumi")])
-    )
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    # 2 轮循环 + 1 次兜底收尾调用
+    stream = scripted_stream([always_tool, always_tool, always_tool])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -607,21 +452,13 @@ async def test_budget_recorder_none_runs_exhausted_path_without_error():
 
 async def test_budget_appended_to_messages_even_without_recorder():
     """预算消息仍追加进 messages（与 recorder 无关的领域语义）。"""
-    calls: list[tuple[list[Message], dict]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append((list(args[0]), dict(kwargs)))
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    stream = scripted_stream([always_tool, always_tool, always_tool])
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -629,10 +466,9 @@ async def test_budget_appended_to_messages_even_without_recorder():
     )
 
     # 第二轮请求收到的 messages 末尾应携带第一轮留下的末轮强化提示
-    second_messages = calls[1][0]
-    last_msg = second_messages[-1]
+    last_msg = stream.calls[1][0][-1]
     assert last_msg.role == "user"
-    _assert_final_round_message(_message_text(last_msg))
+    _assert_final_round_message(last_msg.content)
 
 
 async def test_budget_no_phantom_message_on_final_round():
@@ -642,21 +478,23 @@ async def test_budget_no_phantom_message_on_final_round():
     """
     recorder = _FakeBudgetRecorder()
     observed: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        # 传引用（不 copy）：循环后续 append 会反映到同一列表，便于检查终态
-        observed.append(args[0])
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    base = scripted_stream(
+        [
+            _resp("tool_use", [_tool_use("t", "search_bangumi")]),
+            _resp("tool_use", [_tool_use("t", "search_bangumi")]),
+        ]
     )
 
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        # 传引用（不 copy）：循环后续 append 会反映到同一列表，便于检查终态
+        observed.append(messages)
+        async for chunk in base(messages, tools=tools, tool_choice=tool_choice):
+            yield chunk
+
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream_fn,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=1,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -687,16 +525,22 @@ async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
     import logging
 
     a = _tool_use("a", "search_bangumi")
+    stream = scripted_stream([_resp("tool_use", [a]), _resp("end_turn", None)])
 
-    chat_fn = AsyncMock(return_value=_resp("tool_use", [a]))
-    # 返回 None 结果（模拟 TerminalCapture 泄漏到 aligned 槽位）
-    tool_calls_fn = AsyncMock(return_value={})
+    class _NonToolResultExecutor:
+        """槽位数一致但元素非 ToolResultBlock（模拟泄漏到 aligned 槽位）。"""
+
+        def feed(self, chunk):
+            pass
+
+        async def finalize(self):
+            return [None]
 
     with caplog.at_level(logging.WARNING):
         await run(
-            chat_fn=chat_fn,
+            stream_fn=stream,
+            executor_factory=_NonToolResultExecutor,
             tools_schemas=[],
-            tool_calls_fn=tool_calls_fn,
             max_iterations=1,
             tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
@@ -714,17 +558,12 @@ async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
 
 async def test_run_empty_shell_response_returns_llm_error():
     """空壳响应（stop_reason=""、无 blocks、content 为空）→ stop_reason='llm_error'（不再 end_turn）。"""
-    from app.services.llm.models import ChatResponse
-
     # 模拟 LLMCallError 后被包装成的空壳（client 不再返回此物，但 loop 仍需防御）
-    chat_fn = AsyncMock(
-        return_value=ChatResponse(content="", blocks=[], stop_reason="")
-    )
+    stream = scripted_stream([ChatResponse(content="", blocks=[], stop_reason="")])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -735,18 +574,13 @@ async def test_run_empty_shell_response_returns_llm_error():
 
 async def test_run_max_tokens_response_returns_max_tokens():
     """无 tool_calls 且 stop_reason='max_tokens' → stop_reason='max_tokens'。"""
-    from app.services.llm.models import ChatResponse
-
-    chat_fn = AsyncMock(
-        return_value=ChatResponse(
-            content="truncated...", blocks=[], stop_reason="max_tokens"
-        )
+    stream = scripted_stream(
+        [ChatResponse(content="truncated...", blocks=[], stop_reason="max_tokens")]
     )
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -757,13 +591,13 @@ async def test_run_max_tokens_response_returns_max_tokens():
 
 async def test_run_end_turn_unchanged():
     """stop_reason='end_turn' 路径不变。"""
-    chat_fn = AsyncMock(return_value=_resp("end_turn", None))
-    chat_fn.return_value.content = "已分析完毕"
+    end_turn = _resp("end_turn", None)
+    end_turn.content = "已分析完毕"
+    stream = scripted_stream([end_turn])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
         tools_schemas=[{"name": "search_bangumi"}],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -775,27 +609,24 @@ async def test_run_end_turn_unchanged():
 
 async def test_run_tool_calls_path_unchanged():
     """有 tool_calls 的路径不受影响（stop_reason='tool_use' 含 tool_calls）。"""
-    chat_fn = AsyncMock(
-        side_effect=[
+    stream = scripted_stream(
+        [
             _resp("tool_use", [_tool_use("t1", "search_bangumi")]),
             _resp("end_turn", None),
         ]
     )
-    tool_calls_fn = AsyncMock(
-        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
-    )
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     assert result.stop_reason == "end_turn"
-    assert chat_fn.await_count == 2
+    assert stream.count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -834,12 +665,9 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
     思考模型（Anthropic thinking 模式 / DeepSeek pro）要求 thinking 块随
     tool_use 在后续请求回传，否则真实端点 400。
     """
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        if len(calls) == 1:
-            return ChatResponse(
+    stream = scripted_stream(
+        [
+            ChatResponse(
                 content="先搜索",
                 blocks=[
                     TextBlock(text="先搜索"),
@@ -847,24 +675,21 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
                     _tool_use("t1", "search_bangumi"),
                 ],
                 stop_reason="tool_use",
-            )
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
+            ),
+            _resp("end_turn", None),
+        ]
     )
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
-    assistant_msg = next(m for m in calls[1] if m.role == "assistant")
+    assistant_msg = next(m for m in stream.calls[1][0] if m.role == "assistant")
     content = assistant_msg.content
     assert isinstance(content, list)  # 富内容路径：assistant 消息为块列表
     types = [b.type for b in content]
@@ -880,28 +705,21 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
 
 async def test_final_round_budget_message_is_strengthened():
     """末轮（remaining==1）注入的预算消息含「最后一轮 / submit_suggestion / 不得再检索」。"""
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    # max_iterations=2 → 2 轮循环 + 1 次兜底收尾调用
+    stream = scripted_stream([always_tool, always_tool, always_tool])
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     # max_iterations=2：第一轮递减后 remaining==1 → 注入强化提示，第二轮请求可见
-    last_msg = calls[1][-1]
+    last_msg = stream.calls[1][0][-1]
     assert last_msg.role == "user"
     assert isinstance(last_msg.content, str)
     assert "最后一轮" in last_msg.content
@@ -911,28 +729,21 @@ async def test_final_round_budget_message_is_strengthened():
 
 async def test_non_final_round_budget_message_not_strengthened():
     """非末轮（remaining>1）仍是朴素文案，不含强化提示语义。"""
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    # max_iterations=3 → 3 轮循环 + 1 次兜底收尾调用
+    stream = scripted_stream([always_tool, always_tool, always_tool, always_tool])
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     # 第一轮递减后 remaining==2 → 第二轮请求末尾是朴素预算消息
-    second_last = calls[1][-1]
+    second_last = stream.calls[1][0][-1]
     assert second_last.role == "user"
     assert second_last.content == "[剩余轮次：2]"
     assert "最后一轮" not in second_last.content
@@ -943,20 +754,13 @@ async def test_non_final_round_budget_message_not_strengthened():
 # ---------------------------------------------------------------------------
 
 
-def _exhausting_chat(max_iterations: int, extra: list[ChatResponse]):
-    """构造 chat_fn：前 max_iterations 轮返回非终止工具，之后按 extra 依次返回。"""
-    calls: list[tuple[list[Message], dict]] = []
-    seq = list(extra)
-
-    def _side_effect(*args, **kwargs):
-        calls.append((list(args[0]), dict(kwargs)))
-        if len(calls) <= max_iterations:
-            return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-        if seq:
-            return seq.pop(0)
-        return _resp("tool_use", [_tool_use("t", "search_bangumi")])
-
-    return AsyncMock(side_effect=_side_effect), calls
+def _exhausting_stream(max_iterations: int, extra: list[ChatResponse]):
+    """构造 stream_fn：前 max_iterations 轮返回非终止工具，之后按 extra 依次返回。"""
+    responses = [
+        _resp("tool_use", [_tool_use("t", "search_bangumi")])
+        for _ in range(max_iterations)
+    ] + list(extra)
+    return scripted_stream(responses)
 
 
 async def test_exhausted_final_recovery_submits_suggestion():
@@ -964,16 +768,12 @@ async def test_exhausted_final_recovery_submits_suggestion():
     submit = _tool_use(
         "s", "submit_suggestion", {"subject_id": "49892", "reason": "收尾确定"}
     )
-    recovery = _resp("tool_use", [submit])
-    chat_fn, calls = _exhausting_chat(2, [recovery])
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    stream = _exhausting_stream(2, [_resp("tool_use", [submit])])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -981,58 +781,70 @@ async def test_exhausted_final_recovery_submits_suggestion():
 
     assert result.stop_reason == "submit_suggestion"
     assert result.suggestion == {"subject_id": "49892", "reason": "收尾确定"}
-    assert result.last_response is recovery
+    assert result.last_response is not None
+    # last_response 为收尾响应（含 submit tool_use）
+    assert [
+        b.id for b in result.last_response.blocks if isinstance(b, ToolUseBlock)
+    ] == ["s"]
     # 收尾请求的 messages 末尾为收尾提示
-    _assert_final_recovery_message(calls[2][0][-1].content)
+    _assert_final_recovery_message(stream.calls[2][0][-1].content)
 
 
 async def test_exhausted_final_recovery_still_no_submit_returns_exhausted():
     """耗尽后收尾仍不提交 → exhausted，last_response 为收尾响应。"""
-    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
-    chat_fn, _calls = _exhausting_chat(2, [recovery])
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    stream = _exhausting_stream(
+        2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     assert result.stop_reason == "exhausted"
-    assert result.last_response is recovery
+    assert result.last_response is not None
+    assert result.last_response.stop_reason == "tool_use"
+    # last_response 为收尾响应（仍为 search_bangumi 工具调用）
+    assert [
+        b.id for b in result.last_response.blocks if isinstance(b, ToolUseBlock)
+    ] == ["t"]
 
 
 async def test_exhausted_final_recovery_exception_returns_exhausted_not_crash():
     """收尾调用抛异常 → best-effort 返回 exhausted（last_response 保持循环内最后一次）。"""
-    loop_resp = _resp("tool_use", [_tool_use("t", "search_bangumi")])
+    base = _exhausting_stream(
+        2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
+    )
     call_count = {"n": 0}
 
-    async def _chat(messages, *, tools=None, tool_choice=None):
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
         call_count["n"] += 1
         if call_count["n"] <= 2:  # max_iterations=2 的循环内两轮
-            return loop_resp
-        raise RuntimeError("收尾调用失败")
-
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+            async for chunk in base(messages, tools=tools, tool_choice=tool_choice):
+                yield chunk
+        else:
+            raise RuntimeError("收尾调用失败")
 
     result = await run(
-        chat_fn=_chat,
+        stream_fn=stream_fn,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
     assert result.stop_reason == "exhausted"
-    assert result.last_response is loop_resp
+    assert result.last_response is not None
+    assert result.last_response.stop_reason == "tool_use"
+    # last_response 保持循环内最后一次响应（而非收尾异常）
+    assert [
+        b.id for b in result.last_response.blocks if isinstance(b, ToolUseBlock)
+    ] == ["t"]
 
 
 async def test_exhausted_final_recovery_tools_only_terminal_schema():
@@ -1040,64 +852,60 @@ async def test_exhausted_final_recovery_tools_only_terminal_schema():
     recovery = _resp(
         "tool_use", [_tool_use("s", "submit_suggestion", {"subject_id": "1"})]
     )
-    chat_fn, calls = _exhausting_chat(2, [recovery])
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
-    )
+    stream = _exhausting_stream(2, [recovery])
+    executed: list[str] = []
     schemas = [
         {"name": "search_bangumi"},
         {"name": "submit_suggestion"},
     ]
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=schemas,
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
-    # calls[2] 为收尾调用
-    assert calls[2][1]["tools"] == [{"name": "submit_suggestion"}]
-    assert calls[2][1]["tool_choice"] == "submit_suggestion"
-    # 收尾不执行任何非终止工具：tool_calls_fn 只被循环内两轮调用
-    assert tool_calls_fn.await_count == 2
+    # stream.calls[2] 为收尾调用
+    assert stream.calls[2][1]["tools"] == [{"name": "submit_suggestion"}]
+    assert stream.calls[2][1]["tool_choice"] == "submit_suggestion"
+    # 收尾不执行任何非终止工具：handler 只被循环内两轮调用
+    assert len(executed) == 2
 
 
 async def test_exhausted_final_recovery_called_exactly_once():
-    """收尾调用恰好一次：chat_fn 总调用数 = max_iterations + 1。"""
-    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
-    chat_fn, _calls = _exhausting_chat(2, [recovery])
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    """收尾调用恰好一次：stream_fn 总调用数 = max_iterations + 1。"""
+    stream = _exhausting_stream(
+        2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
-    assert chat_fn.await_count == 3  # 2 轮循环 + 1 次收尾
+    assert stream.count == 3  # 2 轮循环 + 1 次收尾
 
 
 async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
     """收尾提示须经 recorder.record_budget 记录（恢复重放一致性）。"""
     recorder = _FakeBudgetRecorder()
-    recovery = _resp("tool_use", [_tool_use("t", "search_bangumi")])
-    chat_fn, _calls = _exhausting_chat(2, [recovery])
-    tool_calls_fn = AsyncMock(
-        return_value={"t": _ok_result(_tool_use("t", "search_bangumi"))}
+    stream = _exhausting_stream(
+        2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=2,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1155,14 +963,8 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
     second = _tool_use(
         "ts2", "submit_suggestion", {"subject_id": "2", "reason": "确定"}
     )
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [first if len(calls) == 1 else second])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock()
+    stream = scripted_stream([_resp("tool_use", [first]), _resp("tool_use", [second])])
+    executed: list[str] = []
     veto_inputs: list[dict] = []
 
     def _veto(args: dict) -> str | None:
@@ -1170,9 +972,11 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
         return None if args.get("subject_id") == "2" else "请再核对"
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1182,9 +986,9 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
     assert result.stop_reason == "submit_suggestion"
     assert result.suggestion == {"subject_id": "2", "reason": "确定"}
     # 首次 submit 被暂缓：其他工具不执行
-    tool_calls_fn.assert_not_awaited()
+    assert executed == []
     # 第二轮请求携带注入的 veto tool_result（配对 terminal tool_use）
-    blocks = _collect_tool_results(calls[1])
+    blocks = _collect_tool_results(stream.calls[1][0])
     veto_blocks = [b for b in blocks if b.tool_use_id == "ts1"]
     assert veto_blocks, "应注入 terminal tool_use 配对的 tool_result"
     assert veto_blocks[0].content == "请再核对"
@@ -1198,13 +1002,7 @@ async def test_veto_happens_at_most_once_per_run():
     submit = _tool_use(
         "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
     )
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [submit])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
+    stream = scripted_stream([_resp("tool_use", [submit]), _resp("tool_use", [submit])])
     veto_calls: list[dict] = []
 
     def _veto(args: dict) -> str | None:
@@ -1212,9 +1010,9 @@ async def test_veto_happens_at_most_once_per_run():
         return "暂缓"
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1225,7 +1023,7 @@ async def test_veto_happens_at_most_once_per_run():
     assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
     # veto 仅调用一次（第二次 terminal 因「已 veto 过」直接放行，不再询问）
     assert len(veto_calls) == 1
-    assert chat_fn.await_count == 2
+    assert stream.count == 2
 
 
 async def test_veto_not_applied_on_final_round():
@@ -1233,7 +1031,7 @@ async def test_veto_not_applied_on_final_round():
     submit = _tool_use(
         "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
     )
-    chat_fn = AsyncMock(return_value=_resp("tool_use", [submit]))
+    stream = scripted_stream([_resp("tool_use", [submit])])
     veto_calls: list[dict] = []
 
     def _veto(args: dict) -> str | None:
@@ -1241,9 +1039,9 @@ async def test_veto_not_applied_on_final_round():
         return "暂缓"
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=1,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1254,7 +1052,7 @@ async def test_veto_not_applied_on_final_round():
     assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
     # 末轮不 veto：回调根本不被调用
     assert veto_calls == []
-    chat_fn.assert_awaited_once()
+    assert stream.count == 1
 
 
 async def test_veto_none_behaves_like_current_behavior():
@@ -1262,12 +1060,12 @@ async def test_veto_none_behaves_like_current_behavior():
     submit = _tool_use(
         "s", "submit_suggestion", {"subject_id": "1", "reason": "暂推荐"}
     )
-    chat_fn = AsyncMock(return_value=_resp("tool_use", [submit]))
+    stream = scripted_stream([_resp("tool_use", [submit])])
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1276,26 +1074,20 @@ async def test_veto_none_behaves_like_current_behavior():
 
     assert result.stop_reason == "submit_suggestion"
     assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
-    chat_fn.assert_awaited_once()
+    assert stream.count == 1
 
 
 async def test_veto_records_injected_tool_result_span_for_replay():
     """veto 伪执行须经 recorder 落 tool_execute span（replay 一致性）。"""
     first = _tool_use("ts1", "submit_suggestion", {"subject_id": "1"})
     second = _tool_use("ts2", "submit_suggestion", {"subject_id": "2"})
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [first if len(calls) == 1 else second])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
+    stream = scripted_stream([_resp("tool_use", [first]), _resp("tool_use", [second])])
     recorder = _FakeToolRecorder()
 
     await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=AsyncMock(),
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1303,11 +1095,11 @@ async def test_veto_records_injected_tool_result_span_for_replay():
         veto_terminal=lambda args: "请再核对",
     )
 
-    # 仅 veto 伪执行落 span（terminal 分支不经 execute_batch）
+    # 仅 veto 伪执行落 span（terminal 分支不经执行器 handler）
     assert len(recorder.started) == 1
     _span_id, tool_use, sequence = recorder.started[0]
     assert tool_use.id == "ts1"
-    # sequence 与 execute_batch 约定一致：terminal 在 tool_calls 中的下标
+    # sequence 与工具在 tool_calls 中的下标一致
     assert sequence == 0
     assert len(recorder.ended) == 1
     ended_result = recorder.ended[0][1]
@@ -1326,19 +1118,17 @@ async def test_veto_multi_tool_round_injects_paired_results_for_all_tool_uses():
     search = _tool_use("t1", "search_bangumi", {"title": "foo"})
     submit = _tool_use("t2", "submit_suggestion", {"subject_id": "1"})
     second = _tool_use("t3", "submit_suggestion", {"subject_id": "2"})
-    calls: list[list[Message]] = []
-
-    def _side_effect(*args, **kwargs):
-        calls.append(list(args[0]))
-        return _resp("tool_use", [search, submit] if len(calls) == 1 else [second])
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock()
+    stream = scripted_stream(
+        [_resp("tool_use", [search, submit]), _resp("tool_use", [second])]
+    )
+    executed: list[str] = []
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(
+            lambda tc: executed.append(tc.id) or {"ok": tc.id}
+        ),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -1347,9 +1137,9 @@ async def test_veto_multi_tool_round_injects_paired_results_for_all_tool_uses():
 
     assert result.stop_reason == "submit_suggestion"
     # 暂缓轮其他工具不执行
-    tool_calls_fn.assert_not_awaited()
+    assert executed == []
     # 第二轮请求前：assistant 同轮含两条 tool_use，二者都必须有配对 tool_result
-    _assistant, results = _last_assistant_tool_use_and_results(calls[1])
+    _assistant, results = _last_assistant_tool_use_and_results(stream.calls[1][0])
     assert _assistant == ["t1", "t2"]
     assert set(results) >= {"t1", "t2"}, (
         f"同轮每条 tool_use 须有配对 tool_result，实际 {set(results)}"
@@ -1453,7 +1243,6 @@ def _stream_end_turn() -> StreamChunk:
 
 def _streaming_executor(events: list, *, gate: asyncio.Event | None = None):
     """构造 StreamingToolExecutor：read_* 幂等（提前），submit_suggestion terminal。"""
-    from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 
     async def execute_fn(tool_use):
         events.append(("exec", tool_use.id))
@@ -1461,11 +1250,30 @@ def _streaming_executor(events: list, *, gate: asyncio.Event | None = None):
             await gate.wait()
         return {"echo": tool_use.name}
 
-    return StreamingToolExecutor(
-        execute_fn=execute_fn,
-        is_idempotent=lambda name: name.startswith("read"),
-        is_terminal=lambda name: name == "submit_suggestion",
+    # 复用共享辅助的默认调度判据（read* 幂等、submit_suggestion terminal）
+    return scripted_executor(execute_fn)()
+
+
+async def test_scripted_executor_passes_through_tool_result_block():
+    """辅助契约：handler 直传 ToolResultBlock 时按原样回填（内容/is_error 不被包装）。"""
+    a = _tool_use("a", "search_bangumi")
+    stream = scripted_stream([_resp("tool_use", [a]), _resp("end_turn", None)])
+    exact = ToolResultBlock(tool_use_id="a", content="exact", is_error=False)
+
+    result = await run(
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: exact),
+        tools_schemas=[],
+        max_iterations=3,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
     )
+
+    assert result.stop_reason == "end_turn"
+    blocks = _collect_tool_results(stream.calls[1][0])
+    assert len(blocks) == 1
+    assert blocks[0].content == "exact"
+    assert blocks[0].is_error is False
 
 
 async def test_stream_path_starts_idempotent_tool_before_stream_ends():
@@ -1665,7 +1473,7 @@ async def test_stream_path_pads_missing_slots_to_close_protocol(caplog):
 
     assert result.stop_reason == "end_turn"
     assistant = next(m for m in calls[1] if m.role == "assistant")
-    tool_use_ids = [b.id for b in _message_blocks(assistant) if b.type == "tool_use"]
+    tool_use_ids = [b.id for b in assistant.content if b.type == "tool_use"]
     assert tool_use_ids == ["a", "b"]
 
     blocks = _collect_tool_results(calls[1])
@@ -1714,14 +1522,13 @@ async def test_stream_path_budget_and_recovery_use_stream():
     assert result.suggestion == {"subject_id": "9", "reason": "收尾"}
 
 
-async def test_run_requires_stream_fn_or_chat_fn():
-    """二者都不提供 → ValueError（显式契约）。"""
+async def test_run_requires_stream_fn():
+    """不提供 stream_fn → ValueError（显式契约）。"""
     import pytest
 
     with pytest.raises(ValueError, match="stream_fn"):
         await run(
             tools_schemas=[],
-            tool_calls_fn=AsyncMock(),
             max_iterations=1,
             tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
@@ -1784,39 +1591,6 @@ async def test_stream_exception_converges_early_tasks_and_propagates():
     ex = created[0]
     assert all(t.done() for t in ex._tasks), "提前任务应已收敛，无 pending 泄漏"
     assert ex._states["a"].result is not None, "提前任务结果应已回填"
-
-
-# ---------------------------------------------------------------------------
-# 双注入：stream_fn + chat_fn → 告警且以流式路径为准
-# ---------------------------------------------------------------------------
-
-
-async def test_double_injection_warns_and_prefers_stream(caplog):
-    """同时注入 stream_fn 与 chat_fn → 告警 + 走流式路径（chat_fn 不被调用）。"""
-    import logging
-
-    stream_calls = {"n": 0}
-    chat_fn = AsyncMock()
-
-    async def stream_fn(messages, *, tools=None, tool_choice=None):
-        stream_calls["n"] += 1
-        yield _stream_end_turn()
-
-    with caplog.at_level(logging.WARNING):
-        result = await run(
-            stream_fn=stream_fn,
-            chat_fn=chat_fn,
-            tools_schemas=[],
-            max_iterations=2,
-            tool_choice_terminal="submit_suggestion",
-            seed_messages=_seed(),
-        )
-
-    assert result.stop_reason == "end_turn"
-    assert stream_calls["n"] == 1
-    chat_fn.assert_not_awaited()
-    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("同时收到 stream_fn 与 chat_fn" in r.message for r in warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1961,23 +1735,17 @@ async def test_run_does_not_mutate_caller_seed_list():
     """
     seed = _seed()
     original_len = len(seed)
-    state = {"round": 0}
-
-    def _side_effect(*args, **kwargs):
-        state["round"] += 1
-        if state["round"] == 1:
-            return _resp("tool_use", [_tool_use("t1", "search_bangumi")])
-        return _resp("end_turn", None)
-
-    chat_fn = AsyncMock(side_effect=_side_effect)
-    tool_calls_fn = AsyncMock(
-        return_value={"t1": _ok_result(_tool_use("t1", "search_bangumi"))}
+    stream = scripted_stream(
+        [
+            _resp("tool_use", [_tool_use("t1", "search_bangumi")]),
+            _resp("end_turn", None),
+        ]
     )
 
     result = await run(
-        chat_fn=chat_fn,
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
-        tool_calls_fn=tool_calls_fn,
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=seed,
