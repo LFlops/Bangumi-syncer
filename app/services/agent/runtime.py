@@ -26,7 +26,6 @@ from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent import trace
 from app.services.agent.loop import (
-    ChatFn,
     RunResult,
     StreamFn,
     normalize_stop_reason,
@@ -56,7 +55,6 @@ async def run(
     ctx: Any,
     thinking_level: str,
     stream_fn: StreamFn | None = None,
-    chat_fn: ChatFn | None = None,
     notification_service: NotificationService | None = None,
     span_recorder: TraceRecorder | None = None,
 ) -> str:
@@ -65,11 +63,8 @@ async def run(
     status 取值：``succeeded`` / ``no_suggestion`` / ``failed`` / ``processing``
     （调度轮次重试中）/ ``skipped``（并发抢占失败，由调用方忽略）。
 
-    LLM 调用注入：``stream_fn`` 为**主路径**（流式，默认由 hooks.build_stream_fn
-    构造）；``chat_fn`` 为旧契约兼容（返回 ``ChatResponse``，仅测试/迁移期使用）。
-
-    .. deprecated:: ``chat_fn`` 参数仅测试/迁移期兼容，后续清理时移除；
-       新代码请只传 ``stream_fn``（或两者都不传由 hooks 构造流式客户端）。
+    LLM 调用注入：``stream_fn`` 为唯一入口（流式，缺省由 ``hooks.build_stream_fn``
+    构造）。
     """
     dbm = get_database_manager()
 
@@ -92,17 +87,16 @@ async def run(
     # 由场景保证单一来源。
     max_iterations = hooks.resolve_max_iterations(thinking_level)
 
-    if stream_fn is None and chat_fn is None:
+    if stream_fn is None:
         stream_fn = hooks.build_stream_fn(thinking_level)
 
     # 写 seed 行（供 replay 显式提取种子消息）
     span_recorder.write_seed_row(seed)
 
-    # LLM 调用异常（stream_fn/chat_fn 抛错）→ 按可重试性分流
+    # LLM 调用异常（stream_fn 抛错）→ 按可重试性分流
     try:
         result = await _invoke_loop(
             stream_fn=stream_fn,
-            chat_fn=chat_fn,
             registry=registry,
             span_recorder=span_recorder,
             tools_schemas=tools_schemas,
@@ -179,8 +173,7 @@ def _make_executor_factory(
 
 async def _invoke_loop(
     *,
-    stream_fn: StreamFn | None,
-    chat_fn: ChatFn | None,
+    stream_fn: StreamFn,
     registry: ToolRegistry,
     span_recorder: TraceRecorder,
     tools_schemas: list[dict],
@@ -188,11 +181,7 @@ async def _invoke_loop(
     hooks: ScenarioHooks,
     seed_messages: Sequence[Message],
 ) -> RunResult:
-    """按注入形态选择主路径（流式）或旧路径（chat_fn）运行通用循环。
-
-    旧路径分支（``chat_fn``）为迁移期兼容：``.. deprecated::`` 仅测试/迁移期使用，
-    后续清理时移除（届时 ``chat_fn`` 置空、只保留 ``stream_fn`` 分支）。
-    """
+    """以流式主路径运行通用循环（chat span 包装 + 按轮执行器工厂）。"""
     common: dict[str, Any] = dict(
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
@@ -202,18 +191,9 @@ async def _invoke_loop(
         # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
         veto_terminal=getattr(hooks, "veto_terminal", None),
     )
-    if stream_fn is not None:
-        return await loop_run(
-            stream_fn=span_recorder.wrap_stream_fn(stream_fn),
-            executor_factory=_make_executor_factory(registry, span_recorder),
-            **common,
-        )
-    # 旧契约兼容路径（deprecated，仅测试/迁移期）：chat_fn + execute_batch
-    # run() 已保证「至少注入其一」：stream_fn 为空时 chat_fn 必非空
-    assert chat_fn is not None
     return await loop_run(
-        chat_fn=span_recorder.wrap_chat_fn(chat_fn),
-        tool_calls_fn=functools.partial(registry.execute_batch, recorder=span_recorder),
+        stream_fn=span_recorder.wrap_stream_fn(stream_fn),
+        executor_factory=_make_executor_factory(registry, span_recorder),
         **common,
     )
 
@@ -501,7 +481,6 @@ async def _execute_continuation(
 
     result = await _invoke_loop(
         stream_fn=hooks.build_stream_fn(thinking_level),
-        chat_fn=None,
         registry=registry,
         span_recorder=span_recorder,
         tools_schemas=tools_schemas,

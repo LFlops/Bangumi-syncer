@@ -1,13 +1,12 @@
 """轻量 Agent 循环。
 
-通用骨架核心：固定 ``max_iterations`` 上限的 for 循环，每轮经注入的 LLM 调用
-（**流式为主** ``stream_fn``，``chat_fn`` 为旧契约兼容）取响应，按既定流程处理终止、
-聚合、分段并行、透明预算与 stop_reason。
+通用骨架核心：固定 ``max_iterations`` 上限的 for 循环，每轮经注入的流式 LLM 调用
+``stream_fn`` 取响应，按既定流程处理终止、聚合、分段并行、透明预算与 stop_reason。
 
 设计要点：
 - **不直接依赖 LLMClient**：LLM 调用经注入的 ``stream_fn(messages, tools=, tool_choice=)``
   （返回 ``AsyncIterator[StreamChunk]``），便于测试 mock 与场景层（llm_assist）注入真实
-  客户端。``chat_fn``（返回 ``ChatResponse``）为旧契约兼容路径，行为与改造前等价。
+  客户端。
 - **流式解析 + 提交闸门 + 受控执行**（``stream_fn`` 路径）：逐事件喂
   :class:`~app.services.llm.models.StreamAggregator` 聚合响应，同时喂
   :class:`~app.services.agent.streaming_tool_executor.StreamingToolExecutor`。
@@ -16,8 +15,6 @@
   ``finish_reason`` **流末集中补发**停点 → 仍提前执行但**无重叠收益**；eval replay
   **无停点** → 纯轮级降级。非幂等工具在流结束后按 ``execute_batch`` 语义（连续幂等段
   并行、非幂等串行、保序）执行。执行器由 ``executor_factory`` 按轮构造。
-- **旧路径兼容**：``chat_fn`` + ``tool_calls_fn`` 注入时行为与改造前**完全一致**
-  （整批交给 ``execute_batch``，按独立结果槽位回填）。
 - **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
   流式路径下同轮已提前启动的幂等工具可能已执行完成，其结果保留但走终止分支时被忽略
   （无害；terminal 抑制保证后续停点不再启动新任务）。
@@ -39,9 +36,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import Protocol
 
 from app.services.llm.models import (
     ChatResponse,
@@ -52,10 +49,6 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-
-if TYPE_CHECKING:
-    # 仅为类型别名/签名提供具体批量结果类型；不在运行时依赖 tools，保持通用骨架解耦。
-    from app.services.llm.tools import BatchResults
 
 logger = logging.getLogger(__name__)
 
@@ -128,13 +121,8 @@ class BudgetRecorder(Protocol):
 
 
 # 注入的函数类型（仅做文档化提示，运行时不强制）
-#: .. deprecated:: 旧契约兼容。``ChatFn`` 仅测试/迁移期使用，后续清理时移除；
-#: 主路径请用 :data:`StreamFn`。
-ChatFn = Callable[..., Awaitable[ChatResponse]]
+#: 流式 LLM 调用：``(messages, tools=, tool_choice=) -> AsyncIterator[StreamChunk]``。
 StreamFn = Callable[..., AsyncIterator[StreamChunk]]
-#: .. deprecated:: 旧契约兼容。``ToolCallsFn`` 仅测试/迁移期使用，后续清理时移除；
-#: 主路径请用 ``executor_factory`` + ``StreamingToolExecutor``。
-ToolCallsFn = Callable[[list[ToolUseBlock]], Awaitable["BatchResults | dict[str, Any]"]]
 #: 按轮构造流式工具执行器（返回值需实现 ``StreamingExecutor``）
 ExecutorFactory = Callable[[], StreamingExecutor]
 
@@ -186,36 +174,6 @@ async def _consume_stream(
 def _extract_tool_calls(resp: ChatResponse) -> list[ToolUseBlock]:
     """从 ChatResponse.blocks 中提取全部 ToolUseBlock（同轮工具调用顺序固定）。"""
     return [b for b in resp.blocks if isinstance(b, ToolUseBlock)]
-
-
-def _align_results(
-    tool_calls: list[ToolUseBlock], results: BatchResults | dict[str, Any]
-) -> list[ToolResultBlock | None]:
-    """把执行器返回值对齐为与 ``tool_calls`` 一一对应的结果槽位列表。
-
-    - 执行器返回 ``BatchResults``（带 ``ordered`` 槽位）→ 按槽位取，重复 tool_use_id
-      的每条 tool_use 各取自身结果（首个真实结果不被 duplicate 错误块覆盖）
-    - 普通 ``dict[tool_use_id, result]``（旧契约 / 注入的简易执行器）→ 回退按 id 取值
-    - 逐元素归一化：仅接受 ``ToolResultBlock``，其余（缺失 / 异常泄漏值）归一为
-      ``None``；返回元素类型为具体联合，避免 ``list[None]`` / ``list[Unknown]``
-      在不变性位置被更严格的类型检查器拒绝
-    """
-    aligned: list[ToolResultBlock | None] = []
-    ordered = getattr(results, "ordered", None)
-    if isinstance(ordered, list) and len(ordered) == len(tool_calls):
-        if all(oid == tc.id for (oid, _), tc in zip(ordered, tool_calls, strict=True)):
-            for _, result in ordered:
-                aligned.append(result if isinstance(result, ToolResultBlock) else None)
-            return aligned
-        logger.debug("ordered 槽位与 tool_calls 不一致，回退 dict 取值")
-    getter = getattr(results, "get", None)
-    if getter is None:
-        aligned.extend([None] * len(tool_calls))
-        return aligned
-    for tc in tool_calls:
-        item = getter(tc.id)
-        aligned.append(item if isinstance(item, ToolResultBlock) else None)
-    return aligned
 
 
 def _pad_aligned(
@@ -346,8 +304,6 @@ async def run(
     seed_messages: Sequence[Message],
     stream_fn: StreamFn | None = None,
     executor_factory: ExecutorFactory | None = None,
-    chat_fn: ChatFn | None = None,
-    tool_calls_fn: ToolCallsFn | None = None,
     recorder: BudgetRecorder | None = None,
     veto_terminal: Callable[[dict], str | None] | None = None,
 ) -> RunResult:
@@ -355,21 +311,12 @@ async def run(
 
     参数（除 spec 约定的 seed_messages 外，全部经注入解耦，零 LLMClient 依赖）：
 
-    - ``stream_fn``：**主路径**，``(messages, tools=, tool_choice=) -> AsyncIterator[StreamChunk]``。
-      流式解析 + 提交闸门 + 受控执行（幂等工具停点提前执行）。
-    - ``executor_factory``：主路径按轮构造 ``StreamingToolExecutor`` 的工厂（零参可调用）。
-      为 ``None`` 时主路径退化为纯聚合（不执行工具，供不使用工具的调用方）。
-    - ``chat_fn``：**旧契约兼容路径**，``(messages, tools=, tool_choice=) -> ChatResponse``。
-      与 ``tool_calls_fn`` 搭配时行为与改造前完全一致。
-
-      .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；新代码请用 ``stream_fn``。
+    - ``stream_fn``：**唯一 LLM 调用入口**，``(messages, tools=, tool_choice=) ->
+      AsyncIterator[StreamChunk]``。流式解析 + 提交闸门 + 受控执行（幂等工具停点提前执行）。
+      必须提供；否则抛 ``ValueError``。
+    - ``executor_factory``：按轮构造 ``StreamingToolExecutor`` 的工厂（零参可调用）。
+      为 ``None`` 时退化为纯聚合（不执行工具，供不使用工具的调用方）。
     - ``tools_schemas``：传给 provider 的 tools 参数（schema 列表）
-    - ``tool_calls_fn``：旧路径批量执行器，返回 ``BatchResults``（``ordered`` 与 tool_calls
-      一一对应的结果槽位；同时兼容 ``{tool_use_id: ToolResultBlock | TerminalCapture}`` 的
-      dict 视图）
-
-      .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；新代码请用
-         ``executor_factory`` + ``StreamingToolExecutor``。
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）。入口立即 ``list()``
@@ -382,16 +329,10 @@ async def run(
       该回调（入参=terminal input）；返回提示文案则**不终止**、注入配对 tool_result 后
       继续一轮（仅拦一次，且末轮不拦）。返回 None / 回调为 None 时行为与现状一致。
 
-    必须提供 ``stream_fn`` 或 ``chat_fn`` 之一；否则抛 ``ValueError``。
     """
-    if stream_fn is None and chat_fn is None:
-        raise ValueError("run 需要 stream_fn 或 chat_fn 之一")
-    if stream_fn is not None and chat_fn is not None:
-        # 双注入属调用方误用：忽略旧 chat_fn，以流式路径为准并告警
-        logger.warning(
-            "loop.run 同时收到 stream_fn 与 chat_fn，忽略 chat_fn（流式优先）"
-        )
-        chat_fn = None
+    if stream_fn is None:
+        # 显式契约：stream_fn 为唯一 LLM 调用入口，必须提供
+        raise ValueError("run 需要 stream_fn")
 
     # 物化快照：后续每轮原地 append（assistant/tool_result/预算消息），需可追加容器；
     # list() 浅拷贝保证不改写调用方的 seed 对象（Message 视为不可变，只追加新对象）。
@@ -404,19 +345,13 @@ async def run(
         # 末轮（remaining==1 起手）强制 terminal 收尾；其余轮不指定 tool_choice
         tool_choice = tool_choice_terminal if remaining == 1 else None
 
-        executor: StreamingExecutor | None = None
-        if stream_fn is not None:
-            resp, executor = await _consume_stream(
-                stream_fn,
-                messages,
-                tools=tools_schemas,
-                tool_choice=tool_choice,
-                executor_factory=executor_factory,
-            )
-        else:
-            # 入口不变式：双 None 已 raise、双注入已忽略 chat_fn，此处 chat_fn 必非空
-            assert chat_fn is not None
-            resp = await chat_fn(messages, tools=tools_schemas, tool_choice=tool_choice)
+        resp, executor = await _consume_stream(
+            stream_fn,
+            messages,
+            tools=tools_schemas,
+            tool_choice=tool_choice,
+            executor_factory=executor_factory,
+        )
 
         # ① 终局归一化（与恢复续跑 runtime.continue_run 共用同一判据）：
         #    end_turn / max_tokens / 空壳 llm_error → 直接终止；含工具调用则继续执行。
@@ -456,8 +391,8 @@ async def run(
                 terminal_idx = idx
                 break
         if terminal_tc is not None:
-            # 流式路径：收尾以 await 提前任务（terminal 抑制已保证不再启动新任务、
-            # 且本轮非终止工具不执行）；旧路径不调用执行器。结果在终止分支被忽略。
+            # 收尾以 await 提前任务（terminal 抑制已保证不再启动新任务、且本轮
+            # 非终止工具不执行）；结果在终止分支被忽略。
             if executor is not None:
                 await executor.finalize()
             # 软护栏（veto）：非末轮 + 本 run 尚未拦过时，先询问一次场景回调。
@@ -479,11 +414,9 @@ async def run(
             remaining -= 1
             continue
 
-        # ⑤ 执行本轮工具：
-        #    - 流式路径：finalize 保序返回与 tool_calls 对齐的 ToolResultBlock 列表
-        #    - 旧路径：整批交给 tool_calls_fn（execute_batch 内部分段并行），按槽位对齐
-        # aligned 元素含 None（旧契约按 id 取值可能缺槽位），故用联合元素类型；用
-        # Sequence 承接各分支的不同具体列表（list 不变性下无法统一到同一 list 注解）。
+        # ⑤ 执行本轮工具：finalize 保序返回与 tool_calls 对齐的 ToolResultBlock 列表。
+        # aligned 元素类型含 None（_pad_aligned 补齐结果的联合类型），故用联合元素类型；
+        # 用 Sequence 承接不同分支的具体列表（list 不变性下无法统一到同一 list 注解）。
         aligned: Sequence[ToolResultBlock | None]
         if executor is not None:
             aligned = await executor.finalize()
@@ -496,13 +429,10 @@ async def run(
                     len(tool_calls),
                 )
                 aligned = _pad_aligned(tool_calls, aligned)
-        elif tool_calls_fn is not None:
-            results = await tool_calls_fn(tool_calls)
-            aligned = _align_results(tool_calls, results)
         else:
-            # 防御兜底：既无执行器也无批量执行器（纯聚合调用方误传工具轮）→ 闭合协议
+            # 防御兜底：未配 executor_factory（纯聚合调用方误传工具轮）→ 闭合协议
             logger.warning(
-                "loop 无执行器可用（stream_fn 未配 executor_factory 且无 tool_calls_fn），"
+                "loop 无执行器可用（stream_fn 未配 executor_factory），"
                 "本轮 %d 个工具以错误块回填",
                 len(tool_calls),
             )
@@ -545,7 +475,6 @@ async def run(
     # 尽量在返回 exhausted 前拿到明确结论。
     return await _final_recovery(
         stream_fn=stream_fn,
-        chat_fn=chat_fn,
         tools_schemas=tools_schemas,
         tool_choice_terminal=tool_choice_terminal,
         messages=messages,
@@ -556,13 +485,12 @@ async def run(
 
 async def _final_recovery(
     *,
+    stream_fn: StreamFn,
     tools_schemas: list[dict],
     tool_choice_terminal: str,
     messages: list[Message],
     recorder: BudgetRecorder | None,
     last_response: ChatResponse | None,
-    stream_fn: StreamFn | None = None,
-    chat_fn: ChatFn | None = None,
 ) -> RunResult:
     """耗尽后的兜底收尾调用（最多一次）。
 
@@ -582,20 +510,13 @@ async def _final_recovery(
         if isinstance(s, dict) and s.get("name") == tool_choice_terminal
     ]
     try:
-        if stream_fn is not None:
-            recovery_resp, _ = await _consume_stream(
-                stream_fn,
-                messages,
-                tools=terminal_schemas,
-                tool_choice=tool_choice_terminal,
-                executor_factory=None,
-            )
-        else:
-            # 入口不变式：双 None 已 raise、双注入已忽略 chat_fn，此处 chat_fn 必非空
-            assert chat_fn is not None
-            recovery_resp = await chat_fn(
-                messages, tools=terminal_schemas, tool_choice=tool_choice_terminal
-            )
+        recovery_resp, _ = await _consume_stream(
+            stream_fn,
+            messages,
+            tools=terminal_schemas,
+            tool_choice=tool_choice_terminal,
+            executor_factory=None,
+        )
     except Exception as e:
         # best-effort：收尾失败不应让 run 更糟，保留循环内最后一次可用响应
         logger.warning("收尾调用失败（best-effort 降级为 exhausted）: %s", e)

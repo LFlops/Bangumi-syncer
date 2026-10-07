@@ -19,7 +19,7 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime
-from app.services.agent.loop import ChatFn, StreamFn
+from app.services.agent.loop import StreamFn
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
 from app.services.notification_service import NotificationService
@@ -44,14 +44,12 @@ class ScenarioRuntime:
         bgm: Any,
         thinking_level: str,
         stream_fn: StreamFn | None = None,
-        chat_fn: ChatFn | None = None,
         notification_service: NotificationService | None = None,
         span_recorder: TraceRecorder | None = None,
     ) -> str:
         """执行一次场景任务（转发通用运行时）。
 
-        ``stream_fn`` 为**主路径**流式注入；``chat_fn`` 为旧契约兼容（返回 ChatResponse），
-        两者都为空时由场景默认 ``build_stream_fn`` 构造。
+        ``stream_fn`` 为流式 LLM 调用注入；为空时由场景默认 ``build_stream_fn`` 构造。
         """
         return await agent_runtime.run(
             run_id,
@@ -59,7 +57,6 @@ class ScenarioRuntime:
             ctx=self.make_ctx(sync_record, bgm),
             thinking_level=thinking_level,
             stream_fn=stream_fn,
-            chat_fn=chat_fn,
             notification_service=notification_service,
             span_recorder=span_recorder,
         )

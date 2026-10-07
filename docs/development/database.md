@@ -130,7 +130,7 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
 
 ### span 记录位置与时序
 
-- **chat span**：由 `llm_assist` 的 `chat_fn` 包装层写入（LLM 调用完成后落库）。
+- **chat span**：由 `TraceRecorder.wrap_stream_fn` 流式包装层写入（LLM 调用完成后落库）。
 - **tool span**：由 `execute_batch` 的单工具包裹层写入。`start` 在工具执行**之前**（保证时序真实），每工具完成后**即刻独立事务落库**——批内部分成功时可从已完成 span 恢复，不会因后续工具失败丢失前序观测。
 - **tool span 时序**：`started_at` 由 `start_span` 写入；`end_span` **不回写** `started_at`（仅当显式传入时才覆盖），避免用结束时间覆盖真实开始时间。`ended_at` 由 `end_span` 写入。
 - **loop 层**：零 trace 逻辑，仅编排迭代。

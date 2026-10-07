@@ -31,7 +31,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | `terminal_tool` | 终止工具名（循环末轮强制指向它；恢复分派据此识别终局） |
 | `register_tools(registry, ctx)` | 注册场景工具，返回 `ToolDefinition` 列表 |
 | `build_seed(ctx)` | 构建种子消息（system + user） |
-| `build_chat_fn(thinking_level)` | 构建默认 chat 函数（场景决定 job 归属与思考强度透传） |
+| `build_stream_fn(thinking_level)` | 构建默认流式 LLM 函数（场景决定 job 归属与思考强度透传） |
 | `resolve_thinking_level()` | 从场景集中配置读取思考强度（恢复路径使用） |
 | `resolve_max_iterations(thinking_level)` | 解析轮次预算（含显式覆盖；单一来源由场景保证） |
 | `handle_terminal(dbm, run_id, result, ctx, *, total_tokens, notification_service)` | 终局处理：校验 / 落库 / 通知，返回终态 status |
@@ -65,7 +65,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
   - 追加 `FINAL_RECOVERY_MESSAGE` 并经 `recorder.record_budget(...)` 记录（重放一致性）；
   - `tools` 过滤为**仅** terminal schema，`tool_choice=terminal`；
   - 含 terminal tool_call → `submit_suggestion`；否则 `exhausted`（`last_response` 为收尾响应）；
-  - chat_fn 抛异常 → best-effort 降级为 `exhausted`（保留循环内最后一次响应），不重试。
+  - 收尾 LLM 调用抛异常 → best-effort 降级为 `exhausted`（保留循环内最后一次响应），不重试。
 
 ### continue_run（恢复路径，唯一公开续跑入口）
 

@@ -2,8 +2,8 @@
 
 ``TraceRecorder`` 是 agent 运行时的观测设施（与业务场景无关）：
 
-- **chat span 包装**：``wrap_chat_fn`` 返回包装后的 chat_fn，每轮 start_span
-  → await → end_span（model/tokens 写专用列，不再塞 payload_json）。
+- **chat span 包装**：``wrap_stream_fn`` 包装流式 LLM 调用，每轮 start_span
+  → 透传事件（内部 fold）→ end_span（model/tokens 写专用列，不再塞 payload_json）。
 - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
   包裹层调用；幂等安全。
 - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -20,7 +20,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 from app.core.logging import logger
-from app.services.agent.loop import ChatFn, StreamFn
+from app.services.agent.loop import StreamFn
 from app.services.agent.trace import (
     end_span as trace_end_span,
     record_budget_message as trace_record_budget_message,
@@ -49,8 +49,8 @@ class TraceRecorder(ToolSpanRecorder):
     """统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）。
 
     职责：
-    - **chat span 包装**：``wrap_chat_fn`` 返回包装后的 chat_fn，每轮 start_span
-      → await → end_span（model/tokens 写专用列，不再塞 payload_json）。
+    - **chat span 包装**：``wrap_stream_fn`` 包装流式 LLM 调用，每轮 start_span
+      → 透传事件（内部 fold）→ end_span（model/tokens 写专用列，不再塞 payload_json）。
     - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
       包裹层调用；幂等安全。
     - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -67,7 +67,7 @@ class TraceRecorder(ToolSpanRecorder):
         self.run_id = run_id
         self._clock = clock or _default_clock
         self._next_iteration: int = start_iteration
-        # 当前轮的 iteration（wrap_chat_fn 开始时设定，start_tool / record_budget 读取）
+        # 当前轮的 iteration（wrap_stream_fn 开始时设定，start_tool / record_budget 读取）
         self._current_iteration: int = 0
         self._chat_span_id: str | None = None
         self._last_tool_span_id: str | None = None
@@ -75,40 +75,6 @@ class TraceRecorder(ToolSpanRecorder):
         self.total_tokens: int = 0
         # span_id → (tool_use, t0)，供 end_tool 检索后清除（幂等）
         self._tool_state: dict[str, tuple] = {}
-
-    # -- chat span 包装 -----------------------------------------------------
-
-    def wrap_chat_fn(self, chat_fn: ChatFn) -> ChatFn:
-        """包装旧契约 chat_fn：每轮 start_span → await → end_span。
-
-        .. deprecated:: 仅测试/迁移期兼容，后续清理时移除；主路径请用
-           :meth:`wrap_stream_fn`。
-
-        iteration 状态机：
-        - 每轮开始时设定 ``_current_iteration`` 为 ``_next_iteration`` 的当前值，
-          然后推进 ``_next_iteration``（供下一轮使用）。
-        - ``start_tool`` / ``record_budget`` 读取 ``_current_iteration``，
-          保证同轮内 chat span 与全部 tool span 的 iteration 一致。
-        - ``resp`` 在 ``try`` 前初始化为 ``None``，避免 chat_fn 抛异常时
-          ``finally`` 引用未绑定变量（UnboundLocalError 覆盖原始异常）。
-        """
-        recorder = self
-
-        async def wrapped(messages, *, tools=None, tool_choice=None):
-            # 设定当前轮并推进单调计数（仅在新一轮 chat 开始时推进）
-            span_id = recorder._begin_chat_span()
-            iteration = recorder._current_iteration
-            t0 = recorder._clock()
-            resp = None
-            try:
-                resp = await chat_fn(messages, tools=tools, tool_choice=tool_choice)
-                return resp
-            finally:
-                recorder._finish_chat_span(
-                    span_id, iteration=iteration, t0=t0, resp=resp
-                )
-
-        return wrapped
 
     # -- stream span 包装 ---------------------------------------------------
 
@@ -121,7 +87,7 @@ class TraceRecorder(ToolSpanRecorder):
           使**流进行中**提前执行的工具 span 与本轮 chat span 同 iteration。
         - 逐事件透传给调用方，同时在内部用 :class:`StreamAggregator` fold 出等价
           ``ChatResponse``；**流正常耗尽后**以 fold 结果写 span（schema 与
-          ``wrap_chat_fn`` 完全一致：blocks/stop_reason/content/model/usage）。
+          历史 chat 路径完全一致：blocks/stop_reason/content/model/usage）。
         - 流异常（LLMCallError 等）或消费方提前关闭 → resp 为空 → 写 error span，
           不落成功、不遮掩原始异常。
         """
@@ -278,7 +244,7 @@ class TraceRecorder(ToolSpanRecorder):
         """锚定到指定轮次，供恢复路径补执行缺失工具落 span 使用。
 
         将 ``_current_iteration`` 设为 ``iteration``，并使 ``_next_iteration``
-        设为 ``iteration + 1``（保证后续 ``wrap_chat_fn`` 从正确轮次开始推进，
+        设为 ``iteration + 1``（保证后续 ``wrap_stream_fn`` 从正确轮次开始推进，
         避免与补执行的 tool span 撞号）。
         """
         self._current_iteration = iteration
