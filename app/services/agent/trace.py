@@ -250,7 +250,7 @@ class ReplayResult:
     - ``messages``：重建的可续跑消息列表（seed 前缀 + 各轮重建的消息）。
     - ``executed_iterations``：已完整重放的轮数（调用方可据此计算剩余轮次）。
     - ``missing_tool_calls``：最后一轮 llm_chat 声明的工具调用中、尚未记录
-      tool_execute 的缺失项（供调用方补执行；readonly 校验由调用方做）。
+      tool_execute 的缺失项（供调用方补执行；只读校验由调用方做）。
     - ``last_response``：最后一条完整 llm_chat 的响应（当其未产生工具/已终止时，
       调用方直接消费分派 end_turn / tool_use / submit；为 None 表示应直接进入下一轮 chat）。
     - ``total_tokens``：本次重放中**所有已出现 llm_chat span** 的 ``tokens`` 列之和。

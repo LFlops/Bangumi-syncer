@@ -16,8 +16,8 @@ import asyncio
 from typing import Any
 
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+from app.services.agent.tools import ToolError
 from app.services.llm.models import StreamChunk, ToolResultBlock
-from app.services.llm.tools import ToolError
 
 
 def _start(tid: str, name: str) -> StreamChunk:
@@ -406,7 +406,7 @@ async def test_early_execution_default_cap_limits_peak_concurrency():
     行为断言：喂入上限 +3 个幂等停点，观测到的峰值并发必须等于默认上限（不是 ≤，
     否则默认值被改小/改大都会漏检）。
     """
-    from app.services.llm.tools import _MAX_PARALLEL_TOOLS
+    from app.services.agent.tools import _MAX_PARALLEL_TOOLS
 
     limit = _MAX_PARALLEL_TOOLS
     active = 0

@@ -18,9 +18,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.services.agent.loop import StreamFn
+from app.services.agent.protocols import StreamFn
+from app.services.agent.tools import ToolDefinition, ToolRegistry
 from app.services.llm.models import Message
-from app.services.llm.tools import ToolDefinition, ToolRegistry
 
 
 @dataclass(frozen=True)

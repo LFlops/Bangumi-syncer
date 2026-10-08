@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 
 from app.services.agent.loop import RunResult, run
+from app.services.agent.tools import ToolError
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -28,7 +29,6 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from app.services.llm.tools import ToolError
 from tests.services.agent.stream_script import scripted_executor, scripted_stream
 
 # ---------------------------------------------------------------------------

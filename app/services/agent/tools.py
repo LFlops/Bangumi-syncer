@@ -1,7 +1,7 @@
 """通用工具注册表与执行器。
 
 提供：
-- ``ToolDefinition``：工具元信息（含 access 枚举、readonly 与 idempotent 推导）
+- ``ToolDefinition``：工具元信息（含 access 枚举与 idempotent 推导）
 - ``ToolRegistry``：注册 / 执行 / JSON Schema 轻量校验 / 分段并行批量执行（按幂等分段）
 
 零新增依赖：JSON Schema 校验使用手写轻量实现（必填字段、类型、pattern、maxLength），
@@ -77,9 +77,6 @@ class ToolDefinition:
 
     - ``access``：read（只读）/ write（写，执行前审计）/ terminal（终止性，仅捕获参数）。
       表示**副作用语义**，用于 write 审计、terminal 捕获、补执行门控。
-    - ``readonly``：仅代码层面属性，表示**无副作用**语义；不序列化进 tools schema。
-      默认由 ``access`` 推导（read→True；write/terminal→False），注册时可显式覆盖。
-      补执行门控（``runtime._replay_missing_tool``）以此为准。
     - ``idempotent``：表示**重复执行安全性**，决定 ``execute_batch`` 的并行调度判据；
       与 ``access`` 正交（幂等 write 重复执行仍有副作用记录）。默认由 ``access``
       推导（read→True；write/terminal→False），工具开发者可显式标注覆盖。
@@ -91,20 +88,17 @@ class ToolDefinition:
     parameters: dict
     handler: Callable[[dict], Any]
     access: ToolAccess
-    readonly: bool | None = None
     idempotent: bool | None = None
 
     def __post_init__(self) -> None:
-        if self.readonly is None:
-            self.readonly = self.access == "read"
-        # 显式标注优先；未标注时以 access 作便捷推导（幂等维度独立于 readonly）
+        # 显式标注优先；未标注时以 access 作便捷推导
         if self.idempotent is None:
             self.idempotent = self.access == "read"
 
     def to_schema(self) -> dict:
         """供 provider ``tools`` 参数的 schema：仅 name/description/parameters。
 
-        readonly / idempotent / access 不序列化（LLM 不可见，天然防诱导）。
+        idempotent / access 不序列化（LLM 不可见，天然防诱导）。
         """
         return {
             "name": self.name,
@@ -191,11 +185,6 @@ class ToolRegistry:
 
     def get(self, name: str) -> ToolDefinition | None:
         return self._tools.get(name)
-
-    def is_readonly(self, name: str) -> bool:
-        """工具是否无副作用（补执行门控判据）。"""
-        defn = self._tools.get(name)
-        return defn is not None and bool(defn.readonly)
 
     def is_idempotent(self, name: str) -> bool:
         """工具是否幂等（连续幂等段可并行执行的判据）。"""

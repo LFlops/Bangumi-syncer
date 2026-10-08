@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+from app.services.agent.tools import serialize_tool_result
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -33,7 +34,6 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from app.services.llm.tools import serialize_tool_result
 
 
 def response_to_chunks(resp: ChatResponse) -> list[StreamChunk]:

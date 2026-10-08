@@ -57,15 +57,15 @@ from app.services.agent.recorder import (
 )
 from app.services.agent.registry import ScenarioRuntime
 from app.services.agent.scenario import ScenarioHooks
+from app.services.agent.tools import (
+    ToolDefinition,
+    ToolRegistry,
+)
 from app.services.llm.client import get_llm_client
 from app.services.llm.models import (
     Message,
 )
 from app.services.llm.output_parser import parse_suggestion
-from app.services.llm.tools import (
-    ToolDefinition,
-    ToolRegistry,
-)
 from app.services.matching.identity import build_match_business_key
 from app.services.sync_service import SyncService
 

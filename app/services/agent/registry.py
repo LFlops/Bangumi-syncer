@@ -19,7 +19,7 @@ from typing import Any
 
 from app.core.logging import logger
 from app.services.agent import runtime as agent_runtime
-from app.services.agent.loop import StreamFn
+from app.services.agent.protocols import StreamFn
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
 from app.services.notification_service import NotificationService

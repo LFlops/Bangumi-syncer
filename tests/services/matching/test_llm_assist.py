@@ -20,6 +20,10 @@ import pytest
 from app.core.database import database_manager, set_database_manager
 from app.services.agent import recorder as agent_recorder, runtime as agent_runtime
 from app.services.agent.loop import RunResult
+from app.services.agent.tools import (
+    ToolDefinition,
+    ToolRegistry,
+)
 from app.services.agent.trace import (
     ReplayResponse,
     ReplayResult,
@@ -34,10 +38,6 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
     Usage,
-)
-from app.services.llm.tools import (
-    ToolDefinition,
-    ToolRegistry,
 )
 from app.services.matching import llm_assist
 from app.services.matching.identity import build_match_business_key
@@ -1635,7 +1635,7 @@ def _drain_stream(wrapped, messages=None):
 def test_register_match_tools_overwrite_no_warning(caplog):
     import logging
 
-    from app.services.llm.tools import ToolRegistry
+    from app.services.agent.tools import ToolRegistry
 
     registry = ToolRegistry()
     bgm = _make_bgm()
@@ -1673,8 +1673,8 @@ def test_register_match_tools_idempotent_flags():
     assert registry.is_idempotent("submit_suggestion") is False
 
 
-def test_register_match_tools_idempotent_consistent_with_readonly():
-    """显式标注与缺省推导一致：4 个 read 工具 readonly=True；terminal readonly=False。"""
+def test_register_match_tools_idempotent_consistent_with_access():
+    """显式标注与缺省推导一致：4 个 read 工具 idempotent=True；terminal idempotent=False。"""
     registry = ToolRegistry()
     llm_assist.register_match_tools(registry, _make_bgm())
 
@@ -1686,12 +1686,10 @@ def test_register_match_tools_idempotent_consistent_with_readonly():
     ):
         defn = registry.get(name)
         assert defn is not None
-        assert defn.readonly is True, name
         assert defn.idempotent is True, name
 
     submit = registry.get("submit_suggestion")
     assert submit is not None
-    assert submit.readonly is False
     assert submit.idempotent is False
 
 
@@ -1700,7 +1698,7 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
     """match 5 工具批量：4 幂等查询并行成段，submit_suggestion 捕获为 terminal。"""
     import asyncio as _asyncio
 
-    from app.services.llm.tools import TerminalCapture
+    from app.services.agent.tools import TerminalCapture
 
     class _SlowBgm:
         def search(self, **kwargs):
@@ -1749,7 +1747,7 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
 
 
 def test_register_match_tools_rebinds_handlers_to_latest_bgm():
-    from app.services.llm.tools import ToolRegistry
+    from app.services.agent.tools import ToolRegistry
 
     registry = ToolRegistry()
     bgm1 = _make_bgm(search_result=[{"id": 1, "name": "first"}])
@@ -3943,11 +3941,11 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
     assert json.loads(blk.content) == {"id": 2, "name": "花咲くいろは"}
 
 
-# 补执行门控仍以 readonly（无副作用语义）为准，与 idempotent 正交 ---------
+# 补执行门控以 access == "read"（无副作用语义）为准，与 idempotent 正交 ---------
 
 
 def test_replay_missing_non_idempotent_read_tool_still_replayed():
-    """access=read 但 idempotent=False：补执行门控看 readonly，仍会补执行（不重放副作用语义）。"""
+    """access=read 但 idempotent=False：补执行门控看 access，仍会补执行（不重放副作用语义）。"""
     called: list = []
     registry = ToolRegistry()
     registry.register(
@@ -3970,7 +3968,7 @@ def test_replay_missing_non_idempotent_read_tool_still_replayed():
         )
     )
 
-    # readonly 门控放行：handler 被补执行
+    # access == "read" 门控放行：handler 被补执行
     assert called == ["read_non_idem"]
     blk = _last_tool_result(messages)
     assert blk is not None

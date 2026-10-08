@@ -20,7 +20,8 @@ from dataclasses import asdict
 from datetime import datetime
 
 from app.core.logging import logger
-from app.services.agent.loop import StreamFn
+from app.services.agent.protocols import BudgetRecorder, StreamFn
+from app.services.agent.tools import ToolSpanRecorder
 from app.services.agent.trace import (
     end_span as trace_end_span,
     record_budget_message as trace_record_budget_message,
@@ -32,7 +33,6 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from app.services.llm.tools import ToolSpanRecorder
 
 
 def _default_clock() -> float:
@@ -45,7 +45,7 @@ def _input_summary(inp: dict) -> str:
     return ", ".join(f"{k}:{type(v).__name__}" for k, v in (inp or {}).items())
 
 
-class TraceRecorder(ToolSpanRecorder):
+class TraceRecorder(ToolSpanRecorder, BudgetRecorder):
     """统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）。
 
     职责：

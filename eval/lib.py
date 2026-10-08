@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.core.logging import logger
+from app.services.agent.tools import ToolRegistry
 from app.services.llm.models import (
     ChatResponse,
     StreamAggregator,
@@ -31,7 +32,6 @@ from app.services.llm.models import (
     ToolUseBlock,
     Usage,
 )
-from app.services.llm.tools import ToolRegistry
 from app.services.matching import llm_assist
 from app.services.notification_service import NotificationService
 

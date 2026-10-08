@@ -36,36 +36,46 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
 
+from app.services.agent.protocols import BudgetRecorder, StreamFn, StreamingExecutor
 from app.services.llm.models import (
     ChatResponse,
     ContentBlock,
     Message,
     StreamAggregator,
-    StreamChunk,
     ToolResultBlock,
     ToolUseBlock,
 )
 
 logger = logging.getLogger(__name__)
 
-# 末轮（remaining==1）强化提示：思考模型在强制 tool_choice=terminal 被供应商降级为
-# auto 时容易不提交，明确要求给出结论（含放弃）并禁止再检索。
-FINAL_ROUND_BUDGET_MESSAGE = (
-    "[剩余轮次：1（最后一轮）] 必须调用 submit_suggestion 给出结论："
-    "若已确定推荐条目则提交 subject_id 与理由；若确实无法确定，也要调用并说明放弃理由。"
-    "不得再调用其他检索工具。"
-)
 
-# 兜底收尾：for 循环自然结束（即将 exhausted）时追加一次收尾调用，best-effort
-# 争取一个明确结论；该消息须经 recorder 预算通道记录，保证恢复重放一致性。
-FINAL_RECOVERY_MESSAGE = (
-    "[最终收尾] 轮次预算已耗尽。请立即调用 submit_suggestion 给出结论："
-    "若已确定则提交 subject_id 与理由；若确实无法确定也请调用并说明放弃理由。"
-)
+def final_round_budget_message(tool_choice_terminal: str) -> str:
+    """末轮（remaining==1）强化提示。
+
+    思考模型在强制 ``tool_choice=terminal`` 被供应商降级为 auto 时容易不提交，
+    明确要求给出结论（含放弃）并禁止再检索。
+    """
+    return (
+        f"[剩余轮次：1（最后一轮）] 必须调用 {tool_choice_terminal} 给出结论："
+        "若已确定推荐条目则提交 subject_id 与理由；若确实无法确定，也要调用并说明放弃理由。"
+        "不得再调用其他检索工具。"
+    )
+
+
+def final_recovery_message(tool_choice_terminal: str) -> str:
+    """兜底收尾提示。
+
+    for 循环自然结束（即将 exhausted）时追加一次收尾调用，best-effort 争取一个明确结论；
+    该消息须经 recorder 预算通道记录，保证恢复重放一致性。
+    """
+    return (
+        f"[最终收尾] 轮次预算已耗尽。请立即调用 {tool_choice_terminal} 给出结论："
+        "若已确定则提交 subject_id 与理由；若确实无法确定也请调用并说明放弃理由。"
+    )
+
 
 # veto 暂缓轮：同轮非 terminal 工具的配对 tool_result 占位文案。本轮不执行这些
 # 工具（暂缓），仅用于闭合会话协议，避免悬垂 tool_use 触发下一轮端点 400。
@@ -88,41 +98,6 @@ class RunResult:
     last_response: ChatResponse | None = None
 
 
-class StreamingExecutor(Protocol):
-    """流式工具执行器协议。
-
-    本地声明（不 import 具体 ``StreamingToolExecutor``），保持通用骨架对执行器实现的
-    运行时解耦；返回值需实现 ``feed`` / ``finalize``。
-    """
-
-    def feed(self, chunk: StreamChunk) -> None: ...
-
-    async def finalize(self) -> list[ToolResultBlock]: ...
-
-
-class BudgetRecorder(Protocol):
-    """预算与工具 span 记录器协议。
-
-    本地声明（不 import 具体 ``TraceRecorder``），避免通用骨架与 recorder 循环依赖；
-    签名与 ``recorder.TraceRecorder`` 一致。
-    """
-
-    def record_budget(self, budget_message: str) -> None: ...
-
-    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None: ...
-
-    def end_tool(
-        self,
-        span_id: str,
-        *,
-        result: ToolResultBlock | None = None,
-        error: str = "",
-    ) -> None: ...
-
-
-# 注入的函数类型（仅做文档化提示，运行时不强制）
-#: 流式 LLM 调用：``(messages, tools=, tool_choice=) -> AsyncIterator[StreamChunk]``。
-StreamFn = Callable[..., AsyncIterator[StreamChunk]]
 #: 按轮构造流式工具执行器（返回值需实现 ``StreamingExecutor``）
 ExecutorFactory = Callable[[], StreamingExecutor]
 
@@ -463,7 +438,7 @@ async def run(
         remaining -= 1
         if remaining > 0:
             budget_message = (
-                FINAL_ROUND_BUDGET_MESSAGE
+                final_round_budget_message(tool_choice_terminal)
                 if remaining == 1
                 else f"[剩余轮次：{remaining}]"
             )
@@ -500,9 +475,10 @@ async def _final_recovery(
     - LLM 调用抛异常 → best-effort 捕获返回 exhausted（保留循环内最后一次响应），不重试
     - 收尾不执行任何工具（``executor_factory=None``：纯聚合流，不构造执行器）
     """
-    messages.append(Message(role="user", content=FINAL_RECOVERY_MESSAGE))
+    recovery_msg = final_recovery_message(tool_choice_terminal)
+    messages.append(Message(role="user", content=recovery_msg))
     if recorder is not None:
-        recorder.record_budget(FINAL_RECOVERY_MESSAGE)
+        recorder.record_budget(recovery_msg)
 
     terminal_schemas = [
         s

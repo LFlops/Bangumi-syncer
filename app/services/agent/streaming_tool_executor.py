@@ -42,12 +42,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import logger
-from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
-from app.services.llm.tools import (
+from app.services.agent.tools import (
     _MAX_PARALLEL_TOOLS,
     ToolSpanRecorder,
     serialize_tool_result,
 )
+from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
 
 # 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。
 # 正常业务路径不会消费它（terminal 轮 loop 直接走终止分支），仅作协议闭合兜底。

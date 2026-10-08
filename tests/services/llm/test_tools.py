@@ -1,9 +1,9 @@
 """工具注册表与执行器单元测试。
 
 覆盖：
-- ToolDefinition 的 readonly 推导与 to_schema 序列化
+- ToolDefinition 的 to_schema 序列化
 - ToolRegistry.register / get / execute 的注册、审计、terminal 捕获、超时、JSON Schema 校验
-- execute_batch 的分段并行（连续 readonly 段 gather 并行、非只读串行、保序）与异常统一包装
+- execute_batch 的分段并行（连续幂等段 gather 并行、非幂等串行、保序）与异常统一包装
 - execute_batch + ToolSpanRecorder：工具级包裹（真实时序 + 逐工具即刻落库）
 """
 
@@ -13,14 +13,14 @@ import logging
 
 import pytest
 
-from app.services.llm.models import ToolResultBlock, ToolUseBlock
-from app.services.llm.tools import (
+from app.services.agent.tools import (
     TerminalCapture,
     ToolDefinition,
     ToolError,
     ToolRegistry,
     serialize_tool_result,
 )
+from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
 
 def _noop_handler(args):
@@ -32,64 +32,11 @@ async def _async_noop(args):
 
 
 # ---------------------------------------------------------------------------
-# ToolDefinition：readonly 推导
+# ToolDefinition：to_schema 不序列化 access / idempotent
 # ---------------------------------------------------------------------------
 
 
-def test_tool_definition_readonly_derives_true_for_read_access():
-    d = ToolDefinition(
-        name="t", description="d", parameters={}, handler=_noop_handler, access="read"
-    )
-    assert d.readonly is True
-
-
-def test_tool_definition_readonly_derives_false_for_write_access():
-    d = ToolDefinition(
-        name="t", description="d", parameters={}, handler=_noop_handler, access="write"
-    )
-    assert d.readonly is False
-
-
-def test_tool_definition_readonly_derives_false_for_terminal_access():
-    d = ToolDefinition(
-        name="t",
-        description="d",
-        parameters={},
-        handler=_noop_handler,
-        access="terminal",
-    )
-    assert d.readonly is False
-
-
-def test_tool_definition_readonly_explicit_override():
-    # 显式覆盖：read 但指定 readonly=False（罕见"读但需串行"场景）
-    d = ToolDefinition(
-        name="t",
-        description="d",
-        parameters={},
-        handler=_noop_handler,
-        access="read",
-        readonly=False,
-    )
-    assert d.readonly is False
-    # 显式覆盖 write 为 True
-    d2 = ToolDefinition(
-        name="t",
-        description="d",
-        parameters={},
-        handler=_noop_handler,
-        access="write",
-        readonly=True,
-    )
-    assert d2.readonly is True
-
-
-# ---------------------------------------------------------------------------
-# ToolDefinition：to_schema 不序列化 readonly / access
-# ---------------------------------------------------------------------------
-
-
-def test_tool_definition_to_schema_excludes_readonly_and_access():
+def test_tool_definition_to_schema_excludes_access_and_idempotent():
     d = ToolDefinition(
         name="search",
         description="search bangumi",
@@ -106,8 +53,8 @@ def test_tool_definition_to_schema_excludes_readonly_and_access():
     assert schema["name"] == "search"
     assert schema["description"] == "search bangumi"
     assert schema["parameters"]["properties"]["title"]["maxLength"] == 200
-    assert "readonly" not in schema
     assert "access" not in schema
+    assert "idempotent" not in schema
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +619,7 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
 
 
 def test_batch_results_construct_keeps_first_result():
-    from app.services.llm.tools import BatchResults
+    from app.services.agent.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="dup", content="real", is_error=False)
     r2 = ToolResultBlock(tool_use_id="dup", content="dup", is_error=True)
@@ -681,7 +628,7 @@ def test_batch_results_construct_keeps_first_result():
 
 
 def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
-    from app.services.llm.tools import BatchResults
+    from app.services.agent.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
     r2 = ToolResultBlock(tool_use_id="a", content="second", is_error=False)
@@ -700,7 +647,7 @@ def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
 
 
 def test_batch_results_setitem_allows_new_key():
-    from app.services.llm.tools import BatchResults
+    from app.services.agent.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
     r2 = ToolResultBlock(tool_use_id="b", content="new", is_error=False)
@@ -1111,27 +1058,10 @@ def test_tool_definition_idempotent_explicit_override_read_false():
         idempotent=False,
     )
     assert d.idempotent is False
-    # readonly 仍按 access 推导（read→True），不被 idempotent 覆盖
-    assert d.readonly is True
-
-
-def test_tool_definition_idempotent_and_readonly_are_independent():
-    """两个维度正交：readonly 只看 access，idempotent 独立推导/覆盖。"""
-    d = ToolDefinition(
-        name="t",
-        description="d",
-        parameters={},
-        handler=_noop_handler,
-        access="write",
-        readonly=True,
-        idempotent=False,
-    )
-    assert d.readonly is True
-    assert d.idempotent is False
 
 
 # ---------------------------------------------------------------------------
-# ToolRegistry.is_idempotent 查询（与 is_readonly 并存、未注册口径一致）
+# ToolRegistry.is_idempotent 查询
 # ---------------------------------------------------------------------------
 
 
@@ -1185,11 +1115,10 @@ def test_is_idempotent_false_for_write_default_and_explicit_read():
     assert reg.is_idempotent("r") is False
 
 
-def test_is_idempotent_unregistered_returns_false_like_is_readonly():
-    """未注册工具与 is_readonly 口径一致：返回 False（不抛错）。"""
+def test_is_idempotent_unregistered_returns_false():
+    """未注册工具返回 False（不抛错）。"""
     reg = ToolRegistry()
     assert reg.is_idempotent("ghost") is False
-    assert reg.is_readonly("ghost") is False
 
 
 # ---------------------------------------------------------------------------
@@ -1387,7 +1316,7 @@ async def test_execute_batch_idempotent_write_tool_runs_in_parallel():
 @pytest.mark.asyncio
 async def test_execute_batch_idempotent_segment_caps_parallelism():
     """超过上限的幂等工具并发数不超过 _MAX_PARALLEL_TOOLS。"""
-    from app.services.llm.tools import _MAX_PARALLEL_TOOLS
+    from app.services.agent.tools import _MAX_PARALLEL_TOOLS
 
     reg = ToolRegistry()
     active = 0
