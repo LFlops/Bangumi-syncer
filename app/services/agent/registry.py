@@ -33,7 +33,7 @@ class ScenarioRuntime:
     hooks: ScenarioHooks
     #: (sync_record, bgm) -> ctx（场景上下文，runtime 原样透传）。
     #: 刻意用 ``Any``：ctx 结构由各场景自定义，通用层对其完全不可见（不透明边界）。
-    make_ctx: Callable[[dict, Any], Any]
+    make_ctx: Callable[..., Any]
 
     async def run(
         self,
