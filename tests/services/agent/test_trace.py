@@ -26,6 +26,7 @@ from app.services.agent.recorder import TraceRecorder
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    RedactedThinkingBlock,
     StreamChunk,
     TextBlock,
     ThinkingBlock,
@@ -96,35 +97,49 @@ def _ensure_run(dbm, run_id: str):
 def _stream_from_response(resp):
     """把单个 ``ChatResponse`` 展开为事件流（含工具停点），供 ``wrap_stream_fn`` 消费。
 
-    与生产 provider 的事件序列对齐：thinking/text/tool_use（start+delta+stop）、
-    usage、结尾 stop（携带 stop_reason/model）；无块但有 content 时补一个文本块。
+    与生产 provider 的事件序列对齐：thinking/redacted_thinking/text/tool_use
+    （start+delta+stop）、usage、结尾 stop（携带 stop_reason/model）；无块但有
+    content 时补一个文本块。``block_index`` 按块的实际位置填充，交错块才不会塌陷。
     """
 
     async def _stream(messages, *, tools=None, tool_choice=None):
         blocks = list(resp.blocks)
         if not blocks and resp.content:
             blocks = [TextBlock(text=resp.content)]
-        for block in blocks:
+        for index, block in enumerate(blocks):
             if isinstance(block, TextBlock):
-                yield StreamChunk(type="text_delta", text=block.text)
+                yield StreamChunk(type="text_delta", text=block.text, block_index=index)
             elif isinstance(block, ThinkingBlock):
                 yield StreamChunk(
                     type="thinking_delta",
                     thinking=block.thinking,
                     signature=block.signature or "",
+                    block_index=index,
+                )
+            elif isinstance(block, RedactedThinkingBlock):
+                yield StreamChunk(
+                    type="redacted_thinking_delta",
+                    redacted_data=block.data,
+                    block_index=index,
                 )
             elif isinstance(block, ToolUseBlock):
                 yield StreamChunk(
                     type="tool_use_start",
                     tool_use_id=block.id,
                     tool_name=block.name,
+                    block_index=index,
                 )
                 yield StreamChunk(
                     type="tool_use_delta",
                     tool_use_id=block.id,
                     partial_json=json.dumps(block.input, ensure_ascii=False),
+                    block_index=index,
                 )
-                yield StreamChunk(type="tool_use_stop", tool_use_id=block.id)
+                yield StreamChunk(
+                    type="tool_use_stop",
+                    tool_use_id=block.id,
+                    block_index=index,
+                )
         if resp.usage is not None:
             yield StreamChunk(type="usage", usage=resp.usage)
         yield StreamChunk(type="stop", stop_reason=resp.stop_reason, model=resp.model)

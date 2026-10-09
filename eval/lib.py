@@ -24,6 +24,7 @@ from app.core.logging import logger
 from app.services.agent.tools import ToolRegistry
 from app.services.llm.models import (
     ChatResponse,
+    RedactedThinkingBlock,
     StreamAggregator,
     StreamChunk,
     TextBlock,
@@ -101,25 +102,41 @@ def response_from_wire(wire: dict) -> ChatResponse:
 def response_to_chunks(response: ChatResponse) -> list[StreamChunk]:
     """ChatResponse.blocks → 等价 ``StreamChunk`` 事件序列（回放展开）。
 
-    与生产 provider 的**无停点协议**等价：只产出 text/thinking/tool_use(start+delta)/
-    usage/stop，**不产出 ``tool_use_stop``**。因此 eval 回放/录制天然退化为
-    Agent 循环的**轮级执行**（工具统一经 ``execute_batch``），既保证 cassette 的
-    轮级结构自洽，也让回放完全离线（不会因提前执行触发真实工具调用）。
+    与生产 provider 的**无停点协议**等价：只产出 text/thinking/redacted_thinking/
+    tool_use(start+delta)/usage/stop，**不产出 ``tool_use_stop``**。因此 eval
+    回放/录制天然退化为 Agent 循环的**轮级执行**（工具统一经 ``execute_batch``），
+    既保证 cassette 的轮级结构自洽，也让回放完全离线（不会因提前执行触发真实
+    工具调用）。
+
+    ``block_index`` 按块在 ``blocks`` 中的**实际位置**填充：聚合器据此分桶，
+    ``text(A) → tool_use → text(B)`` 才能还原成三块。省略会让多块塌陷成单块，
+    回放产出的 assistant 消息结构与 live 不一致（签名拼接、顺序错位）。
     """
     chunks: list[StreamChunk] = []
     blocks = list(response.blocks)
     if not blocks and response.content:
         # 防御兜底：provider 仅填 content 未填 blocks 时，仍还原文本
         blocks = [TextBlock(text=response.content)]
-    for block in blocks:
+    for index, block in enumerate(blocks):
         if isinstance(block, TextBlock):
-            chunks.append(StreamChunk(type="text_delta", text=block.text))
+            chunks.append(
+                StreamChunk(type="text_delta", text=block.text, block_index=index)
+            )
         elif isinstance(block, ThinkingBlock):
             chunks.append(
                 StreamChunk(
                     type="thinking_delta",
                     thinking=block.thinking,
                     signature=block.signature or "",
+                    block_index=index,
+                )
+            )
+        elif isinstance(block, RedactedThinkingBlock):
+            chunks.append(
+                StreamChunk(
+                    type="redacted_thinking_delta",
+                    redacted_data=block.data,
+                    block_index=index,
                 )
             )
         elif isinstance(block, ToolUseBlock):
@@ -128,6 +145,7 @@ def response_to_chunks(response: ChatResponse) -> list[StreamChunk]:
                     type="tool_use_start",
                     tool_use_id=block.id,
                     tool_name=block.name,
+                    block_index=index,
                 )
             )
             chunks.append(
@@ -135,10 +153,11 @@ def response_to_chunks(response: ChatResponse) -> list[StreamChunk]:
                     type="tool_use_delta",
                     tool_use_id=block.id,
                     partial_json=json.dumps(block.input, ensure_ascii=False),
+                    block_index=index,
                 )
             )
         else:
-            # 防御兜底：未知 block 类型（如 RedactedThinkingBlock）跳过并记录
+            # 防御兜底：未知 block 类型跳过并记录（不静默）
             logger.warning(
                 "response_to_chunks 遇到未知 block 类型，已跳过: %r",
                 type(block).__name__,

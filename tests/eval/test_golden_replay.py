@@ -18,7 +18,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from app.services.llm.models import collect
+from app.services.llm.models import ChatResponse, collect
 from eval.lib import (
     FingerprintMismatch,
     FixtureDriver,
@@ -314,3 +314,113 @@ async def test_fixture_driver_stream_tampered_fingerprint_raises():
     with pytest.raises(FingerprintMismatch):
         async for _c in driver.stream([{"role": "user", "content": "hi"}]):
             pass
+
+
+# ---------------------------------------------------------------------------
+# 6. blocks → chunks 展开保真：多块结构往返不塌陷
+# ---------------------------------------------------------------------------
+
+
+def test_expand_preserves_multiple_text_blocks_across_tool_use():
+    """交错的多段文本块经展开再聚合，块边界与顺序不塌陷。
+
+    展开若不带block_index，``text(A) → tool_use → text(B)`` 会被合并成
+    ``[TextBlock("AB"), tool_use]``——回放与live 的 assistant 消息结构不一致，
+    断点续跑的下一轮请求语义已改变。
+    """
+    from app.services.llm.models import (
+        StreamAggregator,
+        TextBlock,
+        ToolUseBlock,
+    )
+    from eval.lib import response_to_chunks
+
+    resp = ChatResponse(
+        content="AB",
+        blocks=[
+            TextBlock(text="A"),
+            ToolUseBlock(id="t1", name="search", input={"q": "x"}),
+            TextBlock(text="B"),
+        ],
+        stop_reason="tool_use",
+    )
+
+    agg = StreamAggregator()
+    for chunk in response_to_chunks(resp):
+        agg.feed(chunk)
+    back = agg.finalize()
+
+    assert [type(b).__name__ for b in back.blocks] == [
+        "TextBlock",
+        "ToolUseBlock",
+        "TextBlock",
+    ]
+    assert back.blocks[0].text == "A"
+    assert back.blocks[2].text == "B"
+    assert back.content == "AB"
+
+
+def test_expand_preserves_separate_thinking_signatures():
+    """两段 thinking 的签名经展开往返后仍各自独立，不被拼成 "s1s2"。"""
+    from app.services.llm.models import (
+        StreamAggregator,
+        TextBlock,
+        ThinkingBlock,
+        ToolUseBlock,
+    )
+    from eval.lib import response_to_chunks
+
+    resp = ChatResponse(
+        content="",
+        blocks=[
+            ThinkingBlock(thinking="思1", signature="s1"),
+            ToolUseBlock(id="t1", name="f", input={}),
+            ThinkingBlock(thinking="思2", signature="s2"),
+            TextBlock(text="结语"),
+        ],
+        stop_reason="tool_use",
+    )
+
+    agg = StreamAggregator()
+    for chunk in response_to_chunks(resp):
+        agg.feed(chunk)
+    back = agg.finalize()
+
+    assert [type(b).__name__ for b in back.blocks] == [
+        "ThinkingBlock",
+        "ToolUseBlock",
+        "ThinkingBlock",
+        "TextBlock",
+    ]
+    assert back.blocks[0].signature == "s1"
+    assert back.blocks[2].signature == "s2"
+
+
+def test_expand_preserves_redacted_thinking_block():
+    """被遮蔽的思考块经展开往返后仍在（不再被当作未知类型丢弃）。"""
+    from app.services.llm.models import (
+        RedactedThinkingBlock,
+        StreamAggregator,
+        TextBlock,
+    )
+    from eval.lib import response_to_chunks
+
+    resp = ChatResponse(
+        content="结论",
+        blocks=[
+            RedactedThinkingBlock(data="ENCRYPTED"),
+            TextBlock(text="结论"),
+        ],
+        stop_reason="end_turn",
+    )
+
+    agg = StreamAggregator()
+    for chunk in response_to_chunks(resp):
+        agg.feed(chunk)
+    back = agg.finalize()
+
+    assert [type(b).__name__ for b in back.blocks] == [
+        "RedactedThinkingBlock",
+        "TextBlock",
+    ]
+    assert back.blocks[0].data == "ENCRYPTED"

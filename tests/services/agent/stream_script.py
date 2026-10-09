@@ -28,6 +28,7 @@ from app.services.agent.tools import serialize_tool_result
 from app.services.llm.models import (
     ChatResponse,
     Message,
+    RedactedThinkingBlock,
     StreamChunk,
     TextBlock,
     ThinkingBlock,
@@ -40,35 +41,51 @@ def response_to_chunks(resp: ChatResponse) -> list[StreamChunk]:
     """把一条 ``ChatResponse`` 转为等价的 ``StreamChunk`` 序列。
 
     - ``TextBlock`` → ``text_delta``；``ThinkingBlock`` → ``thinking_delta``（含 signature）
+    - ``RedactedThinkingBlock`` → ``redacted_thinking_delta``（data 原样保留）
     - ``ToolUseBlock`` → ``tool_use_start`` + ``tool_use_delta``（``json.dumps(input)``）
       + ``tool_use_stop``
     - ``blocks`` 无 ``TextBlock`` 但 ``content`` 非空（旧 ``_resp`` 常只填 content）→
       补一条 ``text_delta``，保证聚合后 ``content`` 一致
     - ``usage`` → ``usage`` 事件；结尾 ``stop`` 事件（``stop_reason`` / ``model``）
 
-    不支持的块类型（如 ``RedactedThinkingBlock``）显式报错，避免静默丢内容。
+    ``block_index`` 按块在 ``blocks`` 中的实际位置填充，聚合器据此分桶——省略会让
+    ``text → tool_use → text`` 这类交错块塌陷成单块，回放结构与 live 不一致。
+
+    不支持的块类型显式报错，避免静默丢内容。
     """
     chunks: list[StreamChunk] = []
     has_text_block = any(isinstance(b, TextBlock) for b in resp.blocks)
     if resp.content and not has_text_block:
         chunks.append(StreamChunk(type="text_delta", text=resp.content))
-    for block in resp.blocks:
+    for index, block in enumerate(resp.blocks):
         if isinstance(block, ThinkingBlock):
             chunks.append(
                 StreamChunk(
                     type="thinking_delta",
                     thinking=block.thinking,
                     signature=block.signature or "",
+                    block_index=index,
                 )
             )
         elif isinstance(block, TextBlock):
-            chunks.append(StreamChunk(type="text_delta", text=block.text))
+            chunks.append(
+                StreamChunk(type="text_delta", text=block.text, block_index=index)
+            )
+        elif isinstance(block, RedactedThinkingBlock):
+            chunks.append(
+                StreamChunk(
+                    type="redacted_thinking_delta",
+                    redacted_data=block.data,
+                    block_index=index,
+                )
+            )
         elif isinstance(block, ToolUseBlock):
             chunks.append(
                 StreamChunk(
                     type="tool_use_start",
                     tool_use_id=block.id,
                     tool_name=block.name,
+                    block_index=index,
                 )
             )
             chunks.append(
@@ -76,9 +93,16 @@ def response_to_chunks(resp: ChatResponse) -> list[StreamChunk]:
                     type="tool_use_delta",
                     tool_use_id=block.id,
                     partial_json=json.dumps(block.input, ensure_ascii=False),
+                    block_index=index,
                 )
             )
-            chunks.append(StreamChunk(type="tool_use_stop", tool_use_id=block.id))
+            chunks.append(
+                StreamChunk(
+                    type="tool_use_stop",
+                    tool_use_id=block.id,
+                    block_index=index,
+                )
+            )
         else:
             raise AssertionError(
                 f"response_to_chunks 不支持的块类型: {type(block).__name__}"
