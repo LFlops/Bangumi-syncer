@@ -28,7 +28,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
@@ -38,10 +38,27 @@ from app.services.agent.tools import ToolDefinition, ToolRegistry
 from app.services.llm.models import Message
 from app.services.notification_service import NotificationService
 
+
+class RunInputs(Protocol):
+    """场景上下文的**通用能力**：必须携带本次run 的种子消息。
+
+    这是通用层对 ``ctx`` 的**唯一**要求，且只要求通用概念（LLM 消息）；ctx 的其余
+    内容（``sync_record`` / ``bgm`` / 候选表 / 业务键等）通用层一概不感知。
+
+    seed 之所以是 ctx 的必备属性而非 ``ScenarioHooks`` 钩子：它是**数据**（本次 run
+    的派生输入快照），不是**行为**（怎么做）。由场景在 ``new_ctx``（run 初始化）时
+    一次性备好，通用层只读取，避免执行期再回调场景派生。
+    """
+
+    @property
+    def seed(self) -> Sequence[Message]: ...
+
+
 #: 场景上下文类型（**场景私有**，如 ``_MatchContext``）。通用层只以本类型变量出现，
 #: 不引用其具体类型，从而在收紧类型的同时保持解耦。
-#: 声明为**不变**：``ScenarioHooks`` / ``ScenarioRuntime`` 的字段与 run 参数双向使用它。
-CtxT = TypeVar("CtxT")
+#: 声明为**不变**：``ScenarioHooks`` / ``ScenarioRuntime`` 的字段与 run 参数双向使用它；
+#: 受 :class:`RunInputs` 约束，故通用层读 ``ctx.seed`` 有类型保障。
+CtxT = TypeVar("CtxT", bound=RunInputs)
 
 #: ``TerminalHandler`` 专用：ctx 只出现在参数位置（逆变），故须声明为逆变类型变量。
 _CtxT_contra = TypeVar("_CtxT_contra", contravariant=True)
@@ -78,9 +95,6 @@ class ScenarioHooks(Generic[CtxT]):
     terminal_tool: str
     #: 注册场景工具（``registry`` + ``ctx`` → 工具定义列表）
     register_tools: Callable[[ToolRegistry, CtxT], list[ToolDefinition]]
-    #: 构建种子消息（``ctx`` → ``[system, user, ...]``）。**run 级工厂**：seed 依赖本次
-    #: sync_record（候选/用户输入），装配期不存在，故只能在执行时按 ctx 构造。
-    build_seed: Callable[[CtxT], list[Message]]
     #: 构建默认**流式** LLM 函数（``thinking_level`` → ``StreamFn``；场景决定 job 归属
     #: 与思考强度透传）。返回 async iterator（``StreamChunk``），由 runtime 经 recorder 包装。
     build_stream_fn: Callable[[str], StreamFn]

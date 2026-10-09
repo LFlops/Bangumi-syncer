@@ -78,7 +78,9 @@ async def run(
     defns = hooks.register_tools(registry, ctx)
     tools_schemas = [d.to_schema() for d in defns]
 
-    seed = hooks.build_seed(ctx)
+    # seed 是本次 run 的**数据**（由场景在 new_ctx 初始化时备好），非行为钩子：
+    # 通用层只读取，不在执行期回调场景派生。
+    seed = ctx.seed
 
     if span_recorder is None:
         span_recorder = TraceRecorder(run_id, start_iteration=0)

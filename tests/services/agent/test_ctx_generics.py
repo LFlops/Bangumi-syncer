@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
 import typing
 from pathlib import Path
@@ -53,15 +54,55 @@ def test_agent_runtime_ctx_annotated_with_typevar():
 
 
 def test_scenario_hooks_ctx_hooks_are_typed():
-    """``register_tools`` / ``build_seed`` 的 ctx 位置标注 ``CtxT``。"""
+    """``register_tools`` 的 ctx 位置标注 ``CtxT``。"""
     hints = typing.get_type_hints(ScenarioHooks)
-    for field in ("register_tools", "build_seed"):
-        annotation = hints[field]
-        # Callable[[..., CtxT], ...] —— get_args 返回 (参数列表, 返回类型)
-        params = typing.get_args(annotation)[0]
-        assert CtxT in params, (
-            f"ScenarioHooks.{field} 应以 CtxT 标注 ctx，实际 {annotation!r}"
-        )
+    annotation = hints["register_tools"]
+    # Callable[[..., CtxT], ...] —— get_args 返回 (参数列表, 返回类型)
+    params = typing.get_args(annotation)[0]
+    assert CtxT in params, f"register_tools 应以 CtxT 标注 ctx，实际 {annotation!r}"
+
+
+# ---------------------------------------------------------------------------
+# 2b. seed 建模为「数据」而非「行为」（对应评审 runtime.py:81）
+# ---------------------------------------------------------------------------
+
+
+def test_ctx_typevar_bounded_to_run_inputs():
+    """``CtxT`` 受 ``RunInputs`` 约束：通用层对 ctx 的**唯一**要求是 seed。"""
+    from app.services.agent.scenario import RunInputs
+
+    assert CtxT.__bound__ is RunInputs, (
+        f"CtxT 应受 RunInputs 约束（否则通用层读 ctx.seed 无类型保障），"
+        f"实际 bound={CtxT.__bound__!r}"
+    )
+    # RunInputs 只要求 seed 这一个通用能力，不得夹带业务字段
+    hints = typing.get_type_hints(RunInputs)
+    business_fields = set(hints) - {"seed"}
+    assert business_fields == set(), (
+        f"RunInputs 只应声明 seed（通用概念），实际还声明了 {business_fields}"
+    )
+
+
+def test_scenario_hooks_no_longer_exposes_build_seed():
+    """``build_seed`` 已从 hooks 移除：seed 是数据，由 ``new_ctx`` 在初始化时产出。"""
+    assert "build_seed" not in {f.name for f in dataclasses.fields(ScenarioHooks)}, (
+        "seed 应归入 ctx（数据），不应留在 hooks（行为）"
+    )
+
+
+def test_runtime_reads_seed_from_ctx_not_from_hooks():
+    """通用层从 ``ctx.seed`` 取 seed，不再回调场景派生（AST 级断言）。"""
+    runtime_src = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
+    assert "hooks.build_seed" not in runtime_src, "通用层不应再驱动场景派生 seed"
+    assert "ctx.seed" in runtime_src, "run() 应直接取 ctx.seed"
+
+
+def test_scene_ctx_carries_seed():
+    """匹配场景 ctx 携带 seed（与 sync_record / bgm 同类的本次 run 数据）。"""
+    fields = {f.name for f in dataclasses.fields(llm_assist._MatchContext)}
+    assert {"sync_record", "bgm", "seed"} <= fields, (
+        f"_MatchContext 应含 sync_record/bgm/seed，实际 {fields}"
+    )
 
 
 def test_new_ctx_returns_ctx_type():

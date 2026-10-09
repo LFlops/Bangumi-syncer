@@ -15,7 +15,7 @@ span 的读写细节由 :mod:`app.services.agent.trace` 承担。
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime
 
@@ -227,7 +227,7 @@ class TraceRecorder(BudgetRecorder):
 
     # -- seed 行 ------------------------------------------------------------
 
-    def write_seed_row(self, seed_messages: list[Message]) -> None:
+    def write_seed_row(self, seed_messages: Sequence[Message]) -> None:
         """run 启动时写一条 name='seed' span 行。"""
         span_id = trace_start_span(self.run_id, name="seed", iteration=0, sequence=0)
         seed_delta = [m.model_dump() for m in seed_messages]

@@ -595,19 +595,20 @@ def _build_default_stream_fn(thinking_level: str):
 
 @dataclass(frozen=True)
 class _MatchContext:
-    """匹配场景上下文（runtime 原样透传，不感知内部结构）。"""
+    """匹配场景上下文（runtime 只读 ``seed``，其余结构不感知）。
+
+    字段均为**本次 run 的数据快照**（非行为）：seed 由 ``make_match_ctx`` 在 run
+    初始化时一次性派生，通用层不再回调场景生成。
+    """
 
     sync_record: dict
+    #: 种子消息（``build_seed_messages`` 的产物；写 seed 行 + loop 首轮输入）
+    seed: list[Message]
     bgm: Any
 
 
 def _match_register_tools(registry: ToolRegistry, ctx: _MatchContext):
     return register_match_tools(registry, ctx.bgm)
-
-
-def _match_build_seed(ctx: _MatchContext) -> list:
-    candidates = _extract_candidates(ctx.sync_record)
-    return build_seed_messages(ctx.sync_record, candidates, DEFAULT_SYSTEM_TEMPLATE)
 
 
 def _match_build_stream_fn(thinking_level: str):
@@ -695,7 +696,6 @@ _MATCH_HOOKS: ScenarioHooks[_MatchContext] = ScenarioHooks(
     task_type="match",
     terminal_tool="submit_suggestion",
     register_tools=_match_register_tools,
-    build_seed=_match_build_seed,
     build_stream_fn=_match_build_stream_fn,
     resolve_thinking_level=_match_resolve_thinking_level,
     resolve_max_iterations=_match_resolve_max_iterations,
@@ -738,14 +738,21 @@ def build_bgm(user_name: str | None) -> BangumiApi | None:
 
 
 def make_match_ctx(sync_record: dict) -> _MatchContext:
-    """构造本次 run 的场景上下文（含按用户自建的 Bangumi 客户端）。
+    """构造本次 run 的场景上下文（run 初始化时一次性备齐全部场景数据）。
 
     由 ``ScenarioRuntime.new_ctx`` 暴露给通用层：通用层只交付 run 的输入数据
-    （``sync_record``），**不感知 ctx 结构、不构造 Bangumi 客户端**。
+    （``sync_record``），**不感知 ctx 结构、不构造 Bangumi 客户端、不派生 seed**。
+
+    seed 在此派生（原 ``hooks.build_seed``）：它是本次 run 的**数据**（由
+    ``sync_record`` 派生的候选与用户输入快照），与 ``sync_record`` / ``bgm`` 同类，
+    不应是「通用层执行期回调场景」的行为钩子。
     """
+    record = sync_record or {}
+    candidates = _extract_candidates(record)
     return _MatchContext(
         sync_record=sync_record,
-        bgm=build_bgm((sync_record or {}).get("user_name")),
+        seed=build_seed_messages(record, candidates, DEFAULT_SYSTEM_TEMPLATE),
+        bgm=build_bgm(record.get("user_name")),
     )
 
 
