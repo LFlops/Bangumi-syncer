@@ -88,11 +88,23 @@ class Message(BaseModel):
 
 
 class Usage(BaseModel):
-    """聊天补全的 token 用量统计。"""
+    """聊天补全的 token 用量统计。
+
+    缓存字段（Anthropic prompt caching）语义：
+
+    - ``cache_creation_input_tokens``：本次因写入缓存而额外计费的输入 token
+    - ``cache_read_input_tokens``：本次从缓存命中读取的输入 token
+
+    两者为 0 表示端点未返回缓存信息或未启用缓存。缓存命中的 token 仍计入
+    ``prompt_tokens``（Anthropic 的 input_tokens 已含缓存部分），故
+    ``total_tokens`` 口径不变，下游计费/配额逻辑无需改动。
+    """
 
     prompt_tokens: int = 0
     completion_tokens: int = 0
     total_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
 
 class ChatResponse(BaseModel):

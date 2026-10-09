@@ -164,13 +164,35 @@ class TestUsage:
     def test_usage_serialization(self):
         u = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
         d = u.model_dump()
-        assert d == {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        assert d == {
+            "prompt_tokens": 10,
+            "completion_tokens": 20,
+            "total_tokens": 30,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
 
     def test_usage_partial_values(self):
         u = Usage(prompt_tokens=5)
         assert u.prompt_tokens == 5
         assert u.completion_tokens == 0
         assert u.total_tokens == 0
+        assert u.cache_creation_input_tokens == 0
+        assert u.cache_read_input_tokens == 0
+
+    def test_usage_cache_fields_settable(self):
+        """缓存读写用量可写入（Anthropic prompt cache 命中率可观测）。"""
+        u = Usage(
+            prompt_tokens=10,
+            completion_tokens=5,
+            total_tokens=15,
+            cache_creation_input_tokens=1200,
+            cache_read_input_tokens=800,
+        )
+        assert u.cache_creation_input_tokens == 1200
+        assert u.cache_read_input_tokens == 800
+        # 缓存命中不改写既有口径：total_tokens 仍为 prompt + completion
+        assert u.total_tokens == 15
 
 
 class TestChatResponse:
@@ -208,6 +230,8 @@ class TestChatResponse:
             "prompt_tokens": 1,
             "completion_tokens": 2,
             "total_tokens": 3,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
         }
 
     def test_chat_response_default_model(self):

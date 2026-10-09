@@ -40,11 +40,15 @@ class _AnthropicStreamState:
     - ``tool_index``：content block index → (tool_use_id, tool_name)
       （input_json_delta 只带 index，需据此回填 tool_use_id）；
     - ``input_tokens``：message_start 的输入用量，待 message_delta 合并；
+    - ``cache_creation_input_tokens`` / ``cache_read_input_tokens``：message_start
+      携带的 prompt cache 读写用量（可观测缓存命中率，默认 0）；
     - ``stopped``：已补发 tool_use_stop 的 index，避免重复补发。
     """
 
     tool_index: dict[int, tuple[str, str]] = field(default_factory=dict)
     input_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
     stopped: set[int] = field(default_factory=set)
 
 
@@ -63,6 +67,9 @@ class AnthropicProvider(BaseProvider):
         timeout: 请求超时时间（秒）。
         proxy: 可选的 HTTP 代理 URL。
         thinking_level: 思考强度 off/low/medium/high（每任务 kwargs 可覆盖）。
+        prompt_cache: 是否给 system 打 cache_control 断点（Anthropic prompt
+            caching）。system 前缀逐轮稳定，开启后多轮对话不必重复计费
+            system；关闭则不发断点（短 prompt 或按量计费场景）。
     """
 
     # thinking_level → Anthropic budget_tokens 映射
@@ -89,6 +96,7 @@ class AnthropicProvider(BaseProvider):
         timeout: int = 60,
         proxy: str | None = None,
         thinking_level: ThinkingLevel = "off",
+        prompt_cache: bool = True,
     ) -> None:
         """初始化 Anthropic provider。"""
         self.api_base = api_base.rstrip("/")
@@ -99,6 +107,7 @@ class AnthropicProvider(BaseProvider):
         self.timeout = timeout
         self.proxy = proxy
         self.thinking_level = thinking_level
+        self.prompt_cache = prompt_cache
 
     async def stream(
         self, messages: list[Message], **kwargs: Any
@@ -191,6 +200,10 @@ class AnthropicProvider(BaseProvider):
 
             if etype == "message_start":
                 state.input_tokens = self._extract_input_tokens(payload)
+                (
+                    state.cache_creation_input_tokens,
+                    state.cache_read_input_tokens,
+                ) = self._extract_cache_tokens(payload)
                 pending_model = self._extract_model(payload)
             elif etype == "content_block_start":
                 chunk = self._map_content_block_start(payload, state)
@@ -232,6 +245,18 @@ class AnthropicProvider(BaseProvider):
         message = payload.get("message") or {}
         usage = message.get("usage") or {}
         return int(usage.get("input_tokens", 0) or 0)
+
+    @staticmethod
+    def _extract_cache_tokens(payload: dict) -> tuple[int, int]:
+        """从 message_start 提取 (缓存写入, 缓存读取) token 数。
+
+        端点未返回该字段时为 (0, 0)——即无可观测的缓存活动。
+        """
+        message = payload.get("message") or {}
+        usage = message.get("usage") or {}
+        created = int(usage.get("cache_creation_input_tokens", 0) or 0)
+        read = int(usage.get("cache_read_input_tokens", 0) or 0)
+        return created, read
 
     @staticmethod
     def _extract_model(payload: dict) -> str:
@@ -371,6 +396,8 @@ class AnthropicProvider(BaseProvider):
             prompt_tokens=state.input_tokens,
             completion_tokens=output_tokens,
             total_tokens=state.input_tokens + output_tokens,
+            cache_creation_input_tokens=state.cache_creation_input_tokens,
+            cache_read_input_tokens=state.cache_read_input_tokens,
         )
         stop_reason = (payload.get("delta") or {}).get("stop_reason")
         return (
@@ -392,7 +419,17 @@ class AnthropicProvider(BaseProvider):
             ),
         }
         if system_parts:
-            body["system"] = "\n\n".join(system_parts)
+            # system 以**块数组**发送（而非单个字符串）：Anthropic 的
+            # cache_control 断点只能挂在块上，多条 system 先按既有 "\n\n"
+            # 语义合并为单块，断点打在末块——保证 system 前缀逐字节稳定，
+            # 多轮对话才能命中 prompt cache。
+            system_block: dict[str, Any] = {
+                "type": "text",
+                "text": "\n\n".join(system_parts),
+            }
+            if self.prompt_cache:
+                system_block["cache_control"] = {"type": "ephemeral"}
+            body["system"] = [system_block]
 
         # tools / tool_choice：工具协议 wire 规范化（provider 拥有 wire 格式，
         # agent/场景层保持 provider 无关）。

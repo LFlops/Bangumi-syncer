@@ -27,6 +27,7 @@ def _make_provider(
     temperature: float = 0.7,
     timeout: int = 60,
     thinking_level: ThinkingLevel = "off",
+    prompt_cache: bool = True,
 ) -> AnthropicProvider:
     """构造测试 provider，仅允许覆盖需要调整的参数。"""
     return AnthropicProvider(
@@ -37,6 +38,7 @@ def _make_provider(
         temperature=temperature,
         timeout=timeout,
         thinking_level=thinking_level,
+        prompt_cache=prompt_cache,
     )
 
 
@@ -127,6 +129,13 @@ def _aggregate(chunks: list):
     return aggregator.finalize()
 
 
+def _system_texts(body: dict) -> list[str]:
+    """提取请求体 system 各块的纯文本（system 为块数组形态）。"""
+    system = body["system"]
+    assert isinstance(system, list), "system 必须为块数组，否则无法挂 cache_control"
+    return [b["text"] for b in system]
+
+
 class TestAnthropicProviderInit:
     """构造函数和默认值。"""
 
@@ -197,11 +206,11 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "你是追番助手"
+        assert _system_texts(body) == ["你是追番助手"]
         assert all(m["role"] != "system" for m in body["messages"])
 
     def test_multiple_system_messages_joined(self):
-        """多条 system 消息用 \\n\\n 合并。"""
+        """多条 system 消息用 \\n\\n 合并为单块。"""
         provider = _make_provider()
         body = provider._build_request(
             [
@@ -210,7 +219,7 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "规则A\n\n规则B"
+        assert _system_texts(body) == ["规则A\n\n规则B"]
 
     def test_single_system_message_unchanged(self):
         """单条 system 消息原样传递，不合并不加分隔符。"""
@@ -221,7 +230,7 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "规则A"
+        assert _system_texts(body) == ["规则A"]
 
     def test_system_message_content_blocks(self):
         """system 消息 content 为 list 时提取 text block，块间用 \\n\\n 拼接（与多条 system 合并语义一致）。"""
@@ -235,7 +244,7 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "规则A\n\n规则B"
+        assert _system_texts(body) == ["规则A\n\n规则B"]
 
     def test_system_message_blocks_ignore_non_text(self):
         """system 消息 content 混入 thinking block 时只提取 text。"""
@@ -249,7 +258,7 @@ class TestBuildRequest:
                 Message(role="user", content="Hello"),
             ]
         )
-        assert body["system"] == "规则A"
+        assert _system_texts(body) == ["规则A"]
 
     def test_thinking_level_medium_maps_budget(self):
         """thinking_level=medium 映射 budget_tokens=4096，
@@ -703,6 +712,112 @@ class TestAnthropicBlockIndexAndInitialContent:
         assert resp.blocks[2].signature == "sig-2"
         assert resp.blocks[0].thinking == "思1"
         assert resp.blocks[2].thinking == "思2"
+
+
+class TestAnthropicPromptCache:
+    """system 缓存断点与缓存用量可观测性。"""
+
+    def test_system_is_block_array_with_cache_breakpoint(self):
+        """system 以块数组发送，末块带 cache_control 断点。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(role="system", content="长系统提示"),
+                Message(role="user", content="Q"),
+            ]
+        )
+
+        system = body["system"]
+        assert isinstance(system, list)
+        assert system[-1]["cache_control"] == {"type": "ephemeral"}
+        assert system[-1]["text"] == "长系统提示"
+
+    def test_only_last_system_block_carries_breakpoint(self):
+        """多块 system 仅末块带断点（断点数量越多缓存写入越贵）。"""
+        provider = _make_provider()
+        body = provider._build_request(
+            [
+                Message(role="system", content="规则A"),
+                Message(role="system", content="规则B"),
+                Message(role="user", content="Q"),
+            ]
+        )
+
+        system = body["system"]
+        assert len(system) == 1
+        assert "cache_control" in system[0]
+        assert system[0]["text"] == "规则A\n\n规则B"
+
+    def test_no_system_message_omits_key(self):
+        """无 system 消息时不发送该键（不发空数组）。"""
+        provider = _make_provider()
+        body = provider._build_request([Message(role="user", content="Q")])
+
+        assert "system" not in body
+
+    def test_cache_control_disable_switch(self):
+        """显式关闭缓存时不带断点（provider 构造参数 opt-out）。"""
+        provider = _make_provider(prompt_cache=False)
+        body = provider._build_request(
+            [
+                Message(role="system", content="长系统提示"),
+                Message(role="user", content="Q"),
+            ]
+        )
+
+        system = body["system"]
+        assert isinstance(system, list)
+        assert all("cache_control" not in b for b in system)
+
+    @pytest.mark.asyncio
+    async def test_cache_usage_extracted_from_stream(self):
+        """message_start / message_delta 的缓存读写 token 被提取到 usage。"""
+        lines = _sse_lines(
+            (
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "model": "claude-x",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 1,
+                            "cache_creation_input_tokens": 1200,
+                            "cache_read_input_tokens": 800,
+                        },
+                    },
+                },
+            ),
+            _block_delta(0, {"type": "text_delta", "text": "hi"}),
+            _message_delta(output_tokens=20),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        resp = _aggregate(chunks)
+        assert resp.usage is not None
+        assert resp.usage.cache_creation_input_tokens == 1200
+        assert resp.usage.cache_read_input_tokens == 800
+        # 既有口径不变
+        assert resp.usage.prompt_tokens == 10
+        assert resp.usage.completion_tokens == 20
+        assert resp.usage.total_tokens == 30
+
+    @pytest.mark.asyncio
+    async def test_cache_usage_defaults_to_zero_when_absent(self):
+        """端点未返回缓存字段时保持为 0。"""
+        lines = _sse_lines(
+            _message_start(input_tokens=10),
+            _block_delta(0, {"type": "text_delta", "text": "hi"}),
+            _message_delta(output_tokens=20),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        usage = _aggregate(chunks).usage
+        assert usage is not None
+        assert usage.cache_creation_input_tokens == 0
+        assert usage.cache_read_input_tokens == 0
 
 
 class TestAnthropicUsageAndStop:
