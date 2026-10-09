@@ -638,3 +638,82 @@ class TestOpenAICompatProviderStream:
             provider = self._provider()
             with pytest.raises(httpx.HTTPStatusError):
                 await self._collect(provider, [Message(role="user", content="Q")])
+
+
+class TestOpenAICompatAssistantTextFidelity:
+    """assistant/user 多段文本块的分隔语义（与 ChatResponse.content 同口径）。
+
+    chat completions 的 assistant 消息 content 是**单个字符串**，协议无法表达
+    「文本 → 工具调用 → 文本」的交错，只能降级为拼接。拼接必须与聚合器
+    ``ChatResponse.content`` 同口径（空串连接），不得注入 wire 上不存在的
+    ``"\\n\\n"``——否则模型看到的是「A\\n\\nB 然后调工具」，而实际是
+    「A 调工具，然后说 B」，语义被改写。
+    """
+
+    def _provider(self, **kwargs) -> OpenAICompatProvider:
+        params = {
+            "api_base": "https://api.openai.com/v1",
+            "api_key": "sk-test",
+            "model": "gpt-4o-mini",
+        }
+        params.update(kwargs)
+        return OpenAICompatProvider(**params)
+
+    def test_interleaved_text_joined_without_injected_separator(self):
+        """assistant 交错文本不以 \\n\\n 合并，与 content 口径一致。"""
+        from app.services.llm.models import TextBlock, ToolUseBlock
+
+        msg = Message(
+            role="assistant",
+            content=[
+                TextBlock(text="A"),
+                ToolUseBlock(id="t1", name="f", input={}),
+                TextBlock(text="B"),
+            ],
+        )
+        wire = self._provider()._to_wire_messages(msg)
+
+        assert len(wire) == 1
+        assert wire[0]["content"] == "AB"
+        assert len(wire[0]["tool_calls"]) == 1
+
+    def test_single_text_block_unchanged(self):
+        """单段文本行为不变（无额外分隔符）。"""
+        from app.services.llm.models import TextBlock
+
+        msg = Message(role="assistant", content=[TextBlock(text="只有一段")])
+        wire = self._provider()._to_wire_messages(msg)
+
+        assert wire == [{"role": "assistant", "content": "只有一段"}]
+
+    def test_text_around_tool_result_joined_without_separator(self):
+        """user 消息中工具结果两侧的文本同样不注入分隔符。"""
+        from app.services.llm.models import TextBlock, ToolResultBlock
+
+        msg = Message(
+            role="user",
+            content=[
+                TextBlock(text="前"),
+                ToolResultBlock(tool_use_id="t1", content="r"),
+                TextBlock(text="后"),
+            ],
+        )
+        wire = self._provider()._to_wire_messages(msg)
+
+        assert wire[0] == {"role": "user", "content": "前后"}
+        assert wire[1] == {"role": "tool", "tool_call_id": "t1", "content": "r"}
+
+    def test_system_multi_block_keeps_paragraph_separator(self):
+        """system 多块的 \\n\\n 分隔是**既有语义**（多条 system 合并），保持不变。
+
+        区别在于：system 的多块本就代表多条独立规则，用空串连接会把两条规则
+        粘成一段，反而更糟。
+        """
+        from app.services.llm.models import TextBlock
+
+        msg = Message(
+            role="system", content=[TextBlock(text="规则A"), TextBlock(text="规则B")]
+        )
+        wire = self._provider()._to_wire_message(msg)
+
+        assert wire["content"] == "规则A\n\n规则B"

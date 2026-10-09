@@ -378,6 +378,13 @@ class OpenAICompatProvider(BaseProvider):
           （content 与 tool_calls 共存；无文本时 content=null）
         - user 消息含 ToolResultBlock：文本先输出为独立 user 消息，
           再逐条拆为 role=tool 消息（is_error 加 [ERROR] 前缀）
+
+        多段 TextBlock 的拼接口径：**空串连接**，与聚合器 ``ChatResponse.content``
+        一致。chat completions 的 content 是单个字符串，协议无法表达
+        「文本 → 工具调用 → 文本」的交错，只能降级为拼接；此时若注入 wire 上
+        不存在的 ``"\\n\\n"``，模型读到的语义会被改写（"A\\n\\nB 然后调工具"
+        vs 实际的"A 调工具，然后说 B"）。system 的 ``"\\n\\n"`` 分隔是另一回事
+        （见 :meth:`_to_wire_message`，多块本就代表多条独立规则），保持不变。
         """
         if isinstance(m.content, str):
             return [{"role": m.role, "content": m.content}]
@@ -404,13 +411,13 @@ class OpenAICompatProvider(BaseProvider):
                 tool_results.append(block)
 
         if m.role == "assistant" and tool_calls:
-            content = "\n\n".join(text_parts) if text_parts else None
+            content = "".join(text_parts) if text_parts else None
             return [{"role": "assistant", "content": content, "tool_calls": tool_calls}]
 
         if m.role == "user" and tool_results:
             result: list[dict] = []
             if text_parts:
-                result.append({"role": "user", "content": "\n\n".join(text_parts)})
+                result.append({"role": "user", "content": "".join(text_parts)})
             for tr in tool_results:
                 prefix = "[ERROR] " if tr.is_error else ""
                 result.append(
