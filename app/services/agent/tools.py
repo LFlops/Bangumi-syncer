@@ -15,8 +15,9 @@ import re
 from collections import UserDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal
 
+from app.services.agent.protocols import ToolSpanRecorder
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
 logger = logging.getLogger(__name__)
@@ -133,33 +134,6 @@ class BatchResults(UserDict[str, ToolResultBlock]):
             )
             return
         super().__setitem__(key, item)
-
-
-@runtime_checkable
-class ToolSpanRecorder(Protocol):
-    """工具执行 span 记录协议（鸭子类型）。
-
-    实现者需持有可注入的时钟（构造参数注入 clock，默认真实时钟），
-    在 ``start_tool`` 记 t0、``end_tool`` 记 t1。包裹层只负责在正确时机
-    （await 前 start、完成后 end）调用，不持有时钟，不感知时间。
-    """
-
-    def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None:
-        """记录工具执行开始；返回 span_id（或 None 表示无需记录）。"""
-
-    def end_tool(
-        self,
-        span_id: str,
-        *,
-        result: ToolResultBlock | None = None,
-        error: str = "",
-    ) -> None:
-        """记录工具执行结束。
-
-        - ``result=None 且 error 非空``：执行异常（异常类型名）
-        - ``result=ToolResultBlock``：正常结果（含 is_error 的占位块）
-        - ``result=None 且 error=""``：terminal 捕获等非结果路径
-        """
 
 
 class ToolRegistry:
@@ -293,7 +267,8 @@ class ToolRegistry:
            - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
              槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
              （独立槽位避免 dup 错误块覆盖首个真实结果）
-        - ``recorder``：工具级 span 记录器（鸭子类型 ``ToolSpanRecorder``）。
+        - ``recorder``：工具级 span 记录器（结构满足
+          :class:`~app.services.agent.protocols.ToolSpanRecorder`；不要求 budget 能力）。
           每个工具执行前 ``start_tool``、完成后 ``end_tool``（finally 必达）；
           重复 ``tool_use_id`` 的占位错误块同样走包裹（有 span，is_error）；
           ``None`` 时行为与现在完全一致（零回归）。

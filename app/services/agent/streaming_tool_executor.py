@@ -24,8 +24,8 @@
 - ``execute_fn``：``tool_use: ToolUseBlock -> Awaitable[Any]``，单工具执行（返回原始结果），
   异常自行抛出，由本组件统一包装为 ``ToolResultBlock(is_error=True)``。
 - ``is_idempotent`` / ``is_terminal``：``name -> bool``，用于调度决策。
-- ``on_recorder``：可选 ``ToolSpanRecorder``，为**提前执行**的工具落 span（延迟执行走
-  ``batch_execute_fn`` 自带的 span 包裹）。
+- ``on_recorder``：可选 :class:`~app.services.agent.protocols.ToolSpanRecorder`，
+  为**提前执行**的工具落 span（延迟执行走 ``batch_execute_fn`` 自带的 span 包裹）。
 - ``batch_execute_fn``：``list[ToolUseBlock] -> Awaitable[BatchResults]``，延迟执行的批量
   路径（复用 ``ToolRegistry.execute_batch`` 的分段并行/保序语义）。为 ``None`` 时退化为
   经 ``execute_fn`` 串行执行。
@@ -42,9 +42,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import logger
+from app.services.agent.protocols import StreamingExecutor, ToolSpanRecorder
 from app.services.agent.tools import (
     _MAX_PARALLEL_TOOLS,
-    ToolSpanRecorder,
     serialize_tool_result,
 )
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
@@ -69,7 +69,7 @@ class _ToolState:
     result: ToolResultBlock | None = None
 
 
-class StreamingToolExecutor:
+class StreamingToolExecutor(StreamingExecutor):
     """停点驱动的工具执行器（见模块 docstring 的调度决策树）。"""
 
     def __init__(

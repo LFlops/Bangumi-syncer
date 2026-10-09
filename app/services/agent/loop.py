@@ -98,7 +98,20 @@ class RunResult:
     last_response: ChatResponse | None = None
 
 
-#: 按轮构造流式工具执行器（返回值需实现 ``StreamingExecutor``）
+#: 按轮构造流式工具执行器（返回值需实现 ``StreamingExecutor``）。
+#:
+#: **必须是工厂而不是单个 executor 实例**：执行器是「一轮一具」的状态机
+#: （``_order`` / ``_states`` / ``_tasks`` / ``_terminal_seen`` 每轮必须重置，
+#: 且没有 ``reset()``），由 ``_consume_stream`` 在 for 循环内**每轮调用一次**。
+#: 复用单实例会导致两类静默错误：
+#:
+#: 1. ``seq=len(self._order)`` 跨轮累加 → 第 2 轮起始序号不是 0，而
+#:    ``agent_steps`` 按 ``(iteration, sequence, id)`` 排序 → span 顺序错乱；
+#: 2. ``finalize()`` 返回 ``[result_for(tid) for tid in self._order]``，即**累计**
+#:    所有轮次的结果 → loop 向会话重复注入历史 tool_result，违反
+#:    「每个 tool_use 恰好一个 tool_result」的会话协议。
+#:
+#: 零参可调用这一形状本身就是契约的一部分：调用方不得缓存 factory 的返回值。
 ExecutorFactory = Callable[[], StreamingExecutor]
 
 
@@ -290,6 +303,9 @@ async def run(
       AsyncIterator[StreamChunk]``。流式解析 + 提交闸门 + 受控执行（幂等工具停点提前执行）。
       必须提供；否则抛 ``ValueError``。
     - ``executor_factory``：按轮构造 ``StreamingToolExecutor`` 的工厂（零参可调用）。
+      **必须是工厂**：执行器是一轮一具的状态机，由 ``_consume_stream`` 每轮调用一次；
+      传单个实例会跨轮串状态（seq 不归零 → span 排序错乱；finalize 重复返回历史结果
+      → 重复注入 tool_result 破坏协议）。详见 ``ExecutorFactory`` 注释。
       为 ``None`` 时退化为纯聚合（不执行工具，供不使用工具的调用方）。
     - ``tools_schemas``：传给 provider 的 tools 参数（schema 列表）
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
