@@ -33,7 +33,7 @@ from app.services.agent.loop import (
 )
 from app.services.agent.protocols import ToolSpanRecorder
 from app.services.agent.recorder import TraceRecorder
-from app.services.agent.scenario import ScenarioHooks
+from app.services.agent.scenario import CtxT, ScenarioHooks
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.agent.tools import (
     ToolRegistry,
@@ -51,8 +51,8 @@ _SKIP_PLACEHOLDER_CONTENT = "skipped: will be re-invoked in continuation"
 async def run(
     run_id: str,
     *,
-    hooks: ScenarioHooks,
-    ctx: Any,
+    hooks: ScenarioHooks[CtxT],
+    ctx: CtxT,
     thinking_level: str,
     stream_fn: StreamFn | None = None,
     notification_service: NotificationService | None = None,
@@ -177,7 +177,7 @@ async def _invoke_loop(
     span_recorder: TraceRecorder,
     tools_schemas: list[dict],
     max_iterations: int,
-    hooks: ScenarioHooks,
+    hooks: ScenarioHooks[CtxT],
     seed_messages: Sequence[Message],
 ) -> RunResult:
     """以流式主路径运行通用循环（chat span 包装 + 按轮执行器工厂）。"""
@@ -200,8 +200,8 @@ async def _invoke_loop(
 async def continue_run(
     run_id: str,
     *,
-    hooks: ScenarioHooks,
-    ctx: Any,
+    hooks: ScenarioHooks[CtxT],
+    ctx: CtxT,
     notification_service: NotificationService | None = None,
 ) -> None:
     """恢复续跑单一入口（通用状态机）：replay → 补执行 → 续跑 → 终局处理。
@@ -440,8 +440,8 @@ async def _execute_continuation(
     thinking_level: str,
     *,
     remaining: int,
-    hooks: ScenarioHooks,
-    ctx: Any,
+    hooks: ScenarioHooks[CtxT],
+    ctx: CtxT,
     notification_service: NotificationService | None,
     anchor_replayed_round: bool,
 ) -> None:

@@ -691,7 +691,7 @@ async def _match_handle_terminal(
     )
 
 
-_MATCH_HOOKS = ScenarioHooks(
+_MATCH_HOOKS: ScenarioHooks[_MatchContext] = ScenarioHooks(
     task_type="match",
     terminal_tool="submit_suggestion",
     register_tools=_match_register_tools,
@@ -749,7 +749,7 @@ def make_match_ctx(sync_record: dict) -> _MatchContext:
     )
 
 
-def get_scenario_runtime() -> ScenarioRuntime:
+def get_scenario_runtime() -> ScenarioRuntime[_MatchContext]:
     """场景运行入口工厂（供 ``app.services.agent.registry`` 惰性加载）。
 
     通用层（调度器等）不直接依赖本模块；反向由本模块提供工厂，
