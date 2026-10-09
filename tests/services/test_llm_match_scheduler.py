@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from typing import Any, cast
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -378,7 +378,7 @@ def test_recovery_present_sync_record_continues():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
@@ -409,7 +409,7 @@ def test_recover_run_calls_continue_run_single_entry():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value=sync_record),
-        patch.object(sched, "_build_bgm", return_value=fake_bgm),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=fake_bgm),
         patch(
             "app.services.llm_match_scheduler.get_notification_service",
             return_value=fake_svc,
@@ -421,12 +421,10 @@ def test_recover_run_calls_continue_run_single_entry():
     ):
         asyncio.run(sched._recover_run(_run_model(run_id="A", sync_record_id=42)))
 
-    cont.assert_awaited_once_with(
-        "A",
-        sync_record=sync_record,
-        bgm=fake_bgm,
-        notification_service=fake_svc,
-    )
+    cont.assert_awaited_once_with("A", ctx=ANY, notification_service=fake_svc)
+    # ctx 由场景侧 new_ctx 自建（通用层不感知其结构）：只断言它携带本次 sync_record
+    ctx = cont.await_args.kwargs["ctx"]
+    assert ctx.sync_record is sync_record
 
 
 def test_scheduler_source_no_scenario_private_symbols():
@@ -443,9 +441,34 @@ def test_scheduler_source_no_scenario_private_symbols():
         "LLMCallError",
         "ToolUseBlock",
         "ToolResultBlock",
+        # Bangumi 客户端与凭据属场景知识：bgm 构造已下沉到 llm_assist.build_bgm，
+        # 通用调度器只交付 run 的输入数据（sync_record），不构造客户端、不碰token。
+        "BangumiApi",
+        "get_primary_bangumi_config",
+        "access_token",
+        "_build_bgm",
+        "build_bgm",
+        "make_match_ctx",
     )
     leaked = [name for name in forbidden if name in source]
     assert leaked == [], f"调度器不应引用场景层私有符号，实际残留：{leaked}"
+
+
+def test_scheduler_has_no_bgm_construction_path():
+    """调度器不再构造 Bangumi 客户端（bgm 由场景侧 new_ctx 自建）。
+
+    通用层持有凭据是层级违规：ctx 的构造（含访问凭据）属场景职责，
+    见``app/services/matching/llm_assist.py::build_bgm``。
+    """
+    import inspect
+
+    source = inspect.getsource(sched_module)
+    # 调度器源码中不应再出现客户端构造点
+    assert "BangumiApi(" not in source
+    # 也不应再有 _build_bgm 方法
+    assert not hasattr(sched_module.LlmMatchScheduler, "_build_bgm"), (
+        "调度器不应保留 _build_bgm（bgm 构造已下沉场景侧）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +494,7 @@ def test_process_pending_calls_llm_assist_run_per_item():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
@@ -499,7 +522,7 @@ def test_process_pending_respects_batch_limit_five():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
@@ -525,7 +548,7 @@ def test_run_exception_increments_attempts():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
@@ -552,7 +575,7 @@ def test_run_exception_attempts_reach_three_single_point_no_double_mark_failed()
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
@@ -582,7 +605,7 @@ def test_exception_in_one_run_does_not_stop_others():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         import asyncio
@@ -617,7 +640,7 @@ def test_process_run_passes_thinking_level_from_config():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
     ):
         asyncio.run(sched._process_run(run))
@@ -647,7 +670,7 @@ def test_process_run_passes_notification_service_to_scenario_runtime_run():
             return_value=_make_dbm(repo),
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch("app.services.agent.registry.ScenarioRuntime.run", run_mock),
         patch(
             "app.services.llm_match_scheduler.get_notification_service",
@@ -702,7 +725,7 @@ def test_recover_run_passes_caller_timestamp_to_refresh():
         ),
         patch("app.services.llm_match_scheduler.time.time", return_value=1700000000),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(),
@@ -725,7 +748,7 @@ def test_concurrent_recover_same_run_only_one_acquires():
     cont_calls = {"n": 0}
     events: dict = {}
 
-    async def _gated_continue(run_id, sync_record, bgm, *, notification_service=None):
+    async def _gated_continue(run_id, ctx, *, notification_service=None):
         cont_calls["n"] += 1
         events["started"].set()
         await events["release"].wait()
@@ -751,7 +774,7 @@ def test_concurrent_recover_same_run_only_one_acquires():
         ),
         patch("app.services.llm_match_scheduler.time.time", return_value=1700000001),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.continue_run",
             side_effect=_gated_continue,
@@ -781,7 +804,7 @@ def test_recover_run_cas_loser_skips_continuation_and_releases_active():
         ),
         patch("app.services.llm_match_scheduler.time.time", return_value=1700000009),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=cont,
@@ -816,7 +839,7 @@ def test_recover_run_releases_after_unexpected_exception():
         patch("app.services.llm_match_scheduler.logger", log),
         patch("app.services.llm_match_scheduler.time.time", return_value=1700000002),
         patch.object(sched, "_get_sync_record", return_value={"id": 42, "title": "x"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.continue_run",
             new=AsyncMock(side_effect=RuntimeError("boom")),
@@ -1283,8 +1306,13 @@ def test_scheduler_module_has_no_function_level_imports():
 
 def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
     """构造 BangumiApi 异常 → warning 不含原始异常文本（防 access_token 泄漏），
-    但保留可诊断的用户维度与异常类型。"""
-    sched = LlmMatchScheduler()
+    但保留可诊断的用户维度与异常类型。
+
+    **归属变更**：bgm 构造已从调度器下沉到匹配场景（``llm_assist.build_bgm``），
+    通用调度器不再接触凭据；脱敏责任随之迁到场景侧。
+    """
+    from app.services.matching import llm_assist
+
     log = MagicMock()
     secret = "SECRET-ACCESS-TOKEN-abc123"
     cm = MagicMock()
@@ -1297,17 +1325,17 @@ def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():
     }
     with (
         patch(
-            "app.services.llm_match_scheduler.get_primary_bangumi_config",
+            "app.services.matching.llm_assist.get_primary_bangumi_config",
             return_value={"username": "u1", "access_token": secret},
         ),
-        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch("app.services.matching.llm_assist.config_manager", cm),
         patch(
-            "app.services.llm_match_scheduler.BangumiApi",
+            "app.services.matching.llm_assist.BangumiApi",
             side_effect=ValueError(f"invalid access_token={secret}"),
         ),
-        patch("app.services.llm_match_scheduler.logger", log),
+        patch("app.services.matching.llm_assist.logger", log),
     ):
-        result = sched._build_bgm({"user_name": "alice"})
+        result = llm_assist.build_bgm("alice")
 
     assert result is None
     log.warning.assert_called_once()
@@ -1412,7 +1440,7 @@ def test_per_run_timeout_cancels_hang_releases_active_and_isolates():
             return_value=0.05,
         ),
         patch.object(sched, "_get_sync_record", return_value={"id": 1, "title": "t"}),
-        patch.object(sched, "_build_bgm", return_value=MagicMock()),
+        patch("app.services.matching.llm_assist.build_bgm", return_value=MagicMock()),
         patch(
             "app.services.agent.registry.ScenarioRuntime.run",
             side_effect=_run_side_effect,
@@ -1458,7 +1486,9 @@ def test_per_run_timeout_leaves_run_processing_then_recovery_continues():
             patch.object(
                 sched, "_get_sync_record", return_value={"id": 1, "title": "t"}
             ),
-            patch.object(sched, "_build_bgm", return_value=MagicMock()),
+            patch(
+                "app.services.matching.llm_assist.build_bgm", return_value=MagicMock()
+            ),
         ]
 
     def _enter(*extra):

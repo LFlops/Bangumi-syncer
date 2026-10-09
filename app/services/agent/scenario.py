@@ -47,6 +47,10 @@ class ScenarioHooks:
     #: ``ctx`` 类型（通用层不可见）与**仅关键字**参数 ``total_tokens`` /
     #: ``notification_service``，二者均无法用普通 ``Callable`` 参数列表表达；
     #: 若改用 ``__call__`` Protocol 会迫使通用层引用场景私有 ctx 类型，破坏解耦。
+    #:
+    #: 运行时**不注入 dbm**：数据库管理器是全局单例（``get_database_manager``），
+    #: 由场景实现内部自取；作为参数跨层传递既无测试收益（测试注入走
+    #: ``set_database_manager``），又使通用层持有场景存储依赖。
     handle_terminal: Callable[..., Awaitable[str]]
     #: 终止提交软护栏（veto）：入参为 terminal 工具调用 input；返回 None=放行，
     #: 返回字符串=暂缓提示文案（loop 注入配对 tool_result 后继续一轮，仅拦一次）。

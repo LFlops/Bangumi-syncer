@@ -44,7 +44,6 @@ from typing import Any
 from apscheduler.triggers.cron import CronTrigger
 from pydantic import ValidationError
 
-from app.core.accounts import get_primary_bangumi_config
 from app.core.config import config_manager
 from app.core.database import get_database_manager
 from app.core.logging import logger
@@ -53,7 +52,6 @@ from app.services.agent.budget import compute_match_run_timeout
 from app.services.agent.registry import get_scenario
 from app.services.base.scheduler import BaseScheduler
 from app.services.notification_service import get_notification_service
-from app.utils.bangumi_api import BangumiApi
 
 # tick 级兜底超时缓冲（秒）：gather 并发等待最慢 run 后再加一段收尾余量。
 # tick_timeout = run_timeout + TICK_TIMEOUT_BUFFER
@@ -355,14 +353,13 @@ class LlmMatchScheduler(BaseScheduler):
                 )
                 return
 
-            bgm = self._build_bgm(sync_record)
+            ctx = get_scenario(run.task_type).new_ctx(sync_record)
             try:
                 # 续跑的场景内部逻辑（replay / 补执行 / loop / 落库 / 失败分流）
                 # 全部收敛在 continue_run 内；此处不再触碰其私有符号。
                 await get_scenario(run.task_type).continue_run(
                     run_id,
-                    sync_record=sync_record,
-                    bgm=bgm,
+                    ctx=ctx,
                     notification_service=get_notification_service(),
                 )
             except Exception as e:
@@ -403,7 +400,7 @@ class LlmMatchScheduler(BaseScheduler):
                 )
                 return
 
-            bgm = self._build_bgm(sync_record)
+            ctx = get_scenario(run.task_type).new_ctx(sync_record)
             try:
                 # thinking_level 统一从集中配置读取并透传给场景运行入口
                 # （config_override 由场景运行入口内部从同一配置读取）。
@@ -412,8 +409,7 @@ class LlmMatchScheduler(BaseScheduler):
                 # atomic_claim / 状态流转 / 落库均在场景运行入口内部完成
                 await get_scenario(run.task_type).run(
                     run_id,
-                    sync_record=sync_record,
-                    bgm=bgm,
+                    ctx=ctx,
                     thinking_level=thinking_level,
                     notification_service=get_notification_service(),
                 )
@@ -436,33 +432,6 @@ class LlmMatchScheduler(BaseScheduler):
             return get_database_manager().get_sync_record_by_id(int(sync_record_id))
         except Exception as e:
             logger.debug(f"🤖 查询 sync_record {sync_record_id} 失败: {e}")
-            return None
-
-    def _build_bgm(self, sync_record: dict):
-        """从用户配置构造 BangumiApi 实例（失败返回 None，交由场景层降级）。"""
-        user_name = (sync_record or {}).get("user_name")
-        try:
-            cfg = get_primary_bangumi_config(user_name)
-            if not cfg or not cfg.get("username") or not cfg.get("access_token"):
-                logger.debug("🤖 无可用 Bangumi 账号配置，bgm 为 None")
-                return None
-
-            dev = config_manager.get_dev_http_snapshot()
-            return BangumiApi(
-                username=cfg["username"],
-                access_token=cfg["access_token"],
-                private=cfg.get("private", False),
-                http_proxy=dev["script_proxy"],
-                ssl_verify=dev["ssl_verify"],
-                bgm_api_proxy=dev["bgm_api_proxy"],
-                bgm_next_proxy=dev["bgm_next_proxy"],
-                ech_mode=dev["ech_mode"],
-            )
-        except Exception as e:
-            # 脱敏：异常文本可能包含构造参数（access_token），仅记录类型 + 用户维度
-            logger.warning(
-                f"🤖 构造 BangumiApi 失败（user={user_name}）: {type(e).__name__}"
-            )
             return None
 
 

@@ -548,10 +548,13 @@ async def run_case(
         _maybe_patch_legacy_search(bgm)
 
     with tools_cm:
+        # bgm 构造已下沉到场景侧 ``llm_assist.build_bgm``：评测要控制客户端
+        # （replay 传 None / live 传真实 BangumiApi），故仅在构造 ctx 期间替换它。
+        with patch.object(llm_assist, "build_bgm", return_value=bgm):
+            ctx = llm_assist.make_match_ctx(sync_record)
         status = await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=sync_record,
-            bgm=bgm,
+            ctx=ctx,
             thinking_level=thinking_level,
             stream_fn=stream_fn,
             notification_service=notifier,

@@ -31,12 +31,12 @@ from app.services.agent.loop import (
     normalize_stop_reason,
     run as loop_run,
 )
+from app.services.agent.protocols import ToolSpanRecorder
 from app.services.agent.recorder import TraceRecorder
 from app.services.agent.scenario import ScenarioHooks
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.agent.tools import (
     ToolRegistry,
-    ToolSpanRecorder,
     serialize_tool_result,
 )
 from app.services.llm.client import LLMCallError
@@ -127,7 +127,6 @@ async def run(
         return "failed" if attempts >= 3 else "processing"
 
     return await hooks.handle_terminal(
-        dbm,
         run_id,
         result,
         ctx,
@@ -301,7 +300,6 @@ async def continue_run(
             # (c) 终局仍统一走 normalize_stop_reason + handle_terminal 归一化落库，
             #     与 live 放行路径的落点一致，保证落库口径不因恢复路径而分叉。
             await hooks.handle_terminal(
-                dbm,
                 run_id,
                 result,
                 ctx,
@@ -345,7 +343,6 @@ async def continue_run(
             # 续跑。交场景终态处理（llm_assist 按 stop_reason 落 failed）。
             result = RunResult(stop_reason=terminal_reason, last_response=None)
             await hooks.handle_terminal(
-                dbm,
                 run_id,
                 result,
                 ctx,
@@ -489,7 +486,6 @@ async def _execute_continuation(
         seed_messages=replay_result.messages,
     )
     await hooks.handle_terminal(
-        dbm,
         run_id,
         result,
         ctx,

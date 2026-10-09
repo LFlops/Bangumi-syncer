@@ -7,8 +7,9 @@ Composition Root）静态 import 场景工厂后调用 :func:`register_scenario`
 如此既让场景工厂的静态分析可见（LSP 可解析调用），又保留「通用层不反向依赖
 场景模块」的解耦（装配层位于应用层，不是 agent 通用层）。
 
-新增场景：实现 ``ScenarioHooks`` 与 ``make_ctx``，提供 ``ScenarioRuntime``
-工厂，并在装配层 ``wire_scenarios`` 静态 import 该工厂并登记 ``task_type``。
+新增场景：实现 ``ScenarioHooks`` 与「run 输入 → 场景 ctx」工厂（``new_ctx``），
+提供 ``ScenarioRuntime`` 工厂，并在装配层 ``wire_scenarios`` 静态 import 该工厂
+并登记 ``task_type``。
 """
 
 from __future__ import annotations
@@ -31,17 +32,16 @@ class ScenarioRuntime:
 
     task_type: str
     hooks: ScenarioHooks
-    #: (sync_record, bgm) -> ctx（场景上下文，runtime 原样透传）。
-    #: 刻意用 ``Any``：ctx 结构由各场景自定义，通用层对其完全不可见（不透明边界）。
-    make_ctx: Callable[..., Any]
+    #: run 输入数据 → 场景上下文工厂（**由场景提供**）：通用层只交付自己拥有的
+    #: 输入（如 ``sync_record``），ctx 的构造（含凭据等场景私有依赖）由场景自建，
+    #: 通用层既不感知 ctx 结构，也不import 场景模块。
+    new_ctx: Callable[..., Any]
 
     async def run(
         self,
         run_id: str,
         *,
-        sync_record: dict,
-        # 刻意用 Any：bgm 为场景侧对象（非通用层契约），仅原样透传给 make_ctx。
-        bgm: Any,
+        ctx: Any,
         thinking_level: str,
         stream_fn: StreamFn | None = None,
         notification_service: NotificationService | None = None,
@@ -49,12 +49,13 @@ class ScenarioRuntime:
     ) -> str:
         """执行一次场景任务（转发通用运行时）。
 
+        ``ctx`` 为场景上下文，由调用方构造；通用层对其完全不可见（不透明边界）。
         ``stream_fn`` 为流式 LLM 调用注入；为空时由场景默认 ``build_stream_fn`` 构造。
         """
         return await agent_runtime.run(
             run_id,
             hooks=self.hooks,
-            ctx=self.make_ctx(sync_record, bgm),
+            ctx=ctx,
             thinking_level=thinking_level,
             stream_fn=stream_fn,
             notification_service=notification_service,
@@ -65,16 +66,17 @@ class ScenarioRuntime:
         self,
         run_id: str,
         *,
-        sync_record: dict,
-        # 刻意用 Any：bgm 为场景侧对象（非通用层契约），仅原样透传给 make_ctx。
-        bgm: Any,
+        ctx: Any,
         notification_service: NotificationService | None = None,
     ) -> None:
-        """恢复续跑（转发通用状态机）。"""
+        """恢复续跑（转发通用状态机）。
+
+        ``ctx`` 为场景上下文，由调用方构造；通用层对其完全不可见（不透明边界）。
+        """
         await agent_runtime.continue_run(
             run_id,
             hooks=self.hooks,
-            ctx=self.make_ctx(sync_record, bgm),
+            ctx=ctx,
             notification_service=notification_service,
         )
 

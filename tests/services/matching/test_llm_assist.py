@@ -270,8 +270,7 @@ async def test_run_submit_suggestion_updates_existing_candidate(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -318,8 +317,7 @@ async def test_run_submit_suggestion_creates_new_row_when_no_candidate(monkeypat
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -352,8 +350,7 @@ async def test_run_submit_suggestion_new_row_writes_business_key(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -381,8 +378,7 @@ async def test_llm_candidate_reuse_hit_via_business_key_closed_loop(monkeypatch)
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -429,8 +425,7 @@ async def test_run_submit_suggestion_backfills_business_key_on_existing_row(
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -461,8 +456,7 @@ async def test_run_submit_suggestion_projects_llm_fields_and_leaves_columns_empt
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -509,8 +503,7 @@ async def test_run_submit_suggestion_marks_existing_candidate_on_duplicate_subje
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -563,8 +556,7 @@ async def test_run_submit_skips_reviving_resolved_candidate(
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -987,8 +979,7 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -1032,8 +1023,7 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -1092,8 +1082,7 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_Boom(),
+        ctx=_ctx(sr, _Boom()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -1145,8 +1134,7 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -1185,8 +1173,7 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -1305,8 +1292,7 @@ async def test_run_candidate_committed_and_visible_to_independent_connection(
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(
             _chat_side_effect([_submit_response("888", "提交可见")])
@@ -1401,8 +1387,7 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
     results = await asyncio.gather(
         llm_assist.get_scenario_runtime().run(
             run_a,
-            sync_record=_make_sync_record(sync_record_id=sr_a),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_a), _make_bgm()),
             thinking_level="medium",
             stream_fn=_scripted_stream(
                 _chat_side_effect([_submit_response(sid_a, "并发A")])
@@ -1412,8 +1397,7 @@ async def test_concurrent_runs_persist_and_notify_each_exactly_once(monkeypatch)
         ),
         llm_assist.get_scenario_runtime().run(
             run_b,
-            sync_record=_make_sync_record(sync_record_id=sr_b),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_b), _make_bgm()),
             thinking_level="medium",
             stream_fn=_scripted_stream(
                 _chat_side_effect([_submit_response(sid_b, "并发B")])
@@ -1475,8 +1459,7 @@ async def test_run_atomic_claim_failure_returns_skipped(monkeypatch):
     chat = _chat_side_effect([_submit_response()])
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=_make_sync_record(sync_record_id=sr_id),
-        bgm=bgm,
+        ctx=_ctx(_make_sync_record(sync_record_id=sr_id), bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -1515,6 +1498,16 @@ def _make_bgm(search_result=None):
             return []
 
     return _Bgm()
+
+
+def _ctx(sync_record: dict, bgm: Any = None) -> Any:
+    """构造本次 run 的场景上下文（测试替身）。
+
+    bgm 构造已下沉到场景侧 ``llm_assist.build_bgm``（通用层不再碰凭据），
+    故测试在**构造期间**把 ``build_bgm`` 替换为固定值即可控制 ctx 内的客户端。
+    """
+    with patch.object(llm_assist, "build_bgm", return_value=bgm):
+        return llm_assist.make_match_ctx(sync_record)
 
 
 def _make_notify():
@@ -1787,8 +1780,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
     database_manager.agent_runs.create_pending(run_a, "match", sr_a)
     await llm_assist.get_scenario_runtime().run(
         run_a,
-        sync_record=_make_sync_record(sync_record_id=sr_a),
-        bgm=bgm1,
+        ctx=_ctx(_make_sync_record(sync_record_id=sr_a), bgm1),
         thinking_level="medium",
         stream_fn=_scripted_stream(_chat_side_effect([_search_response()])),
         span_recorder=None,
@@ -1799,8 +1791,7 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
     database_manager.agent_runs.create_pending(run_b, "match", sr_b)
     await llm_assist.get_scenario_runtime().run(
         run_b,
-        sync_record=_make_sync_record(sync_record_id=sr_b),
-        bgm=bgm2,
+        ctx=_ctx(_make_sync_record(sync_record_id=sr_b), bgm2),
         thinking_level="medium",
         stream_fn=_scripted_stream(_chat_side_effect([_search_response()])),
         span_recorder=None,
@@ -1849,7 +1840,7 @@ async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     sr = _make_sync_record(sync_record_id=sr_id)
     await llm_assist.get_scenario_runtime().run(
-        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="high"
+        run_id, ctx=_ctx(sr, _make_bgm()), thinking_level="high"
     )
 
     assert captured["task_type"] == "match"
@@ -1889,7 +1880,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     sr = _make_sync_record(sync_record_id=sr_id)
     await llm_assist.get_scenario_runtime().run(
-        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
+        run_id, ctx=_ctx(sr, _make_bgm()), thinking_level="medium"
     )
 
     assert captured["config_override"] is None
@@ -1943,7 +1934,7 @@ async def test_run_non_positive_config_override_falls_back_to_none(
     )
     sr = _make_sync_record(sync_record_id=sr_id)
     status = await llm_assist.get_scenario_runtime().run(
-        run_id, sync_record=sr, bgm=_make_bgm(), thinking_level="medium"
+        run_id, ctx=_ctx(sr, _make_bgm()), thinking_level="medium"
     )
     assert status != "skipped"
 
@@ -1987,8 +1978,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
     await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=_make_sync_record(sync_record_id=sr_id),
-        bgm=_make_bgm(),
+        ctx=_ctx(_make_sync_record(sync_record_id=sr_id), _make_bgm()),
         thinking_level="medium",
     )
 
@@ -2110,8 +2100,7 @@ async def test_run_default_stream_fn_passes_thinking_level_medium(monkeypatch):
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
         await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=_make_sync_record(sync_record_id=sr_id),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_id), _make_bgm()),
             thinking_level="medium",
         )
 
@@ -2152,8 +2141,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
         await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=_make_sync_record(sync_record_id=sr_id),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_id), _make_bgm()),
             thinking_level="high",
         )
 
@@ -2182,8 +2170,7 @@ async def test_run_default_stream_fn_passes_thinking_level_off(monkeypatch):
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
         await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=_make_sync_record(sync_record_id=sr_id),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_id), _make_bgm()),
             thinking_level="off",
         )
 
@@ -2218,8 +2205,7 @@ async def test_run_custom_stream_fn_injection_unaffected(monkeypatch):
         database_manager.agent_runs.create_pending(run_id, "match", sr_id)
         await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=_make_sync_record(sync_record_id=sr_id),
-            bgm=_make_bgm(),
+            ctx=_ctx(_make_sync_record(sync_record_id=sr_id), _make_bgm()),
             thinking_level="medium",
             stream_fn=custom_stream_fn,
         )
@@ -2292,8 +2278,7 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -2348,8 +2333,7 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         span_recorder=None,
@@ -2705,8 +2689,7 @@ async def test_run_llm_call_error_retryable_true_increments_attempts(
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(_boom),
         span_recorder=None,
@@ -2732,8 +2715,7 @@ async def test_run_llm_call_error_retryable_false_immediately_failed(monkeypatch
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(_boom),
         span_recorder=None,
@@ -2765,8 +2747,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
     # 第 1 次 → processing (attempts=1)
     status1 = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(_boom),
         span_recorder=None,
@@ -2777,8 +2758,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
     database_manager.agent_runs.update_run_status(run_id, "pending")
     status2 = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(_boom),
         span_recorder=None,
@@ -2789,8 +2769,7 @@ async def test_run_llm_call_error_retryable_true_three_times_failed(monkeypatch)
     database_manager.agent_runs.update_run_status(run_id, "pending")
     status3 = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(_boom),
         span_recorder=None,
@@ -3096,7 +3075,7 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3143,8 +3122,7 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
                 "r",
-                sync_record={"id": 1},
-                bgm=MagicMock(),
+                ctx=_ctx({"id": 1}, MagicMock()),
                 notification_service=fake_svc,
             )
         )
@@ -3195,7 +3173,7 @@ def test_continue_run_submit_uses_replayed_total_tokens():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-tok", sync_record={"id": 1}, bgm=MagicMock()
+                "r-tok", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3238,7 +3216,7 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3276,7 +3254,7 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3321,7 +3299,7 @@ def test_continue_run_continuation_sums_replay_and_new_round_tokens():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3363,7 +3341,7 @@ def _run_continue_run_with_config(raw_max: str):
         cm.get_sync_llm_match_config.return_value = _medium_cfg(raw_max)
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
     return captured.get("config_override"), log
@@ -3418,7 +3396,7 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3452,7 +3430,7 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3481,7 +3459,7 @@ def test_continue_run_replay_exhausted_logs_warning():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3534,7 +3512,7 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3568,7 +3546,7 @@ def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn(
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r", sync_record={"id": 1}, bgm=MagicMock()
+                "r", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3607,7 +3585,7 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r2", sync_record={"id": 1}, bgm=MagicMock()
+                "r2", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3653,7 +3631,7 @@ def test_continue_run_llm_call_error_retryable_false_marks_failed():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-err-terminal", sync_record={"id": 1}, bgm=MagicMock()
+                "r-err-terminal", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3690,7 +3668,7 @@ def test_continue_run_llm_call_error_retryable_true_increments_attempts():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-err-retry", sync_record={"id": 1}, bgm=MagicMock()
+                "r-err-retry", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -3728,7 +3706,7 @@ def test_continue_run_outer_exception_logs_current_run_status():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-outer-err", sync_record={"id": 1}, bgm=MagicMock()
+                "r-outer-err", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -4072,12 +4050,10 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
     async def _go():
         # 初始正常运行至崩溃（记录 1 条 llm_chat span，但 tool_execute 缺失）
         await llm_assist.get_scenario_runtime().run(
-            run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+            run_id, ctx=_ctx(sr, bgm), thinking_level="medium"
         )
         # 恢复续跑：真实 trace.replay + 真实 loop_run
-        await llm_assist.get_scenario_runtime().continue_run(
-            run_id, sync_record=sr, bgm=bgm
-        )
+        await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     asyncio.run(_go())
 
@@ -4153,11 +4129,9 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
 
     async def _go():
         await llm_assist.get_scenario_runtime().run(
-            run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+            run_id, ctx=_ctx(sr, bgm), thinking_level="medium"
         )
-        await llm_assist.get_scenario_runtime().continue_run(
-            run_id, sync_record=sr, bgm=bgm
-        )
+        await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     asyncio.run(_go())
 
@@ -4203,7 +4177,7 @@ def test_continue_run_writes_chat_span(monkeypatch):
 
     asyncio.run(
         llm_assist.get_scenario_runtime().continue_run(
-            run_id, sync_record=sr, bgm=MagicMock()
+            run_id, ctx=_ctx(sr, MagicMock())
         )
     )
 
@@ -4247,7 +4221,7 @@ def test_continue_run_respects_thinking_level(monkeypatch):
         }
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-think", sync_record={"id": 1}, bgm=MagicMock()
+                "r-think", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -4306,7 +4280,7 @@ def test_continue_run_normalizes_uppercase_thinking_level(tmp_path):
     ):
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-think-normalize", sync_record={"id": 1}, bgm=MagicMock()
+                "r-think-normalize", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -4350,7 +4324,7 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
 
     asyncio.run(
         llm_assist.get_scenario_runtime().continue_run(
-            run_id, sync_record=sr, bgm=MagicMock()
+            run_id, ctx=_ctx(sr, MagicMock())
         )
     )
 
@@ -4437,12 +4411,10 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
 
     # 第一次 run → 崩溃
     await llm_assist.get_scenario_runtime().run(
-        run_id, sync_record=sr, bgm=bgm, thinking_level="medium"
+        run_id, ctx=_ctx(sr, bgm), thinking_level="medium"
     )
     # 第一次恢复（完成对话）
-    await llm_assist.get_scenario_runtime().continue_run(
-        run_id, sync_record=sr, bgm=bgm
-    )
+    await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     steps_after_first = database_manager.agent_runs.get_steps(run_id)
     chat_iters_after_first = [
@@ -4456,9 +4428,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     database_manager.agent_runs.update_run_status(run_id, "processing")
 
     # 第二次恢复（应直接 mark_no_suggestion，无额外 LLM 调用）
-    await llm_assist.get_scenario_runtime().continue_run(
-        run_id, sync_record=sr, bgm=bgm
-    )
+    await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     assert chat_calls["n"] == 2, (
         f"期望累计 2 次 LLM 调用（第二次恢复不应额外调 LLM），实际 {chat_calls['n']}"
@@ -4500,8 +4470,7 @@ def test_run_retryable_llm_error_at_limit_single_terminal_write():
         status = asyncio.run(
             llm_assist.get_scenario_runtime().run(
                 "run-double-write",
-                sync_record=_make_sync_record(sync_record_id=520),
-                bgm=MagicMock(),
+                ctx=_ctx(_make_sync_record(sync_record_id=520), MagicMock()),
                 thinking_level="medium",
                 stream_fn=_scripted_stream(_boom),
             )
@@ -4590,8 +4559,7 @@ async def test_total_tokens_accumulates_across_all_rounds(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=None,
@@ -4618,8 +4586,7 @@ async def test_total_tokens_zero_when_no_usage():
         )
         status = await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=sr,
-            bgm=_make_bgm(),
+            ctx=_ctx(sr, _make_bgm()),
             thinking_level="medium",
             stream_fn=_scripted_stream(chat),
             notification_service=None,
@@ -4849,8 +4816,7 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
     try:
         status = await llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=sr,
-            bgm=_SlowBgm(),
+            ctx=_ctx(sr, _SlowBgm()),
             thinking_level="medium",
             stream_fn=_scripted_stream(
                 _chat_side_effect([_search_response(), _submit_response()])
@@ -4914,8 +4880,7 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
     task = asyncio.create_task(
         llm_assist.get_scenario_runtime().run(
             run_id,
-            sync_record=sr,
-            bgm=_BlockingBgm(),
+            ctx=_ctx(sr, _BlockingBgm()),
             thinking_level="medium",
             stream_fn=_scripted_stream(
                 _chat_side_effect([_search_response(), _submit_response()])
@@ -5017,7 +4982,7 @@ def test_continue_run_submit_tail_runs_off_event_loop_thread():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-tail", sync_record={"id": 1}, bgm=MagicMock()
+                "r-tail", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -5054,7 +5019,7 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
             llm_assist.get_scenario_runtime().continue_run(
-                "r-cont", sync_record={"id": 1}, bgm=MagicMock()
+                "r-cont", ctx=_ctx({"id": 1}, MagicMock())
             )
         )
 
@@ -5255,8 +5220,7 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=_make_bgm(),
+        ctx=_ctx(sr, _make_bgm()),
         thinking_level="medium",
         stream_fn=_scripted_stream(chat),
         notification_service=ns,
@@ -5317,8 +5281,7 @@ async def test_run_stream_fn_end_to_end_early_execution_and_submit(monkeypatch):
 
     status = await llm_assist.get_scenario_runtime().run(
         run_id,
-        sync_record=sr,
-        bgm=bgm,
+        ctx=_ctx(sr, bgm),
         thinking_level="medium",
         stream_fn=stream_fn,
         notification_service=ns,

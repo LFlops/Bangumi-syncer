@@ -16,7 +16,11 @@ from typing import cast
 
 import pytest
 
-from app.core.database import DatabaseManager, set_database_manager
+from app.core.database import (
+    DatabaseManager,
+    get_database_manager,
+    set_database_manager,
+)
 from app.services.agent import runtime, trace
 from app.services.agent.scenario import ScenarioHooks
 
@@ -97,13 +101,13 @@ class _FakeHooks:
         self.veto_calls.append(suggestion)
         return "请先核对候选再提交"
 
-    async def handle_terminal(self, *args, **kwargs):
-        self.terminal_calls.append((args, kwargs))
+    async def handle_terminal(self, run_id, result, ctx, **kwargs):
+        """终局回调：新契约**不再**接收 dbm（全局单例由场景自取）。"""
+        self.terminal_calls.append(((run_id, result, ctx), kwargs))
         # 模拟真实场景（llm_assist）终态落点：llm_error/max_tokens → failed
-        result = args[2]
         if getattr(result, "stop_reason", None) in ("llm_error", "max_tokens"):
-            args[0].agent_runs.mark_failed(
-                args[1],
+            get_database_manager().agent_runs.mark_failed(
+                run_id,
                 stop_reason=result.stop_reason,
                 last_error=f"循环终止原因: {result.stop_reason}",
             )
@@ -179,7 +183,7 @@ def test_continue_run_with_matching_terminal_tool_call_dispatches_normally(
 
     assert len(hooks.terminal_calls) == 1
     args, _kwargs = hooks.terminal_calls[0]
-    result = args[2]
+    result = args[1]
     assert result.suggestion == submit_input
     assert result.stop_reason == "submit_suggestion"
 
@@ -240,7 +244,7 @@ def test_continue_run_empty_shell_response_marks_failed_llm_error(
     asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     assert len(hooks.terminal_calls) == 1
-    result = hooks.terminal_calls[0][0][2]
+    result = hooks.terminal_calls[0][0][1]
     assert result.stop_reason == "llm_error"
     _assert_failed_with_stop(dbm, run_id, "llm_error")
 
@@ -257,7 +261,7 @@ def test_continue_run_max_tokens_response_marks_failed_max_tokens(
     asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
 
     assert len(hooks.terminal_calls) == 1
-    result = hooks.terminal_calls[0][0][2]
+    result = hooks.terminal_calls[0][0][1]
     assert result.stop_reason == "max_tokens"
     _assert_failed_with_stop(dbm, run_id, "max_tokens")
 

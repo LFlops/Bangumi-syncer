@@ -45,7 +45,9 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any
 
+from app.core.accounts import get_primary_bangumi_config
 from app.core.config import config_manager
+from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent.budget import (
     get_max_iterations,
@@ -68,6 +70,7 @@ from app.services.llm.models import (
 from app.services.llm.output_parser import parse_suggestion
 from app.services.matching.identity import build_match_business_key
 from app.services.sync_service import SyncService
+from app.utils.bangumi_api import BangumiApi
 
 # ---------------------------------------------------------------------------
 # Prompt 常量（注入防护）
@@ -662,7 +665,6 @@ def _match_veto_terminal(args: dict) -> str | None:
 
 
 async def _match_handle_terminal(
-    dbm,
     run_id: str,
     result: RunResult,
     ctx: _MatchContext,
@@ -670,7 +672,13 @@ async def _match_handle_terminal(
     total_tokens: int,
     notification_service: Any | None,
 ) -> str:
-    """场景终局处理：校验 / 落库 / 通知（含竞态跳过与落库错误语义）。"""
+    """场景终局处理：校验 / 落库 / 通知（含竞态跳过与落库错误语义）。
+
+    数据库管理器在此**自取**而非由通用运行时传入：``dbm`` 是全局单例
+    （``get_database_manager``），作为参数层层传递既无测试收益（测试注入走
+    ``set_database_manager``），又让通用层持有场景存储依赖。
+    """
+    dbm = get_database_manager()
     return await _handle_result_async(
         dbm,
         run_id,
@@ -696,6 +704,51 @@ _MATCH_HOOKS = ScenarioHooks(
 )
 
 
+def build_bgm(user_name: str | None) -> BangumiApi | None:
+    """按用户配置构造本run 的 BangumiApi 实例（失败返回 None，交由场景降级）。
+
+    **本函数是 Bangumi 客户端的唯一构造点**（原在调度器 ``_build_bgm``）：匹配场景
+    才需要 Bangumi 客户端，且「用哪个账号的token」是场景知识。通用层（调度器）不再
+    构造客户端、不再接触 ``access_token``，只把 run 的输入数据交给
+    ``make_match_ctx``。
+    """
+    try:
+        cfg = get_primary_bangumi_config(user_name)
+        if not cfg or not cfg.get("username") or not cfg.get("access_token"):
+            logger.debug("[llm_assist] 无可用 Bangumi 账号配置，bgm 为 None")
+            return None
+
+        dev = config_manager.get_dev_http_snapshot()
+        return BangumiApi(
+            username=cfg["username"],
+            access_token=cfg["access_token"],
+            private=cfg.get("private", False),
+            http_proxy=dev["script_proxy"],
+            ssl_verify=dev["ssl_verify"],
+            bgm_api_proxy=dev["bgm_api_proxy"],
+            bgm_next_proxy=dev["bgm_next_proxy"],
+            ech_mode=dev["ech_mode"],
+        )
+    except Exception as e:
+        # 脱敏：异常文本可能包含构造参数（access_token），仅记录类型 + 用户维度
+        logger.warning(
+            f"[llm_assist] 构造 BangumiApi 失败（user={user_name}）: {type(e).__name__}"
+        )
+        return None
+
+
+def make_match_ctx(sync_record: dict) -> _MatchContext:
+    """构造本次 run 的场景上下文（含按用户自建的 Bangumi 客户端）。
+
+    由 ``ScenarioRuntime.new_ctx`` 暴露给通用层：通用层只交付 run 的输入数据
+    （``sync_record``），**不感知 ctx 结构、不构造 Bangumi 客户端**。
+    """
+    return _MatchContext(
+        sync_record=sync_record,
+        bgm=build_bgm((sync_record or {}).get("user_name")),
+    )
+
+
 def get_scenario_runtime() -> ScenarioRuntime:
     """场景运行入口工厂（供 ``app.services.agent.registry`` 惰性加载）。
 
@@ -705,9 +758,7 @@ def get_scenario_runtime() -> ScenarioRuntime:
     return ScenarioRuntime(
         task_type="match",
         hooks=_MATCH_HOOKS,
-        make_ctx=lambda sync_record, bgm: _MatchContext(
-            sync_record=sync_record, bgm=bgm
-        ),
+        new_ctx=make_match_ctx,
     )
 
 
