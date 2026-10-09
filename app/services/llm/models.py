@@ -11,7 +11,7 @@ import json
 import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
@@ -129,7 +129,18 @@ class StreamChunk:
 
     ``model`` 为真实模型名（provider 从流事件顶层字段提取），通常首个带 model 的
     事件填入一次即可，后续留空；供 client/聚合器回填 ChatResponse.model。
+
+    ``block_index`` 为 wire 侧**内容块序号**（Anthropic content_block 的 index、
+    Responses 的 item 序号等）。同一序号的多段增量属同一个块，聚合器据此分桶——
+    这是 ``text(A) → tool_use → text(B)`` 这类交错输出不被压平成单个 TextBlock、
+    多段 thinking 的 signature 不被拼成非法值的前提。未提供时取 ``UNINDEXED``，
+    全部增量归入**单一槽**合并成单块：openai_compat 的 chat.completion delta 只有
+    一条连续 content 流、无块概念，合并即其 wire 语义。
     """
+
+    #: 未声明块序号的哨兵值。真实 wire 序号从 0 起，故不能用 0，
+    #: 否则「未提供」会与「第 0 块」混为一谈、把不同来源的增量错误合桶。
+    UNINDEXED: ClassVar[int] = -1
 
     type: Literal[
         "text_delta",
@@ -149,6 +160,7 @@ class StreamChunk:
     usage: Usage | None = None
     stop_reason: str | None = None
     model: str = ""
+    block_index: int = UNINDEXED
 
 
 @dataclass
@@ -157,20 +169,27 @@ class StreamAggregator:
 
     聚合规则：
 
-    - text_delta → 单个 TextBlock；thinking_delta → 单个
-      ThinkingBlock（thinking / signature 均增量拼接）
+    - text_delta / thinking_delta 按 ``StreamChunk.block_index`` **分桶**：同一序号的
+      多段增量合并为一个 TextBlock / ThinkingBlock（thinking 与 signature 各自拼接）。
+      分桶是保持 wire 块边界的前提——``text(A) → tool_use → text(B)`` 必须产出三块
+      （顺序 A、tool、B），不能压平成 ``[TextBlock("AB"), tool_use]``；多段 thinking
+      的 signature 也必须各自独立，拼接后的 ``"sig1sig2"`` 会被 Anthropic 端点拒绝。
+    - 序号为 ``StreamChunk.UNINDEXED``（provider 未提供块概念，如 openai_compat 的
+      单条 content 流）时全部增量归入同一槽，产出单个块——即该 wire 的真实语义。
+    - 空文本增量不建桶、不产出空块（部分端点会发 text_delta(text="")）
     - tool_use_start → 新建 ToolUseBlock 槽；tool_use_delta 按 tool_use_id
       累积 partial_json，finalize 时 json.loads，失败兜底 {"raw": ...}
     - tool_use_stop 为停点标记，不参与参数累积（参数照常从 delta 累积）
     - usage / stop 事件透传到 ChatResponse 的 usage / stop_reason
     - 非空 model 事件跟踪为真实模型名，finalize 回填 ChatResponse.model
-    - blocks 顺序 = 各块「首次出现」的事件顺序
+    - blocks 顺序 = 各块「首次出现」的事件顺序（**不按序号重排**：序号仅用于分桶，
+      顺序以事件到达为准，与 wire 一致）
     """
 
     _order: list[tuple[str, str]] = field(default_factory=list)
-    _text_parts: list[str] = field(default_factory=list)
-    _thinking_parts: list[str] = field(default_factory=list)
-    _signature_parts: list[str] = field(default_factory=list)
+    _text_parts: dict[int, list[str]] = field(default_factory=dict)
+    _thinking_parts: dict[int, list[str]] = field(default_factory=dict)
+    _signature_parts: dict[int, list[str]] = field(default_factory=dict)
     _tool_names: dict[str, str] = field(default_factory=dict)
     _tool_json_parts: dict[str, list[str]] = field(default_factory=dict)
     _usage: Usage | None = None
@@ -182,7 +201,7 @@ class StreamAggregator:
         if chunk.model:
             self._model = chunk.model
         if chunk.type == "text_delta":
-            self._append_text(chunk.text)
+            self._append_text(chunk)
         elif chunk.type == "thinking_delta":
             self._append_thinking(chunk)
         elif chunk.type == "tool_use_start":
@@ -200,16 +219,26 @@ class StreamAggregator:
             # 防御兜底：Literal 已限定类型，未知事件仅记录不中断
             logger.warning("StreamAggregator 收到未知事件类型: %r", chunk.type)
 
-    def _append_text(self, text: str) -> None:
-        if not self._text_parts:
-            self._order.append(("text", ""))
-        self._text_parts.append(text)
+    def _append_text(self, chunk: StreamChunk) -> None:
+        """按 block_index 追加文本增量；首次出现该序号时登记一次块位。"""
+        # 空文本不建桶：否则会产出 text="" 的空 TextBlock，回传时是无意义的协议噪声
+        if not chunk.text:
+            return
+        index = chunk.block_index
+        if index not in self._text_parts:
+            self._order.append(("text", str(index)))
+            self._text_parts[index] = []
+        self._text_parts[index].append(chunk.text)
 
     def _append_thinking(self, chunk: StreamChunk) -> None:
-        if not self._thinking_parts and not self._signature_parts:
-            self._order.append(("thinking", ""))
-        self._thinking_parts.append(chunk.thinking)
-        self._signature_parts.append(chunk.signature)
+        """按 block_index 追加思考增量与签名增量，各自独立成块。"""
+        index = chunk.block_index
+        if index not in self._thinking_parts:
+            self._order.append(("thinking", str(index)))
+            self._thinking_parts[index] = []
+            self._signature_parts[index] = []
+        self._thinking_parts[index].append(chunk.thinking)
+        self._signature_parts[index].append(chunk.signature)
 
     def _start_tool(self, tool_use_id: str, tool_name: str) -> None:
         if tool_use_id in self._tool_names:
@@ -248,12 +277,12 @@ class StreamAggregator:
         blocks: list[ContentBlock] = []
         for kind, key in self._order:
             if kind == "text":
-                blocks.append(TextBlock(text="".join(self._text_parts)))
+                blocks.append(TextBlock(text="".join(self._text_parts[int(key)])))
             elif kind == "thinking":
                 blocks.append(
                     ThinkingBlock(
-                        thinking="".join(self._thinking_parts),
-                        signature="".join(self._signature_parts) or None,
+                        thinking="".join(self._thinking_parts[int(key)]),
+                        signature="".join(self._signature_parts[int(key)]) or None,
                     )
                 )
             elif kind == "tool_use":

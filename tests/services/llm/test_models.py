@@ -330,6 +330,144 @@ class TestStreamAggregator:
         assert resp.usage is None
 
 
+class TestStreamAggregatorBlockIndexBuckets:
+    """按 block_index 分桶：多段 text/thinking 保持各自块边界与相对顺序。"""
+
+    def test_same_index_text_deltas_merge_into_one_block(self):
+        """同一 block_index 的多段 text_delta 合并为单个 TextBlock。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="你", block_index=0))
+        agg.feed(StreamChunk(type="text_delta", text="好", block_index=0))
+        agg.feed(StreamChunk(type="text_delta", text="世界", block_index=0))
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, TextBlock)
+        assert block.text == "你好世界"
+        assert resp.content == "你好世界"
+
+    def test_interleaved_text_around_tool_use_keeps_wire_order(self):
+        """文本 → 工具调用 → 文本：两段文本各自成块，顺序与 wire 一致。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="A", block_index=0))
+        agg.feed(
+            StreamChunk(
+                type="tool_use_start",
+                tool_use_id="t1",
+                tool_name="search",
+                block_index=1,
+            )
+        )
+        agg.feed(
+            StreamChunk(
+                type="tool_use_delta",
+                tool_use_id="t1",
+                partial_json="{}",
+                block_index=1,
+            )
+        )
+        agg.feed(StreamChunk(type="text_delta", text="B", block_index=2))
+
+        resp = agg.finalize()
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "TextBlock",
+            "ToolUseBlock",
+            "TextBlock",
+        ]
+        first, middle, last = resp.blocks
+        assert first.text == "A"
+        assert middle.id == "t1"
+        assert last.text == "B"
+        assert resp.content == "AB"
+
+    def test_multiple_thinking_blocks_keep_own_signature(self):
+        """多段 thinking 各自成块，signature 不跨块拼接（否则端点签名校验失败）。"""
+        agg = StreamAggregator()
+        agg.feed(
+            StreamChunk(
+                type="thinking_delta", thinking="思1", signature="s1", block_index=0
+            )
+        )
+        agg.feed(
+            StreamChunk(
+                type="tool_use_start", tool_use_id="t1", tool_name="f", block_index=1
+            )
+        )
+        agg.feed(
+            StreamChunk(
+                type="thinking_delta", thinking="思2", signature="s2", block_index=2
+            )
+        )
+
+        resp = agg.finalize()
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "ThinkingBlock",
+            "ToolUseBlock",
+            "ThinkingBlock",
+        ]
+        first, _, last = resp.blocks
+        assert (first.thinking, first.signature) == ("思1", "s1")
+        assert (last.thinking, last.signature) == ("思2", "s2")
+
+    def test_unindexed_deltas_keep_single_slot(self):
+        """未声明 block_index（openai_compat 等无块概念的 wire）→ 仍合并为单块。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="A"))
+        agg.feed(StreamChunk(type="tool_use_start", tool_use_id="t1", tool_name="f"))
+        agg.feed(StreamChunk(type="text_delta", text="B"))
+
+        resp = agg.finalize()
+
+        assert [type(b).__name__ for b in resp.blocks] == ["TextBlock", "ToolUseBlock"]
+        assert resp.blocks[0].text == "AB"
+        assert resp.content == "AB"
+
+    def test_out_of_order_index_uses_first_appearance_order(self):
+        """块序号非单调时按事件首次出现排序，不按序号重排。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text="B", block_index=5))
+        agg.feed(StreamChunk(type="text_delta", text="A", block_index=2))
+
+        resp = agg.finalize()
+
+        assert [b.text for b in resp.blocks] == ["B", "A"]
+        assert resp.content == "BA"
+
+    def test_empty_text_delta_produces_no_block(self):
+        """空文本增量不产出空 TextBlock。"""
+        agg = StreamAggregator()
+        agg.feed(StreamChunk(type="text_delta", text=""))
+
+        resp = agg.finalize()
+
+        assert resp.blocks == []
+        assert resp.content == ""
+
+    def test_unindexed_tool_delta_without_start_still_builds_block(self):
+        """无 start 的 tool_use_delta 防御不退化：仍产出 input 完整的块。"""
+        agg = StreamAggregator()
+        agg.feed(
+            StreamChunk(
+                type="tool_use_delta",
+                tool_use_id="t1",
+                partial_json="{}",
+                block_index=7,
+            )
+        )
+
+        resp = agg.finalize()
+
+        assert len(resp.blocks) == 1
+        block = resp.blocks[0]
+        assert isinstance(block, ToolUseBlock)
+        assert block.id == "t1"
+        assert block.input == {}
+
+
 class TestStreamChunkModelField:
     """StreamChunk.model 与 tool_use_stop 事件字段。"""
 
