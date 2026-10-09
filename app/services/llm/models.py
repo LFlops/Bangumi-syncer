@@ -118,6 +118,8 @@ class StreamChunk:
     各 provider 负责把自己的 wire 流式事件映射到本模型：
 
     - text_delta / thinking_delta: 增量文本，分别填 text / thinking（signature 亦增量）
+    - redacted_thinking_delta: 被遮蔽的思考块（Anthropic 安全机制），填 redacted_data。
+      该块**不可解码但必须原样回传**，否则多轮对话被端点拒绝
     - tool_use_start: 新建工具调用槽，填 tool_use_id / tool_name
     - tool_use_delta: 工具入参 JSON 增量片段，填 tool_use_id / partial_json
     - tool_use_stop: **停点事件**——该工具（tool_use_id）参数已完整、可校验并执行。
@@ -145,6 +147,7 @@ class StreamChunk:
     type: Literal[
         "text_delta",
         "thinking_delta",
+        "redacted_thinking_delta",
         "tool_use_start",
         "tool_use_delta",
         "tool_use_stop",
@@ -154,6 +157,7 @@ class StreamChunk:
     text: str = ""
     thinking: str = ""
     signature: str = ""
+    redacted_data: str = ""
     tool_use_id: str = ""
     tool_name: str = ""
     partial_json: str = ""
@@ -177,6 +181,8 @@ class StreamAggregator:
     - 序号为 ``StreamChunk.UNINDEXED``（provider 未提供块概念，如 openai_compat 的
       单条 content 流）时全部增量归入同一槽，产出单个块——即该 wire 的真实语义。
     - 空文本增量不建桶、不产出空块（部分端点会发 text_delta(text="")）
+    - redacted_thinking_delta → 每个序号一个 RedactedThinkingBlock（按序号分桶，
+      多段遮蔽思考各自成块；data 原样保留，不做拼接）
     - tool_use_start → 新建 ToolUseBlock 槽；tool_use_delta 按 tool_use_id
       累积 partial_json，finalize 时 json.loads，失败兜底 {"raw": ...}
     - tool_use_stop 为停点标记，不参与参数累积（参数照常从 delta 累积）
@@ -190,6 +196,7 @@ class StreamAggregator:
     _text_parts: dict[int, list[str]] = field(default_factory=dict)
     _thinking_parts: dict[int, list[str]] = field(default_factory=dict)
     _signature_parts: dict[int, list[str]] = field(default_factory=dict)
+    _redacted_parts: dict[int, list[str]] = field(default_factory=dict)
     _tool_names: dict[str, str] = field(default_factory=dict)
     _tool_json_parts: dict[str, list[str]] = field(default_factory=dict)
     _usage: Usage | None = None
@@ -204,6 +211,8 @@ class StreamAggregator:
             self._append_text(chunk)
         elif chunk.type == "thinking_delta":
             self._append_thinking(chunk)
+        elif chunk.type == "redacted_thinking_delta":
+            self._append_redacted(chunk)
         elif chunk.type == "tool_use_start":
             self._start_tool(chunk.tool_use_id, chunk.tool_name)
         elif chunk.type == "tool_use_delta":
@@ -239,6 +248,18 @@ class StreamAggregator:
             self._signature_parts[index] = []
         self._thinking_parts[index].append(chunk.thinking)
         self._signature_parts[index].append(chunk.signature)
+
+    def _append_redacted(self, chunk: StreamChunk) -> None:
+        """按 block_index 追加被遮蔽的思考数据；每个序号一个独立块。
+
+        data 是端点加密后的不透明串，**不做跨块拼接**——拼接后的值不是任何
+        合法签名，回传即被拒。
+        """
+        index = chunk.block_index
+        if index not in self._redacted_parts:
+            self._order.append(("redacted_thinking", str(index)))
+            self._redacted_parts[index] = []
+        self._redacted_parts[index].append(chunk.redacted_data)
 
     def _start_tool(self, tool_use_id: str, tool_name: str) -> None:
         if tool_use_id in self._tool_names:
@@ -284,6 +305,10 @@ class StreamAggregator:
                         thinking="".join(self._thinking_parts[int(key)]),
                         signature="".join(self._signature_parts[int(key)]) or None,
                     )
+                )
+            elif kind == "redacted_thinking":
+                blocks.append(
+                    RedactedThinkingBlock(data="".join(self._redacted_parts[int(key)]))
                 )
             elif kind == "tool_use":
                 blocks.append(self._build_tool_block(key))

@@ -243,19 +243,60 @@ class AnthropicProvider(BaseProvider):
     def _map_content_block_start(
         payload: dict, state: _AnthropicStreamState
     ) -> StreamChunk | None:
-        """content_block_start → tool_use_start；text/thinking 无需立即产出。"""
+        """content_block_start → 起止块对应事件（序号一并透传）。
+
+        四类起止块：
+        - ``tool_use`` → tool_use_start，并登记 index → (id, name) 供后续
+          input_json_delta 回填 tool_use_id
+        - ``text`` / ``thinking`` → 起止块**可能自带非空初始内容**（部分响应把首个
+          片段放在 start 里），须产出等价增量事件，否则该内容永久丢失。空串则不产出
+          事件（避免聚合出 text="" 的空块）
+        - ``redacted_thinking`` → 被遮蔽的思考块，必须原样回传，不产出即多轮报错
+        """
         block = payload.get("content_block") or {}
-        if block.get("type") != "tool_use":
-            return None
-        index = payload.get("index", 0)
-        tool_use_id = block.get("id", "")
-        tool_name = block.get("name", "")
-        state.tool_index[index] = (tool_use_id, tool_name)
-        return StreamChunk(
-            type="tool_use_start",
-            tool_use_id=tool_use_id,
-            tool_name=tool_name,
-        )
+        index = int(payload.get("index", 0) or 0)
+        btype = block.get("type")
+
+        if btype == "tool_use":
+            tool_use_id = block.get("id", "")
+            tool_name = block.get("name", "")
+            state.tool_index[index] = (tool_use_id, tool_name)
+            return StreamChunk(
+                type="tool_use_start",
+                tool_use_id=tool_use_id,
+                tool_name=tool_name,
+                block_index=index,
+            )
+
+        if btype == "text":
+            text = block.get("text", "") or ""
+            if not text:
+                return None
+            return StreamChunk(type="text_delta", text=text, block_index=index)
+
+        if btype == "thinking":
+            thinking = block.get("thinking", "") or ""
+            signature = block.get("signature", "") or ""
+            if not thinking and not signature:
+                return None
+            return StreamChunk(
+                type="thinking_delta",
+                thinking=thinking,
+                signature=signature,
+                block_index=index,
+            )
+
+        if btype == "redacted_thinking":
+            data = block.get("data", "") or ""
+            if not data:
+                return None
+            return StreamChunk(
+                type="redacted_thinking_delta",
+                redacted_data=data,
+                block_index=index,
+            )
+
+        return None
 
     @staticmethod
     def _map_content_block_stop(
@@ -279,20 +320,28 @@ class AnthropicProvider(BaseProvider):
         """content_block_delta → 对应增量事件；未知 delta 类型返回 None。"""
         delta = payload.get("delta") or {}
         dtype = delta.get("type")
+        # 序号透传：同一 content block 的增量须归入同一槽，交错块才不会互相压平
+        index = int(payload.get("index", 0) or 0)
         if dtype == "text_delta":
-            return StreamChunk(type="text_delta", text=delta.get("text", ""))
+            return StreamChunk(
+                type="text_delta", text=delta.get("text", ""), block_index=index
+            )
         if dtype == "thinking_delta":
             return StreamChunk(
-                type="thinking_delta", thinking=delta.get("thinking", "")
+                type="thinking_delta",
+                thinking=delta.get("thinking", ""),
+                block_index=index,
             )
         if dtype == "signature_delta":
             # thinking signature 增量：映射为 thinking_delta，仅填 signature 字段。
-            # 签名需完整拼接后随 thinking block 回传，否则多轮对话被端点拒绝。
+            # 签名需在同一 block_index 内完整拼接后随 thinking block 回传，否则多轮
+            # 对话被端点拒绝；跨块拼接则是非法值，故序号必须透传。
             return StreamChunk(
-                type="thinking_delta", signature=delta.get("signature", "")
+                type="thinking_delta",
+                signature=delta.get("signature", ""),
+                block_index=index,
             )
         if dtype == "input_json_delta":
-            index = payload.get("index", 0)
             tool_use_id = state.tool_index.get(index, ("", ""))[0]
             if not tool_use_id:
                 logger.warning(
@@ -302,6 +351,7 @@ class AnthropicProvider(BaseProvider):
                 type="tool_use_delta",
                 tool_use_id=tool_use_id,
                 partial_json=delta.get("partial_json", ""),
+                block_index=index,
             )
         logger.debug("忽略未知 content_block_delta 类型：%r", dtype)
         return None

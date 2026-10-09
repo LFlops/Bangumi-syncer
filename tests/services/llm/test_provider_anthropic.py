@@ -8,6 +8,7 @@ import pytest
 
 from app.services.llm.models import (
     Message,
+    RedactedThinkingBlock,
     StreamAggregator,
     TextBlock,
     ThinkingBlock,
@@ -381,6 +382,10 @@ def _block_delta(index: int, delta: dict) -> tuple[str, dict]:
     )
 
 
+def _block_stop(index: int) -> tuple[str, dict]:
+    return ("content_block_stop", {"type": "content_block_stop", "index": index})
+
+
 def _message_delta(
     stop_reason: str = "end_turn", output_tokens: int = 5
 ) -> tuple[str, dict]:
@@ -527,6 +532,181 @@ class TestAnthropicProviderStream:
         chunks, _ = await _collect_stream(_make_provider(), lines)
 
         assert not [c for c in chunks if c.type == "tool_use_stop"]
+
+
+class TestAnthropicBlockIndexAndInitialContent:
+    """content_block 的序号透传与起止块自带内容的保真映射。"""
+
+    @pytest.mark.asyncio
+    async def test_block_index_passthrough_on_deltas(self):
+        """content_block_delta 透传 wire 的 content block 序号。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "text", "text": ""}),
+            _block_delta(0, {"type": "text_delta", "text": "A"}),
+            _block_stop(0),
+            _block_start(1, {"type": "text", "text": ""}),
+            _block_delta(1, {"type": "text_delta", "text": "B"}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        text_chunks = [c for c in chunks if c.type == "text_delta"]
+        assert [c.block_index for c in text_chunks] == [0, 1]
+        assert [c.text for c in text_chunks] == ["A", "B"]
+
+    @pytest.mark.asyncio
+    async def test_redacted_thinking_block_preserved(self):
+        """redacted_thinking 起止块 → 产出 redacted_thinking_delta，携带原始 data。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "redacted_thinking", "data": "ENCRYPTED"}),
+            _block_stop(0),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        redacted = [c for c in chunks if c.type == "redacted_thinking_delta"]
+        assert len(redacted) == 1
+        assert redacted[0].redacted_data == "ENCRYPTED"
+        assert redacted[0].block_index == 0
+
+        # 必须能还原成可回传的块，否则多轮对话被端点拒绝
+        resp = _aggregate(chunks)
+        blocks = [b for b in resp.blocks if isinstance(b, RedactedThinkingBlock)]
+        assert len(blocks) == 1
+        assert blocks[0].data == "ENCRYPTED"
+
+    @pytest.mark.asyncio
+    async def test_initial_text_in_block_start_preserved(self):
+        """起止块自带的非空初始文本不被丢弃。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "text", "text": "开头文本"}),
+            _block_delta(0, {"type": "text_delta", "text": "后续"}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        text_chunks = [c for c in chunks if c.type == "text_delta"]
+        assert [c.text for c in text_chunks] == ["开头文本", "后续"]
+        assert all(c.block_index == 0 for c in text_chunks)
+
+        resp = _aggregate(chunks)
+        assert resp.blocks[0].text == "开头文本后续"
+        assert resp.content == "开头文本后续"
+
+    @pytest.mark.asyncio
+    async def test_initial_thinking_and_signature_in_block_start_preserved(self):
+        """起止块自带的初始 thinking / signature 不被丢弃。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(
+                0, {"type": "thinking", "thinking": "已在start", "signature": "sig-0"}
+            ),
+            _block_delta(0, {"type": "thinking_delta", "thinking": "补充"}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        think_chunks = [c for c in chunks if c.type == "thinking_delta"]
+        assert [c.thinking for c in think_chunks] == ["已在start", "补充"]
+        assert [c.signature for c in think_chunks] == ["sig-0", ""]
+
+        resp = _aggregate(chunks)
+        block = resp.blocks[0]
+        assert isinstance(block, ThinkingBlock)
+        assert block.thinking == "已在start补充"
+        assert block.signature == "sig-0"
+
+    @pytest.mark.asyncio
+    async def test_empty_initial_text_produces_no_event(self):
+        """起止块初始文本为空串时不产出空事件（避免污染 blocks）。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "text", "text": ""}),
+            _message_delta(output_tokens=2),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        assert [c for c in chunks if c.type == "text_delta"] == []
+        assert _aggregate(chunks).blocks == []
+
+    @pytest.mark.asyncio
+    async def test_interleaved_blocks_keep_order_end_to_end(self):
+        """端到端：文本 → 工具调用 → 文本，blocks 顺序与 wire 一致。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "text", "text": "先说一句"}),
+            _block_delta(0, {"type": "text_delta", "text": "。"}),
+            _block_stop(0),
+            _block_start(
+                1, {"type": "tool_use", "id": "toolu_1", "name": "get_weather"}
+            ),
+            _block_delta(
+                1, {"type": "input_json_delta", "partial_json": '{"city":"X"}'}
+            ),
+            _block_stop(1),
+            _block_start(2, {"type": "text", "text": "调用后再说"}),
+            _block_stop(2),
+            _message_delta(stop_reason="tool_use", output_tokens=8),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        resp = _aggregate(chunks)
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "TextBlock",
+            "ToolUseBlock",
+            "TextBlock",
+        ]
+        assert resp.blocks[0].text == "先说一句。"
+        assert resp.blocks[1].id == "toolu_1"
+        assert resp.blocks[2].text == "调用后再说"
+        assert resp.content == "先说一句。调用后再说"
+
+    @pytest.mark.asyncio
+    async def test_two_thinking_blocks_keep_separate_signatures(self):
+        """两段 thinking 各自签名不被拼接（否则端点签名校验失败）。"""
+        lines = _sse_lines(
+            _message_start(),
+            _block_start(0, {"type": "thinking", "thinking": "思1"}),
+            _block_delta(0, {"type": "signature_delta", "signature": "sig-1"}),
+            _block_stop(0),
+            _block_start(
+                1, {"type": "tool_use", "id": "toolu_1", "name": "get_weather"}
+            ),
+            _block_delta(1, {"type": "input_json_delta", "partial_json": "{}"}),
+            _block_stop(1),
+            _block_start(2, {"type": "thinking", "thinking": "思2"}),
+            _block_delta(2, {"type": "signature_delta", "signature": "sig-2"}),
+            _block_stop(2),
+            _message_delta(stop_reason="tool_use", output_tokens=8),
+            ("message_stop", {"type": "message_stop"}),
+        )
+        chunks, _ = await _collect_stream(_make_provider(), lines)
+
+        resp = _aggregate(chunks)
+
+        assert [type(b).__name__ for b in resp.blocks] == [
+            "ThinkingBlock",
+            "ToolUseBlock",
+            "ThinkingBlock",
+        ]
+        assert resp.blocks[0].signature == "sig-1"
+        assert resp.blocks[2].signature == "sig-2"
+        assert resp.blocks[0].thinking == "思1"
+        assert resp.blocks[2].thinking == "思2"
+
+
+class TestAnthropicUsageAndStop:
+    """usage / stop_reason 映射（原 TestAnthropicProviderStream 后半段）。"""
 
     @pytest.mark.asyncio
     async def test_usage_merges_input_and_output_tokens(self):
