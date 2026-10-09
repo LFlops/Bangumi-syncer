@@ -473,6 +473,22 @@ class DatabaseConnection:
                 f"agent_runs 已迁移：{cursor.rowcount} 条 applied/rejected 收敛为 succeeded"
             )
 
+    def _migrate_agent_run_no_suggestion(self, cursor) -> None:
+        """旧库迁移：``no_suggestion`` 终态收敛为 ``succeeded``。
+
+        「成功结束但未产出建议」不再是独立终态（它就是 succeeded，差异由
+        ``stop_reason`` 承载）。遗留行必须迁移，否则既不在终态集合内
+        （``cleanup_expired`` 清不掉、留孤儿行），也不在活性态内（不会被恢复扫描
+        捞起）—— 处于两不管的死状态。幂等：首次迁移后重复执行影响 0 行。
+        """
+        cursor.execute(
+            "UPDATE agent_runs SET status='succeeded' WHERE status='no_suggestion'"
+        )
+        if cursor.rowcount > 0:
+            logger.info(
+                f"agent_runs 已迁移：{cursor.rowcount} 条 no_suggestion 收敛为 succeeded"
+            )
+
     def _ensure_sync_records_account_results(self, cursor) -> None:
         """旧库迁移：为 sync_records 增加 account_results（各 Bangumi 账号的同步结果）。
 
@@ -729,7 +745,7 @@ class DatabaseConnection:
         self._ensure_pending_sync_queue_sync_record_id(cursor)
 
         # Agent 通用会话表：agent_runs（一次会话状态机）+ agent_steps（span 可重放日志）
-        # status 枚举：pending/processing/succeeded/no_suggestion/failed/cancelled
+        # status 枚举：pending/processing/succeeded/failed/cancelled
         # （applied/rejected 已移除，用户处理结果由 pending_candidates 承载；
         #   exhausted 仅作 stop_reason，不作 status）
         # 时间列统一 epoch 秒整数（写入方显式写入，DEFAULT 0 占位）。
@@ -920,6 +936,7 @@ class DatabaseConnection:
 
         # 旧库迁移：applied/rejected 业务特化终态收敛为 succeeded（幂等）
         self._migrate_agent_run_terminal_statuses(cursor)
+        self._migrate_agent_run_no_suggestion(cursor)
 
         # 一次性数据迁移：加密历史明文 token（仓储层已改为写入即加密）
         self._ensure_tokens_encrypted(cursor)

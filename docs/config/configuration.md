@@ -49,7 +49,7 @@ order: 30
 - **调度周期（内部机制）**：LLM 匹配任务默认每分钟执行一次（cron `*/1 * * * *`），由内部调度器统一管理，用户无需在界面配置。如需高级调优，可通过环境变量 `LLM_MATCH_CRON` 覆盖（如 `LLM_MATCH_CRON="*/5 * * * *"`）。
 - **结果保留天数（llm_match_retention_days）**：LLM 匹配结果在数据库中保留天数，默认 30 天。
 - **最大迭代次数（llm_match_max_iterations）**：单次 LLM 匹配的最大循环轮次。留空（默认）时按思考开关自动映射（见下方）；填写正整数时显式覆盖。
-- **业务键去重（business_key）**：同一用户、同一剧集（归一化标题 + 季）只保留一个在途评估，键为 `{task_type}|{user}|{normalized_title}|{season}`，来源（`source` / `retry-*`）不参与身份判定。最新 run 为 `failed` 时按同键失败行累计 `total_attempts` 判断：未达上限（`MATCH_ASSIST_MAX_TOTAL_ATTEMPTS=10`）则每次新建 run 重试，达上限则 `exhausted` 不再入队。最新 run 为 `succeeded` / `no_suggestion` 时按候选子状态复用、不重复调用 LLM：用户已接受且映射仍有效 → `reuse_accepted`（不限时间）；候选待审 → `reuse_holding`（无限期）；用户已拒绝且在处理窗口（`MATCH_ASSIST_REUSE_WINDOW_DAYS=30` 天）内 → `reuse_holding`，出窗则重新评估。
+- **业务键去重（business_key）**：同一用户、同一剧集（归一化标题 + 季）只保留一个在途评估，键为 `{task_type}|{user}|{normalized_title}|{season}`，来源（`source` / `retry-*`）不参与身份判定。最新 run 为 `failed` 时按同键失败行累计 `total_attempts` 判断：未达上限（`MATCH_ASSIST_MAX_TOTAL_ATTEMPTS=10`）则每次新建 run 重试，达上限则 `exhausted` 不再入队。最新 run 为 `succeeded` 时（含「无建议」这类成功结束）按候选子状态复用、不重复调用 LLM：用户已接受且映射仍有效 → `reuse_accepted`（不限时间）；候选待审 → `reuse_holding`（无限期）；用户已拒绝且在处理窗口（`MATCH_ASSIST_REUSE_WINDOW_DAYS=30` 天）内 → `reuse_holding`，出窗则重新评估。
 - **恢复超时（llm_match_recovery_timeout_s）**：LLM 匹配恢复超时秒数，默认 120 秒。
 - **思考开关（llm_match_thinking_level）**：可选 `off` / `low` / `medium` / `high`，默认 `medium`。该字段同时控制两个维度：
   - **Agent 循环轮次**：`off`→1 / `low`→2 / `medium`→3 / `high`→5；若设置了 `llm_match_max_iterations` 则显式覆盖轮次上限。

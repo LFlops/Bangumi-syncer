@@ -132,7 +132,7 @@ def test_continue_run_terminal_stop_without_tool_call_degrades_to_exhausted(
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
-    assert run["status"] == "no_suggestion"
+    assert run["status"] == "succeeded"
     assert run["stop_reason"] == "exhausted"
     assert hooks.terminal_calls == [], "空建议不得传给 handle_terminal"
     warns = [line for level, line in log_records if level == "WARNING"]
@@ -158,7 +158,7 @@ def test_continue_run_terminal_stop_without_matching_tool_call_degrades_to_exhau
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
-    assert run["status"] == "no_suggestion"
+    assert run["status"] == "succeeded"
     assert run["stop_reason"] == "exhausted"
     assert hooks.terminal_calls == []
 
@@ -281,16 +281,16 @@ def test_continue_run_unknown_stop_reason_with_content_is_end_turn(
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
-    assert run["status"] == "no_suggestion"
+    assert run["status"] == "succeeded"
     assert run["stop_reason"] == "end_turn"
-    # end_turn 不经 handle_terminal（与既有直落 mark_no_suggestion 语义一致）
+    # end_turn 不经 handle_terminal（与既有直落 mark_succeeded 语义一致）
     assert hooks.terminal_calls == []
 
 
-def test_continue_run_end_turn_still_marks_no_suggestion(
+def test_continue_run_end_turn_still_marks_succeeded(
     dbm: DatabaseManager,
 ):
-    """正常 end_turn 路径零回归：直接 mark_no_suggestion，不调 LLM/不 handle_terminal。"""
+    """正常 end_turn 路径零回归：直接 mark_succeeded，不调 LLM/不 handle_terminal。"""
     run_id = "run-end-turn"
     _write_seed(dbm, run_id)
     _write_llm_chat(dbm, run_id, 0, [], stop_reason="end_turn", content="无建议")
@@ -300,6 +300,6 @@ def test_continue_run_end_turn_still_marks_no_suggestion(
 
     run = dbm.agent_runs.get_run(run_id)
     assert run is not None
-    assert run["status"] == "no_suggestion"
+    assert run["status"] == "succeeded"
     assert run["stop_reason"] == "end_turn"
     assert hooks.terminal_calls == []

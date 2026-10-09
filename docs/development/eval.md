@@ -49,6 +49,8 @@ eval/
 - `scenario`：输入形态分类，取值对齐 `scripts/gen_golden_cases.py` 的 `SCENARIOS`
   （见下节），用于报告聚合与扩集查漏补缺；`tags` 保留自定义细分标注。
 - `expect_stop`：`submit_suggestion`（应给出建议）或 `no_suggestion`（负样本）。
+  > 用例规格词汇，与 `agent_runs.status` 无关：状态机已把「无建议」收敛为 `succeeded`，
+  > 差异由 `stop_reason`（如 `give_up`）承载。
 - 案例来源建议：GitHub issues 中的匹配错误报告（输入 + 正确条目号），标注后用
   Bangumi API 校验 `subject_id` 存在性与标题吻合。
 
@@ -191,7 +193,7 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
 2. **thinking 模型兼容**：thinking 块需随 tool_use 回传；thinking 模式拒绝强制
    `tool_choice` → loop 保留响应块 + client/provider 三层降级（`auto`）。
 
-遗留问题（恢复路径 thinking 回传、no_suggestion 的 tokens 口径、预算调优等）
+遗留问题（恢复路径 thinking 回传、无建议场景的 tokens 口径、预算调优等）
 见项目内部归档（`remain/eval_round1_findings.md`）。
 
 ### 扩集后（2026-09-20，10 条案例，flash · medium=5 轮）
@@ -206,7 +208,7 @@ EVAL_LLM_API_KEY=... uv run python eval/run_eval.py --mode live --all --judge
 
 - 实施「放弃协议（`give_up`）+ 终止提交软护栏（veto 一次）+ 收尾 prompt 强化」后重录：
   **20/21 命中**（此前 18/21）；
-- **m011/m012 转为明确放弃**（`no_suggestion`、不落库、不通知）——搜索充分性明显提升
+- **m011/m012 转为明确放弃**（`succeeded(stop_reason=give_up)`、不落库、不通知）——搜索充分性明显提升
   （m012 尝试 4 组关键词后放弃），且是**直接 `give_up`**（veto 未触发，护栏作为兜底保留）；
 - 18 条正向**零误伤**（veto 词表预检 + 实测均未触发）；
 - 遗留：m013「剧场版 高达」（未识别歧义型——理由中无不确定表述，需更强的歧义检测，非本机制覆盖）。

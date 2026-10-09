@@ -993,12 +993,12 @@ async def test_run_no_candidate_full_link_search_then_submit(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# submit_suggestion subject_id 非法 → no_suggestion + last_error
+# submit_suggestion subject_id 非法 → succeeded + last_error（无建议也是 succeeded）
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
+async def test_run_submit_invalid_subject_id_succeeded_without_suggestion(monkeypatch):
     run_id = "run-m15"
     sr_id = 4
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1030,9 +1030,9 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
         span_recorder=None,
     )
 
-    assert status == "no_suggestion"
+    assert status == "succeeded"
     run_row = _run_row(run_id)
-    assert run_row["status"] == "no_suggestion"
+    assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "submit_suggestion"
     assert "非法" in (run_row["last_error"] or "")
 
@@ -1044,12 +1044,12 @@ async def test_run_submit_invalid_subject_id_no_suggestion(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 工具执行失败（bgm.search 抛错）→ 循环继续 → 最终 no_suggestion
+# 工具执行失败（bgm.search 抛错）→ 循环继续 → 最终 succeeded(exhausted)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
+async def test_run_tool_execution_failure_leads_to_succeeded(monkeypatch):
     run_id = "run-m25"
     sr_id = 5
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1089,9 +1089,9 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
         span_recorder=None,
     )
 
-    assert status == "no_suggestion"
+    assert status == "succeeded"
     run_row = _run_row(run_id)
-    assert run_row["status"] == "no_suggestion"
+    assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "exhausted"
     # 既有候选行未被 LLM 改写
     row = _read_candidate(sr_id)
@@ -1100,7 +1100,7 @@ async def test_run_tool_execution_failure_leads_to_no_suggestion(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 耗尽兜底：exhausted + 文本 JSON → 成功落库；文本无 JSON → no_suggestion
+# 耗尽兜底：exhausted + 文本 JSON → 成功落库；文本无 JSON → succeeded(exhausted)
 # ---------------------------------------------------------------------------
 
 
@@ -1148,7 +1148,7 @@ async def test_run_exhausted_with_json_fallback_succeeds(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
+async def test_run_exhausted_without_json_succeeded(monkeypatch):
     run_id = "run-exh-bad"
     sr_id = 7
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -1180,7 +1180,7 @@ async def test_run_exhausted_without_json_no_suggestion(monkeypatch):
         span_recorder=None,
     )
 
-    assert status == "no_suggestion"
+    assert status == "succeeded"
     run_row = _run_row(run_id)
     assert run_row["stop_reason"] == "exhausted"
 
@@ -2836,8 +2836,8 @@ async def test_handle_result_max_tokens_marks_failed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_result_end_turn_still_no_suggestion(monkeypatch):
-    """_handle_result 对 stop_reason='end_turn' 仍落 no_suggestion（语义不变）。"""
+async def test_handle_result_end_turn_still_succeeded(monkeypatch):
+    """_handle_result 对 stop_reason='end_turn' 仍落 succeeded（语义不变）。"""
     from unittest.mock import MagicMock
 
     from app.services.agent.loop import RunResult
@@ -2856,15 +2856,15 @@ async def test_handle_result_end_turn_still_no_suggestion(monkeypatch):
         total_tokens=321,
     )
 
-    assert status == "no_suggestion"
-    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+    assert status == "succeeded"
+    dbm.agent_runs.mark_succeeded.assert_called_once_with(
         "run-end-turn", stop_reason="end_turn", total_tokens=321
     )
 
 
 @pytest.mark.asyncio
 async def test_handle_result_invalid_subject_id_passes_total_tokens(monkeypatch):
-    """submit 校验失败落 no_suggestion 时透传全轮累计 total_tokens。"""
+    """submit 校验失败落 succeeded 时透传全轮累计 total_tokens。"""
     from unittest.mock import MagicMock
 
     from app.services.agent.loop import RunResult
@@ -2889,8 +2889,8 @@ async def test_handle_result_invalid_subject_id_passes_total_tokens(monkeypatch)
         total_tokens=88,
     )
 
-    assert status == "no_suggestion"
-    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+    assert status == "succeeded"
+    dbm.agent_runs.mark_succeeded.assert_called_once_with(
         "run-invalid-sid",
         stop_reason="submit_suggestion",
         last_error="subject_id 非法",
@@ -2899,8 +2899,8 @@ async def test_handle_result_invalid_subject_id_passes_total_tokens(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_handle_result_exhausted_no_suggestion_passes_total_tokens(monkeypatch):
-    """exhausted 且兜底解析无建议时落 no_suggestion 并透传 total_tokens。"""
+async def test_handle_result_exhausted_passes_total_tokens(monkeypatch):
+    """exhausted 且兜底解析无建议时落 succeeded 并透传 total_tokens。"""
     from unittest.mock import MagicMock
 
     from app.services.agent.loop import RunResult
@@ -2922,8 +2922,8 @@ async def test_handle_result_exhausted_no_suggestion_passes_total_tokens(monkeyp
         total_tokens=99,
     )
 
-    assert status == "no_suggestion"
-    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+    assert status == "succeeded"
+    dbm.agent_runs.mark_succeeded.assert_called_once_with(
         "run-exhausted",
         stop_reason="exhausted",
         last_error="无建议",
@@ -3054,8 +3054,8 @@ def _medium_cfg(raw_max: str = "") -> dict:
 # end_turn 分派 ---------------------------------------------------------
 
 
-def test_continue_run_end_turn_marks_no_suggestion_without_llm():
-    """last_response=end_turn → 直接 mark_no_suggestion，不调 LLM（loop_run）。"""
+def test_continue_run_end_turn_marks_succeeded_without_llm():
+    """last_response=end_turn → 直接 mark_succeeded，不调 LLM（loop_run）。"""
     repo = _make_continuation_repo()
     rr = _make_replay_result(
         executed=1,
@@ -3079,7 +3079,7 @@ def test_continue_run_end_turn_marks_no_suggestion_without_llm():
             )
         )
 
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r", stop_reason="end_turn", total_tokens=222
     )
     loop.assert_not_awaited()
@@ -3367,8 +3367,8 @@ def test_continue_run_positive_config_override_is_passed_through():
 # 预算耗尽必须落终态 -----------------------------------------------------
 
 
-def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
-    """tool_use 补执行后 remaining<=0 → 落 no_suggestion/exhausted，不续跑。"""
+def test_continue_run_tool_use_no_remaining_marks_succeeded():
+    """tool_use 补执行后 remaining<=0 → 落 succeeded(exhausted)，不续跑。"""
     repo = _make_continuation_repo()
     missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
     rr = _make_replay_result(
@@ -3403,12 +3403,12 @@ def test_continue_run_tool_use_no_remaining_marks_no_suggestion():
     # 不再续跑 loop，但必须落终态（否则 run 永久 processing）
     loop.assert_not_awaited()
     backfill.assert_not_awaited()
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r", stop_reason="exhausted", total_tokens=111
     )
 
 
-def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
+def test_continue_run_no_remaining_before_replay_marks_succeeded():
     """replay 后剩余轮次已耗尽（remaining<=0）同样必须落终态。"""
     repo = _make_continuation_repo()
     rr = _make_replay_result(
@@ -3435,7 +3435,7 @@ def test_continue_run_no_remaining_before_replay_marks_no_suggestion():
         )
 
     loop.assert_not_awaited()
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r", stop_reason="exhausted", total_tokens=333
     )
 
@@ -3463,7 +3463,7 @@ def test_continue_run_replay_exhausted_logs_warning():
             )
         )
 
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r", stop_reason="exhausted", total_tokens=444
     )
     warnings = [str(c.args[0]) for c in log.warning.call_args_list]
@@ -3520,12 +3520,12 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
     result_arg = handle.call_args[0][2]
     assert result_arg.stop_reason == "submit_suggestion"
     assert result_arg.suggestion == {"subject_id": "123", "reason": "末轮已提交"}
-    repo.mark_no_suggestion.assert_not_called()
+    repo.mark_succeeded.assert_not_called()
     loop.assert_not_awaited()
 
 
-def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn():
-    """remaining==0 + last_response 为 end_turn → mark_no_suggestion('end_turn')。"""
+def test_continue_run_zero_remaining_with_end_turn_marks_succeeded_end_turn():
+    """remaining==0 + last_response 为 end_turn → mark_succeeded('end_turn')。"""
     repo = _make_continuation_repo()
     rr = _make_replay_result(
         executed=5,  # medium=5 → remaining=0
@@ -3550,7 +3550,7 @@ def test_continue_run_zero_remaining_with_end_turn_marks_no_suggestion_end_turn(
             )
         )
 
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r", stop_reason="end_turn", total_tokens=55
     )
     loop.assert_not_awaited()
@@ -3589,7 +3589,7 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
             )
         )
 
-    repo.mark_no_suggestion.assert_called_once_with(
+    repo.mark_succeeded.assert_called_once_with(
         "r2", stop_reason="exhausted", total_tokens=66
     )
     warnings = [str(c.args[0]) for c in log.warning.call_args_list]
@@ -4073,7 +4073,7 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
 
 
 def test_continue_run_recovery_no_double_llm_call(monkeypatch):
-    """崩溃前 1 次 + 恢复后 1 次 → 累计 LLM 调用 2，run 落 no_suggestion。"""
+    """崩溃前 1 次 + 恢复后 1 次 → 累计 LLM 调用 2，run 落 succeeded。"""
     run_id = "run-continue-m22"
     sr_id = 992
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -4139,7 +4139,7 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
         f"期望累计 2 次 LLM 调用，实际 {response_fn.call_count}"
     )
     run_row = _run_row(run_id)
-    assert run_row["status"] == "no_suggestion"
+    assert run_row["status"] == "succeeded"
 
 
 # 恢复续跑写 chat span + thinking_level 透传 -------------------------
@@ -4427,7 +4427,7 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     # 模拟二次崩溃：改回 processing
     database_manager.agent_runs.update_run_status(run_id, "processing")
 
-    # 第二次恢复（应直接 mark_no_suggestion，无额外 LLM 调用）
+    # 第二次恢复（应直接 mark_succeeded，无额外 LLM 调用）
     await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     assert chat_calls["n"] == 2, (
@@ -5001,7 +5001,7 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
 
     def _capture(*args, **kwargs):
         seen["ident"] = threading.get_ident()
-        return "no_suggestion"
+        return "succeeded"
 
     with (
         patch("app.services.agent.trace.replay", return_value=rr),
@@ -5108,10 +5108,10 @@ def test_match_veto_terminal_passes_give_up_and_missing_reason():
     assert llm_assist._match_veto_terminal({"subject_id": "1"}) is None
 
 
-def test_handle_result_give_up_marks_no_suggestion_without_persist_or_notify(
+def test_handle_result_give_up_marks_succeeded_without_persist_or_notify(
     monkeypatch,
 ):
-    """give_up=true → no_suggestion/give_up，不落库、不通知、不校验 subject_id。"""
+    """give_up=true → succeeded/give_up，不落库、不通知、不校验 subject_id。"""
     from unittest.mock import MagicMock
 
     from app.services.agent.loop import RunResult
@@ -5144,8 +5144,8 @@ def test_handle_result_give_up_marks_no_suggestion_without_persist_or_notify(
         total_tokens=42,
     )
 
-    assert status == "no_suggestion"
-    dbm.agent_runs.mark_no_suggestion.assert_called_once_with(
+    assert status == "succeeded"
+    dbm.agent_runs.mark_succeeded.assert_called_once_with(
         "run-give-up", stop_reason="give_up", total_tokens=42
     )
     assert persist_spy.call_count == 0
@@ -5182,12 +5182,12 @@ def test_handle_result_give_up_false_takes_normal_submit_path(monkeypatch):
 
     assert status == "succeeded"
     assert persist_spy.call_count == 1
-    dbm.agent_runs.mark_no_suggestion.assert_not_called()
+    dbm.agent_runs.mark_succeeded.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeypatch):
-    """端到端：不确定 submit 被 veto → 下一轮 give_up → 终态 no_suggestion。"""
+async def test_run_uncertain_reason_veto_then_give_up_ends_succeeded(monkeypatch):
+    """端到端：不确定 submit 被 veto → 下一轮 give_up → 终态 succeeded(give_up)。"""
     run_id = "run-veto-giveup"
     sr_id = 7711
     database_manager.agent_runs.create_pending(run_id, "match", sr_id)
@@ -5227,9 +5227,9 @@ async def test_run_uncertain_reason_veto_then_give_up_ends_no_suggestion(monkeyp
         span_recorder=None,
     )
 
-    assert status == "no_suggestion"
+    assert status == "succeeded"
     run_row = _run_row(run_id)
-    assert run_row["status"] == "no_suggestion"
+    assert run_row["status"] == "succeeded"
     assert run_row["stop_reason"] == "give_up"
     ns.notify.assert_not_called()
     assert _read_candidate(sr_id) is None, "give_up 不应落库任何候选"

@@ -846,16 +846,16 @@ def _handle_result(
     if stop == "submit_suggestion":
         suggestion = result.suggestion or {}
         if suggestion.get("give_up"):
-            # 放弃协议：模型明确放弃 → 不落库、不通知，直接记 no_suggestion。
+            # 放弃协议：模型明确放弃 → 不落库、不通知，直接记 succeeded(stop_reason='give_up')。
             # 这是被鼓励的正确终态（好于提交不确定的推荐），reason 仅作观测。
             logger.info(
                 f"[llm_assist] run {run_id} LLM 明确放弃（give_up）："
                 f"{str(suggestion.get('reason', '') or '')[:200]}"
             )
-            dbm.agent_runs.mark_no_suggestion(
+            dbm.agent_runs.mark_succeeded(
                 run_id, stop_reason="give_up", total_tokens=total_tokens
             )
-            return "no_suggestion"
+            return "succeeded"
         sid = str(suggestion.get("subject_id", "") or "")
         reason = str(suggestion.get("reason", "") or "")
         ok, err = _validate_subject_id(sid)
@@ -874,14 +874,14 @@ def _handle_result(
             )
             # 竞态跳过（候选已被用户处理）时返回空串，与正常 succeeded 区分
             return "succeeded" if persisted else ""
-        # 校验失败：不落库，标记 no_suggestion + last_error
-        dbm.agent_runs.mark_no_suggestion(
+        # 校验失败：不落库，标记 succeeded + last_error（诊断信息）
+        dbm.agent_runs.mark_succeeded(
             run_id,
             stop_reason="submit_suggestion",
             last_error=err,
             total_tokens=total_tokens,
         )
-        return "no_suggestion"
+        return "succeeded"
 
     if stop == "exhausted":
         # 耗尽兜底：解析最后响应文本
@@ -904,16 +904,16 @@ def _handle_result(
                 )
                 return "succeeded" if persisted else ""
             perr = verr
-        dbm.agent_runs.mark_no_suggestion(
+        dbm.agent_runs.mark_succeeded(
             run_id,
             stop_reason="exhausted",
             last_error=perr or "无建议",
             total_tokens=total_tokens,
         )
-        return "no_suggestion"
+        return "succeeded"
 
     if stop in ("llm_error", "max_tokens"):
-        # LLM 调用失败 / 生成长度超限 → 显式标记 failed（不再伪装 no_suggestion）
+        # LLM 调用失败 / 生成长度超限 → 显式标记 failed（不再伪装 succeeded）
         dbm.agent_runs.mark_failed(
             run_id,
             stop_reason=stop,
@@ -923,10 +923,10 @@ def _handle_result(
         return "failed"
 
     # end_turn：直接终止，无建议
-    dbm.agent_runs.mark_no_suggestion(
+    dbm.agent_runs.mark_succeeded(
         run_id, stop_reason="end_turn", total_tokens=total_tokens
     )
-    return "no_suggestion"
+    return "succeeded"
 
 
 def _persist_and_notify(

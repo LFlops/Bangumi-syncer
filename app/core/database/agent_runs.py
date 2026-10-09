@@ -1,7 +1,7 @@
 """Agent 通用会话仓库（agent_runs / agent_steps / agent_run_sync_records）
 
 承载通用 Agent 会话状态机与可重放 span 日志：
-- agent_runs：一次会话（pending -> processing -> succeeded / no_suggestion / failed ...）
+- agent_runs：一次会话（pending -> processing -> succeeded / failed / cancelled）
 - agent_steps：每轮 LLM 调用 / 每次工具执行的 span
   （按 iteration, sequence, id 排序）
 - agent_run_sync_records：run ↔ sync_record 关联（多对一：N 条集级 record 关联 1 个剧集级 run）
@@ -17,7 +17,7 @@
 关键并发与守卫语义：
 - atomic_claim：原子 UPDATE `WHERE status='pending'`，受影响行数=0 视为抢占失败
 - increment_attempts：调度轮次失败计数，>=3 单点置 failed（同事务携带 last_error）
-- mark_failed / mark_succeeded / mark_no_suggestion：状态守卫 first-wins
+- mark_failed / mark_succeeded：状态守卫 first-wins
   （仅 pending/processing 可转终态，非活性态 rowcount=0 → 返回 False，不覆盖先到终态）
 - refresh_started_at：ts 为空/非正值取当前时间（保证 started_at>0 可被恢复扫描拾取）
 - enqueue_match_run：单事务内完成 created / in_flight / 复用 / exhausted 决策；
@@ -37,9 +37,10 @@ from ..logging import logger
 from .base_repository import BaseRepository
 
 # 终态：除 pending / processing 外的全部状态（业务无关，不含 applied/rejected）
+# 「成功结束但未产出建议」（预算耗尽 / 校验失败 / 明确放弃）**不是独立终态**：
+# 它就是 succeeded，差异由 stop_reason 承载、诊断信息由 last_error 承载。
 _TERMINAL_STATUSES = (
     "succeeded",
-    "no_suggestion",
     "failed",
     "cancelled",
 )
@@ -108,7 +109,7 @@ def apply_cancelled(conn, run_id: str, *, stop_reason: str) -> bool:
 
     供已持有写锁/在事务内执行的调用方直接调用（**不二次取锁**，避免
     ``_run_write`` 嵌套写锁）。守卫为活性态 ``pending`` / ``processing``，
-    非活性态（succeeded / no_suggestion / failed / 已 cancelled）返回 False，
+    非活性态（succeeded / failed / 已 cancelled）返回 False，
     原值不变；``ended_at`` 写 ``_now()``（epoch 秒，与其它终态口径一致）。
 
     返回是否真正改写（受影响行数 > 0）。
@@ -129,27 +130,34 @@ def apply_succeeded(
     run_id: str,
     *,
     stop_reason: str,
-    total_tokens: int,
+    last_error: str = "",
+    total_tokens: int = 0,
     ended_at: int | None = None,
 ) -> bool:
     """事务内 succeeded 写入口：SQL 与源状态守卫与 mark_succeeded 完全相同。
 
     供已持有写锁/在事务内执行的调用方直接调用（**不二次取锁**，避免
     ``_run_write`` 嵌套写锁）。守卫为活性态 ``pending`` / ``processing``，
-    非活性态（no_suggestion / failed / cancelled / 已 succeeded）返回 False，
+    非活性态（failed / cancelled / 已 succeeded）返回 False，
     原值不变；``ended_at`` 缺省取 ``_now()``（epoch 秒，与其它终态口径一致），
     显式传入时按调用方时钟写入（供与候选写入同事务的场景统一时间基准）。
+
+    ``last_error`` 仅承载**诊断信息**（如「建议校验未通过的原因」），不影响
+    ``succeeded`` 判定 —— 「成功结束但无建议」不是独立终态，差异由 ``stop_reason``
+    表达（如 ``exhausted`` / ``give_up`` / ``end_turn``）。
 
     返回是否真正改写（受影响行数 > 0）。
     """
     cursor = conn.execute(
         """
         UPDATE agent_runs
-        SET status='succeeded', stop_reason=?, total_tokens=?, ended_at=?
+        SET status='succeeded', stop_reason=?, last_error=?,
+            total_tokens=?, ended_at=?
         WHERE run_id=? AND status IN ('pending','processing')
         """,
         (
             stop_reason,
+            last_error,
             total_tokens,
             _now() if ended_at is None else ended_at,
             run_id,
@@ -212,7 +220,7 @@ class AgentRunsRepository(BaseRepository):
         - 最新 run pending/processing → ``in_flight``（返回已有 run_id）
         - 最新 run failed → 累计失败 = SUM(total_attempts)（同键 failed 行）：
           < max_total_attempts → 新建 ``created``；≥ 上限 → ``exhausted``（不写库）
-        - 最新 run succeeded/no_suggestion → 按候选子状态复用：
+        - 最新 run succeeded（含「无建议」这类成功结束的情况）→ 按候选子状态复用：
           * confirmed + accepted_mapping_valid → ``reuse_accepted``（不限时间）
           * pending → ``reuse_holding``（无限期）
           * rejected 且 resolved_at 在保留窗口内 → ``reuse_holding``
@@ -305,7 +313,7 @@ class AgentRunsRepository(BaseRepository):
                     )
                 return
 
-            if status in ("succeeded", "no_suggestion"):
+            if status == "succeeded":
                 reuse_decision = self._decide_reuse_from_candidate(
                     conn,
                     business_key,
@@ -444,12 +452,22 @@ class AgentRunsRepository(BaseRepository):
         )
 
     def mark_succeeded(
-        self, run_id: str, stop_reason: str = "", total_tokens: int = 0
+        self,
+        run_id: str,
+        stop_reason: str = "",
+        last_error: str = "",
+        total_tokens: int = 0,
     ) -> bool:
-        """标记成功（产出建议并通过校验），记录终态时间。
+        """标记 run 成功结束（终态），记录终态时间。
+
+        「产出建议并通过校验」与「成功结束但无建议」（预算耗尽 / 校验失败 /
+        明确放弃）**同为 succeeded**：终态只回答「这次 run 结束了吗」，差异由
+        ``stop_reason``（``exhausted`` / ``give_up`` / ``end_turn`` /
+        ``submit_suggestion`` 等）承载，诊断信息由 ``last_error`` 承载。
+        不再存在独立的 ``no_suggestion`` 终态。
 
         **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 succeeded；
-        对 ``no_suggestion`` / ``failed`` / ``cancelled`` / 已 ``succeeded``
+        对 ``failed`` / ``cancelled`` / 已 ``succeeded``
         等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
 
         守卫为 first-wins：双跑 / 超时取消后恢复续跑与原执行者竞态时，
@@ -459,50 +477,21 @@ class AgentRunsRepository(BaseRepository):
         本方法在其外层保留 ``_run_write`` 取锁与错误消息。
         """
 
-        def _write(conn):
-            return apply_succeeded(
-                conn, run_id, stop_reason=stop_reason, total_tokens=total_tokens
-            )
-
-        return self._run_write(
-            _write, error_msg="标记 agent_run succeeded 失败", default=False
-        )
-
-    def mark_no_suggestion(
-        self,
-        run_id: str,
-        stop_reason: str = "",
-        last_error: str = "",
-        total_tokens: int = 0,
-    ) -> bool:
-        """标记无建议（预算耗尽 / 校验失败 / 无候选），终态。
-
-        **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 no_suggestion；
-        对 ``succeeded`` / ``failed`` / ``cancelled`` / 已 ``no_suggestion``
-        等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
-
-        守卫为 first-wins：双跑 / 超时取消后恢复续跑与原执行者竞态时，
-        后到者的落库不覆盖先到终态。
-        """
-
         # 先对完整文本脱敏、后截断：避免调用方预截断（如 str(e)[:500]）
         # 把敏感值切在边界上导致模式失配而泄漏裸片段。
         last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):
-            cursor = conn.execute(
-                """
-                UPDATE agent_runs
-                SET status='no_suggestion', stop_reason=?, last_error=?,
-                    total_tokens=?, ended_at=?
-                WHERE run_id=? AND status IN ('pending','processing')
-                """,
-                (stop_reason, last_error, total_tokens, _now(), run_id),
+            return apply_succeeded(
+                conn,
+                run_id,
+                stop_reason=stop_reason,
+                last_error=last_error,
+                total_tokens=total_tokens,
             )
-            return cursor.rowcount > 0
 
         return self._run_write(
-            _write, error_msg="标记 agent_run no_suggestion 失败", default=False
+            _write, error_msg="标记 agent_run succeeded 失败", default=False
         )
 
     def mark_failed(
@@ -511,7 +500,7 @@ class AgentRunsRepository(BaseRepository):
         """标记失败（LLM 调用失败 attempts 达上限），记录终态时间。
 
         **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 failed；
-        对 ``succeeded`` / ``no_suggestion`` / ``cancelled`` / 已 ``failed``
+        对 ``failed`` / ``cancelled`` / 已 ``succeeded``
         等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
 
         失败累计：转终态时 ``total_attempts += 1``（同键 failed 行的
@@ -520,7 +509,7 @@ class AgentRunsRepository(BaseRepository):
         increment_attempts 达上限置终态后调用方再 mark_failed 造成双计。
         """
 
-        # 先对完整文本脱敏、后截断（见 mark_no_suggestion 注释）。
+        # 先对完整文本脱敏、后截断（见 mark_succeeded 注释）。
         last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):
@@ -544,7 +533,7 @@ class AgentRunsRepository(BaseRepository):
         """标记取消（用户已处理同 record 的候选，本次 LLM 建议作废，不再通知）。
 
         **状态守卫**：仅 ``pending`` / ``processing`` 活性态可转 cancelled；
-        对 ``succeeded`` / ``no_suggestion`` / ``failed`` / 已 ``cancelled``
+        对 ``succeeded`` / ``failed`` / 已 ``cancelled``
         等非活性态不生效（受影响行数=0 → 返回 False），避免误改终态。
 
         写 ``ended_at``（epoch 秒，与其它终态方法口径一致）。
@@ -571,7 +560,7 @@ class AgentRunsRepository(BaseRepository):
         非 processing 态 / run 不存在 → 不计数，返回 0。
         """
 
-        # 先对完整文本脱敏、后截断（见 mark_no_suggestion 注释）。
+        # 先对完整文本脱敏、后截断（见 mark_succeeded 注释）。
         last_error = (redact_secrets(last_error) or "")[:500]
 
         def _write(conn):

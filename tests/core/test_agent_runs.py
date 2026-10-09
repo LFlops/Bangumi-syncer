@@ -242,7 +242,7 @@ class TestStatusTransitions:
         finally:
             _db_conn(dbm).close()
 
-    @pytest.mark.parametrize("terminal", ["succeeded", "no_suggestion", "cancelled"])
+    @pytest.mark.parametrize("terminal", ["succeeded", "cancelled"])
     def test_mark_failed_guard_rejects_terminal_states(self, tmp_path, terminal):
         """状态守卫：非 pending/processing 终态不被 mark_failed 改写（返回 False）"""
         dbm = _make_db(tmp_path)
@@ -251,8 +251,6 @@ class TestStatusTransitions:
             dbm.agent_runs.atomic_claim("guard")
             if terminal == "succeeded":
                 dbm.agent_runs.mark_succeeded("guard")
-            elif terminal == "no_suggestion":
-                dbm.agent_runs.mark_no_suggestion("guard")
             else:
                 dbm.agent_runs.update_run_status("guard", "cancelled")
 
@@ -353,10 +351,10 @@ class TestStatusTransitions:
 
 
 class TestSucceededNoSuggestionTerminalGuard:
-    """mark_succeeded / mark_no_suggestion 终态守卫（first-wins）。
+    """mark_succeeded / mark_failed 等终态守卫（first-wins）。
 
-    仅 pending/processing 活性态可转 succeeded/no_suggestion；对已终态
-    （succeeded/no_suggestion/failed/cancelled）再次调用不生效（返回 False，
+    仅 pending/processing 活性态可转终态；对已终态
+    （succeeded/failed/cancelled）再次调用不生效（返回 False，
     原 status 与字段保持不变），避免双跑/恢复续跑竞态覆盖先到终态。
     """
 
@@ -391,15 +389,19 @@ class TestSucceededNoSuggestionTerminalGuard:
         finally:
             _db_conn(dbm).close()
 
-    def test_mark_no_suggestion_from_processing_sets_terminal_fields(self, tmp_path):
-        """processing → no_suggestion 成功，写 stop_reason/last_error/total_tokens。"""
+    def test_mark_succeeded_with_stop_reason_from_processing(self, tmp_path):
+        """processing → succeeded，写 stop_reason/last_error/total_tokens。
+
+        「成功结束但无建议」不再是独立终态，它就是 succeeded +
+        stop_reason（如 exhausted / give_up）。
+        """
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("nsg1", "match", 1)
             assert dbm.agent_runs.atomic_claim("nsg1") is True
 
             assert (
-                dbm.agent_runs.mark_no_suggestion(
+                dbm.agent_runs.mark_succeeded(
                     "nsg1",
                     stop_reason="exhausted",
                     last_error="无建议",
@@ -408,7 +410,7 @@ class TestSucceededNoSuggestionTerminalGuard:
                 is True
             )
             run = _run(dbm, "nsg1")
-            assert run["status"] == "no_suggestion"
+            assert run["status"] == "succeeded"
             assert run["stop_reason"] == "exhausted"
             assert run["last_error"] == "无建议"
             assert run["total_tokens"] == 55
@@ -428,13 +430,6 @@ class TestSucceededNoSuggestionTerminalGuard:
                 )
                 is True
             )
-        elif terminal == "no_suggestion":
-            assert (
-                dbm.agent_runs.mark_no_suggestion(
-                    run_id, stop_reason="first", last_error="first-err", total_tokens=22
-                )
-                is True
-            )
         elif terminal == "failed":
             assert dbm.agent_runs.mark_failed(run_id, "first", "first-err", 33) is True
         elif terminal == "cancelled":
@@ -442,9 +437,7 @@ class TestSucceededNoSuggestionTerminalGuard:
         else:  # pragma: no cover - 防御分支：非法 terminal 参数须显式失败
             raise AssertionError(f"未知终态构造参数: {terminal}")
 
-    @pytest.mark.parametrize(
-        "terminal", ["succeeded", "no_suggestion", "failed", "cancelled"]
-    )
+    @pytest.mark.parametrize("terminal", ["succeeded", "failed", "cancelled"])
     def test_mark_succeeded_guard_rejects_terminal_states(self, tmp_path, terminal):
         """已终态再 mark_succeeded → False，且原终态与全字段读回不变。"""
         dbm = _make_db(tmp_path)
@@ -459,31 +452,6 @@ class TestSucceededNoSuggestionTerminalGuard:
                 is False
             )
             after = _run(dbm, "sg-guard")
-            assert after == before
-            assert after["status"] == terminal
-        finally:
-            _db_conn(dbm).close()
-
-    @pytest.mark.parametrize(
-        "terminal", ["succeeded", "no_suggestion", "failed", "cancelled"]
-    )
-    def test_mark_no_suggestion_guard_rejects_terminal_states(self, tmp_path, terminal):
-        """已终态再 mark_no_suggestion → False，且原终态与全字段读回不变。"""
-        dbm = _make_db(tmp_path)
-        try:
-            self._to_terminal(dbm, "ns-guard", terminal)
-            before = _run(dbm, "ns-guard")
-
-            assert (
-                dbm.agent_runs.mark_no_suggestion(
-                    "ns-guard",
-                    stop_reason="second",
-                    last_error="second-err",
-                    total_tokens=999,
-                )
-                is False
-            )
-            after = _run(dbm, "ns-guard")
             assert after == before
             assert after["status"] == terminal
         finally:
@@ -571,7 +539,7 @@ class TestIncrementAttempts:
 class TestLastErrorRedaction:
     """last_error 落库前统一脱敏（经 /api/agent/runs 暴露，防密钥外泄）。
 
-    覆盖三个写入点：mark_failed / mark_no_suggestion / increment_attempts。
+    覆盖三个写入点：mark_failed / mark_succeeded / increment_attempts。
     断言「敏感值已遮蔽 + 正常字段（状态/stop_reason/tokens/attempts）不变」。
     """
 
@@ -620,12 +588,12 @@ class TestLastErrorRedaction:
         finally:
             _db_conn(dbm).close()
 
-    def test_mark_no_suggestion_redacts_secret(self, tmp_path):
+    def test_mark_succeeded_redacts_secret(self, tmp_path):
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("rn1", "match", 1)
             assert (
-                dbm.agent_runs.mark_no_suggestion(
+                dbm.agent_runs.mark_succeeded(
                     "rn1", "budget_exhausted", "调用超限: access_token=tok-999"
                 )
                 is True
@@ -633,30 +601,30 @@ class TestLastErrorRedaction:
             run = _run(dbm, "rn1")
             assert "tok-999" not in run["last_error"]
             assert "access_token=***" in run["last_error"]
-            assert run["status"] == "no_suggestion"
+            assert run["status"] == "succeeded"
             assert run["stop_reason"] == "budget_exhausted"
         finally:
             _db_conn(dbm).close()
 
-    def test_mark_no_suggestion_records_total_tokens(self, tmp_path):
-        """mark_no_suggestion 写入 total_tokens（终态口径与 succeeded/failed 一致）。"""
+    def test_mark_succeeded_records_total_tokens(self, tmp_path):
+        """mark_succeeded 写入 total_tokens（终态口径与 failed 一致）。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("rnt1", "match", 1)
             assert (
-                dbm.agent_runs.mark_no_suggestion("rnt1", "exhausted", total_tokens=77)
+                dbm.agent_runs.mark_succeeded("rnt1", "exhausted", total_tokens=77)
                 is True
             )
             assert _run(dbm, "rnt1")["total_tokens"] == 77
         finally:
             _db_conn(dbm).close()
 
-    def test_mark_no_suggestion_defaults_total_tokens_to_zero(self, tmp_path):
+    def test_mark_succeeded_defaults_total_tokens_to_zero(self, tmp_path):
         """未传 total_tokens → 默认 0（向后兼容既有调用）。"""
         dbm = _make_db(tmp_path)
         try:
             dbm.agent_runs.create_pending("rnt2", "match", 1)
-            assert dbm.agent_runs.mark_no_suggestion("rnt2", "end_turn") is True
+            assert dbm.agent_runs.mark_succeeded("rnt2", "end_turn") is True
             assert _run(dbm, "rnt2")["total_tokens"] == 0
         finally:
             _db_conn(dbm).close()
@@ -979,9 +947,9 @@ class TestCleanupExpired:
             )
             conn.commit()
 
-            # run B：no_suggestion 未超期 + 1 条 step（不应被删）
+            # run B：succeeded(exhausted) 未超期 + 1 条 step（不应被删）
             dbm.agent_runs.create_pending("cleanup-b", "match", 2)
-            dbm.agent_runs.mark_no_suggestion("cleanup-b")
+            dbm.agent_runs.mark_succeeded("cleanup-b", stop_reason="exhausted")
             dbm.agent_runs.add_step(
                 {
                     "run_id": "cleanup-b",
@@ -1069,7 +1037,6 @@ class TestCleanupExpired:
             for rid, term_fn in [
                 ("succeeded", dbm.agent_runs.mark_succeeded),
                 ("failed", lambda r: dbm.agent_runs.mark_failed(r, "failed", "e", 0)),
-                ("no_suggestion", dbm.agent_runs.mark_no_suggestion),
             ]:
                 dbm.agent_runs.create_pending(rid, "match", 1)
                 dbm.agent_runs.atomic_claim(rid)
@@ -1087,7 +1054,6 @@ class TestCleanupExpired:
             # 全部保留
             assert dbm.agent_runs.get_run("succeeded") is not None
             assert dbm.agent_runs.get_run("failed") is not None
-            assert dbm.agent_runs.get_run("no_suggestion") is not None
             assert dbm.agent_runs.get_run("cancelled") is not None
             assert dbm.agent_runs.get_run("proc-in-window") is not None
         finally:

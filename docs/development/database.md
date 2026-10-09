@@ -114,7 +114,7 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
 | `agent_runs` | 一次会话的状态机 | `run_id`、`task_type`、`status`、`stop_reason`、`total_tokens`、时间列 |
 | `agent_steps` | 每轮 LLM 调用 / 每次工具执行的 span | `span_id`、`name`、`status`、`model`、`tokens`、`latency_ms`、`tool_name`、`iteration`、`sequence`、`replay_delta` |
 
-`agent_runs.status` 枚举：`pending` / `processing` / `succeeded` / `no_suggestion` / `failed` / `cancelled`（`exhausted` 仅作 `stop_reason` 与 `enqueue_match_run` 的入队决策 `decision`，不作状态）。Agent 表为业务无关的通用状态机，不持有 `applied` / `rejected` 等业务特化终态；用户处理结果由 `pending_candidates`（`status` + `resolved_at`）承载。
+`agent_runs.status` 枚举：`pending` / `processing` / `succeeded` / `failed` / `cancelled`（`exhausted` 仅作 `stop_reason` 与 `enqueue_match_run` 的入队决策 `decision`，不作状态）。「成功结束但未产出建议」（预算耗尽 / 校验失败 / 明确放弃）**不是独立终态**：它就是 `succeeded`，差异由 `stop_reason`（`exhausted` / `give_up` / `end_turn` 等）承载、诊断信息由 `last_error` 承载；旧库的 `no_suggestion` 行在启动迁移中收敛为 `succeeded`。Agent 表为业务无关的通用状态机，不持有 `applied` / `rejected` 等业务特化终态；用户处理结果由 `pending_candidates`（`status` + `resolved_at`）承载。
 
 ### 双职责模型
 
@@ -152,7 +152,7 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
   - 无历史 run，或 `business_key` 为空（去重禁用，每次直接新建）→ 新建 pending（`created`）。
   - 同键最新 run 为在途（`pending`/`processing`）→ `in_flight`（复用已有 run，仅当传入 `sync_record_id` 非空时刷新主指针）。
   - 同键最新 run 为 `failed` → 统计同键 failed 行的 `SUM(total_attempts)`：未达上限（`MATCH_ASSIST_MAX_TOTAL_ATTEMPTS=10`）→ 新建 pending（`created`）；达上限 → `exhausted`（不写库）。失败重试语义为「每次新建 run」，不做同 run 复活。
-  - 同键最新 run 为 `succeeded`/`no_suggestion` → 按 `pending_candidates` 子状态复用：`confirmed` 且映射仍有效 → `reuse_accepted`（不限时间）；`pending` → `reuse_holding`（无限期）；`rejected` 且 `resolved_at` 在复用窗口（`MATCH_ASSIST_REUSE_WINDOW_DAYS=30` 天）内 → `reuse_holding`；`rejected` 出窗 / 无候选 → 新建（`created`）。
+  - 同键最新 run 为 `succeeded`（含无建议这类成功结束）→ 按 `pending_candidates` 子状态复用：`confirmed` 且映射仍有效 → `reuse_accepted`（不限时间）；`pending` → `reuse_holding`（无限期）；`rejected` 且 `resolved_at` 在复用窗口（`MATCH_ASSIST_REUSE_WINDOW_DAYS=30` 天）内 → `reuse_holding`；`rejected` 出窗 / 无候选 → 新建（`created`）。
   - 同键最新 run 为 `cancelled` / 其他终态 → 新建（`created`）。
   - 复用（`reuse_accepted`/`reuse_holding`）仅刷新 run↔record 关联与主指针，不重跑 LLM。来源（`source` / `retry-*`）不参与身份。
 - **`pending_candidates.business_key`**：同一身份（归一化标题 + 季 + 用户）只保留一条 pending 候选；部分唯一索引 `WHERE status='pending' AND business_key != ''` 保证在途唯一（空 key 不参与约束，兼容老数据 / 手动沉淀）。

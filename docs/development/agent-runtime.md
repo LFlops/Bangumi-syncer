@@ -72,18 +72,18 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 1. 场景解析 thinking_level / max_iterations；
 2. `trace.replay` 从 `agent_steps` 重建消息与终局响应；
 3. **终局优先**（先于预算耗尽判定）按 `last_response` 分派：
-   - `end_turn` → `mark_no_suggestion`；
+   - `end_turn` → `mark_succeeded`（stop_reason=`end_turn`）；
    - `terminal_tool`（或 tool_calls 含终止工具）→ 场景 `handle_terminal`（tokens 取 replay 累计）；
-   - `None`（轮次已完整记录）→ 预算耗尽则 `no_suggestion(exhausted)`，否则续跑 loop；
+   - `None`（轮次已完整记录）→ 预算耗尽则 `succeeded(stop_reason=exhausted)`，否则续跑 loop；
    - 含 tool_use → 补执行缺失只读工具（写 tool span 自包含）→ 预算够则续跑 loop；
-4. 非终局且 `remaining <= 0` → `no_suggestion(exhausted)`（避免 run 永久滞留 `processing`）；
+4. 非终局且 `remaining <= 0` → `succeeded(stop_reason=exhausted)`（避免 run 永久滞留 `processing`）；
 5. 异常在函数内部消化（不向调度器抛出）。
 
 > 顺序说明：末轮可能已产出 `submit` 但 run 中断，若先判预算耗尽会误判 `exhausted` 丢失提交，
 > 故终局语义必须先消费。
 >
 > 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run`）。恢复路径预算耗尽时不再发起
-> 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_no_suggestion`）。
+> 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_succeeded`）。
 
 ## 新增一个 Agent 场景
 

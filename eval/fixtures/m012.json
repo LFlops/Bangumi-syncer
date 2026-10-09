@@ -216,7 +216,7 @@
     }
   ],
   "expected_outcome": {
-    "run_status": "no_suggestion",
+    "run_status": "succeeded",
     "stop_reason": "give_up",
     "candidate_subject_id": null,
     "notifications": 0

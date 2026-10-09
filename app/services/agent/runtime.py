@@ -60,7 +60,7 @@ async def run(
 ) -> str:
     """执行一次 Agent 场景任务（通用编排），返回终态 status 字符串。
 
-    status 取值：``succeeded`` / ``no_suggestion`` / ``failed`` / ``processing``
+    status 取值：``succeeded``（含「无建议」这类成功结束）/ ``failed`` / ``processing``
     （调度轮次重试中）/ ``skipped``（并发抢占失败，由调用方忽略）。
 
     LLM 调用注入：``stream_fn`` 为唯一入口（流式，缺省由 ``hooks.build_stream_fn``
@@ -215,11 +215,11 @@ async def continue_run(
        - 匹配的 ``terminal_tool`` 调用 → 走场景终局处理
        - ``stop_reason == terminal_tool`` 但无匹配调用 → 防御降级 exhausted
        - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run`` 共用判据）：
-         ``end_turn`` → mark_no_suggestion；``max_tokens`` / 空壳 ``llm_error``
+         ``end_turn`` → mark_succeeded；``max_tokens`` / 空壳 ``llm_error``
          → 交场景终态处理（llm_assist 落 failed）；``None``（含非终止工具调用）
          → 补执行缺失只读工具 + 回填结果后续跑 loop
        - ``None``（全部轮次已完整记录）→ 若预算耗尽则落终态，否则续跑 loop
-    4. ``remaining <= 0`` 且非终局 → 落终态 no_suggestion/exhausted
+    4. ``remaining <= 0`` 且非终局 → 落终态 succeeded(stop_reason='exhausted')
        （否则 run 永久滞留 processing）
 
     顺序说明：末轮可能已产出 submit 但 run 中断，若先判预算耗尽会误判 exhausted
@@ -276,7 +276,7 @@ async def continue_run(
 
         if stop == "end_turn":
             # 无建议：直接标记，不调 LLM（透传 replay 累计 tokens，口径同其它终态）
-            repo.mark_no_suggestion(
+            repo.mark_succeeded(
                 run_id,
                 stop_reason="end_turn",
                 total_tokens=replay_result.total_tokens,
@@ -356,7 +356,7 @@ async def continue_run(
         if terminal_reason == "end_turn":
             # 未知 stop_reason 但有内容（无工具调用）→ 兼容旧 provider，落 end_turn：
             # 无建议，不调 LLM（透传 replay 累计 tokens，口径同其它终态）。
-            repo.mark_no_suggestion(
+            repo.mark_succeeded(
                 run_id,
                 stop_reason="end_turn",
                 total_tokens=replay_result.total_tokens,
@@ -405,16 +405,16 @@ async def continue_run(
 
 
 def _mark_exhausted(repo, run_id: str, *, note: str, total_tokens: int = 0) -> None:
-    """预算耗尽且无终局语义 → 落终态 no_suggestion/exhausted。
+    """预算耗尽且无终局语义 → 落终态 succeeded(stop_reason='exhausted')。
 
     不能直接 return（否则 run 永久滞留 processing，下一轮恢复扫描又会重复捞起）。
     ``total_tokens`` 为 replay 累计的历史轮次用量，透传至终态记录（口径与其它终态一致）。
     """
     logger.warning(
         f"🤖 恢复(replay)路径预算耗尽，run {run_id} {note}已无剩余轮次，"
-        f"标记 no_suggestion"
+        f"标记 succeeded(stop_reason=exhausted)"
     )
-    repo.mark_no_suggestion(run_id, stop_reason="exhausted", total_tokens=total_tokens)
+    repo.mark_succeeded(run_id, stop_reason="exhausted", total_tokens=total_tokens)
 
 
 def _current_run_status(repo, run_id: str) -> str:

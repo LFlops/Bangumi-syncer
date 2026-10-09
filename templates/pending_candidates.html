@@ -496,7 +496,7 @@ async function _loadAgentRunSteps(runId, targetId) {
  * 候选列表行的 AI 徽标：
  * - agent_run_status ∈ {pending, processing} → "AI 评估中"
  * - agent_run_status == succeeded 且有 llm_subject_id → "AI 推荐"
- * - 其余（无 run / failed / no_suggestion 等）→ 不显示
+ * - 其余（无 run / failed 等）→ 不显示
  */
 function renderAgentRunBadge(status, llmSubjectId) {
     if (status === 'pending' || status === 'processing') {

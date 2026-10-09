@@ -496,7 +496,12 @@ def collect_outcome(dbm, run_id: str, sync_record_id: int, notifier) -> dict:
 
 
 def hit_expect(expect: dict, outcome: dict) -> bool:
-    """按 golden 期望判定命中（acceptable_ids / no_suggestion）。"""
+    """按golden 期望判定命中（acceptable_ids / 期望无建议）。
+
+    ``expect_stop == "no_suggestion"`` 是**用例规格词汇**（负样本：期望不给出建议），
+    与 ``agent_runs.status`` 无关 —— 状态机已把「无建议」收敛为 ``succeeded``，
+    差异由 ``stop_reason``（如 ``give_up``）承载。
+    """
     cid = outcome.get("candidate_subject_id")
     if expect.get("expect_stop") == "no_suggestion":
         return not cid

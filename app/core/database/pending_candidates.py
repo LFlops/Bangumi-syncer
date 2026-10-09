@@ -347,9 +347,9 @@ class PendingCandidatesRepository(BaseRepository):
                 candidate_id = cur.lastrowid
 
             # 同一事务内更新 agent_runs 为 succeeded（原子）
-            # ended_at 使用 epoch 秒整数，与 mark_succeeded / mark_no_suggestion 一致。
+            # ended_at 使用 epoch 秒整数，与 mark_succeeded 一致。
             # **源状态守卫**：仅 pending/processing 活性态可转 succeeded；
-            # run 已被并发路径终态化（cancelled/failed/no_suggestion/...）时命中 0 行，
+            # run 已被并发路径终态化（cancelled/failed/...）时命中 0 行，
             # 不翻回 succeeded（否则通知与 DB 终态矛盾），跳过通知但保留候选写入。
             if not apply_succeeded(
                 conn,
