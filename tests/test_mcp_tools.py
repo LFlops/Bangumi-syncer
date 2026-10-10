@@ -850,13 +850,21 @@ class TestUpdateConfigKeyValueValidation:
         return mock_token
 
     @pytest.mark.asyncio
-    async def test_update_config_非法key_拒绝(self):
-        """不在 schema 中的 key 应被拒绝。"""
+    async def test_update_config_格式非法的key_拒绝(self):
+        """key 含等号等 INI 注入字符时应被拒绝。
+
+        判据已由「key 是否存在」改为「key 格式是否合法」：``SectionMeta.fields``
+        只登记需特殊渲染的项，不是完整键清单，用它做存在性校验会误拒
+        dev.debug / llm.model 等合法配置。
+        """
         from fastmcp.exceptions import ToolError
 
+        from app.core.config import _validate_section_key
         from app.mcp import tools
 
         mock_cm = MagicMock()
+        # 复现 set_config 的真实行为：格式非法时抛 ValueError
+        mock_cm.set_config.side_effect = lambda s, k, v: _validate_section_key(s, k)
 
         with patch("app.mcp.tools.config_manager", mock_cm):
             with patch(
@@ -866,12 +874,33 @@ class TestUpdateConfigKeyValueValidation:
                 with pytest.raises(ToolError) as exc_info:
                     await tools.update_config(
                         section="sync",
-                        key="nonexistent_key_xyz",
+                        key="bad=key",
                         value="anything",
                     )
 
-        assert "非法配置键" in str(exc_info.value)
-        mock_cm.set_config.assert_not_called()
+        assert "非法配置键名" in str(exc_info.value)
+        mock_cm.set_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_config_未登记但格式合法的key_放行(self):
+        """未在 SectionMeta.fields 登记、但格式合法的 key 应放行（③类策略）。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section="sync",
+                    key="nonexistent_key_xyz",
+                    value="anything",
+                )
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_update_config_超长value_拒绝(self):
@@ -919,3 +948,189 @@ class TestUpdateConfigKeyValueValidation:
         mock_cm.set_config.assert_called_once_with(
             "sync", "match_confidence_threshold", "x" * 10000
         )
+
+
+# ===========================================================================
+# update_config 写入策略测试（评审 #259 修复）
+#
+# 判据（不再是「键敏不敏感」，而是）：
+#   ① 改完之后 MCP 自己不可用         → 禁改
+#   ② 改完之后用户还需回 Web 页面操作 → 禁改
+#   ③ 其余一律开放（等同 Web 界面）
+# ===========================================================================
+
+
+# ① + ② 禁改清单：显式列举，不从实现导入，保持测试为独立规格
+DENIED_WRITE_KEYS = [
+    # ① 改完 MCP 自身不可用
+    ("auth", "enabled"),
+    ("auth", "secret_key"),
+    # ② 改完需回页面操作
+    ("auth", "username"),
+    ("auth", "password"),
+    ("auth", "max_login_attempts"),
+    ("auth", "lockout_duration"),
+    ("auth", "webhook_auth_enabled"),
+    ("trakt", "client_secret"),
+    ("bangumi-oauth", "client_secret"),
+    ("bangumi", "access_token"),
+    ("bangumi", "refresh_token"),
+]
+
+# ③ 开放清单：含此前被 fields 白名单误拒的键，以及用户判据下可自恢复的凭据
+ALLOWED_WRITE_KEYS = [
+    # 此前因 fields 未登记而被误拒的合法配置
+    ("sync", "enable_real_action"),
+    ("sync", "test_skip_permission_check"),
+    ("dev", "debug"),
+    ("dev", "script_proxy"),
+    ("dev", "log_file"),
+    ("dev", "bgm_api_proxy"),
+    ("llm", "model"),
+    ("llm", "api_base"),
+    ("feiniu", "db_path"),
+    ("fongmi", "devices"),
+    ("fongmi", "subnet"),
+    ("bangumi-archive", "http_proxy"),
+    ("bangumi-archive", "retry_interval"),
+    ("bangumi-data", "http_proxy"),
+    # 此前因 auth 整段拉黑而被误伤的无害键
+    ("auth", "webhook_key"),
+    ("auth", "session_timeout"),
+    ("auth", "https_only"),
+    # 可自行恢复的凭据类（判据③）
+    ("llm", "api_key"),
+    ("notify-email-1", "smtp_password"),
+    ("notify-wecom-1", "key"),
+    ("notify-dingtalk-1", "access_token"),
+    ("notify-dingtalk-1", "secret"),
+    # 字段表为空的段：全开放
+    ("trakt", "client_id"),
+    ("trakt", "redirect_uri"),
+    ("web", "base_path"),
+    ("bangumi-mapping", "some_key"),
+    # 多实例段任意键
+    ("notify-webhook-1", "url"),
+    ("notify-webhook", "url"),
+    ("notify-webhook-abc", "url"),
+]
+
+
+class TestUpdateConfigWritePolicy:
+    """写入策略：①MCP自身不可用 / ②需回页面的键禁改，其余开放。"""
+
+    @staticmethod
+    def _make_write_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    async def _call(self, section, key, value="v"):
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section=section, key=key, value=value
+                )
+        return result, mock_cm
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("section", "key"), DENIED_WRITE_KEYS)
+    async def test_update_config_禁用清单内的键_抛出ToolError(self, section, key):
+        """①MCP不可用 / ②需回页面的键 → 拒绝写入。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(section=section, key=key, value="v")
+
+        assert "Web 界面" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("section", "key"), ALLOWED_WRITE_KEYS)
+    async def test_update_config_开放清单内的键_写入成功(self, section, key):
+        """③类键 → 正常写入（含此前被误拒的合法配置）。"""
+        result, mock_cm = await self._call(section, key)
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_config_所有登记段的合法示例键_均可写入(self):
+        """不变式：config.example.ini 里除禁改清单外的全部键都应可写。
+
+        回归防护：旧实现以 SectionMeta.fields 作白名单，会误拒未登记的
+        合法键（dev.debug / llm.model 等），本用例锁死该行为不再出现。
+        """
+        import configparser
+        from pathlib import Path
+
+        from app.core.config_schema import SECTIONS
+
+        denied = set(DENIED_WRITE_KEYS)
+        ini_path = Path(__file__).resolve().parents[1] / "config.example.ini"
+        parser = configparser.ConfigParser()
+        parser.read(ini_path, encoding="utf-8")
+
+        checked = 0
+        for section in sorted(SECTIONS):
+            if not parser.has_section(section):
+                continue
+            for key in parser.options(section):
+                if (section, key) in denied:
+                    continue
+                result, mock_cm = await self._call(section, key)
+                assert result["status"] == "success", f"{section}.{key} 被误拒"
+                checked += 1
+        assert checked > 50, "示例配置解析异常，用例失去意义"
+
+    @pytest.mark.asyncio
+    async def test_update_config_下划线段名归一化后仍命中禁改清单(self):
+        """bangumi_oauth → bangumi-oauth 后应被拒（下划线写法不能绕过）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError):
+                    await tools.update_config(
+                        section="bangumi_oauth", key="client_secret", value="x"
+                    )
+
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_update_config_底层ValueError_转为ToolError(self):
+        """set_config 抛 ValueError 时应转成 ToolError（评审 1c）。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        mock_cm.set_config.side_effect = ValueError("非法配置段名")
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError):
+                    await tools.update_config(
+                        section="sync", key="match_confidence_threshold", value="v"
+                    )
