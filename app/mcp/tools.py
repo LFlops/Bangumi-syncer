@@ -47,6 +47,41 @@ _EXTRA_SENSITIVE_FIELDS: frozenset[tuple[str, str]] = frozenset(
     {("auth", "password"), ("auth", "secret_key")}
 )
 
+# ── update_config 禁改键清单 ───────────────────────────────────────────────
+#
+# 判据不是「键敏不敏感」，而是「**改完之后用户还能不能自己救回来**」：
+#
+#   ① 改完之后 MCP 自己不可用           → 禁改
+#      破坏登录/授权链，MCP 客户端当场失联，用户无感知地丢掉能力。
+#   ② 改完之后用户还需回 Web 页面操作   → 禁改
+#      需重新登录 / 重新走 OAuth 授权 / 手动解锁，或会把自己锁在门外。
+#   ③ 其余一律开放（等同 Web 界面）     → 放行
+#      包含 llm.api_key、notify-* 凭据、auth.webhook_key 等
+#      「重填一个字符串即可恢复」的键，与用户在 Web 界面的能力等价。
+#
+# 早期实现曾把 ``SectionMeta.fields`` 当白名单（"fields 为空即拒绝"），但
+# ``fields`` 的语义是「需要特殊默认值/布尔渲染的项」而非完整键清单
+# （见 FieldMeta docstring），用它做白名单会误拒 dev.debug / llm.model
+# 等大量合法配置；同时对 fields 为空的段（bangumi / trakt / web）反而
+# 完全放行，导致凭据可写。故改为本清单。
+_MCP_WRITE_DENIED: frozenset[tuple[str, str]] = frozenset(
+    {
+        # ① 改完 MCP 自身不可用
+        ("auth", "enabled"),  # 关掉登录校验 → MCP 授权流程失效
+        ("auth", "secret_key"),  # HMAC 主密钥 → 全部会话作废
+        # ② 改完需回页面操作
+        ("auth", "username"),
+        ("auth", "password"),
+        ("auth", "max_login_attempts"),  # 改小会把自己锁在门外
+        ("auth", "lockout_duration"),
+        ("auth", "webhook_auth_enabled"),
+        ("trakt", "client_secret"),  # 需重新走 Trakt OAuth 授权
+        ("bangumi-oauth", "client_secret"),  # 同上
+        ("bangumi", "access_token"),  # 需重新登录 Bangumi
+        ("bangumi", "refresh_token"),
+    }
+)
+
 # 日志行时间戳格式: [2026/09/03 12:00:00.123]
 _LOG_TIMESTAMP_RE = re.compile(r"^\[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
 
@@ -289,10 +324,6 @@ async def update_config(
     # 归一化段名：下划线 → 连字符
     normalized = section.replace("_", "-")
 
-    # auth 段黑名单
-    if normalized == "auth":
-        raise ToolError("auth 段不可通过 MCP 修改，请使用 Web 界面修改认证配置")
-
     # 校验段名合法性
     if not _is_valid_section(normalized):
         valid_names = _valid_section_names()
@@ -300,29 +331,22 @@ async def update_config(
             f"未知配置段: {section}。合法段包括: {', '.join(sorted(valid_names))}"
         )
 
-    # 校验 key 合法性：非多实例段必须在 schema 字段列表中
-    _section_meta = SECTIONS.get(normalized)
-    if _section_meta is None:
-        # 多实例段（notify-webhook-1 等）：前缀匹配父段
-        for prefix in multi_instance_prefixes():
-            if normalized.startswith(f"{prefix}-"):
-                _section_meta = SECTIONS.get(prefix)
-                break
-
-    if _section_meta is not None and _section_meta.fields:
-        valid_keys = {f.name for f in _section_meta.fields}
-        if key not in valid_keys:
-            raise ToolError(
-                f"非法配置键: {key}。段 {normalized} 的合法键包括: "
-                f"{', '.join(sorted(valid_keys))}"
-            )
+    # 禁改键判定：见 _MCP_WRITE_DENIED 的判据说明
+    if (normalized, key) in _MCP_WRITE_DENIED:
+        raise ToolError(
+            f"配置项 {normalized}.{key} 不允许通过 MCP 修改，请到 Web 界面操作"
+        )
 
     # 校验 value 长度上限（防止 INI 膨胀）：按 str(value) 长度计算
     _MAX_VALUE_LENGTH = 10000
     if len(str(value)) > _MAX_VALUE_LENGTH:
         raise ToolError(f"配置值长度超限: {len(str(value))} > {_MAX_VALUE_LENGTH}")
 
-    config_manager.set_config(normalized, key, value)
+    try:
+        config_manager.set_config(normalized, key, value)
+    except ValueError as e:
+        # 底层格式校验失败（非法段名/键名等）应表现为规范的工具错误
+        raise ToolError(f"配置写入失败: {e}") from e
 
     return {
         "status": "success",
