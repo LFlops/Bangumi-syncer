@@ -103,20 +103,28 @@ def _parse_log_timestamp(line: str) -> datetime | None:
 def _parse_iso_datetime(value: str) -> datetime:
     """解析 ISO 格式时间字符串（since/until），无效格式抛出 ValueError。
 
-    兼容 Python 3.9：fromisoformat 不支持 'Z' 后缀与空格分隔。
+    先把 ``Z`` 后缀与空格分隔标准化为 ``fromisoformat`` 可识别的形式
+    （Python 3.10 的 fromisoformat 不接受 ``Z`` 后缀与空格分隔）。
 
-    返回 naive datetime（去掉时区信息），与日志行时间戳（_server 本地时间，naive）
-    保持同一语义，避免比较时抛出 TypeError。
+    返回 naive datetime，与日志行时间戳（服务器本地时间，naive）同一语义，
+    避免比较时抛 TypeError。若输入带时区信息，先 ``astimezone()`` 换算到
+    服务器本地时区再剥掉 tzinfo——仅 ``replace(tzinfo=None)`` 会让 ``...Z``
+    与本地时间直接比较，导致时间窗偏移一个时差。
+
+    另：日志时间戳是服务器本地时间（logging 默认行为），因此不带时区的
+    输入按本地时间原样保留，不做任何换算。
     """
-    # 标准化：空格 → T，Z → +00:00（UTC 标记）
-    normalized = value.replace(" ", "T").replace("Z", "+00:00")
+    # 标准化：空格 → T，末尾 Z → +00:00（UTC 标记）
+    normalized = value.replace(" ", "T")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
     try:
         dt = datetime.fromisoformat(normalized)
     except ValueError:
         raise ValueError(f"无法解析的时间格式: {value}")
-    # 统一为 naive：日志时间戳无时区信息，按服务器本地时间对齐
+    # 带时区 → 先换算到服务器本地，再统一为 naive
     if dt.tzinfo is not None:
-        dt = dt.replace(tzinfo=None)
+        dt = dt.astimezone().replace(tzinfo=None)
     return dt
 
 
@@ -125,15 +133,29 @@ def _filter_by_time_range(
     since: datetime | None,
     until: datetime | None,
 ) -> str:
-    """按时间范围过滤日志内容行。"""
+    """按时间范围过滤日志内容行。
+
+    无时间戳的行（如多行 traceback 的续行）沿用**上一行**的时间戳，避免
+    整段异常栈被丢弃；文件首行若就无时间戳，则按 until/since 的宽松侧
+    （即"早于窗口但无信息量"时保留首个无时间戳块）处理。
+    """
     if since is None and until is None:
         return content
 
     lines = content.splitlines(keepends=True)
     filtered = []
+    last_ts: datetime | None = None
     for line in lines:
         ts = _parse_log_timestamp(line)
+        if ts is not None:
+            last_ts = ts
+        else:
+            # 续行：沿用上一行时间戳；若上一行也没有（文件开头），保留该行，
+            # 由调用方按需兜底——直接丢弃会丢失 traceback 头部。
+            ts = last_ts
         if ts is None:
+            # 文件开头的无时间戳行：不参与时间判定，保留
+            filtered.append(line)
             continue
         if since is not None and ts < since:
             continue
@@ -151,9 +173,16 @@ def _valid_section_names() -> set[str]:
 
 
 def _is_valid_section(normalized: str) -> bool:
-    """判断归一化后的段名是否合法（支持多实例段前缀匹配）。"""
+    """判断归一化后的段名是否合法（支持多实例段前缀匹配）。
+
+    注意：多实例前缀本身（裸父段 ``notify-webhook``）**不**视为合法段。
+    运行时以 ``startswith("notify-webhook-")`` 枚举实例
+    （见 ``app/services/notification_service.py``），裸父段缺尾部横杠不匹配，
+    写入后永远不会被读取——属于配置里永不生效的死段。
+    """
     if normalized in _valid_section_names():
-        return True
+        # 命中多实例前缀但无后缀 → 死段，拒绝
+        return normalized not in multi_instance_prefixes()
     for prefix in multi_instance_prefixes():
         if normalized.startswith(f"{prefix}-"):
             return True
@@ -246,6 +275,10 @@ async def get_logs(
                 "data": {
                     "content": "",
                     "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+                    "notice": (
+                        "文件日志已被禁用（[dev] log_file 为空）。"
+                        "请在 Web 配置页「高级配置 → 日志文件」填写路径后重试。"
+                    ),
                 },
             }
 
@@ -257,16 +290,26 @@ async def get_logs(
                 "data": {
                     "content": "",
                     "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+                    "notice": f"日志文件不存在: {log_file_path}",
                 },
             }
 
-        result = await _dispatch_read_log(log_file_path, level, search, str(limit))
+        # 有时间条件时读全量：先按 limit 取尾部再过滤会吞掉窗口靠前的日志
+        # （表现为"这段时间没有日志"的假象）。无时间条件时保持读尾部 N 行。
+        has_time_range = since_dt is not None or until_dt is not None
+        read_limit = "all" if has_time_range else str(limit)
+        result = await _dispatch_read_log(log_file_path, level, search, read_limit)
 
         # 应用时间范围过滤
         if "content" in result:
             result["content"] = _filter_by_time_range(
                 result["content"], since_dt, until_dt
             )
+            # 全量读取后按 limit 截断尾部，避免返回整个文件
+            if has_time_range:
+                kept = result["content"].splitlines(keepends=True)
+                if len(kept) > limit:
+                    result["content"] = "".join(kept[-limit:])
             result["stats"]["lines"] = result["content"].count("\n")
 
         return {"status": "success", "data": result}
@@ -323,6 +366,13 @@ async def update_config(
 
     # 归一化段名：下划线 → 连字符
     normalized = section.replace("_", "-")
+
+    # 多实例裸父段单独提示：它是 schema 登记的前缀，但缺少实例后缀
+    if normalized in multi_instance_prefixes():
+        raise ToolError(
+            f"{normalized} 是多实例段前缀，须指定实例后缀（如 {normalized}-1），"
+            f"否则运行时不会读取该段"
+        )
 
     # 校验段名合法性
     if not _is_valid_section(normalized):
