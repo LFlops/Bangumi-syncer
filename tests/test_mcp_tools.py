@@ -1009,9 +1009,8 @@ ALLOWED_WRITE_KEYS = [
     ("trakt", "redirect_uri"),
     ("web", "base_path"),
     ("bangumi-mapping", "some_key"),
-    # 多实例段任意键
+    # 多实例段任意键（裸父段除外，见 TestUpdateConfigMultiInstanceSegment）
     ("notify-webhook-1", "url"),
-    ("notify-webhook", "url"),
     ("notify-webhook-abc", "url"),
 ]
 
@@ -1134,3 +1133,315 @@ class TestUpdateConfigWritePolicy:
                     await tools.update_config(
                         section="sync", key="match_confidence_threshold", value="v"
                     )
+
+
+# ===========================================================================
+# get_logs 时间过滤（评审 #259 第 3/4 条 + 次要项）
+#
+# 场景：
+#   1. 时区：带时区的输入应换算到服务器本地，而不是只剥掉标签
+#   2. 顺序：有时间条件时应先过滤再取 limit，否则窗口靠前的日志被吞
+#   3. 续行：多行 traceback 的续行沿用上一行时间戳，不应整段丢失
+#   4. 自解释：文件日志被禁用时返回明确说明，而非静默空内容
+# ===========================================================================
+
+# 10 行日志，时间递增；末行为多行 traceback（含无时间戳的续行）
+SAMPLE_LOG_SPAN = (
+    "[2026/09/03 10:00:00.000] [INFO]  行1\n"
+    "[2026/09/03 11:00:00.000] [INFO]  行2\n"
+    "[2026/09/03 12:00:00.000] [INFO]  行3\n"
+    "[2026/09/03 13:00:00.000] [INFO]  行4\n"
+    "[2026/09/03 14:00:00.000] [INFO]  行5\n"
+    "[2026/09/03 15:00:00.000] [INFO]  行6\n"
+    "[2026/09/03 16:00:00.000] [INFO]  行7\n"
+    "[2026/09/03 17:00:00.000] [ERROR] 行8 触发了异常\n"
+    '  File "sync.py", line 42, in run\n'
+    "    raise RuntimeError('boom')\n"
+)
+
+
+class TestGetLogsTimezone:
+    """时区：带 tz 的输入应换算到服务器本地时区后再比较。"""
+
+    def test_parse_iso_同一时刻的两种时区表示_结果相同(self):
+        """'Z' 与等价偏移量应解析为同一时刻（而非各自剥标签后相差时差）。"""
+        from app.mcp.tools import _parse_iso_datetime
+
+        utc = _parse_iso_datetime("2026-09-03T10:00:00Z")
+        offset = _parse_iso_datetime("2026-09-03T18:00:00+08:00")
+        assert utc == offset
+        assert utc.tzinfo is None
+
+    def test_parse_iso_naive输入_按服务器本地原样保留(self):
+        """无时区信息的输入视为服务器本地时间，不做换算。"""
+        from datetime import datetime
+
+        from app.mcp.tools import _parse_iso_datetime
+
+        assert _parse_iso_datetime("2026-09-03T10:00:00") == datetime(
+            2026, 9, 3, 10, 0, 0
+        )
+
+    def test_parse_iso_非法格式_抛ValueError(self):
+        from app.mcp.tools import _parse_iso_datetime
+
+        with pytest.raises(ValueError):
+            _parse_iso_datetime("not-a-date")
+
+
+class TestGetLogsFilterOrder:
+    """顺序：应先按时间过滤、再应用 limit。"""
+
+    @staticmethod
+    def _make_read_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read"]
+        return mock_token
+
+    @pytest.mark.asyncio
+    async def test_get_logs_有时间条件时_读取全量而非尾部limit(self):
+        """带 since/until 时应读全量，避免窗口靠前的日志被尾部 limit 吞掉。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": SAMPLE_LOG_SPAN,
+                "stats": {"size": 1, "lines": 10, "modified": None, "errors": 0},
+            }
+        )
+        with patch(
+            "app.mcp.tools.get_access_token", return_value=self._make_read_token()
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        await tools.get_logs(limit=3, since="2026-09-03T10:00:00")
+
+        assert mock_dispatch.call_args.args[3] == "all"
+
+    @pytest.mark.asyncio
+    async def test_get_logs_无时间条件时_仍按limit读尾部(self):
+        """无 since/until 时保持原有行为：只读尾部 N 行。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": "",
+                "stats": {"size": 0, "lines": 0, "modified": None, "errors": 0},
+            }
+        )
+        with patch(
+            "app.mcp.tools.get_access_token", return_value=self._make_read_token()
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        await tools.get_logs(limit=7)
+
+        assert mock_dispatch.call_args.args[3] == "7"
+
+    @pytest.mark.asyncio
+    async def test_get_logs_窗口靠前且超出limit_仍能命中(self):
+        """since 落在较早区间时，即使 limit 很小也应返回该窗口内的日志。
+
+        旧实现先按 limit 取尾部 N 行再过滤，窗口不在尾部时会返回空，
+        表现为「这段时间没有日志」的假象。
+        """
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": SAMPLE_LOG_SPAN,
+                "stats": {"size": 1, "lines": 10, "modified": None, "errors": 0},
+            }
+        )
+        with patch(
+            "app.mcp.tools.get_access_token", return_value=self._make_read_token()
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        result = await tools.get_logs(
+                            limit=3,
+                            since="2026-09-03T12:00:00",
+                            until="2026-09-03T14:00:00",
+                        )
+
+        content = result["data"]["content"]
+        # 窗口内为 行3/行4/行5，共 3 行，不应被 limit 截成空
+        assert "行3" in content
+        assert "行5" in content
+        assert "行1" not in content
+
+    @pytest.mark.asyncio
+    async def test_get_logs_过滤后仍受limit截断(self):
+        """全量读取后应按 limit 截断，避免返回整个文件。"""
+        from app.mcp import tools
+
+        mock_dispatch = AsyncMock(
+            return_value={
+                "content": SAMPLE_LOG_SPAN,
+                "stats": {"size": 1, "lines": 10, "modified": None, "errors": 0},
+            }
+        )
+        with patch(
+            "app.mcp.tools.get_access_token", return_value=self._make_read_token()
+        ):
+            with patch(
+                "app.mcp.tools.resolved_dev_log_file_path",
+                return_value=Path("/fake/app.log"),
+            ):
+                with patch("app.mcp.tools.os.path.exists", return_value=True):
+                    with patch("app.mcp.tools._dispatch_read_log", new=mock_dispatch):
+                        result = await tools.get_logs(
+                            limit=2,
+                            since="2026-09-03T10:00:00",
+                            until="2026-09-03T17:00:00",
+                        )
+
+        assert result["data"]["content"].count("\n") <= 2
+
+
+class TestGetLogsContinuationLines:
+    """续行：多行 traceback 的无时间戳行应沿用上一行时间戳。"""
+
+    def test_filter_续行沿用上一行时间戳_窗口内应保留(self):
+        from datetime import datetime
+
+        from app.mcp.tools import _filter_by_time_range
+
+        out = _filter_by_time_range(
+            SAMPLE_LOG_SPAN, datetime(2026, 9, 3, 17, 0, 0), None
+        )
+        assert 'File "sync.py"' in out
+        assert "raise RuntimeError" in out
+
+    def test_filter_首行无时间戳_应保留而非丢弃(self):
+        """文件开头若有无时间戳行（如 banner），不应被整条丢弃。"""
+        from datetime import datetime
+
+        from app.mcp.tools import _filter_by_time_range
+
+        content = "==== 启动 banner ====\n" + SAMPLE_LOG_SPAN
+        out = _filter_by_time_range(
+            content, datetime(2026, 9, 3, 10, 0, 0), datetime(2026, 9, 3, 23, 0, 0)
+        )
+        assert "启动 banner" in out
+
+
+class TestGetLogsDisabledNotice:
+    """自解释：文件日志被禁用时应给出明确说明。"""
+
+    @staticmethod
+    def _make_read_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read"]
+        return mock_token
+
+    @pytest.mark.asyncio
+    async def test_get_logs_日志被禁用时_返回说明而非静默空(self):
+        """[dev] log_file 置空会禁用文件日志，此时应说明原因。"""
+        from app.mcp import tools
+
+        with patch(
+            "app.mcp.tools.get_access_token", return_value=self._make_read_token()
+        ):
+            with patch("app.mcp.tools.resolved_dev_log_file_path", return_value=None):
+                result = await tools.get_logs()
+
+        data = result["data"]
+        assert data["content"] == ""
+        assert "log_file" in data["notice"]
+
+
+class TestUpdateConfigMultiInstanceSegment:
+    """多实例段名须带后缀：裸父段运行时读不到，是永不生效的死段。
+
+    运行时以 ``startswith("notify-webhook-")`` 枚举实例（notification_service.py），
+    ``[notify-webhook]`` 缺尾部横杠不匹配，写入后永远不会被读取。
+    后缀内容不限（``-abc`` 会被当真实渠道使用，与页面操作等价）。
+    """
+
+    @staticmethod
+    def _make_write_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "section",
+        [
+            "notify-webhook",
+            "notify-email",
+            "notify-wecom",
+            "notify-dingtalk",
+            "notify-rule",
+            "summary",
+        ],
+    )
+    async def test_update_config_裸父段_拒绝(self, section):
+        """裸父段（无 -N 后缀）应拒绝：写入后运行时读不到。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(section=section, key="url", value="x")
+
+        assert "实例" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "section",
+        ["notify-webhook-1", "notify-webhook-abc", "notify-email-2", "summary-1"],
+    )
+    async def test_update_config_带后缀的实例段_放行(self, section):
+        """带后缀的实例段应放行（后缀不限数字，因其会被真实读取）。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section=section, key="url", value="x"
+                )
+
+        assert result["status"] == "success"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("section", ["notify-airing-today", "notify-in-app"])
+    async def test_update_config_非多实例的notify段_不受后缀限制(self, section):
+        """notify-airing-today / notify-in-app 不是多实例段，不应被误伤。"""
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section=section, key="enabled", value="true"
+                )
+
+        assert result["status"] == "success"
