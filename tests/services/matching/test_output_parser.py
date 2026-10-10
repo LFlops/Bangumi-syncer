@@ -1,11 +1,11 @@
-"""app.services.llm.output_parser 测试。
+"""app.services.matching.output_parser 测试。
 
 结构化输出解析器：从 LLM 自由文本提取 JSON -> 校验 subject_id/reason ->
 返回 (LLMSuggestion | None, 错误原因)。任何畸形/类型错误都必须以
 (None, 原因) 降级，绝不抛异常。
 """
 
-from app.services.llm.output_parser import LLMSuggestion, parse_suggestion
+from app.services.matching.output_parser import LLMSuggestion, parse_suggestion
 
 
 class TestParseSuggestionSuccess:

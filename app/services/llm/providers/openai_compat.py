@@ -353,23 +353,6 @@ class OpenAICompatProvider(BaseProvider):
         body.pop("cache_control", None)
         return body
 
-    def _to_wire_message(self, m: Message) -> dict:
-        """单条内部消息 → 单条 OpenAI wire 消息（无 tool 拆分的简单路径）。
-
-        content 为 list[ContentBlock] 时取 text block 拼接（与 Anthropic 侧
-        _system_text 同一分隔语义）；thinking/tool 等 block 不适用于当前端点，
-        跳过（工具协议见 _to_wire_messages）。
-        """
-        if isinstance(m.content, str):
-            return {"role": m.role, "content": m.content}
-        parts = [b.text for b in m.content if isinstance(b, TextBlock)]
-        skipped = len(m.content) - len(parts)
-        if skipped:
-            logger.debug(
-                f"OpenAI wire 不支持 {skipped} 个非 text content block，已跳过"
-            )
-        return {"role": m.role, "content": "\n\n".join(parts)}
-
     def _to_wire_messages(self, m: Message) -> list[dict]:
         """内部消息 → 一条或多条 OpenAI wire 消息（工具协议拆并）。
 
@@ -383,8 +366,9 @@ class OpenAICompatProvider(BaseProvider):
         一致。chat completions 的 content 是单个字符串，协议无法表达
         「文本 → 工具调用 → 文本」的交错，只能降级为拼接；此时若注入 wire 上
         不存在的 ``"\\n\\n"``，模型读到的语义会被改写（"A\\n\\nB 然后调工具"
-        vs 实际的"A 调工具，然后说 B"）。system 的 ``"\\n\\n"`` 分隔是另一回事
-        （见 :meth:`_to_wire_message`，多块本就代表多条独立规则），保持不变。
+        vs 实际的"A 调工具，然后说 B"）。system 等**无工具**消息走末尾的纯文本
+        分支，其多块仍以 ``"\\n\\n"`` 连接 —— 多块本就代表多条独立规则，
+        与 Anthropic 侧 ``_system_text`` 同一分隔语义。
         """
         if isinstance(m.content, str):
             return [{"role": m.role, "content": m.content}]

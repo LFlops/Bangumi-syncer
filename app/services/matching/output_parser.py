@@ -1,10 +1,16 @@
-"""结构化输出解析器。
+"""匹配场景的结构化输出解析器（**匹配领域能力，非 llm 层通用设施**）。
 
 LLM 返回自由文本时，从中提取 JSON、校验 subject_id / reason，并以
 ``(LLMSuggestion | None, 错误原因)`` 形式降级返回。任何畸形 / 类型错误都
-以 ``(None, 原因)`` 降级，**绝不抛异常**，供调用方直接写入 ``last_error`` 。
+以 ``(None, 原因)`` 降级，**绝不抛异常**，供调用方直接写入 ``last_error``。
 
-设计为纯函数（无状态），后续诊断报告解析可复用本模块。
+归属说明（原位于 ``app/services/llm/output_parser.py``，2026-10-11 迁出）：
+解析产物 ``subject_id`` 是匹配领域概念，且全仓唯一消费者是
+``matching/llm_assist.py``（``exhausted`` 兜底解析文本建议）。llm 层只保留
+与领域无关的通用设施（client / models / providers / protocols），避免领域
+能力上浮成「通用」后被其它场景误用。
+
+设计为纯函数（无状态）。
 """
 
 import json

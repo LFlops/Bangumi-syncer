@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
-from typing import Any
 
 from app.core.database import get_database_manager
 from app.core.logging import logger
@@ -183,7 +182,8 @@ async def _invoke_loop(
     seed_messages: Sequence[Message],
 ) -> RunResult:
     """以流式主路径运行通用循环（chat span 包装 + 按轮执行器工厂）。"""
-    common: dict[str, Any] = dict(
+    return await loop_run(
+        stream_fn=span_recorder.wrap_stream_fn(stream_fn),
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
         tool_choice_terminal=hooks.terminal_tool,
@@ -191,11 +191,7 @@ async def _invoke_loop(
         recorder=span_recorder,
         # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
         veto_terminal=getattr(hooks, "veto_terminal", None),
-    )
-    return await loop_run(
-        stream_fn=span_recorder.wrap_stream_fn(stream_fn),
         executor_factory=_make_executor_factory(registry, span_recorder),
-        **common,
     )
 
 

@@ -82,7 +82,7 @@ class TestOpenAICompatProviderInit:
 
 
 class TestOpenAICompatBuildRequest:
-    """：_build_request / _to_wire_message / reasoning_effort 映射。"""
+    """：_build_request / _to_wire_messages / reasoning_effort 映射。"""
 
     def _provider(self, thinking_level="off", model="gpt-4o-mini"):
         return OpenAICompatProvider(
@@ -99,14 +99,15 @@ class TestOpenAICompatBuildRequest:
         assert "reasoning_effort" not in body  # off 不传 = 现状行为
 
     def test_content_block_list_flattens_text_blocks(self):
+        """多段 TextBlock 在活路径（_to_wire_messages）上以 ``\\n\\n`` 连接。"""
         from app.services.llm.models import TextBlock
 
         msg = Message(
             role="system",
             content=[TextBlock(text="第一段"), TextBlock(text="第二段")],
         )
-        wire = self._provider()._to_wire_message(msg)
-        assert wire["content"] == "第一段\n\n第二段"
+        wire = self._provider()._to_wire_messages(msg)
+        assert wire == [{"role": "system", "content": "第一段\n\n第二段"}]
 
     @pytest.mark.parametrize(
         "level,expected", [("low", "low"), ("medium", "medium"), ("high", "high")]
@@ -714,6 +715,6 @@ class TestOpenAICompatAssistantTextFidelity:
         msg = Message(
             role="system", content=[TextBlock(text="规则A"), TextBlock(text="规则B")]
         )
-        wire = self._provider()._to_wire_message(msg)
+        wire = self._provider()._to_wire_messages(msg)
 
-        assert wire["content"] == "规则A\n\n规则B"
+        assert wire == [{"role": "system", "content": "规则A\n\n规则B"}]

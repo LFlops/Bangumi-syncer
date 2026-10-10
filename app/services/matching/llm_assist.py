@@ -67,8 +67,8 @@ from app.services.llm.client import get_llm_client
 from app.services.llm.models import (
     Message,
 )
-from app.services.llm.output_parser import parse_suggestion
 from app.services.matching.identity import build_match_business_key
+from app.services.matching.output_parser import parse_suggestion
 from app.services.sync_service import SyncService
 from app.utils.bangumi_api import BangumiApi
 
