@@ -136,12 +136,6 @@ async def run(
     )
 
 
-def _is_terminal_tool(registry: ToolRegistry, name: str) -> bool:
-    """工具是否终止性（access=terminal）：决定执行器是否抑制其提前执行。"""
-    defn = registry.get(name)
-    return defn is not None and defn.access == "terminal"
-
-
 def _make_executor_factory(
     registry: ToolRegistry, span_recorder: ToolSpanRecorder
 ) -> Callable[[], StreamingToolExecutor]:
@@ -161,7 +155,7 @@ def _make_executor_factory(
         return StreamingToolExecutor(
             execute_fn=execute_fn,
             is_idempotent=registry.is_idempotent,
-            is_terminal=lambda name: _is_terminal_tool(registry, name),
+            is_terminal=registry.is_terminal,
             on_recorder=span_recorder,
             batch_execute_fn=functools.partial(
                 registry.execute_batch, recorder=span_recorder

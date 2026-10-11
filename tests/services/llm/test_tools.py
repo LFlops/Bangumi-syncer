@@ -1122,6 +1122,34 @@ def test_is_idempotent_unregistered_returns_false():
 
 
 # ---------------------------------------------------------------------------
+# ToolRegistry.is_terminal 查询（与 is_idempotent 对称：access 属性的自查询）
+# ---------------------------------------------------------------------------
+
+
+def test_is_terminal_true_only_for_terminal_access():
+    reg = ToolRegistry()
+    for name, access in (("r", "read"), ("w", "write"), ("t", "terminal")):
+        reg.register(
+            ToolDefinition(
+                name=name,
+                description="d",
+                parameters={},
+                handler=_noop_handler,
+                access=access,
+            )
+        )
+    assert reg.is_terminal("t") is True
+    assert reg.is_terminal("r") is False
+    assert reg.is_terminal("w") is False
+
+
+def test_is_terminal_unregistered_returns_false():
+    """未注册工具返回 False（不抛错，与 is_idempotent 同口径）。"""
+    reg = ToolRegistry()
+    assert reg.is_terminal("ghost") is False
+
+
+# ---------------------------------------------------------------------------
 # execute_batch 分段判据改为幂等（连续幂等段并行 / 非幂等串行）
 # ---------------------------------------------------------------------------
 

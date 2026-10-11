@@ -165,6 +165,17 @@ class ToolRegistry:
         defn = self._tools.get(name)
         return defn is not None and bool(defn.idempotent)
 
+    def is_terminal(self, name: str) -> bool:
+        """工具是否终止性（``access == "terminal"``）。
+
+        与 :meth:`is_idempotent` 对称的**属性自查询**：调用方（loop / 执行器）
+        无需自行解包 ``ToolDefinition``，也无需在通用层另写一份判定函数。
+
+        未注册工具返回 ``False``（不抛错），与 :meth:`is_idempotent` 同口径。
+        """
+        defn = self._tools.get(name)
+        return defn is not None and defn.access == "terminal"
+
     # -- 校验 ---------------------------------------------------------------
 
     def _validate(self, defn: ToolDefinition, args: dict) -> None:
