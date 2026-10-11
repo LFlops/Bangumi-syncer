@@ -13,9 +13,12 @@ import httpx
 from ...core.config import config_manager
 from ...core.logging import logger
 from ...utils.bangumi_constants import (
+    COLLECTION_TYPE_DOING,
     COLLECTION_TYPE_DONE,
     COLLECTION_TYPE_ON_HOLD,
     COLLECTION_TYPE_WISH,
+    SUBJECT_TYPE_ANIME,
+    SUBJECT_TYPE_REAL,
 )
 
 
@@ -85,7 +88,7 @@ class CollectionMixin:
                 break
         return results[:max_total]
 
-    def get_subject_collection(self, subject_id: int) -> dict[str, Any]:
+    def get_subject_collection(self, subject_id: int | str) -> dict[str, Any]:
         res = self.get(f"users/{self.username}/collections/{subject_id}")
         if res.status_code == 404:
             return {}
@@ -102,7 +105,7 @@ class CollectionMixin:
             res = {}
         return res
 
-    def get_ep_collection(self, episode_id: int) -> dict[str, Any]:
+    def get_ep_collection(self, episode_id: int | str) -> dict[str, Any]:
         res = self.get(f"users/-/collections/-/episodes/{episode_id}")
         if res.status_code == 404:
             return {}
@@ -127,7 +130,7 @@ class CollectionMixin:
     #   并重新抛异常；本方法捕获后入队
     # ------------------------------------------------------------------
 
-    def ensure_subject_watching(self, subject_id: int) -> int:
+    def ensure_subject_watching(self, subject_id: int | str) -> int:
         """
         仅将条目收藏置为「在看」(COLLECTION_TYPE_DOING)，不修改单集进度。
 
@@ -168,16 +171,20 @@ class CollectionMixin:
             # 4xx（除 401 已在 _check_auth_error 处理）：业务错误，不入队，正常抛出
             raise
 
-    def _do_ensure_subject_watching(self, subject_id: int) -> int:
+    def _do_ensure_subject_watching(self, subject_id: int | str) -> int:
         """实际执行 ensure_subject_watching 的子步骤（原逻辑）"""
         data = self.get_subject_collection(subject_id)
         if not data:
-            self.add_collection_subject(subject_id=subject_id, state=3)
+            self.add_collection_subject(
+                subject_id=subject_id, state=COLLECTION_TYPE_DOING
+            )
             return 1
         if data.get("type") == COLLECTION_TYPE_DONE:
             return 0
         if data.get("type") in (COLLECTION_TYPE_WISH, COLLECTION_TYPE_ON_HOLD):
-            self.change_collection_state(subject_id=subject_id, state=3)
+            self.change_collection_state(
+                subject_id=subject_id, state=COLLECTION_TYPE_DOING
+            )
             return 1
         return 0
 
@@ -189,7 +196,7 @@ class CollectionMixin:
     #   并重新抛异常；上层捕获后再决定入队
     # ------------------------------------------------------------------
 
-    def mark_episode_watched(self, subject_id: int, ep_id: int) -> int:
+    def mark_episode_watched(self, subject_id: int | str, ep_id: int | str) -> int:
         """标记单集为已看
 
         返回值：
@@ -228,14 +235,14 @@ class CollectionMixin:
             # 4xx（除 401 已在 _check_auth_error 处理）：业务错误，不入队，正常抛出
             raise
 
-    def _do_mark_episode_watched(self, subject_id: int, ep_id: int) -> int:
+    def _do_mark_episode_watched(self, subject_id: int | str, ep_id: int | str) -> int:
         """实际执行 mark_episode_watched 的子步骤（原逻辑）"""
         data = self.get_subject_collection(subject_id)
 
         # 如果未收藏，则先标记为在看，再点单集格子
         if not data:
             self.add_collection_subject(subject_id=subject_id)
-            self.change_episode_state(ep_id=ep_id, state=2)
+            self.change_episode_state(ep_id=ep_id, state=COLLECTION_TYPE_DONE)
             return 2
         else:
             # 如果整部番已看过则跳过
@@ -246,7 +253,9 @@ class CollectionMixin:
                 data.get("type") == COLLECTION_TYPE_WISH
                 or data.get("type") == COLLECTION_TYPE_ON_HOLD
             ):
-                self.change_collection_state(subject_id=subject_id, state=3)
+                self.change_collection_state(
+                    subject_id=subject_id, state=COLLECTION_TYPE_DOING
+                )
 
         ep_data = self.get_ep_collection(ep_id)
         logger.debug(ep_data)
@@ -255,11 +264,14 @@ class CollectionMixin:
             return 0
         else:
             # 否则直接点单集格子
-            self.change_episode_state(ep_id=ep_id, state=2)
+            self.change_episode_state(ep_id=ep_id, state=COLLECTION_TYPE_DONE)
             return 1
 
     def add_collection_subject(
-        self, subject_id: int, private: bool | None = None, state: int = 3
+        self,
+        subject_id: int | str,
+        private: bool | None = None,
+        state: int = COLLECTION_TYPE_DOING,
     ) -> None:
         private = self.private if private is None else private
         self.post(
@@ -268,7 +280,10 @@ class CollectionMixin:
         )
 
     def change_collection_state(
-        self, subject_id: int, private: bool | None = None, state: int = 3
+        self,
+        subject_id: int | str,
+        private: bool | None = None,
+        state: int = COLLECTION_TYPE_DOING,
     ) -> None:
         private = self.private if private is None else private
         self.post(
@@ -276,9 +291,14 @@ class CollectionMixin:
             _json={"type": state, "private": bool(private)},
         )
 
-    def change_episode_state(self, ep_id: int, state: int = 2) -> None:
+    def change_episode_state(
+        self, ep_id: int | str, state: int = COLLECTION_TYPE_DONE
+    ) -> None:
         res = self.put(f"users/-/collections/-/episodes/{ep_id}", _json={"type": state})
-        if 333 < res.status_code < 444:
+        # 任何 4xx/5xx 都表示标记未成功，必须抛出触发上层失败/重试，
+        # 否则调用方会把未落库的标记当作成功（假阳性）。
+        # 旧实现 ``333 < status < 444`` 会漏掉 444-499（如 451/444）等失败码。
+        if res.status_code >= 400:
             raise ValueError(f"{res.status_code=} {res.text}")
         return res
 
@@ -298,8 +318,8 @@ class _PendingSyncQueued(Exception):
 
     def __init__(
         self,
-        subject_id: int,
-        ep_id: Optional[int] = None,
+        subject_id: int | str,
+        ep_id: int | str | None = None,
         reason: str = "api_unreachable",
         cause: Optional[BaseException] = None,
     ) -> None:
@@ -370,10 +390,14 @@ def get_watching_subject_ids(api: Any) -> set[int]:
         # 默认 500 在重度用户场景会漏条目，提升到 2000 覆盖绝大多数用户
         # （动画/三次元各 2000 上限，合计 4000 部在看）
         anime_watching = api.list_user_collections(
-            subject_type=2, collection_type=3, max_total=2000
+            subject_type=SUBJECT_TYPE_ANIME,
+            collection_type=COLLECTION_TYPE_DOING,
+            max_total=2000,
         )
         real_watching = api.list_user_collections(
-            subject_type=6, collection_type=3, max_total=2000
+            subject_type=SUBJECT_TYPE_REAL,
+            collection_type=COLLECTION_TYPE_DOING,
+            max_total=2000,
         )
         ids = {
             item.get("subject_id")

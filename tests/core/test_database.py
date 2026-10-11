@@ -8,6 +8,12 @@ from unittest.mock import patch
 import pytest
 
 
+def _record(row: dict | None) -> dict:
+    """显式收窄可选查询结果（测试前提：目标记录存在）"""
+    assert row is not None, "查询记录应存在"
+    return row
+
+
 class TestDatabaseManager:
     """测试 DatabaseManager 类。"""
 
@@ -71,8 +77,67 @@ class TestDatabaseManager:
                 status="success",
                 media_type="movie",
             )
-            r = db.get_sync_record_by_id(1)
+            r = _record(db.get_sync_record_by_id(1))
             assert r["media_type"] == "movie"
+
+    def test_log_sync_record_stores_account_results(self, temp_dir, reset_singletons):
+        """account_results 随同步记录落库并可被详情接口读回。"""
+        import json
+
+        db_path = temp_dir / "accounts.db"
+        with patch("app.core.database.logger"):
+            from app.core.database import DatabaseManager
+
+            db = DatabaseManager(str(db_path))
+            outcomes = [
+                {
+                    "section": "bangumi",
+                    "username": "main",
+                    "status": "success",
+                    "message": "",
+                    "primary": True,
+                },
+                {
+                    "section": "bangumi-2",
+                    "username": "alt",
+                    "status": "failed",
+                    "message": "API 不可达",
+                    "primary": False,
+                },
+            ]
+            db.log_sync_record(
+                user_name="u",
+                title="多账号动画",
+                ori_title=None,
+                season=1,
+                episode=1,
+                status="success",
+                source="custom",
+                account_results=outcomes,
+            )
+            record = _record(db.get_sync_record_by_id(1))
+            assert json.loads(record["account_results"]) == outcomes
+
+    def test_log_sync_record_account_results_default_empty(
+        self, temp_dir, reset_singletons
+    ):
+        """未传 account_results 时落库为空字符串，旧记录详情不应报错。"""
+        db_path = temp_dir / "accounts_default.db"
+        with patch("app.core.database.logger"):
+            from app.core.database import DatabaseManager
+
+            db = DatabaseManager(str(db_path))
+            db.log_sync_record(
+                user_name="u",
+                title="单账号动画",
+                ori_title=None,
+                season=1,
+                episode=1,
+                status="success",
+                source="custom",
+            )
+            record = _record(db.get_sync_record_by_id(1))
+            assert record["account_results"] == ""
 
     def test_migrate_adds_media_type_column(self, temp_dir, reset_singletons):
         """旧表无 media_type 时自动 ALTER 并回填"""
@@ -109,7 +174,7 @@ class TestDatabaseManager:
             from app.core.database import DatabaseManager
 
             db = DatabaseManager(str(db_path))
-        row = db.get_sync_record_by_id(1)
+        row = _record(db.get_sync_record_by_id(1))
         assert row["media_type"] == "episode"
 
     def test_migrate_adds_match_fields_columns(self, temp_dir, reset_singletons):
@@ -192,6 +257,52 @@ class TestDatabaseManager:
         for col in ("run_id", "batch_id"):
             assert col in cols
 
+    def test_migrate_adds_account_results_column(self, temp_dir, reset_singletons):
+        """旧表缺 account_results 时自动补齐，既有记录仍可读（值为空串）"""
+        db_path = temp_dir / "account_results_migration.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            """
+            CREATE TABLE sync_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                user_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                ori_title TEXT,
+                season INTEGER NOT NULL,
+                episode INTEGER NOT NULL,
+                subject_id TEXT,
+                episode_id TEXT,
+                status TEXT NOT NULL,
+                message TEXT,
+                source TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """INSERT INTO sync_records
+            (timestamp, user_name, title, ori_title, season, episode, subject_id, episode_id, status, message, source)
+            VALUES ('2020-01-01', 'u', 't', NULL, 1, 1, NULL, NULL, 'success', '', 'custom')
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        with patch("app.core.database.logger"):
+            from app.core.database import DatabaseManager
+
+            db = DatabaseManager(str(db_path))
+        cols = [
+            row[1]
+            for row in db._connection._get_connection().execute(
+                "PRAGMA table_info(sync_records)"
+            )
+        ]
+        assert "account_results" in cols
+        record = _record(db.get_sync_record_by_id(1))
+        assert record["title"] == "t"
+        assert record["account_results"] == ""
+
     def test_log_sync_record_stores_run_and_batch_context(
         self, temp_dir, reset_singletons
     ):
@@ -210,7 +321,7 @@ class TestDatabaseManager:
                     season=1,
                     episode=1,
                 )
-        record = db.get_sync_record_by_id(1)
+        record = _record(db.get_sync_record_by_id(1))
         assert record["run_id"] == "sync_ctx_1"
         assert record["batch_id"] == "batch_ctx_1"
         listed = db.get_sync_records(limit=10)["records"][0]
@@ -233,7 +344,7 @@ class TestDatabaseManager:
                 season=1,
                 episode=1,
             )
-            record = db.get_sync_record_by_id(1)
+            record = _record(db.get_sync_record_by_id(1))
         assert record["run_id"] == ""
         assert record["batch_id"] == ""
 
@@ -433,7 +544,7 @@ class TestDatabaseManager:
             assert success is True
 
             # 验证更新
-            result = db.get_sync_record_by_id(1)
+            result = _record(db.get_sync_record_by_id(1))
             assert result["status"] == "success"
             assert result["message"] == "Updated message"
 
@@ -658,7 +769,7 @@ class TestDatabaseDockerAndTrakt:
                 )
                 is True
             )
-            assert db.get_trakt_config("u1")["access_token"] == "t2"
+            assert _record(db.get_trakt_config("u1"))["access_token"] == "t2"
             assert db.delete_trakt_config("u1") is True
             assert db.get_trakt_config("u1") is None
             assert db.delete_trakt_config("u1") is False
@@ -744,7 +855,7 @@ class TestDatabaseDockerAndTrakt:
                     }
                 )
                 # 仓储层读取：明文
-                row = db.get_trakt_config("u1")
+                row = _record(db.get_trakt_config("u1"))
                 assert row["access_token"] == "secret-at"
                 assert row["refresh_token"] == "secret-rt"
                 # 直接查 DB：密文
@@ -803,7 +914,7 @@ class TestDatabaseDockerAndTrakt:
                     )
                     is True
                 )
-                row = db.get_trakt_config("u1")
+                row = _record(db.get_trakt_config("u1"))
                 assert row["enabled"] is False
                 assert row["sync_interval"] == "0 */12 * * *"
                 assert row["auth_type"] == "bearer"
@@ -872,7 +983,7 @@ class TestDatabaseDockerAndTrakt:
     def test_error_sync_record_no_longer_creates_in_app_notification(
         self, temp_dir, reset_singletons
     ):
-        """P4.5：log_sync_record 移除隐式站内信副作用后，error 记录不再自动写站内信。
+        """log_sync_record 移除隐式站内信副作用后，error 记录不再自动写站内信。
 
         站内信由 notification_service.notify() 显式触发，数据库层只负责记录 sync_records。
         """
@@ -918,7 +1029,7 @@ class TestDatabaseDockerAndTrakt:
 
             db = DatabaseManager(str(db_path))
 
-        # P4.5：站内信由 notification_service.notify() 显式创建，
+        # 站内信由 notification_service.notify() 显式创建，
         # 此处直接调用 insert_notification 模拟显式写入
         db.insert_notification("sync_failed", "同步失败：A S1E1", "e", ref_id=1)
         assert db.count_unread_notifications() == 1
@@ -1001,7 +1112,8 @@ class TestDatabaseDockerAndTrakt:
             message="fail",
             source="test",
         )
-        # P4.5：显式创建站内信（关联 sync_records.id）
+        assert record_id is not None
+        # 显式创建站内信（关联 sync_records.id）
         db.insert_notification(
             "sync_failed",
             "同步失败：联动番剧 S1E1",
@@ -1019,7 +1131,7 @@ class TestDatabaseDockerAndTrakt:
 
             db = DatabaseManager(str(db_path))
 
-        # P4.5：显式创建两条同标题站内信，模拟 notification_service.notify() 写入
+        # 显式创建两条同标题站内信，模拟 notification_service.notify() 写入
         db.insert_notification("sync_failed", "同步失败：组内番剧 S1E1", "e1", ref_id=1)
         db.insert_notification("sync_failed", "同步失败：组内番剧 S1E2", "e2", ref_id=2)
         assert db.count_unread_notifications() == 2
@@ -1208,7 +1320,7 @@ class TestCleanupOldRecords:
     def test_cleanup_removes_orphan_assoc_rows(self, temp_dir, reset_singletons):
         """清理旧记录时，关联表 sync_records_consumed 孤儿行一并清除。
 
-        P2-1：DELETE sync_records 后关联表残留指向已删记录的消费标记，
+        DELETE sync_records 后关联表残留指向已删记录的消费标记，
         表体积膨胀。级联清理避免孤儿行积累。
         """
         db_path = temp_dir / "cleanup_orphan.db"
@@ -1226,7 +1338,8 @@ class TestCleanupOldRecords:
             status="success",
             source="test",
         )
-        from app.services.memory.models import MemoryEntry
+        assert r1 is not None
+        from app.models.memory import MemoryEntry
 
         db.memory.store_and_mark(
             MemoryEntry(

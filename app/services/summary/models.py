@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from app.services.llm.models import Usage
+
 
 @dataclass
 class SummaryJobConfig:
@@ -23,10 +25,13 @@ class SummaryJobConfig:
     )
     max_records: int = -1  # -1 表示不限制
     # 记忆特性（未发布，直接重构）：
-    # memory_limit=0 关闭记忆（不注入/不写入/不排除已消费记录）；
+    # memory_limit=0 关闭记忆特性（不注入最近 N 条摘要/不写入/不排除已消费记录）；
     # >0 注入最近 N 条摘要 + 已消费记录排除（信息由摘要承继）。
+    # related_limit 独立于 memory_limit 生效：memory_limit=0 时仍可单独开启同剧关联，
+    # 但只能召回本任务曾写入过的历史摘要（从未写入过则无内容可注入）。
     memory_limit: int = 0  # 0=关；1–1000=注入最近 N 条摘要（对齐 prune 上限）
     related_limit: int = 0  # 0=关；1–1000=同剧关联最近 N 条（日期倒序）
+    thinking_level: str = "off"  # off | low | medium | high
 
     @classmethod
     def from_config_dict(cls, data: dict) -> SummaryJobConfig:
@@ -40,11 +45,17 @@ class SummaryJobConfig:
                 return 0
 
         def _int(key: str, default: int) -> int:
-            """H2：非法值回落默认——单个坏配置不得拖垮调度注册（与 _limit 同款保护）。"""
+            """非法值回落默认——单个坏配置不得拖垮调度注册（与 _limit 同款保护）。"""
             try:
                 return int(data.get(key, default))
             except (TypeError, ValueError):
                 return default
+
+        def _thinking_level(key: str) -> str:
+            """校验 thinking_level 取值，非法回落 'off'。"""
+            valid = ("off", "low", "medium", "high")
+            value = str(data.get(key, "off")).strip().lower()
+            return value if value in valid else "off"
 
         return cls(
             name=str(data.get("name", "")),
@@ -58,6 +69,7 @@ class SummaryJobConfig:
             max_records=_int("max_records", -1),
             memory_limit=_limit("memory_limit"),
             related_limit=_limit("related_limit"),
+            thinking_level=_thinking_level("thinking_level"),
         )
 
 
@@ -78,3 +90,20 @@ class SummaryRecord:
     consumed_run_ids: set[str] = field(
         default_factory=set
     )  # 消费标记（多对多，空集=未消费）
+
+
+@dataclass
+class SummaryResult:
+    """``generate_summary`` / 成功通知链路的聚合结果 DTO。
+
+    字段与旧结果 dict 的键集一一对应
+    （summary_text/model/usage/latency_ms/record_count/date_from/date_to）。
+    """
+
+    summary_text: str = ""
+    model: str = ""
+    usage: Usage | None = None
+    latency_ms: int = 0
+    record_count: int = 0
+    date_from: str = ""
+    date_to: str = ""

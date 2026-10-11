@@ -22,7 +22,6 @@ bangumi_archive 模块（_title_normalize / _title_index / _store），
 
 from __future__ import annotations
 
-import re
 from typing import Any, NamedTuple, Optional
 
 from ...core.config import config_manager
@@ -38,7 +37,8 @@ from ..bangumi_archive._title_normalize import (
     _strip_season_episode_suffix,
     build_search_variants,
 )
-from ..bangumi_constants import RELATION_ID_SEQUEL
+from ..bangumi_constants import RELATION_ID_SEQUEL, SUBJECT_TYPE_ANIME
+from ..title_patterns import YEAR_RE
 
 
 class ShortcutResult(NamedTuple):
@@ -83,6 +83,14 @@ class ArchiveShortcut:
         )
         if self._enabled:
             logger.debug("bangumi_archive 短路已启用，读操作将优先走 Archive")
+
+    def set_enabled(self, enabled: bool) -> None:
+        """设置启用状态
+
+        供测试隔离与运行时切换使用；注意后续调用 reload_config()
+        会按用户配置再次覆盖本次手动设置。
+        """
+        self._enabled = bool(enabled)
 
     @property
     def enabled(self) -> bool:
@@ -150,7 +158,7 @@ class ArchiveShortcut:
             logger.warning(f"bangumi_archive 短路 get_episodes 异常: {e}")
             return ShortcutResult(False, None, "archive_error")
 
-    def try_get_related_subjects(self, subject_id: int) -> ShortcutResult:
+    def try_get_related_subjects(self, subject_id: int | str) -> ShortcutResult:
         """短路 get_related_subjects
 
         Returns:
@@ -412,7 +420,9 @@ class ArchiveShortcut:
                 return ShortcutResult(False, None, "archive_miss")
 
             # API 默认 type=[2]（与 search() 一致），None/空列表时也用 [2]
-            types_set: set[int] = set(subject_types) if subject_types else {2}
+            types_set: set[int] = (
+                set(subject_types) if subject_types else {SUBJECT_TYPE_ANIME}
+            )
             skip_ids: set[int] = set()
 
             # G1：从 start_date 抽取首播年份，显式透传给标题精确匹配做年份消歧。
@@ -421,7 +431,7 @@ class ArchiveShortcut:
             # start_date 形如 "2006-01-01"，无日期/格式不符时 year=None（退化原行为）。
             year: Optional[int] = None
             if start_date:
-                m = re.search(r"(?:19|20)\d{2}", start_date)
+                m = YEAR_RE.search(start_date)
                 if m:
                     year = int(m.group(0))
 

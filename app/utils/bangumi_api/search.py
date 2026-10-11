@@ -12,6 +12,7 @@ from ..bangumi_archive._title_normalize import (
     _normalize_title_for_match,
     fuse_title_similarity,
 )
+from ..bangumi_constants import SUBJECT_TYPE_ANIME
 
 if TYPE_CHECKING:
     from app.services.sync_service.match_trace import MatchTrace
@@ -60,7 +61,7 @@ class SearchMixin:
             end_date,
             limit,
             list_only,
-            tuple(subject_types or [2]),
+            tuple(subject_types or [SUBJECT_TYPE_ANIME]),
         )
         if cache_key in self._cache["search"]:
             return self._cache["search"][cache_key]
@@ -84,7 +85,7 @@ class SearchMixin:
             if end_date:
                 air_date_filter.append(f"<{end_date}")
             subject_filter: dict[str, Any] = {
-                "type": subject_types if subject_types else [2],
+                "type": subject_types if subject_types else [SUBJECT_TYPE_ANIME],
                 "nsfw": True,
             }
             if air_date_filter:
@@ -120,7 +121,9 @@ class SearchMixin:
         self._put_cache("search", cache_key, result)
         return result
 
-    def get_subject(self, subject_id: int, use_archive: bool = True) -> dict[str, Any]:
+    def get_subject(
+        self, subject_id: int | str, use_archive: bool = True
+    ) -> dict[str, Any]:
         # 使用实例缓存避免内存泄漏。key 区分 use_archive：Archive 数据不含
         # images 字段，混用同一槽位会污染 API 结果的封面解析。
         cache_key = (subject_id, use_archive)
@@ -163,7 +166,7 @@ class SearchMixin:
         return res
 
     def get_related_subjects(
-        self, subject_id: int
+        self, subject_id: int | str
     ) -> list[dict[str, Any]] | dict[str, Any]:
         # 使用实例缓存避免内存泄漏
         if subject_id in self._cache["get_related_subjects"]:

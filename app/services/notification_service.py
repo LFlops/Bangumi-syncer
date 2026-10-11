@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import html
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -65,7 +66,7 @@ class _SafeFormatDict(dict):
 class CooldownPolicy:
     """冷却策略：防止通知轰炸
 
-    - 「条目级」类型（mark_failed / mark_success / ...）按 ``channel_id + type + title + season + episode`` 冷却
+    - 「条目级」类型（mark_failed / mark_success / ...）按 ``channel_id + type + title + season + episode`` 冷却；携带 ``bgm_username`` 时再按账号区分，使多账号场景下各账号的通知互不拦截
     - 「系统级」类型按 ``channel_id + type`` 冷却
     """
 
@@ -81,7 +82,10 @@ class CooldownPolicy:
         meta = get_type_meta(notification_type)
         if meta and meta.is_item_level:
             item_key = f"{data.get('title', '')}::S{data.get('season', 0)}E{data.get('episode', 0)}"
-            key = f"{key}::{item_key}"
+            # bgm_username 区分多账号：同一条目被多个 Bangumi 账号标记时，
+            # 各账号的通知使用各自的 key，避免非首选账号被首选账号的冷却拦截。
+            account_key = data.get("bgm_username", "") or ""
+            key = f"{key}::{item_key}::{account_key}"
         return key
 
     def allow(
@@ -459,13 +463,17 @@ class NotificationService:
             else:
                 rendered = self.template_mgr.render_email(type_data)
             # 如果配置了自定义 subject 则覆盖
+            subject = rendered["subject"]
             custom_subject = channel.config.get("email_subject", "").strip()
             if custom_subject:
-                rendered["subject"] = self.template_mgr.render_string(
-                    custom_subject, type_data
-                )
-            rendered["payload"] = type_data
-            return rendered
+                subject = self.template_mgr.render_string(custom_subject, type_data)
+            # payload 直接承载原始 data（含 meta 注入），body/html 来自模板渲染
+            return {
+                "subject": subject,
+                "body": rendered["body"],
+                "html": rendered["html"],
+                "payload": type_data,
+            }
 
         # 默认回退：直接把 data 当 payload
         return {"payload": type_data}
@@ -512,14 +520,16 @@ class NotificationService:
                 else "剧场版"
             )
             fmt_data = _SafeFormatDict(data)
-            fmt_data.setdefault("title", data.get("title", "unknown"))
+            # 标题强制 HTML 转义，防止 XSS / 模板注入
+            # 注意：data 中已含 title，必须用赋值覆盖而非 setdefault
+            fmt_data["title"] = html.escape(str(data.get("title", "unknown")))
             fmt_data.setdefault("ep_label", ep_label)
             try:
                 title = meta.in_app_title_template.format_map(fmt_data)
             except Exception:
-                title = data.get("title", "unknown")
+                title = html.escape(str(data.get("title", "unknown")))
         else:
-            title = data.get("title", "unknown")
+            title = html.escape(str(data.get("title", "unknown")))
 
         body = (
             custom_body
@@ -527,6 +537,13 @@ class NotificationService:
             or data.get("error_message", "")
             or data.get("message", "")
         )
+
+        # Agent 标识：LLM 建议场景，站内信正文前缀 [AI 建议] 并透传原因
+        # llm_reason 强制 HTML 转义，防止 XSS / 模板注入（与标题一致）
+        if data.get("is_llm_suggestion"):
+            ai_prefix = "[AI 建议] "
+            llm_reason = html.escape(str(data.get("llm_reason", "") or ""))
+            body = f"{ai_prefix}{llm_reason}"
 
         try:
             self._get_db_manager().insert_notification(in_app_type, title, body, ref_id)

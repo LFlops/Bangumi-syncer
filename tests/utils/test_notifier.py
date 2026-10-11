@@ -3,6 +3,7 @@
 """
 
 import smtplib
+from typing import Any, cast
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -724,7 +725,8 @@ class TestNotifierParseHeaders:
         """测试非字符串类型请求头"""
         mock_config = MagicMock()
         notifier = Notifier(mock_config)
-        result = notifier._parse_headers(123)
+        # 非字符串属刻意覆盖：运行期由 _parse_headers 内部类型判断处理
+        result = notifier._parse_headers(cast(Any, 123))
         assert "User-Agent" in result
 
 
@@ -823,6 +825,10 @@ class TestNotificationServiceNotify:
         svc._db_manager = MagicMock()
         return svc
 
+    def _registry(self, svc: NotificationService) -> MagicMock:
+        """把 svc.channel_registry 收窄回 MagicMock，便于断言 mock 行为。"""
+        return cast(MagicMock, svc.channel_registry)
+
     def test_notify_with_item(self):
         """测试发送通知带 item：无规则时停发外部渠道，仅完成数据构造与站内信"""
         svc = self._make_service()
@@ -838,7 +844,7 @@ class TestNotificationServiceNotify:
         result = svc.notify("mark_success", item=item, source="custom")
         assert result is True
         # 无通知规则 = 停发外部渠道，不应进行渠道分发
-        svc.channel_registry.iter_enabled.assert_not_called()
+        self._registry(svc).iter_enabled.assert_not_called()
 
     def test_notify_without_item(self):
         """测试发送通知不带 item"""
@@ -846,12 +852,12 @@ class TestNotificationServiceNotify:
 
         result = svc.notify("mark_success", title="测试")
         assert result is True
-        svc.channel_registry.iter_enabled.assert_not_called()
+        self._registry(svc).iter_enabled.assert_not_called()
 
     def test_notify_exception_returns_false(self):
         """测试发送通知异常时返回 False"""
         svc = self._make_service()
-        svc.channel_registry.all.side_effect = Exception("发送失败")
+        self._registry(svc).all.side_effect = Exception("发送失败")
 
         result = svc.notify("mark_success")
         assert result is False
