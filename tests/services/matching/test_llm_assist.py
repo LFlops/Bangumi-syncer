@@ -3524,8 +3524,14 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
     loop.assert_not_awaited()
 
 
-def test_continue_run_zero_remaining_with_end_turn_marks_succeeded_end_turn():
-    """remaining==0 + last_response 为 end_turn → mark_succeeded('end_turn')。"""
+def test_continue_run_zero_remaining_recovery_end_turn_lands_exhausted():
+    """remaining==0 的文本响应属收尾轮 → 按 live 落 exhausted 并交场景兜底解析。
+
+    收尾轮（预算耗尽后 ``loop._final_recovery``）只做二分：含终止工具调用 →
+    submit_suggestion；否则 exhausted（响应文本交 ``parse_suggestion`` 兜底）。
+    恢复路径若按 provider 原始 stop_reason 直落 end_turn，兜底解析会被跳过、
+    终态语义与 live 分叉（live 侧判据见 loop._final_recovery 及其用例）。
+    """
     repo = _make_continuation_repo()
     rr = _make_replay_result(
         executed=5,  # medium=5 → remaining=0
@@ -3541,6 +3547,10 @@ def test_continue_run_zero_remaining_with_end_turn_marks_succeeded_end_turn():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
+        patch(
+            "app.services.matching.llm_assist.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
         patch("app.services.agent.runtime.loop_run", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3550,8 +3560,12 @@ def test_continue_run_zero_remaining_with_end_turn_marks_succeeded_end_turn():
             )
         )
 
+    # 走场景终态处理：exhausted + 文本兜底解析（"放弃" 非 JSON → 记 last_error）
     repo.mark_succeeded.assert_called_once_with(
-        "r", stop_reason="end_turn", total_tokens=55
+        "r",
+        stop_reason="exhausted",
+        last_error="JSON 提取失败",
+        total_tokens=55,
     )
     loop.assert_not_awaited()
 

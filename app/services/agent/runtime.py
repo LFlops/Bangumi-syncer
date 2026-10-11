@@ -39,7 +39,7 @@ from app.services.agent.tools import (
     serialize_tool_result,
 )
 from app.services.llm.client import LLMCallError
-from app.services.llm.models import Message, ToolResultBlock, ToolUseBlock
+from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 from app.services.notification_service import NotificationService
 
 # 非只读（write/terminal/未注册）缺失工具的占位 tool_result 文案
@@ -202,6 +202,10 @@ async def continue_run(
     1. 场景钩子解析 thinking_level / max_iterations（集中配置单一来源）
     2. ``trace.replay`` 重建可续跑消息列表与终局响应
     3. ``last_response`` 终局优先分派（**先于**预算耗尽判定）：
+       - 收尾轮（``remaining <= 0``，即预算耗尽后 ``loop._final_recovery`` 的
+         响应）：含终止工具调用 → 走场景终局处理；否则一律 ``exhausted``
+         （响应文本交场景 ``parse_suggestion`` 兜底解析）——**不**按 provider
+         原始 stop_reason 归一化，与 ``_final_recovery`` 的二分判据对齐
        - 匹配的 ``terminal_tool`` 调用 → 走场景终局处理
        - ``stop_reason == terminal_tool`` 但无匹配调用 → 防御降级 exhausted
        - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run`` 共用判据）：
@@ -263,8 +267,37 @@ async def continue_run(
         # 末轮已 submit 却被误判 exhausted 丢失提交。
         stop: str = last_response.stop_reason or ""
         tcs = last_response.tool_calls
+        submit_tc = next((tc for tc in tcs if tc.name == hooks.terminal_tool), None)
 
-        if stop == "end_turn":
+        # 收尾轮判据：``remaining <= 0`` 表示 max_iterations 个预算轮已全部执行完
+        # （见上），此后的响应只能来自 ``loop._final_recovery`` 收尾轮。
+        is_final_recovery = remaining <= 0
+
+        # 收尾轮语义还原：live 对该轮只做二分——含终止工具调用 → submit_suggestion；
+        # 否则 exhausted（响应文本交场景 ``parse_suggestion`` 兜底解析）。恢复路径
+        # 不得按 provider 原始 stop_reason 归一化：否则收尾轮文本建议会误落
+        # ``end_turn``（兜底解析丢失）、``max_tokens`` / 空壳还会误落 failed，
+        # 终态语义与 live 分叉。
+        if is_final_recovery and submit_tc is None:
+            await hooks.handle_terminal(
+                run_id,
+                RunResult(
+                    stop_reason="exhausted",
+                    # 恢复路径无实时响应对象：构造等价响应承载兜底解析所需文本。
+                    last_response=ChatResponse(
+                        content=last_response.content,
+                        stop_reason=last_response.stop_reason,
+                    ),
+                ),
+                ctx,
+                total_tokens=replay_result.total_tokens,
+                notification_service=notification_service,
+            )
+            return
+
+        # 常规轮显式 end_turn 优先视为无建议终态；收尾轮不走该判据——其终止工具
+        # 调用优先于 stop_reason 归一化（与 loop._final_recovery 一致）。
+        if stop == "end_turn" and not is_final_recovery:
             # 无建议：直接标记，不调 LLM（透传 replay 累计 tokens，口径同其它终态）
             repo.mark_succeeded(
                 run_id,
@@ -274,7 +307,6 @@ async def continue_run(
             return
 
         # 捕获终止工具调用（终局）→ 走场景校验落库路径
-        submit_tc = next((tc for tc in tcs if tc.name == hooks.terminal_tool), None)
         if submit_tc is not None:
             sug = submit_tc.input or {}
             result = RunResult(

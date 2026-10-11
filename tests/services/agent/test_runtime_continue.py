@@ -81,20 +81,43 @@ def _write_llm_chat(
     trace.end_span(span_id, replay_delta={"response": response})
 
 
+def _write_tool_exec(
+    dbm: DatabaseManager,
+    run_id: str,
+    iteration: int,
+    sequence: int,
+    tool_use_id: str,
+    content: str,
+) -> None:
+    """写入一条 tool_execute span（含 tool_result replay_delta）。"""
+    span_id = trace.start_span(run_id, "tool_execute", iteration, sequence)
+    trace.end_span(
+        span_id,
+        replay_delta={
+            "tool_result": {
+                "tool_use_id": tool_use_id,
+                "content": content,
+                "is_error": False,
+            }
+        },
+    )
+
+
 class _FakeHooks:
     task_type = "match"
     terminal_tool = "submit_suggestion"
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_iterations: int = 10) -> None:
         self.terminal_calls: list[tuple[tuple, dict]] = []
         # 恢复路径不应触发 veto 软护栏（见 runtime.continue_run submit 分支注释）
         self.veto_calls: list[dict] = []
+        self._max_iterations = max_iterations
 
     def resolve_thinking_level(self) -> str:
         return "medium"
 
     def resolve_max_iterations(self, level: str) -> int:
-        return 10
+        return self._max_iterations
 
     def veto_terminal(self, suggestion: dict) -> str | None:
         """live 路径的终止提交软护栏；恢复路径不应调用。"""
@@ -303,3 +326,179 @@ def test_continue_run_end_turn_still_marks_succeeded(
     assert run["status"] == "succeeded"
     assert run["stop_reason"] == "end_turn"
     assert hooks.terminal_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 收尾轮（预算耗尽后的 loop._final_recovery 响应）恢复分派：与 live 判据对齐
+# ---------------------------------------------------------------------------
+
+
+def _write_final_recovery_trace(
+    dbm: DatabaseManager,
+    run_id: str,
+    *,
+    stop_reason: str = "end_turn",
+    content: str = "",
+    tool_calls=None,
+) -> None:
+    """写入「1 轮预算工具轮 + 1 轮收尾轮」的最简 trace（`max_iterations=1`）。
+
+    - iteration 0：工具调用 + 完整 tool_result（预算耗尽）
+    - iteration 1：收尾轮 chat span（provider 原始 stop_reason 由参数给定）
+    """
+    _write_seed(dbm, run_id)
+    _write_llm_chat(
+        dbm,
+        run_id,
+        0,
+        [{"id": "t1", "name": "search_bangumi", "input": {"kw": "x"}}],
+        stop_reason="tool_use",
+    )
+    _write_tool_exec(dbm, run_id, 0, 0, "t1", "候选结果")
+    _write_llm_chat(
+        dbm,
+        run_id,
+        1,
+        tool_calls or [],
+        stop_reason=stop_reason,
+        content=content,
+    )
+
+
+def test_continue_run_final_recovery_text_response_lands_exhausted_with_salvage(
+    dbm: DatabaseManager,
+):
+    """收尾轮未提交（文本响应）→ 按 live 落 exhausted 并透传响应文本供兜底解析。
+
+    live：``loop._final_recovery`` 无终止工具调用 → ``RunResult(stop_reason=
+    "exhausted", last_response=收尾响应)``，场景层据 `last_response.content` 做
+    `parse_suggestion` 文本兜底。
+    恢复路径不得按 provider 原始 stop_reason（此处 ``end_turn``）直落 end_turn——
+    否则建议兜底丢失、终态语义与 live 分叉。
+    """
+    run_id = "run-final-recovery-text"
+    content = '{"subject_id": "12345", "reason": "名称与年份均吻合"}'
+    hooks = _FakeHooks(max_iterations=1)
+    _write_final_recovery_trace(dbm, run_id, stop_reason="end_turn", content=content)
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1, "收尾轮必须交场景终态处理（含文本兜底）"
+    result = hooks.terminal_calls[0][0][1]
+    assert result.stop_reason == "exhausted"
+    assert result.last_response is not None, "响应文本必须透传（兜底解析输入）"
+    assert result.last_response.content == content
+
+
+def test_continue_run_final_recovery_max_tokens_lands_exhausted_not_failed(
+    dbm: DatabaseManager,
+):
+    """收尾轮命中 max_tokens（截断文本）→ 仍按 live 落 exhausted，不得误落 failed。
+
+    live 收尾轮判据与 provider 原始 stop_reason 无关：无终止工具调用一律
+    exhausted（截断文本照常交场景兜底），与常规轮的 max_tokens→failed 分叉。
+    """
+    run_id = "run-final-recovery-maxtok"
+    content = '{"subject_id": "9", "reason": "部分'
+    hooks = _FakeHooks(max_iterations=1)
+    _write_final_recovery_trace(dbm, run_id, stop_reason="max_tokens", content=content)
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1
+    result = hooks.terminal_calls[0][0][1]
+    assert result.stop_reason == "exhausted", (
+        "收尾轮的 max_tokens 不是失败：live 仍按 exhausted 交场景兜底"
+    )
+
+
+def test_continue_run_final_recovery_stop_reason_alone_lands_exhausted(
+    dbm: DatabaseManager,
+):
+    """收尾轮响应为「未知/空 stop_reason 且有内容」→ 仍落 exhausted。
+
+    live 收尾轮不经过 ``normalize_stop_reason``：空壳/未知原因不会伪装成
+    end_turn，也不会被当作 llm_error 失败——统一 exhausted 交场景兜底。
+    """
+    run_id = "run-final-recovery-unknown"
+    content = "我建议提交 subject_id=7"
+    hooks = _FakeHooks(max_iterations=1)
+    _write_final_recovery_trace(
+        dbm, run_id, stop_reason="stop_sequence", content=content
+    )
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1
+    result = hooks.terminal_calls[0][0][1]
+    assert result.stop_reason == "exhausted"
+    assert result.last_response is not None
+    assert result.last_response.content == content
+
+
+def test_continue_run_final_recovery_terminal_call_dispatches_submit(
+    dbm: DatabaseManager,
+):
+    """收尾轮含终止工具调用 → 仍走 submit 分派（与 live 二分一致，零回归）。"""
+    run_id = "run-final-recovery-submit"
+    submit_input = {"subject_id": "2", "reason": "best match"}
+    hooks = _FakeHooks(max_iterations=1)
+    _write_final_recovery_trace(
+        dbm,
+        run_id,
+        stop_reason="tool_use",
+        tool_calls=[{"id": "t9", "name": "submit_suggestion", "input": submit_input}],
+    )
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1
+    result = hooks.terminal_calls[0][0][1]
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == submit_input
+
+
+def test_continue_run_final_recovery_stray_tool_call_ignored_lands_exhausted(
+    dbm: DatabaseManager,
+):
+    """收尾轮的杂散非终止工具调用 → 一律 exhausted 且**不补执行**（与 live 一致）。
+
+    live：``_final_recovery`` 仅识别终止工具调用，其余忽略（``executor_factory=
+    None`` 不执行任何工具）；恢复路径不得把杂散调用当作「待补执行轮」。
+    """
+    run_id = "run-final-recovery-stray"
+    hooks = _FakeHooks(max_iterations=1)
+    _write_final_recovery_trace(
+        dbm,
+        run_id,
+        stop_reason="tool_use",
+        tool_calls=[{"id": "t9", "name": "search_bangumi", "input": {"kw": "y"}}],
+    )
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.terminal_calls) == 1
+    result = hooks.terminal_calls[0][0][1]
+    assert result.stop_reason == "exhausted"
+
+
+def test_continue_run_last_budget_round_end_turn_is_not_recovery(
+    dbm: DatabaseManager,
+):
+    """预算内末轮 end_turn（remaining 仍 > 0）→ 不得误判为收尾轮。
+
+    收尾轮判据是 ``remaining <= 0``（预算轮全部执行完）；预算内直接 end_turn 的
+    轮次必须保持原有落库语义（mark_succeeded; end_turn）。
+    """
+    run_id = "run-budget-end-turn"
+    hooks = _FakeHooks(max_iterations=1)
+    _write_seed(dbm, run_id)
+    _write_llm_chat(dbm, run_id, 0, [], stop_reason="end_turn", content="无建议")
+
+    asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    run = dbm.agent_runs.get_run(run_id)
+    assert run is not None
+    assert run["status"] == "succeeded"
+    assert run["stop_reason"] == "end_turn"
+    assert hooks.terminal_calls == [], "预算内 end_turn 不走 handle_terminal"
