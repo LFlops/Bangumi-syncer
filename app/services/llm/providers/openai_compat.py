@@ -413,8 +413,15 @@ class OpenAICompatProvider(BaseProvider):
                 )
             return result
 
-        # 默认：纯文本（或未知组合）→ 单条文本消息
-        return [{"role": m.role, "content": "\n\n".join(text_parts)}]
+        # 默认：纯文本（或未知组合）→ 单条文本消息。
+        # 分隔符按role 分层（协议无 block 结构，只能降级为单字符串）：
+        # - system：多块本就代表多条独立规则，用 ``\n\n`` 保留其边界
+        #   （与 Anthropic 侧 ``_system_text`` 同一分隔语义）；
+        # - assistant / user：多段文本是**同一次发言被 wire 切开**的结果
+        #   （模型发出的是连续 delta），注入 ``\n\n`` 会凭空改写语义
+        #   （"A\n\nB" vs 模型实际说出的 "AB"），故空串连接、忠实还原。
+        separator = "\n\n" if m.role == "system" else ""
+        return [{"role": m.role, "content": separator.join(text_parts)}]
 
     @staticmethod
     def _normalize_openai_tool(tool: dict) -> dict:

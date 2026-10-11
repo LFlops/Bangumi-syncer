@@ -98,8 +98,11 @@ class TestOpenAICompatBuildRequest:
         assert body["messages"] == [{"role": "user", "content": "Q"}]
         assert "reasoning_effort" not in body  # off 不传 = 现状行为
 
-    def test_content_block_list_flattens_text_blocks(self):
-        """多段 TextBlock 在活路径（_to_wire_messages）上以 ``\\n\\n`` 连接。"""
+    def test_system_multi_block_joins_with_paragraph_separator(self):
+        """system 多块以 ``\\n\\n`` 连接：多块本就代表多条独立规则，需保留边界。
+
+        与 Anthropic 侧 ``_system_text`` 同一分隔语义。
+        """
         from app.services.llm.models import TextBlock
 
         msg = Message(
@@ -108,6 +111,23 @@ class TestOpenAICompatBuildRequest:
         )
         wire = self._provider()._to_wire_messages(msg)
         assert wire == [{"role": "system", "content": "第一段\n\n第二段"}]
+
+    @pytest.mark.parametrize("role", ["assistant", "user"])
+    def test_assistant_and_user_multi_block_join_without_separator(self, role):
+        """assistant / user 多块**空串连接**：忠实还原 wire 形态，不注入分隔符。
+
+        这些角色的多段文本是同一次发言被 wire 切开的结果（模型发出的是连续
+        delta），注入 ``\\n\\n`` 会凭空改写语义。若将来引入多轮会话复用，
+        这些消息会被发回 provider，分隔符即污染。
+        """
+        from app.services.llm.models import TextBlock
+
+        msg = Message(
+            role=role,
+            content=[TextBlock(text="A"), TextBlock(text="B")],
+        )
+        wire = self._provider()._to_wire_messages(msg)
+        assert wire == [{"role": role, "content": "AB"}]
 
     @pytest.mark.parametrize(
         "level,expected", [("low", "low"), ("medium", "medium"), ("high", "high")]
