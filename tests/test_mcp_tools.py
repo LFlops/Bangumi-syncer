@@ -962,12 +962,15 @@ class TestUpdateConfigKeyValueValidation:
 
 # ① + ② 禁改清单：显式列举，不从实现导入，保持测试为独立规格
 DENIED_WRITE_KEYS = [
-    # ① 改完 MCP 自身不可用
-    ("auth", "enabled"),
-    ("auth", "secret_key"),
-    # ② 改完需回页面操作
+    # ① 登录通道本身：改完用户无法自行恢复，只能留在 Web 界面操作
+    ("auth", "enabled"),  # 置 false 会让全站免鉴权（见 app/api/deps.py）
+    ("auth", "secret_key"),  # verify_password 以其做 HMAC，改动使已存密码哈希全部失效
+    ("auth", "password"),  # 用户不知新密码即永久失去访问权
+]
+
+# ② 类：允许修改，但需在返回值中提示用户执行的后续操作（见 _MCP_WRITE_FOLLOWUP）
+FOLLOWUP_REQUIRED_KEYS = [
     ("auth", "username"),
-    ("auth", "password"),
     ("auth", "max_login_attempts"),
     ("auth", "lockout_duration"),
     ("auth", "webhook_auth_enabled"),
@@ -994,7 +997,11 @@ ALLOWED_WRITE_KEYS = [
     ("bangumi-archive", "http_proxy"),
     ("bangumi-archive", "retry_interval"),
     ("bangumi-data", "http_proxy"),
-    # 此前因 auth 整段拉黑而被误伤的无害键
+    # 此前因 auth 整段拉黑而被误伤的无害键（② 类可改，见 FOLLOWUP_REQUIRED_KEYS）
+    ("auth", "username"),
+    ("auth", "max_login_attempts"),
+    ("auth", "lockout_duration"),
+    ("auth", "webhook_auth_enabled"),
     ("auth", "webhook_key"),
     ("auth", "session_timeout"),
     ("auth", "https_only"),
@@ -1097,7 +1104,7 @@ class TestUpdateConfigWritePolicy:
 
     @pytest.mark.asyncio
     async def test_update_config_下划线段名归一化后仍命中禁改清单(self):
-        """bangumi_oauth → bangumi-oauth 后应被拒（下划线写法不能绕过）。"""
+        """auth 的下划线写法不能绕过①类禁改（归一化后仍按连字符比对）。"""
         from fastmcp.exceptions import ToolError
 
         from app.mcp import tools
@@ -1109,9 +1116,7 @@ class TestUpdateConfigWritePolicy:
                 return_value=self._make_write_token(),
             ):
                 with pytest.raises(ToolError):
-                    await tools.update_config(
-                        section="bangumi_oauth", key="client_secret", value="x"
-                    )
+                    await tools.update_config(section="AUTH", key="password", value="x")
 
         mock_cm.set_config.assert_not_called()
 
@@ -1445,3 +1450,131 @@ class TestUpdateConfigMultiInstanceSegment:
                 )
 
         assert result["status"] == "success"
+
+
+class TestUpdateConfigFollowupNotice:
+    """② 类键：允许修改，但返回值须提示用户后续需执行的操作。
+
+    这些键本身可逆（用户回 Web 界面即可修正或完成授权），
+    硬性禁止会削弱 MCP 的实用性；改为写入成功后主动提示。
+    """
+
+    @staticmethod
+    def _make_write_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    async def _call(self, section, key, value="v"):
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                result = await tools.update_config(
+                    section=section, key=key, value=value
+                )
+        return result, mock_cm
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("section", "key"), FOLLOWUP_REQUIRED_KEYS)
+    async def test_update_config_需后续操作类键_写入成功且带后续提示(
+        self, section, key
+    ):
+        """② 类键应写入成功，且 notice 说明用户需做什么。"""
+        result, mock_cm = await self._call(section, key)
+
+        assert result["status"] == "success"
+        mock_cm.set_config.assert_called_once()
+        assert result.get("notice"), f"{section}.{key} 缺少后续操作提示"
+        assert len(result["notice"]) > 5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("section", "key"), FOLLOWUP_REQUIRED_KEYS)
+    async def test_update_config_需后续操作类键_提示逐键不同(self, section, key):
+        """提示文案应按 (段,键) 区分，避免所有键共用一句空话。"""
+        from app.mcp.tools import _MCP_WRITE_FOLLOWUP
+
+        assert (section, key) in _MCP_WRITE_FOLLOWUP
+        assert _MCP_WRITE_FOLLOWUP[(section, key)].strip()
+
+    @pytest.mark.asyncio
+    async def test_update_config_普通键_不返回提示(self):
+        """③ 类键无需提示，避免噪音。"""
+        result, _ = await self._call("sync", "match_confidence_threshold", "0.7")
+        assert result["status"] == "success"
+        assert not result.get("notice")
+
+    @pytest.mark.asyncio
+    async def test_update_config_禁改键_不返回提示只报错(self):
+        """① 类键应直接拒绝，不给「已写入」语义的提示。"""
+        from fastmcp.exceptions import ToolError
+
+        from app.mcp import tools
+
+        mock_cm = MagicMock()
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                with pytest.raises(ToolError) as exc_info:
+                    await tools.update_config(section="auth", key="password", value="x")
+
+        assert "Web 界面" in str(exc_info.value)
+        mock_cm.set_config.assert_not_called()
+
+
+class TestUpdateConfigNewKeyHint:
+    """新增键提示：AI 拼错键名时静默写入会留下垃圾配置，需主动提醒复核。"""
+
+    @staticmethod
+    def _make_write_token():
+        mock_token = MagicMock()
+        mock_token.scopes = ["read", "write"]
+        return mock_token
+
+    @staticmethod
+    def _mock_cm(key_exists: bool) -> MagicMock:
+        parser = MagicMock()
+        parser.has_option.return_value = key_exists
+        cm = MagicMock()
+        cm.get_config_parser.return_value = parser
+        return cm
+
+    async def _call(self, section, key, key_exists):
+        from app.mcp import tools
+
+        mock_cm = self._mock_cm(key_exists)
+        with patch("app.mcp.tools.config_manager", mock_cm):
+            with patch(
+                "app.mcp.tools.get_access_token",
+                return_value=self._make_write_token(),
+            ):
+                return await tools.update_config(section=section, key=key, value="v")
+
+    @pytest.mark.asyncio
+    async def test_update_config_新增键_提示复核(self):
+        """键此前不存在时应提示「疑似拼写错误，请复核」。"""
+        result = await self._call("sync", "made_up_key", key_exists=False)
+        assert result["status"] == "success"
+        assert "此前不存在" in result["notice"]
+        assert "get_current_config" in result["notice"]
+
+    @pytest.mark.asyncio
+    async def test_update_config_已有键_不提示新增(self):
+        """键已存在时不应产生噪音提示。"""
+        result = await self._call("sync", "match_confidence_threshold", key_exists=True)
+        assert result["status"] == "success"
+        assert not result.get("notice")
+
+    @pytest.mark.asyncio
+    async def test_update_config_新增键且属需后续操作类_两段提示合并(self):
+        """②类键同时是新键时，两条提示应合并而非互相覆盖。"""
+        result = await self._call("trakt", "client_secret", key_exists=False)
+        notice = result["notice"]
+        assert "OAuth" in notice
+        assert "此前不存在" in notice
