@@ -202,7 +202,7 @@ class OpenAIResponsesProvider(BaseProvider):
         - assistant 的 ToolUseBlock → {type: function_call, call_id, name, arguments}
         - ToolResultBlock → {type: function_call_output, call_id, output}
         - ThinkingBlock：忽略（Responses 多轮不要求回传 reasoning）
-        文本与工具项按块出现顺序输出（文本块聚合为单项）。
+        文本与工具项按块出现顺序输出（连续文本块聚合为单项）。
         """
         if isinstance(m.content, str):
             return [{"role": m.role, "content": m.content}]
@@ -212,7 +212,16 @@ class OpenAIResponsesProvider(BaseProvider):
 
         def _flush_text() -> None:
             if text_parts:
-                items.append({"role": m.role, "content": "\n\n".join(text_parts)})
+                # 分隔符与 ``openai_compat`` 同口径按 role 分层：
+                # - system：多块本就代表多条独立规则，\n\n 保留其边界
+                #   （与 ``_text_of`` / Anthropic ``_system_text`` 一致）；
+                # - assistant / user：连续文本块是同一次发言被 wire 切开的结果
+                #   （``StreamAggregator`` 亦以 "" 聚合为单块），注入 \n\n 会把
+                #   "AB" 改写成 "A\n\nB"，故空串连接。
+                # 刻意**不**拆成多条 message item：模型从未在此处发出第二条消息，
+                # 凭空造出的消息边界同样是不忠实。
+                separator = "\n\n" if m.role == "system" else ""
+                items.append({"role": m.role, "content": separator.join(text_parts)})
                 text_parts.clear()
 
         for block in m.content:

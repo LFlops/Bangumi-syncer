@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.services.llm.models import Message, TextBlock
 from app.services.llm.providers.openai_compat import OpenAICompatProvider
 
@@ -133,3 +135,62 @@ def test_agent_history_assistant_messages_always_carry_tool_calls():
             f"loop.py:{lineno} append assistant 位于终局提前 return 之后"
             "（即 terminal_reason is None 分支内，必然含 tool_calls）"
         )
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses 侧：items 数组原生保序，但仍有一处 join 需要同口径收口
+# ---------------------------------------------------------------------------
+
+
+def _responses_provider() -> Any:
+    from app.services.llm.providers.openai_responses import OpenAIResponsesProvider
+
+    return OpenAIResponsesProvider(
+        api_base="https://api.openai.com/v1", api_key="sk-test"
+    )
+
+
+def test_responses_interleaved_text_and_tool_keep_wire_order():
+    """Responses 的 items 数组原生保序：文本-工具-文本不得被压平或重排。
+
+    ``_to_input_items`` 在每个 ``function_call`` 处 flush 文本，因此交错顺序天然
+    保真。本用例把该不变量固化，防止后续把 items 合并成单条消息。
+    """
+    from app.services.llm.models import ToolUseBlock
+
+    msg = Message(
+        role="assistant",
+        content=[
+            TextBlock(text="查一下"),
+            ToolUseBlock(id="c1", name="search", input={"q": "x"}),
+            TextBlock(text="然后总结"),
+        ],
+    )
+    assert _responses_provider()._to_input_items(msg) == [
+        {"role": "assistant", "content": "查一下"},
+        {
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "search",
+            "arguments": '{"q": "x"}',
+        },
+        {"role": "assistant", "content": "然后总结"},
+    ]
+
+
+def test_responses_contiguous_text_joined_without_separator():
+    """Responses 侧连续文本块也**空串连接**（与 compat 层同口径）。
+
+    注意与「每块一个 item」的区别：模型流式发出的是连续 delta（``models.py``
+    ``StreamAggregator`` 亦以 ``""`` 聚合为单块），拆成多条 ``message`` item 会
+    凭空造出一条模型没说过的消息边界 —— 那是另一种不忠实。故此处只改分隔符，
+    不改项数。
+    """
+    assert _responses_provider()._to_input_items(_multi("assistant")) == [
+        {"role": "assistant", "content": "AB"}
+    ]
+
+
+def test_responses_system_text_keeps_paragraph_separator():
+    """system 侧 ``_text_of`` 只服务 system，多块保留 ``\\n\\n``（独立规则边界）。"""
+    assert _responses_provider()._text_of(_multi("system").content) == "A\n\nB"
