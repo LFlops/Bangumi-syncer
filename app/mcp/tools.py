@@ -51,10 +51,11 @@ _EXTRA_SENSITIVE_FIELDS: frozenset[tuple[str, str]] = frozenset(
 #
 # 判据不是「键敏不敏感」，而是「**改完之后用户还能不能自己救回来**」：
 #
-#   ① 改完之后 MCP 自己不可用           → 禁改
-#      破坏登录/授权链，MCP 客户端当场失联，用户无感知地丢掉能力。
-#   ② 改完之后用户还需回 Web 页面操作   → 禁改
-#      需重新登录 / 重新走 OAuth 授权 / 手动解锁，或会把自己锁在门外。
+#   ① 改完之后用户**无法自行恢复** → 禁改
+#      仅限登录通道本身：auth.enabled（全站免鉴权）/ secret_key（使已存
+#      密码哈希全部失效）/ password（不知新密码即失去访问权）。
+#   ② 改完之后用户还需做一步操作 → 放行，但返回值附 notice 提示
+#      见 _MCP_WRITE_FOLLOWUP。硬性禁止会削弱 MCP 实用性，提示优于拒绝。
 #   ③ 其余一律开放（等同 Web 界面）     → 放行
 #      包含 llm.api_key、notify-* 凭据、auth.webhook_key 等
 #      「重填一个字符串即可恢复」的键，与用户在 Web 界面的能力等价。
@@ -66,21 +67,48 @@ _EXTRA_SENSITIVE_FIELDS: frozenset[tuple[str, str]] = frozenset(
 # 完全放行，导致凭据可写。故改为本清单。
 _MCP_WRITE_DENIED: frozenset[tuple[str, str]] = frozenset(
     {
-        # ① 改完 MCP 自身不可用
-        ("auth", "enabled"),  # 关掉登录校验 → MCP 授权流程失效
-        ("auth", "secret_key"),  # HMAC 主密钥 → 全部会话作废
-        # ② 改完需回页面操作
-        ("auth", "username"),
-        ("auth", "password"),
-        ("auth", "max_login_attempts"),  # 改小会把自己锁在门外
-        ("auth", "lockout_duration"),
-        ("auth", "webhook_auth_enabled"),
-        ("trakt", "client_secret"),  # 需重新走 Trakt OAuth 授权
-        ("bangumi-oauth", "client_secret"),  # 同上
-        ("bangumi", "access_token"),  # 需重新登录 Bangumi
-        ("bangumi", "refresh_token"),
+        # ① 登录通道本身：改完用户无法自行恢复，只能留在 Web 界面操作
+        ("auth", "enabled"),  # 置 false 会让全站免鉴权（见 app/api/deps.py）
+        (
+            "auth",
+            "secret_key",
+        ),  # verify_password 以其做 HMAC，改动使已存密码哈希全部失效
+        ("auth", "password"),  # 用户不知新密码即永久失去访问权
     }
 )
+
+# ② 允许改、但改完用户需执行后续操作的键 → 写入成功后通过返回值 notice 提示。
+# 这些键本身可逆（用户回 Web 界面即可修正或完成授权），硬性禁止会削弱 MCP
+# 的实用性；提示优于拒绝。提示文案按 (段, 键) 区分，避免共用一句空话。
+_MCP_WRITE_FOLLOWUP: dict[tuple[str, str], str] = {
+    (
+        "auth",
+        "username",
+    ): "已修改登录用户名，下次登录请使用新用户名；已登录会话不受影响",
+    ("auth", "max_login_attempts"): (
+        "已修改最大登录尝试次数，调小可能导致连续失败后被锁定，请确认取值合理"
+    ),
+    ("auth", "lockout_duration"): "已修改锁定时长（分钟），请确认与预期一致",
+    ("auth", "webhook_auth_enabled"): (
+        "已修改 Webhook 鉴权开关，置为关闭后 /api/webhook 接口将不再校验凭据，"
+        "请确认这是预期行为"
+    ),
+    ("trakt", "client_secret"): (
+        "已更新 Trakt API 凭据，该配置在进程启动时读取，"
+        "且凭据变更后需在「Trakt 同步」页面重新完成 OAuth 授权才能生效"
+    ),
+    ("bangumi-oauth", "client_secret"): (
+        "已更新 Bangumi OAuth 应用密钥，需重新完成 OAuth 授权流程才能生效"
+    ),
+    ("bangumi", "access_token"): (
+        "已更新 Bangumi access_token，该字段仅用于从旧版配置迁移账号，"
+        "不会影响数据库中已入库的账号；如需更换账号请在「Bangumi 账号」卡片操作"
+    ),
+    ("bangumi", "refresh_token"): (
+        "已更新 Bangumi refresh_token，同上仅影响旧版配置迁移来源，"
+        "已入库账号的令牌请在「Bangumi 账号」卡片管理"
+    ),
+}
 
 # 日志行时间戳格式: [2026/09/03 12:00:00.123]
 _LOG_TIMESTAMP_RE = re.compile(r"^\[(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\]")
@@ -343,10 +371,14 @@ async def update_config(
 
     写入判据是「改完之后用户还能不能自己救回来」，而非逐键白名单：
 
-    - 少数「改完 MCP 自己不可用」或「改完需回 Web 页面操作」的键禁改
-      （如 auth.secret_key、trakt.client_secret、bangumi.access_token）；
-    - 其余一律开放，等同用户在 Web 界面的编辑能力（含 llm.api_key、
+    - ① 改完用户无法自行恢复的键禁改，仅限登录通道本身
+      （auth.enabled / auth.secret_key / auth.password），请到 Web 界面操作；
+    - ② 改完用户还需做一步操作的键放行，但返回值带 notice 说明后续操作；
+    - ③ 其余一律开放，等同用户在 Web 界面的编辑能力（含 llm.api_key、
       notify-* 凭据、auth.webhook_key 等重填即可恢复的键）。
+
+    本工具是 upsert：段或键不存在时会自动创建。若本次写入的是新键，
+    返回值会额外提示「疑似拼写错误，请用 get_current_config 复核」。
 
     Args:
         section: 配置段名（支持下划线，自动归一化为连字符）。
@@ -355,10 +387,11 @@ async def update_config(
         value: 配置值。
 
     Returns:
-        {"status": "success", "message": "...", "data": {"section": ..., "key": ...}}
+        {"status": "success", "message": ..., "data": {...}}
+        另可能含 "notice"：需用户后续操作，或本次为新增键的复核提醒。
 
     Raises:
-        ToolError: 段名非法、多实例段缺后缀、键在禁改清单、值超长或无 write scope。
+        ToolError: 段名非法、多实例段缺后缀、键在①类禁改清单、值超长或无 write scope。
     """
     # scope 校验：update_config 要求 write 权限
     token = get_access_token()
@@ -400,14 +433,38 @@ async def update_config(
     if len(str(value)) > _MAX_VALUE_LENGTH:
         raise ToolError(f"配置值长度超限: {len(str(value))} > {_MAX_VALUE_LENGTH}")
 
+    # 写入前取快照：判断本次是「改已有键」还是「新增键」
+    # （写后再查恒为 True，无法区分）
+    is_new_key = not config_manager.get_config_parser().has_option(normalized, key)
+
     try:
         config_manager.set_config(normalized, key, value)
     except ValueError as e:
         # 底层格式校验失败（非法段名/键名等）应表现为规范的工具错误
         raise ToolError(f"配置写入失败: {e}") from e
 
-    return {
+    result = {
         "status": "success",
         "message": f"已更新配置: {normalized}.{key}",
         "data": {"section": normalized, "key": key},
     }
+
+    # ② 类键：写入成功，但用户还需执行一步操作，必须主动告知而非让 Agent 自行臆测
+    followup = _MCP_WRITE_FOLLOWUP.get((normalized, key))
+    if followup:
+        result["notice"] = followup
+
+    # 本次为新增键：配置里出现陌生键通常是拼写错误，提醒 Agent 用读工具复核
+    if is_new_key:
+        result["notice"] = _with_new_key_hint(result.get("notice", ""), normalized, key)
+
+    return result
+
+
+def _with_new_key_hint(existing_notice: str, section: str, key: str) -> str:
+    """在已有提示后追加「疑似新键，请复核」的提醒。"""
+    hint = (
+        f"注意：{section}.{key} 此前不存在，本次为新增配置项。"
+        "若属拼写错误，请用 get_current_config 复核该段的实际键名"
+    )
+    return f"{existing_notice}\n{hint}" if existing_notice else hint
