@@ -339,10 +339,18 @@ async def update_config(
     key: str,
     value: Any,
 ) -> dict[str, Any]:
-    """修改配置项，直接生效；auth 段不可修改。
+    """修改配置项，直接生效。
+
+    写入判据是「改完之后用户还能不能自己救回来」，而非逐键白名单：
+
+    - 少数「改完 MCP 自己不可用」或「改完需回 Web 页面操作」的键禁改
+      （如 auth.secret_key、trakt.client_secret、bangumi.access_token）；
+    - 其余一律开放，等同用户在 Web 界面的编辑能力（含 llm.api_key、
+      notify-* 凭据、auth.webhook_key 等重填即可恢复的键）。
 
     Args:
         section: 配置段名（支持下划线，自动归一化为连字符）。
+            多实例段须带实例后缀（如 notify-webhook-1）。
         key: 配置键名。
         value: 配置值。
 
@@ -350,7 +358,7 @@ async def update_config(
         {"status": "success", "message": "...", "data": {"section": ..., "key": ...}}
 
     Raises:
-        ToolError: 非法段名或 auth 段拒绝。
+        ToolError: 段名非法、多实例段缺后缀、键在禁改清单、值超长或无 write scope。
     """
     # scope 校验：update_config 要求 write 权限
     token = get_access_token()
