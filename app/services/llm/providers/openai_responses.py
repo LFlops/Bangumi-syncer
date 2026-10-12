@@ -477,10 +477,10 @@ class OpenAIResponsesProvider(BaseProvider):
         try:
             parsed = json.loads(sse.data)
         except (json.JSONDecodeError, TypeError):
-            logger.debug(f"Responses SSE data 非 JSON，忽略：{sse.data!r}")
+            logger.warning(f"Responses SSE data 非 JSON，忽略：{sse.data!r}")
             return None
         if not isinstance(parsed, dict):
-            logger.debug(f"Responses SSE data 非 JSON 对象，忽略：{sse.data!r}")
+            logger.warning(f"Responses SSE data 非 JSON 对象，忽略：{sse.data!r}")
             return None
         return parsed
 

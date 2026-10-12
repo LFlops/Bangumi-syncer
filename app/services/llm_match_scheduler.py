@@ -327,10 +327,10 @@ class LlmMatchScheduler(BaseScheduler):
         # （不 mark_failed，等回填后下一轮再处理），且必须在 acquire 之前判断，
         # 避免占用（并随后释放）执行权造成同轮 pending 被误跳过。
         if not run.sync_record_id:
-            logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
+            logger.info(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
             return
         if not _try_acquire_run(run_id):
-            logger.debug(f"🤖 恢复 run {run_id} 跳过：本进程已在处理")
+            logger.info(f"🤖 恢复 run {run_id} 跳过：本进程已在处理")
             return
         try:
             repo = get_database_manager().agent_runs
@@ -342,7 +342,7 @@ class LlmMatchScheduler(BaseScheduler):
             if not repo.refresh_started_at(
                 run_id, ts, expected_started_at=run.started_at
             ):
-                logger.debug(f"🤖 恢复 run {run_id} 跳过：已被其他执行者抢占或状态已变")
+                logger.info(f"🤖 恢复 run {run_id} 跳过：已被其他执行者抢占或状态已变")
                 return
 
             sync_record = self._get_sync_record(run.sync_record_id)
@@ -384,10 +384,10 @@ class LlmMatchScheduler(BaseScheduler):
         # sync_record_id 由 persist 后回填，存在毫秒级窗口；未回填时跳过本轮
         # （不 mark_failed，等回填后下一轮再处理），避免无意义地占用执行权。
         if not run.sync_record_id:
-            logger.debug(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
+            logger.info(f"🤖 run {run_id} 的 sync_record_id 尚未回填，跳过本轮")
             return
         if not _try_acquire_run(run_id):
-            logger.debug(f"🤖 处理 run {run_id} 跳过：本进程已在处理")
+            logger.info(f"🤖 处理 run {run_id} 跳过：本进程已在处理")
             return
         try:
             repo = get_database_manager().agent_runs
@@ -431,7 +431,7 @@ class LlmMatchScheduler(BaseScheduler):
         try:
             return get_database_manager().get_sync_record_by_id(int(sync_record_id))
         except Exception as e:
-            logger.debug(f"🤖 查询 sync_record {sync_record_id} 失败: {e}")
+            logger.warning(f"🤖 查询 sync_record {sync_record_id} 失败: {e}")
             return None
 
 

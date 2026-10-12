@@ -1151,9 +1151,9 @@ def test_process_run_skips_run_without_sync_record_id(empty_id):
     acquire_spy.assert_not_called()
     run_mock.assert_not_awaited()
     repo.mark_failed.assert_not_called()
-    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
-    assert any("sync_record_id" in m for m in debugs), (
-        f"跳过时应记 debug 说明原因，实际 {debugs}"
+    infos = [str(c.args[0]) for c in log.info.call_args_list]
+    assert any("sync_record_id" in m for m in infos), (
+        f"跳过时应记 info 说明原因，实际 {infos}"
     )
 
 
@@ -1185,9 +1185,9 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
     repo.refresh_started_at.assert_not_called()
     repo.mark_failed.assert_not_called()
     assert "A" not in llm_match_scheduler._active_run_ids
-    debugs = [str(c.args[0]) for c in log.debug.call_args_list]
-    assert any("sync_record_id" in m for m in debugs), (
-        f"跳过时应记 debug 说明原因，实际 {debugs}"
+    infos = [str(c.args[0]) for c in log.info.call_args_list]
+    assert any("sync_record_id" in m for m in infos), (
+        f"跳过时应记 info 说明原因，实际 {infos}"
     )
 
 

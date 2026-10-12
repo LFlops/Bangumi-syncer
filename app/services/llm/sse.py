@@ -46,7 +46,7 @@ def _parse_retry(value: str) -> int | None:
     try:
         return int(value)
     except ValueError:
-        logger.debug("SSE retry 字段值非法，忽略：%r", value)
+        logger.warning("SSE retry 字段值非法，忽略：%r", value)
         return None
 
 

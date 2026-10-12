@@ -329,7 +329,7 @@ class LLMClient:
                 last_error = e
                 if isinstance(e, LLMCallError):
                     # 确定性 LLMCallError 不套用重试策略，保留 retryable 原样抛出
-                    logger.debug(
+                    logger.info(
                         "LLM stream 收到 LLMCallError，直接透传（不重试）: "
                         f"{_format_error_detail(e)}"
                     )
