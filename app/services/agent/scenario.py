@@ -96,7 +96,8 @@ class ScenarioHooks(Generic[CtxT]):
     #: 注册场景工具（``registry`` + ``ctx`` → 工具定义列表）
     register_tools: Callable[[ToolRegistry, CtxT], list[ToolDefinition]]
     #: 构建默认**流式** LLM 函数（``thinking_level`` → ``StreamFn``；场景决定 job 归属
-    #: 与思考强度透传）。返回 async iterator（``StreamChunk``），由 runtime 经 recorder 包装。
+    #: 与思考强度透传）。返回 async iterator（``StreamChunk``）；每轮的聚合与落库由
+    #: loop 经 recorder 的 chat span（``recorder.chat_span()``）单点完成。
     build_stream_fn: Callable[[str], StreamFn]
     #: 解析思考强度（从场景集中配置读取；恢复续跑路径使用）
     resolve_thinking_level: Callable[[], str]

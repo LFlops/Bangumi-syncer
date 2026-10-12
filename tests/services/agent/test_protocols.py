@@ -11,6 +11,8 @@
 - **执行器显式实现协议**：``StreamingToolExecutor`` 显式继承
   ``protocols.StreamingExecutor``（nominal 而非纯鸭子类型），使协议变更由类型检查与
   本守卫同时兜住，而非仅靠结构约定。
+- **chat span 单聚合契约**：``protocols.ChatSpan`` 定义四个契约点，两处实现
+  （``recorder._ChatSpan`` / ``loop.PlainChatSpan``）显式继承。
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from pathlib import Path
 
 from app.services.agent.protocols import (
     BudgetRecorder,
+    ChatSpan,
     StreamingExecutor,
     ToolSpanRecorder,
 )
@@ -49,6 +52,14 @@ def _defined_class_names(name: str) -> set[str]:
     }
 
 
+def _class_bases(name: str, class_name: str) -> list[str]:
+    """收集指定类定义的基类表达式源码（显式继承守卫用）。"""
+    for node in ast.walk(_parse(name)):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return [ast.unparse(b) for b in node.bases]
+    raise AssertionError(f"未找到 {class_name} 类定义（{name}）")
+
+
 # ---------------------------------------------------------------------------
 # 1. 协议单一来源：记录器协议只允许在 protocols.py 定义
 # ---------------------------------------------------------------------------
@@ -65,14 +76,16 @@ def test_tools_defines_no_recorder_protocol():
 
 
 def test_recorder_protocol_defined_in_protocols_module():
-    """ToolSpanRecorder / BudgetRecorder 均在 protocols.py 定义。"""
+    """ToolSpanRecorder / BudgetRecorder / ChatSpan 均在 protocols.py 定义。"""
     defined = _defined_class_names("protocols.py")
-    assert {"ToolSpanRecorder", "BudgetRecorder"} <= defined
+    assert {"ToolSpanRecorder", "BudgetRecorder", "ChatSpan"} <= defined
 
 
 def test_budget_recorder_covers_budget_and_tool_span():
-    """BudgetRecorder 同时具备 record_budget/start_tool/end_tool 三种能力。"""
-    assert {"record_budget", "start_tool", "end_tool"} <= set(dir(BudgetRecorder))
+    """BudgetRecorder 同时具备 record_budget/chat_span/start_tool/end_tool 能力。"""
+    assert {"record_budget", "chat_span", "start_tool", "end_tool"} <= set(
+        dir(BudgetRecorder)
+    )
 
 
 def test_tool_span_recorder_only_requires_tool_span():
@@ -144,3 +157,25 @@ def test_streaming_tool_executor_declares_protocol_as_base_class():
             )
             return
     raise AssertionError("未找到 StreamingToolExecutor 类定义")
+
+
+# ---------------------------------------------------------------------------
+# 5. chat span 协议：单聚合契约（feed / resp / async 上下文）
+# ---------------------------------------------------------------------------
+
+
+def test_chat_span_protocol_surface():
+    """ChatSpan 协议暴露 feed / resp / 异步上下文进出四个契约点。"""
+    assert {"feed", "resp", "__aenter__", "__aexit__"} <= set(dir(ChatSpan))
+
+
+def test_chat_span_implementations_explicitly_inherit_protocol():
+    """两处 chat span 实现显式继承协议（nominal，非纯鸭子类型）。
+
+    - ``recorder._ChatSpan``：落库实现（唯一 finalize + 轮末写 span）；
+    - ``loop.PlainChatSpan``：无 recorder 时的纯聚合实现。
+
+    显式继承使协议变更（如新增契约点）由类型检查与本源码守卫同时兜住。
+    """
+    assert _class_bases("recorder.py", "_ChatSpan") == ["ChatSpan"]
+    assert _class_bases("loop.py", "PlainChatSpan") == ["ChatSpan"]

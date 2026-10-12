@@ -1609,15 +1609,20 @@ def _scripted_stream(script):
     return _stream
 
 
-def _drain_stream(wrapped, messages=None):
-    """把 ``wrap_stream_fn`` 返回的异步生成器消费至结束（同步包装）。"""
+def _drain_chat_span(recorder, stream_fn, messages=None):
+    """以 ``recorder.chat_span()`` 消费一轮脚本化流（同步包装，等价 loop 的单聚合用法）。
+
+    ``resp`` 在 ``async with`` **块外**读取：``__aexit__`` 才做唯一一次 finalize。
+    """
     msgs = messages if messages is not None else [Message(role="user", content="hi")]
 
     async def _run():
-        async for _chunk in wrapped(msgs, tools=[]):
-            pass
+        async with recorder.chat_span() as span:
+            async for chunk in stream_fn(msgs, tools=[]):
+                span.feed(chunk)
+        return span.resp
 
-    asyncio.run(_run())
+    return asyncio.run(_run())
 
 
 # ---------------------------------------------------------------------------
@@ -2345,8 +2350,8 @@ async def test_run_recorder_none_path_semantic_preserved(monkeypatch):
     assert run_row["stop_reason"] == "submit_suggestion"
 
 
-def test_trace_recorder_wrap_stream_fn_tracks_iteration():
-    """wrap_stream_fn 每轮 start/end span，iteration 自增。"""
+def test_trace_recorder_chat_span_tracks_iteration():
+    """chat span 每轮 start/end span，iteration 自增。"""
     from unittest.mock import patch
 
     starts = []
@@ -2369,14 +2374,12 @@ def test_trace_recorder_wrap_stream_fn_tracks_iteration():
             model="test-model",
         )
 
-    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
-
     # patch llm_assist 模块上的引用（闭包通过模块全局名字查找）
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
-        _drain_stream(wrapped)
+        _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
     # 应有一条 llm_chat start + end
     assert len(starts) == 1
@@ -2467,11 +2470,11 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
 
 
 # ---------------------------------------------------------------------------
-# wrap_stream_fn chat span 与 tool span 同轮 iteration 一致
+# chat span 与 tool span 同轮 iteration 一致
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_stream_fn_chat_and_tool_same_iteration():
+def test_chat_span_and_tool_same_iteration():
     """同一轮内 chat span 与 tool span 的 iteration 必须一致；连续两轮时第二轮 iteration=1。"""
     from unittest.mock import patch
 
@@ -2496,20 +2499,18 @@ def test_wrap_stream_fn_chat_and_tool_same_iteration():
             model="test-model",
         )
 
-    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
-
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         # 第一轮
-        _drain_stream(wrapped)
+        _drain_chat_span(recorder, _scripted_stream(dummy_script))
         # 模拟工具执行（与 chat 同轮）
         tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
         recorder.start_tool(tc, sequence=0)
 
         # 第二轮
-        _drain_stream(wrapped)
+        _drain_chat_span(recorder, _scripted_stream(dummy_script))
         tc2 = ToolUseBlock(
             id="t2", name="get_subject_detail", input={"subject_id": "1"}
         )
@@ -2540,11 +2541,11 @@ def test_wrap_stream_fn_chat_and_tool_same_iteration():
 
 
 # ---------------------------------------------------------------------------
-# wrap_stream_fn 异常不得被 UnboundLocalError 遮蔽
+# chat span 异常不得被 UnboundLocalError 遮蔽
 # ---------------------------------------------------------------------------
 
 
-def test_wrap_stream_fn_exception_propagates_original():
+def test_chat_span_exception_propagates_original():
     """脚本抛 ValueError('boom') → 捕获的必须是 ValueError('boom')，不是 UnboundLocalError。"""
     from unittest.mock import patch
 
@@ -2561,14 +2562,12 @@ def test_wrap_stream_fn_exception_propagates_original():
     async def exploding_script(messages, *, tools=None, tool_choice=None):
         raise ValueError("boom")
 
-    wrapped = recorder.wrap_stream_fn(_scripted_stream(exploding_script))
-
     with (
         patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
         patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
     ):
         with pytest.raises(ValueError, match="boom"):
-            _drain_stream(wrapped)
+            _drain_chat_span(recorder, _scripted_stream(exploding_script))
 
     # 不应写 ok span（允许写 error span，但 status 不得为 "ok"）
     ok_ends = [e for e in ends if e.get("status") == "ok"]
@@ -2609,7 +2608,7 @@ def test_trace_recorder_requires_start_iteration():
     )
 
 
-def test_trace_recorder_start_iteration_affects_first_stream_iteration():
+def test_trace_recorder_start_iteration_affects_first_chat_span_iteration():
     """start_iteration=N → 首轮 chat span iteration=N。"""
     from unittest.mock import patch
 
@@ -2624,10 +2623,8 @@ def test_trace_recorder_start_iteration_affects_first_stream_iteration():
     async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(content="", stop_reason="end_turn", blocks=[], model="m")
 
-    wrapped = recorder.wrap_stream_fn(_scripted_stream(dummy_script))
-
     with patch.object(agent_recorder, "trace_start_span", side_effect=fake_start):
-        _drain_stream(wrapped)
+        _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
     chat_starts = [s for s in starts if s["name"] == "llm_chat"]
     assert len(chat_starts) == 1
@@ -4532,7 +4529,7 @@ def _submit_response_with_usage(tokens: int, subject_id="123", reason="跨季匹
 
 
 def test_trace_recorder_accumulates_total_tokens_across_rounds():
-    """wrap_stream_fn 逐轮累计 usage.total_tokens。"""
+    """chat span 逐轮累计 usage.total_tokens。"""
     from unittest.mock import patch
 
     recorder = llm_assist.TraceRecorder("run-tok-rec", start_iteration=0)
@@ -4541,14 +4538,13 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
         ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
     ]
     chat = _chat_side_effect(responses)
-    wrapped = recorder.wrap_stream_fn(_scripted_stream(chat))
 
     with (
         patch.object(agent_recorder, "trace_start_span", return_value="span-x"),
         patch.object(agent_recorder, "trace_end_span"),
     ):
-        _drain_stream(wrapped)
-        _drain_stream(wrapped)
+        _drain_chat_span(recorder, _scripted_stream(chat))
+        _drain_chat_span(recorder, _scripted_stream(chat))
 
     assert recorder.total_tokens == 200, (
         f"应累计 2 轮 tokens=200，实际 {recorder.total_tokens}"

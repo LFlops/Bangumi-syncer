@@ -12,9 +12,15 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
+from types import TracebackType
 from typing import Protocol
 
-from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
+from app.services.llm.models import (
+    ChatResponse,
+    StreamChunk,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 # ---------------------------------------------------------------------------
 # 流式 LLM 调用
@@ -41,8 +47,40 @@ class StreamingExecutor(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# 记录器协议（工具 span / 预算）
+# 记录器协议（chat span / 工具 span / 预算）
 # ---------------------------------------------------------------------------
+
+
+class ChatSpan(Protocol):
+    """一轮 chat span 上下文：既是聚合视图，也是 ``async with`` 上下文管理器。
+
+    单聚合契约（消除「同一轮流被两处聚合」）：
+
+    - ``__aenter__``：落本轮 span 起点（iteration / 父级上下文由实现自持）并返回 self；
+    - ``feed(chunk)``：逐事件聚合（调用方**唯一**的馈入点，不再另建 aggregator）；
+    - ``__aexit__``：正常退出做**唯一**一次 ``StreamAggregator.finalize()`` 并写 span
+      终态；异常退出（流异常 / 取消）写 error span、不吞异常、不产出响应。
+
+    ``resp`` 仅在 ``__aexit__`` 正常退出后有效（异常路径为 ``None``）。
+    实现者（``recorder`` 的 chat span / ``loop.PlainChatSpan``）需保证：
+    正常退出必有响应，且每个实例的聚合恰好一次。
+    """
+
+    def feed(self, chunk: StreamChunk) -> None:
+        """馈入一个流事件（唯一聚合点）。"""
+
+    @property
+    def resp(self) -> ChatResponse | None:
+        """本轮聚合响应；仅 ``__aexit__`` 正常退出后有效。"""
+
+    async def __aenter__(self) -> ChatSpan: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool | None: ...
 
 
 class ToolSpanRecorder(Protocol):
@@ -74,7 +112,7 @@ class ToolSpanRecorder(Protocol):
 
 
 class BudgetRecorder(ToolSpanRecorder, Protocol):
-    """通用循环要求的记录器协议：预算消息 + 工具 span（继承 ``ToolSpanRecorder``）。
+    """通用循环要求的记录器协议：chat span + 预算消息 + 工具 span（继承 ``ToolSpanRecorder``）。
 
     仅 ``loop.run`` 需要 ``record_budget``；``start_tool`` / ``end_tool`` 的签名
     **不在此重复声明**，统一由基类 :class:`ToolSpanRecorder` 提供（避免此前
@@ -82,3 +120,11 @@ class BudgetRecorder(ToolSpanRecorder, Protocol):
     """
 
     def record_budget(self, budget_message: str) -> None: ...
+
+    def chat_span(self) -> ChatSpan:
+        """开一轮 chat span（``async with`` 上下文）。
+
+        轮次编号由实现自持（构造时的起始轮次 / 恢复锚定），**不接收调用方下标**：
+        loop 的本地轮次与持久化历史编号可能不同源（续跑从 ``executed_iterations``
+        起算，loop 只看剩余预算）。
+        """

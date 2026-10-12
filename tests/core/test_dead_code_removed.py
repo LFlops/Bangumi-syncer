@@ -40,6 +40,19 @@ def test_span_recorder_removed_from_llm_assist():
     )
 
 
+def test_wrap_stream_fn_removed_from_trace_recorder():
+    """TraceRecorder.wrap_stream_fn 已删除（双聚合来源），不得回归。
+
+    聚合与落库统一由 ``recorder.chat_span()`` 的 ``async with`` 承担：
+    ``feed`` 单点聚合、``__aexit__`` 唯一一次 finalize。
+    """
+    from app.services.agent.recorder import TraceRecorder
+
+    assert not hasattr(TraceRecorder, "wrap_stream_fn"), (
+        "TraceRecorder.wrap_stream_fn 应已删除（改由 chat_span() 单点聚合）"
+    )
+
+
 def test_llm_match_cross_call_cache_removed_from_config():
     """llm_match_cross_call_cache 已删除（enqueue_match_run 的 reused 决策无条件实现）。"""
     import inspect

@@ -15,7 +15,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
 | 循环 | `agent/loop.py` | 通用 LLM 循环（工具调用、终止工具、预算注入） |
-| 观测 | `agent/trace.py`、`agent/recorder.py` | span 读写与 `TraceRecorder`（chat/tool span、seed 行、budget 钩子、全轮 tokens 累计） |
+| 观测 | `agent/trace.py`、`agent/recorder.py` | span 读写与 `TraceRecorder`（chat span 上下文、tool span、seed 行、budget 钩子、全轮 tokens 累计） |
 | 预算 | `agent/budget.py` | 轮次预算策略（`task_type` + `thinking_level` → `max_iterations`） |
 | 运行时 | `agent/runtime.py` | `run` 编排与 `continue_run` 恢复状态机（原子抢占 / 异常分流 / replay 分派 / 补执行 / 终局分派） |
 | 场景协议 | `agent/scenario.py` | `ScenarioHooks`：场景差异点契约 |
@@ -46,7 +46,8 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 1. 原子抢占 run（`atomic_claim`，失败返回 `"skipped"`）；
 2. per-run `ToolRegistry` + 场景工具注册（并发隔离）；
 3. `build_seed` → 写 seed span；`resolve_max_iterations` 解析预算；
-4. `loop.py` 编排（chat span / tool span / 预算消息由 recorder 记录）；
+4. `loop.py` 编排（每轮经 `recorder.chat_span()` 单点聚合与落库；
+   tool span / 预算消息由 recorder 记录）；
 5. LLM 异常分流：`LLMCallError(retryable=False)` → `failed(llm_error)`；
    可重试 → `increment_attempts`（≥3 由仓储单点转 failed）；
 6. 终局交 `handle_terminal`。

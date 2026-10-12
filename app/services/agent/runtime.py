@@ -175,9 +175,13 @@ async def _invoke_loop(
     hooks: ScenarioHooks[CtxT],
     seed_messages: Sequence[Message],
 ) -> RunResult:
-    """以流式主路径运行通用循环（chat span 包装 + 按轮执行器工厂）。"""
+    """以流式主路径运行通用循环（chat span 由 recorder 提供 + 按轮执行器工厂）。
+
+    ``stream_fn`` 保持**原始**流式入口：聚合与落库在 loop 内经
+    ``span_recorder.chat_span()`` 单点完成（不再另有包装层聚合）。
+    """
     return await loop_run(
-        stream_fn=span_recorder.wrap_stream_fn(stream_fn),
+        stream_fn=stream_fn,
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
         tool_choice_terminal=hooks.terminal_tool,

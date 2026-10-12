@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 
-from app.services.agent.loop import RunResult, run
+from app.services.agent.loop import PlainChatSpan, RunResult, run
 from app.services.agent.tools import ToolError
 from app.services.llm.models import (
     ChatResponse,
@@ -389,7 +389,8 @@ async def test_max_iterations_exhausted_returns_last_response():
 class _FakeBudgetRecorder:
     """记录 record_budget 调用，便于断言预算消息。
 
-    满足 loop 的 ``BudgetRecorder`` 协议：本替身仅断言 ``record_budget``，
+    满足 loop 的 ``BudgetRecorder`` 协议：chat span 用 ``PlainChatSpan`` 纯聚合
+    （与 loop 的 recorder=None 分支同实现），本替身只断言 ``record_budget``，
     工具 span 相关方法为协议占位（不记录），由子类 ``_FakeToolRecorder`` 覆写。
     """
 
@@ -398,6 +399,10 @@ class _FakeBudgetRecorder:
 
     def record_budget(self, budget_message: str) -> None:
         self.budget_calls.append(budget_message)
+
+    def chat_span(self) -> PlainChatSpan:
+        """返回纯聚合 chat span（不落库）：loop 的聚合语义与生产实现一致。"""
+        return PlainChatSpan()
 
     def start_tool(self, tool_use: ToolUseBlock, *, sequence: int) -> str | None:
         """协议占位：本替身不追踪工具 span（无 veto 场景不会触发）。"""

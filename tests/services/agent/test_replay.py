@@ -436,7 +436,7 @@ class TestReplayRebuildsFullBlocks:
 
         asyncio.run(
             loop_module.run(
-                stream_fn=recorder.wrap_stream_fn(_scripted_stream(chat)),
+                stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
                 max_iterations=2,
@@ -495,7 +495,7 @@ class TestReplayRebuildsFullBlocks:
 
         asyncio.run(
             loop_module.run(
-                stream_fn=recorder.wrap_stream_fn(_scripted_stream(chat)),
+                stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
                 max_iterations=3,

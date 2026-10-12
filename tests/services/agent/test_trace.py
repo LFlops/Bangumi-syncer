@@ -7,11 +7,13 @@
 - get_steps 解密后还原明文
 - 无前缀明文容错（decrypt 对明文原样返回）
 - record_budget_message 读改写后仍密文
+- chat span（``recorder.chat_span()``）落库契约：全量 blocks / 空 blocks / 大载荷 / 异常 error span
 - 无 32KB / error 标记机制
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from collections.abc import Iterator
@@ -95,7 +97,7 @@ def _ensure_run(dbm, run_id: str):
 
 
 def _stream_from_response(resp):
-    """把单个 ``ChatResponse`` 展开为事件流（含工具停点），供 ``wrap_stream_fn`` 消费。
+    """把单个 ``ChatResponse`` 展开为事件流（含工具停点），供 chat span 消费。
 
     与生产 provider 的事件序列对齐：thinking/redacted_thinking/text/tool_use
     （start+delta+stop）、usage、结尾 stop（携带 stop_reason/model）；无块但有
@@ -145,6 +147,22 @@ def _stream_from_response(resp):
         yield StreamChunk(type="stop", stop_reason=resp.stop_reason, model=resp.model)
 
     return _stream
+
+
+def _consume_chat_span(recorder, stream_fn, messages=None):
+    """以 ``recorder.chat_span()`` 消费一轮流（与 loop 的用法一致），返回聚合响应。
+
+    ``resp`` 在 ``async with`` **块外**读取：``__aexit__`` 才做唯一一次 finalize。
+    """
+    msgs = messages if messages is not None else [Message(role="user", content="hi")]
+
+    async def _run():
+        async with recorder.chat_span() as span:
+            async for chunk in stream_fn(msgs, tools=[]):
+                span.feed(chunk)
+        return span.resp
+
+    return asyncio.run(_run())
 
 
 class TestEndSpanSignature:
@@ -260,8 +278,8 @@ class TestRecorderPersistsFullBlocks:
     旧数据（无 blocks）读取方走回退逻辑。
     """
 
-    async def test_wrap_stream_fn_persists_full_blocks_with_thinking(self, dbm):
-        """wrap_stream_fn 落库含全量 blocks（thinking/text/tool_use 顺序保持）。"""
+    def test_chat_span_persists_full_blocks_with_thinking(self, dbm):
+        """chat span 落库含全量 blocks（thinking/text/tool_use 顺序保持）。"""
         _ensure_run(dbm, "run-blocks-rec")
         recorder = TraceRecorder("run-blocks-rec", start_iteration=0)
         resp = ChatResponse(
@@ -275,9 +293,11 @@ class TestRecorderPersistsFullBlocks:
             model="m",
         )
 
-        wrapped = recorder.wrap_stream_fn(_stream_from_response(resp))
-        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
-            pass
+        got = _consume_chat_span(recorder, _stream_from_response(resp))
+
+        # 聚合响应与落库同源：loop 读到的内容即 span 记录的内容
+        assert got is not None
+        assert got.blocks == resp.blocks
 
         step = next(
             s
@@ -299,7 +319,7 @@ class TestRecorderPersistsFullBlocks:
             "tool_use",
         ]
 
-    async def test_wrap_stream_fn_persists_empty_blocks(self, dbm):
+    def test_chat_span_persists_empty_blocks(self, dbm):
         """无任何块事件的响应（end_turn）→ response["blocks"] 存空列表。"""
         _ensure_run(dbm, "run-blocks-empty")
         recorder = TraceRecorder("run-blocks-empty", start_iteration=0)
@@ -307,9 +327,7 @@ class TestRecorderPersistsFullBlocks:
         async def stream_fn(messages, *, tools=None, tool_choice=None):
             yield StreamChunk(type="stop", stop_reason="end_turn", model="m")
 
-        wrapped = recorder.wrap_stream_fn(stream_fn)
-        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
-            pass
+        _consume_chat_span(recorder, stream_fn)
 
         step = next(
             s
@@ -319,9 +337,7 @@ class TestRecorderPersistsFullBlocks:
         response = json.loads(step["replay_delta"])["response"]
         assert response["blocks"] == []
 
-    async def test_large_thinking_blocks_round_trip_through_encryption(
-        self, dbm, crypto_on
-    ):
+    def test_large_thinking_blocks_round_trip_through_encryption(self, dbm, crypto_on):
         """加密管道对更大 JSON 无影响：超长 thinking 块往返完整、不截断。"""
         _ensure_run(dbm, "run-blocks-big")
         big_thinking = "t" * 60_000
@@ -336,9 +352,7 @@ class TestRecorderPersistsFullBlocks:
             model="m",
         )
 
-        wrapped = recorder.wrap_stream_fn(_stream_from_response(resp))
-        async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
-            pass
+        _consume_chat_span(recorder, _stream_from_response(resp))
 
         # crypto_on 下 get_steps 透明解密；往返完整
         step = next(
@@ -512,12 +526,10 @@ class TestRecordBudgetMessageEncryptFailure:
         assert any("加密失败" in line for line in warns)
 
 
-class TestRecorderWrapStreamFn:
-    """``wrap_stream_fn`` 透传事件 + 内部 fold，流结束后写 span（schema 不变）。"""
+class TestRecorderChatSpan:
+    """``recorder.chat_span()``：单点聚合 + 轮末写 span（schema 不变）。"""
 
-    def test_wrap_stream_fn_forwards_chunks_and_persists_folded_response(self, dbm):
-        import asyncio
-
+    def test_chat_span_persists_folded_response(self, dbm):
         from app.services.llm.models import StreamChunk, Usage
 
         _ensure_run(dbm, "run-stream-rec")
@@ -539,25 +551,13 @@ class TestRecorderWrapStreamFn:
             )
             yield StreamChunk(type="stop", stop_reason="tool_use")
 
-        async def _consume():
-            wrapped = recorder.wrap_stream_fn(stream_fn)
-            seen = []
-            async for chunk in wrapped([Message(role="user", content="hi")], tools=[]):
-                seen.append(chunk.type)
-            return seen
+        got = _consume_chat_span(recorder, stream_fn)
 
-        seen = asyncio.run(_consume())
+        # 聚合结果直接供控制流使用（与落库同源）
+        assert got is not None
+        assert got.content == "搜"
+        assert [b.type for b in got.blocks] == ["thinking", "text", "tool_use"]
 
-        # 事件透传（含停点）
-        assert seen == [
-            "thinking_delta",
-            "text_delta",
-            "tool_use_start",
-            "tool_use_delta",
-            "tool_use_stop",
-            "usage",
-            "stop",
-        ]
         step = next(
             s
             for s in dbm.agent_runs.get_steps("run-stream-rec")
@@ -574,9 +574,7 @@ class TestRecorderWrapStreamFn:
             "tool_use",
         ]
 
-    def test_wrap_stream_fn_exception_writes_error_span(self, dbm):
-        import asyncio
-
+    def test_chat_span_exception_writes_error_span(self, dbm):
         from app.services.llm.models import StreamChunk
 
         _ensure_run(dbm, "run-stream-err")
@@ -587,14 +585,14 @@ class TestRecorderWrapStreamFn:
             raise RuntimeError("stream boom")
 
         async def _consume():
-            wrapped = recorder.wrap_stream_fn(stream_fn)
-            async for _chunk in wrapped([Message(role="user", content="hi")], tools=[]):
-                pass
+            with pytest.raises(RuntimeError, match="stream boom"):
+                async with recorder.chat_span() as span:
+                    async for chunk in stream_fn(
+                        [Message(role="user", content="hi")], tools=[]
+                    ):
+                        span.feed(chunk)
 
-        import pytest
-
-        with pytest.raises(RuntimeError):
-            asyncio.run(_consume())
+        asyncio.run(_consume())
 
         step = next(
             s

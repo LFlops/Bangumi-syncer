@@ -2,8 +2,9 @@
 
 ``TraceRecorder`` 是 agent 运行时的观测设施（与业务场景无关）：
 
-- **chat span 包装**：``wrap_stream_fn`` 包装流式 LLM 调用，每轮 start_span
-  → 透传事件（内部 fold）→ end_span（model/tokens 写专用列，不再塞 payload_json）。
+- **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文（``_ChatSpan``）：
+  进入时 start_span → ``feed`` 单点聚合 → 退出时**唯一**一次 finalize + end_span
+  （model/tokens 写专用列，不再塞 payload_json）。
 - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
   包裹层调用；幂等安全。
 - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -18,17 +19,20 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime
+from types import TracebackType
 
 from app.core.logging import logger
-from app.services.agent.protocols import BudgetRecorder, StreamFn
+from app.services.agent.protocols import BudgetRecorder, ChatSpan
 from app.services.agent.trace import (
     end_span as trace_end_span,
     record_budget_message as trace_record_budget_message,
     start_span as trace_start_span,
 )
 from app.services.llm.models import (
+    ChatResponse,
     Message,
     StreamAggregator,
+    StreamChunk,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -45,11 +49,12 @@ def _input_summary(inp: dict) -> str:
 
 
 class TraceRecorder(BudgetRecorder):
-    """统一 trace 记录器（chat 包装 / tool span / seed 行 / budget 钩子）。
+    """统一 trace 记录器（chat span / tool span / seed 行 / budget 钩子）。
 
     职责：
-    - **chat span 包装**：``wrap_stream_fn`` 包装流式 LLM 调用，每轮 start_span
-      → 透传事件（内部 fold）→ end_span（model/tokens 写专用列，不再塞 payload_json）。
+    - **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文
+      （``_ChatSpan``）：进入时 start_span、``feed`` 单点聚合、退出时**唯一**一次
+      finalize + end_span（model/tokens 写专用列，不再塞 payload_json）。
     - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
       包裹层调用；幂等安全。
     - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -66,7 +71,7 @@ class TraceRecorder(BudgetRecorder):
         self.run_id = run_id
         self._clock = clock or _default_clock
         self._next_iteration: int = start_iteration
-        # 当前轮的 iteration（wrap_stream_fn 开始时设定，start_tool / record_budget 读取）
+        # 当前轮的 iteration（chat span 进入时设定，start_tool / record_budget 读取）
         self._current_iteration: int = 0
         self._chat_span_id: str | None = None
         self._last_tool_span_id: str | None = None
@@ -75,42 +80,19 @@ class TraceRecorder(BudgetRecorder):
         # span_id → (tool_use, t0)，供 end_tool 检索后清除（幂等）
         self._tool_state: dict[str, tuple] = {}
 
-    # -- stream span 包装 ---------------------------------------------------
+    # -- chat span 上下文 ---------------------------------------------------
 
-    def wrap_stream_fn(self, stream_fn: StreamFn) -> StreamFn:
-        """包装流式 LLM 调用：每轮 start_span → 透传事件（内部 fold）→ end_span。
+    def chat_span(self) -> ChatSpan:
+        """开一轮 chat span（``async with``）：唯一聚合点 + 唯一 finalize + 轮末入库。
 
-        流式唯一入口的观测包装：
+        轮次编号由本记录器自持（构造时的 ``start_iteration`` 与
+        ``begin_replayed_round`` 锚定）：loop 的本地轮次与持久化历史编号不同源
+        （续跑从 ``executed_iterations`` 起算），故**不接收**调用方下标。
 
-        - 每轮开始时（首次 ``__anext__``）设定 ``_current_iteration`` 并 start chat span，
-          使**流进行中**提前执行的工具 span 与本轮 chat span 同 iteration。
-        - 逐事件透传给调用方，同时在内部用 :class:`StreamAggregator` fold 出等价
-          ``ChatResponse``；**流正常耗尽后**以 fold 结果写 span（schema 与
-          历史 chat 路径完全一致：blocks/stop_reason/content/model/usage）。
-        - 流异常（LLMCallError 等）或消费方提前关闭 → resp 为空 → 写 error span，
-          不落成功、不遮掩原始异常。
+        落库时机保持轮粒度（崩溃恢复依赖）：
+        ``__aenter__`` 立即 start_span；``__aexit__`` 在轮末立即 end_span。
         """
-        recorder = self
-
-        async def wrapped(messages, *, tools=None, tool_choice=None):
-            span_id = recorder._begin_chat_span()
-            iteration = recorder._current_iteration
-            t0 = recorder._clock()
-            aggregator = StreamAggregator()
-            resp = None
-            try:
-                async for chunk in stream_fn(
-                    messages, tools=tools, tool_choice=tool_choice
-                ):
-                    aggregator.feed(chunk)
-                    yield chunk
-                resp = aggregator.finalize()
-            finally:
-                recorder._finish_chat_span(
-                    span_id, iteration=iteration, t0=t0, resp=resp
-                )
-
-        return wrapped
+        return _ChatSpan(self)
 
     def _begin_chat_span(self) -> str:
         """开启新一轮 chat span：推进 iteration 并重置本轮 tool 追踪。"""
@@ -243,7 +225,7 @@ class TraceRecorder(BudgetRecorder):
         """锚定到指定轮次，供恢复路径补执行缺失工具落 span 使用。
 
         将 ``_current_iteration`` 设为 ``iteration``，并使 ``_next_iteration``
-        设为 ``iteration + 1``（保证后续 ``wrap_stream_fn`` 从正确轮次开始推进，
+        设为 ``iteration + 1``（保证后续 ``chat_span`` 从正确轮次开始推进，
         避免与补执行的 tool span 撞号）。
         """
         self._current_iteration = iteration
@@ -257,3 +239,57 @@ class TraceRecorder(BudgetRecorder):
         target = self._last_tool_span_id or self._chat_span_id
         if target:
             trace_record_budget_message(target, budget_message)
+
+
+class _ChatSpan(ChatSpan):
+    """一轮 chat span 上下文（``TraceRecorder.chat_span()`` 产出）：聚合 + 落库。
+
+    单聚合契约：``feed`` 是**唯一**聚合点，``__aexit__`` 做**唯一**一次
+    ``StreamAggregator.finalize()``——调用方（loop）在块外读 ``resp`` 供控制流，
+    与落库内容同源。
+
+    落库时机（轮粒度，崩溃恢复依赖）：``__aenter__`` 立即 start_span（使流进行中
+    提前执行的工具 span 与本轮 chat span 同 iteration）；``__aexit__`` 立即 end_span
+    （成功写 response delta / model / tokens；异常写 error span，不吞异常）。
+    """
+
+    def __init__(self, recorder: TraceRecorder) -> None:
+        self._recorder = recorder
+        self._span_id = ""
+        self._iteration = 0
+        self._t0 = 0.0
+        self._aggregator = StreamAggregator()
+        self._resp: ChatResponse | None = None
+
+    async def __aenter__(self) -> _ChatSpan:
+        recorder = self._recorder
+        self._span_id = recorder._begin_chat_span()
+        self._iteration = recorder._current_iteration
+        self._t0 = recorder._clock()
+        return self
+
+    def feed(self, chunk: StreamChunk) -> None:
+        self._aggregator.feed(chunk)
+
+    @property
+    def resp(self) -> ChatResponse | None:
+        return self._resp
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        # 异常退出（流异常 / 取消）：不 finalize——半截流不得记成成功响应；
+        # 复用 _finish_chat_span 的 error 分支落 span，原异常照常透传。
+        resp = None if exc_type is not None else self._aggregator.finalize()
+        self._resp = resp
+        try:
+            self._recorder._finish_chat_span(
+                self._span_id, iteration=self._iteration, t0=self._t0, resp=resp
+            )
+        except Exception as e:
+            # 观测层 best-effort：落库自身失败绝不遮蔽主流程（尤其原始流异常）
+            logger.warning(f"[agent] chat span 落库失败（已忽略）: {e}")
+        return False

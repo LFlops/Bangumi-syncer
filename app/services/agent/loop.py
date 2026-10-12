@@ -7,8 +7,10 @@
 - **不直接依赖 LLMClient**：LLM 调用经注入的 ``stream_fn(messages, tools=, tool_choice=)``
   （返回 ``AsyncIterator[StreamChunk]``），便于测试 mock 与场景层（llm_assist）注入真实
   客户端。
-- **流式解析 + 提交闸门 + 受控执行**（``stream_fn`` 路径）：逐事件喂
-  :class:`~app.services.llm.models.StreamAggregator` 聚合响应，同时喂
+- **流式解析 + 提交闸门 + 受控执行**（``stream_fn`` 路径）：逐事件喂本轮
+  chat span（``recorder.chat_span()``，其 ``__aexit__`` 做**唯一**一次
+  ``StreamAggregator.finalize()``；``recorder=None`` 时为 :class:`PlainChatSpan`
+  纯聚合），同时喂
   :class:`~app.services.agent.streaming_tool_executor.StreamingToolExecutor`。
   停点时序因协议而异：anthropic/responses **逐工具停点** → 幂等工具在参数停点
   （``tool_use_stop``）到达时**提前启动并与生成重叠**；openai_compat 在
@@ -27,7 +29,7 @@
   best-effort 争取明确结论；不执行任何非终止工具，异常时降级为 exhausted，仅调用一次。
 - **预算钩子**：非末轮预算消息与收尾提示生成后调用 ``recorder.record_budget(...)``，
   由 recorder 内部决定并入哪条 span（同轮最后 tool_execute 或回退 llm_chat）。
-  ``recorder=None`` 时整体跳过（可空实现）。
+  ``recorder=None`` 时不落库（观察层缺省），控制流经 :class:`PlainChatSpan` 纯聚合。
 
 不引入 token/wall-time 预算系统，只做轮次上限。
 """
@@ -38,13 +40,20 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from types import TracebackType
 
-from app.services.agent.protocols import BudgetRecorder, StreamFn, StreamingExecutor
+from app.services.agent.protocols import (
+    BudgetRecorder,
+    ChatSpan,
+    StreamFn,
+    StreamingExecutor,
+)
 from app.services.llm.models import (
     ChatResponse,
     ContentBlock,
     Message,
     StreamAggregator,
+    StreamChunk,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -115,6 +124,40 @@ class RunResult:
 ExecutorFactory = Callable[[], StreamingExecutor]
 
 
+class PlainChatSpan(ChatSpan):
+    """纯聚合 chat span（不落库）：``recorder`` 缺省时的默认实现。
+
+    loop 控制流需要本轮响应与是否落库无关，故无记录器时也必须聚合；语义与
+    记录器实现一致（``feed`` 单点聚合、``__aexit__`` 唯一一次 finalize），
+    仅不做 span 写库。可被测试替身复用（``chat_span()`` 返回本类实例）。
+    """
+
+    def __init__(self) -> None:
+        self._aggregator = StreamAggregator()
+        self._resp: ChatResponse | None = None
+
+    async def __aenter__(self) -> PlainChatSpan:
+        return self
+
+    def feed(self, chunk: StreamChunk) -> None:
+        self._aggregator.feed(chunk)
+
+    @property
+    def resp(self) -> ChatResponse | None:
+        return self._resp
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool:
+        # 异常退出不 finalize（半截流不作为响应交给控制流）；原异常照常透传。
+        if exc_type is None:
+            self._resp = self._aggregator.finalize()
+        return False
+
+
 async def _consume_stream(
     stream_fn: StreamFn,
     messages: list[Message],
@@ -122,11 +165,20 @@ async def _consume_stream(
     tools: list[dict] | None,
     tool_choice: str | None,
     executor_factory: ExecutorFactory | None,
+    recorder: BudgetRecorder | None = None,
 ) -> tuple[ChatResponse, StreamingExecutor | None]:
-    """消费一轮流：聚合响应，并把工具事件喂给执行器（若注入）。
+    """消费一轮流：聚合响应（唯一聚合点），并把工具事件喂给执行器（若注入）。
 
     返回 ``(resp, executor)``；``executor_factory=None`` 时不构造执行器（纯聚合，
     用于收尾调用等不执行工具的场景）。
+
+    聚合与落库（单聚合契约）：
+
+    - ``recorder`` 非 None → ``recorder.chat_span()``：``__aenter__`` 落本轮 span
+      起点、``feed`` 是**唯一**聚合点、``__aexit__`` 做**唯一**一次
+      ``StreamAggregator.finalize()`` 并写 span 终态；loop 在块外读 ``span.resp``
+      供控制流，与落库内容同源。
+    - ``recorder`` 为 None → :class:`PlainChatSpan` 纯聚合（不落库），控制流不变。
 
     异常安全：执行器**先于消费构造**，流中途异常（httpx 超时/断连等）时先
     ``await asyncio.shield(executor.finalize())`` 收敛已提前启动的任务（避免孤儿后台
@@ -134,13 +186,16 @@ async def _consume_stream(
     收敛经 ``shield`` 保护：外层协程被取消（关机/取消竞态）时收敛动作仍在后台完成。
     收敛自身失败（含取消类 ``BaseException``）只记 warning，**绝不掩盖原始异常**。
     """
-    aggregator = StreamAggregator()
     executor = executor_factory() if executor_factory is not None else None
+    span: ChatSpan = recorder.chat_span() if recorder is not None else PlainChatSpan()
     try:
-        async for chunk in stream_fn(messages, tools=tools, tool_choice=tool_choice):
-            aggregator.feed(chunk)
-            if executor is not None:
-                executor.feed(chunk)
+        async with span:
+            async for chunk in stream_fn(
+                messages, tools=tools, tool_choice=tool_choice
+            ):
+                span.feed(chunk)  # 唯一聚合点
+                if executor is not None:
+                    executor.feed(chunk)
     except BaseException:
         if executor is not None:
             try:
@@ -156,7 +211,13 @@ async def _consume_stream(
                     type(e).__name__,
                 )
         raise
-    return aggregator.finalize(), executor
+    resp = span.resp
+    if resp is None:
+        # 协议防御：正常退出必有响应（异常路径已在上方 re-raise）。实现未 finalize
+        # 属协议破坏，按空壳响应降级（由 normalize_stop_reason 判 llm_error），不静默。
+        logger.warning("chat span 正常退出却无响应（未 finalize），按空壳响应处理")
+        resp = ChatResponse(content="")
+    return resp, executor
 
 
 def _extract_tool_calls(resp: ChatResponse) -> list[ToolUseBlock]:
@@ -314,8 +375,10 @@ async def run(
       做快照：不改写调用方对象、调用方仍可复用；用 ``Sequence`` 而非 ``Iterable``
       ——seed 会被 runtime 的 ``write_seed_row`` 与 loop **多次消费**，生成器必须被
       类型排除
-    - ``recorder``：可选预算记录器（满足本地 :class:`BudgetRecorder` 协议；不导入具体
-      实现以避免与 recorder.py 循环依赖），None 时跳过钩子
+    - ``recorder``：可选记录器（满足本地 :class:`BudgetRecorder` 协议；不导入具体
+      实现以避免与 recorder.py 循环依赖）。每轮经 ``recorder.chat_span()`` 进入本轮
+      chat span（唯一聚合点 + 唯一 finalize + 轮末落库）；None 时用
+      :class:`PlainChatSpan` 纯聚合（不落库，控制流不变）。
     - ``veto_terminal``：可选终止提交软护栏。非 None 时，命中终止工具的轮次会先询问
       该回调（入参=terminal input）；返回提示文案则**不终止**、注入配对 tool_result 后
       继续一轮（仅拦一次，且末轮不拦）。返回 None / 回调为 None 时行为与现状一致。
@@ -342,6 +405,7 @@ async def run(
             tools=tools_schemas,
             tool_choice=tool_choice,
             executor_factory=executor_factory,
+            recorder=recorder,
         )
 
         # ① 终局归一化（与恢复续跑 runtime.continue_run 共用同一判据）：
@@ -508,6 +572,7 @@ async def _final_recovery(
             tools=terminal_schemas,
             tool_choice=tool_choice_terminal,
             executor_factory=None,
+            recorder=recorder,
         )
     except Exception as e:
         # best-effort：收尾失败不应让 run 更糟，保留循环内最后一次可用响应
