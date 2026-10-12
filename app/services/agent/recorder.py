@@ -2,9 +2,12 @@
 
 ``TraceRecorder`` 是 agent 运行时的观测设施（与业务场景无关）：
 
-- **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文（``_ChatSpan``）：
-  进入时 start_span → ``feed`` 单点聚合 → 退出时**唯一**一次 finalize + end_span
-  （model/tokens 写专用列，不再塞 payload_json）。
+- **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文
+  （:class:`~app.services.agent.chat_span.RecorderChatSpan`）：进入时 start_span →
+  ``feed`` 单点聚合 → 退出时**唯一**一次 finalize + end_span
+  （model/tokens 写专用列，不再塞 payload_json）。与 span 实现的协作经两个同伴 API：
+  ``begin_chat_span()`` / ``finish_chat_span()``（span 实现在 chat_span 模块，
+  不访问本类私有属性）。
 - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
   包裹层调用；幂等安全。
 - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -19,23 +22,12 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import datetime
-from types import TracebackType
 
 from app.core.logging import logger
-from app.services.agent.protocols import BudgetRecorder, ChatSpan
-from app.services.agent.trace import (
-    end_span as trace_end_span,
-    record_budget_message as trace_record_budget_message,
-    start_span as trace_start_span,
-)
-from app.services.llm.models import (
-    ChatResponse,
-    Message,
-    StreamAggregator,
-    StreamChunk,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from app.services.agent.chat_span import ChatSpan, ChatSpanStart, RecorderChatSpan
+from app.services.agent.protocols import BudgetRecorder
+from app.services.agent.trace import end_span, record_budget_message, start_span
+from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 
 
 def _default_clock() -> float:
@@ -53,8 +45,9 @@ class TraceRecorder(BudgetRecorder):
 
     职责：
     - **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文
-      （``_ChatSpan``）：进入时 start_span、``feed`` 单点聚合、退出时**唯一**一次
-      finalize + end_span（model/tokens 写专用列，不再塞 payload_json）。
+      （:class:`~app.services.agent.chat_span.RecorderChatSpan`）：进入时 start_span、
+      ``feed`` 单点聚合、退出时**唯一**一次 finalize + end_span
+      （model/tokens 写专用列，不再塞 payload_json）。
     - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
       包裹层调用；幂等安全。
     - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
@@ -90,23 +83,40 @@ class TraceRecorder(BudgetRecorder):
         （续跑从 ``executed_iterations`` 起算），故**不接收**调用方下标。
 
         落库时机保持轮粒度（崩溃恢复依赖）：
-        ``__aenter__`` 立即 start_span；``__aexit__`` 在轮末立即 end_span。
+        进入时立即 start_span；退出时在轮末立即 end_span。
         """
-        return _ChatSpan(self)
+        return RecorderChatSpan(self)
 
-    def _begin_chat_span(self) -> str:
-        """开启新一轮 chat span：推进 iteration 并重置本轮 tool 追踪。"""
+    def begin_chat_span(self) -> ChatSpanStart:
+        """开启新一轮 chat span：推进 iteration、重置本轮 tool 追踪并记 t0。
+
+        与 :meth:`finish_chat_span` 同为 :class:`RecorderChatSpan` 的**同伴 API**
+        （span 实现位于 :mod:`app.services.agent.chat_span`，不访问本类私有属性）。
+        """
         self._current_iteration = self._next_iteration
         self._next_iteration += 1
-        span_id = trace_start_span(
+        span_id = start_span(
             self.run_id, name="llm_chat", iteration=self._current_iteration, sequence=0
         )
         self._chat_span_id = span_id
         self._last_tool_span_id = None  # 新轮重置
-        return span_id
+        return ChatSpanStart(
+            span_id=span_id, iteration=self._current_iteration, t0=self._clock()
+        )
 
-    def _finish_chat_span(self, span_id, *, iteration: int, t0: float, resp) -> None:
-        """写 chat span 终态（成功写 response delta；失败写 error span）。"""
+    def finish_chat_span(
+        self,
+        span_id: str,
+        *,
+        iteration: int,
+        t0: float,
+        resp: ChatResponse | None,
+    ) -> None:
+        """写 chat span 终态（成功写 response delta；失败写 error span）。
+
+        同伴 API：由 :class:`RecorderChatSpan` 在 ``__aexit__`` 调用（唯一 finalize
+        之后），不在别处调用。
+        """
         latency_ms = int((self._clock() - t0) * 1000)
         if resp is not None:
             tokens = resp.usage.total_tokens if resp.usage is not None else 0
@@ -122,7 +132,7 @@ class TraceRecorder(BudgetRecorder):
             # 断点续跑的下一轮请求会 400（与 live loop 的 list(resp.blocks) 对齐）。
             # 仅追加字段、不升级 schema：旧数据无 blocks 时读取方走 tool_calls 回退。
             blocks = [b.model_dump() for b in resp.blocks]
-            trace_end_span(
+            end_span(
                 span_id,
                 status="ok",
                 model=resp.model,
@@ -142,7 +152,7 @@ class TraceRecorder(BudgetRecorder):
             logger.warning(
                 f"[agent] LLM 调用异常（iteration={iteration}），写 error span"
             )
-            trace_end_span(
+            end_span(
                 span_id,
                 status="error",
                 latency_ms=latency_ms,
@@ -156,7 +166,7 @@ class TraceRecorder(BudgetRecorder):
 
         读取 ``_current_iteration``（当前轮），保证与本轮 chat span 的 iteration 一致。
         """
-        span_id = trace_start_span(
+        span_id = start_span(
             self.run_id,
             name="tool_execute",
             iteration=self._current_iteration,
@@ -197,7 +207,7 @@ class TraceRecorder(BudgetRecorder):
                 }
             }
 
-        trace_end_span(
+        end_span(
             span_id,
             status=status,
             tool_name=tool_use.name,
@@ -211,9 +221,9 @@ class TraceRecorder(BudgetRecorder):
 
     def write_seed_row(self, seed_messages: Sequence[Message]) -> None:
         """run 启动时写一条 name='seed' span 行。"""
-        span_id = trace_start_span(self.run_id, name="seed", iteration=0, sequence=0)
+        span_id = start_span(self.run_id, name="seed", iteration=0, sequence=0)
         seed_delta = [m.model_dump() for m in seed_messages]
-        trace_end_span(
+        end_span(
             span_id,
             status="ok",
             replay_delta={"seed_messages": seed_delta},
@@ -238,58 +248,4 @@ class TraceRecorder(BudgetRecorder):
         """预算钩子：并入本轮最后 tool span，无则回退 chat span。"""
         target = self._last_tool_span_id or self._chat_span_id
         if target:
-            trace_record_budget_message(target, budget_message)
-
-
-class _ChatSpan(ChatSpan):
-    """一轮 chat span 上下文（``TraceRecorder.chat_span()`` 产出）：聚合 + 落库。
-
-    单聚合契约：``feed`` 是**唯一**聚合点，``__aexit__`` 做**唯一**一次
-    ``StreamAggregator.finalize()``——调用方（loop）在块外读 ``resp`` 供控制流，
-    与落库内容同源。
-
-    落库时机（轮粒度，崩溃恢复依赖）：``__aenter__`` 立即 start_span（使流进行中
-    提前执行的工具 span 与本轮 chat span 同 iteration）；``__aexit__`` 立即 end_span
-    （成功写 response delta / model / tokens；异常写 error span，不吞异常）。
-    """
-
-    def __init__(self, recorder: TraceRecorder) -> None:
-        self._recorder = recorder
-        self._span_id = ""
-        self._iteration = 0
-        self._t0 = 0.0
-        self._aggregator = StreamAggregator()
-        self._resp: ChatResponse | None = None
-
-    async def __aenter__(self) -> _ChatSpan:
-        recorder = self._recorder
-        self._span_id = recorder._begin_chat_span()
-        self._iteration = recorder._current_iteration
-        self._t0 = recorder._clock()
-        return self
-
-    def feed(self, chunk: StreamChunk) -> None:
-        self._aggregator.feed(chunk)
-
-    @property
-    def resp(self) -> ChatResponse | None:
-        return self._resp
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool:
-        # 异常退出（流异常 / 取消）：不 finalize——半截流不得记成成功响应；
-        # 复用 _finish_chat_span 的 error 分支落 span，原异常照常透传。
-        resp = None if exc_type is not None else self._aggregator.finalize()
-        self._resp = resp
-        try:
-            self._recorder._finish_chat_span(
-                self._span_id, iteration=self._iteration, t0=self._t0, resp=resp
-            )
-        except Exception as e:
-            # 观测层 best-effort：落库自身失败绝不遮蔽主流程（尤其原始流异常）
-            logger.warning(f"[agent] chat span 落库失败（已忽略）: {e}")
-        return False
+            record_budget_message(target, budget_message)

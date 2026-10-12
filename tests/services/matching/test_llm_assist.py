@@ -2249,9 +2249,9 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         "end": [],
         "budget": [],
     }
-    original_start = agent_recorder.trace_start_span
-    original_end = agent_recorder.trace_end_span
-    original_budget = agent_recorder.trace_record_budget_message
+    original_start = agent_recorder.start_span
+    original_end = agent_recorder.end_span
+    original_budget = agent_recorder.record_budget_message
 
     def fake_start(run_id, name, iteration, sequence, parent_id=""):
         span_id = original_start(run_id, name, iteration, sequence, parent_id)
@@ -2275,9 +2275,9 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         )
         return original_budget(span_id, budget_message)
 
-    monkeypatch.setattr(agent_recorder, "trace_start_span", fake_start)
-    monkeypatch.setattr(agent_recorder, "trace_end_span", fake_end)
-    monkeypatch.setattr(agent_recorder, "trace_record_budget_message", fake_budget)
+    monkeypatch.setattr(agent_recorder, "start_span", fake_start)
+    monkeypatch.setattr(agent_recorder, "end_span", fake_end)
+    monkeypatch.setattr(agent_recorder, "record_budget_message", fake_budget)
 
     chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
 
@@ -2376,8 +2376,8 @@ def test_trace_recorder_chat_span_tracks_iteration():
 
     # patch llm_assist 模块上的引用（闭包通过模块全局名字查找）
     with (
-        patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
+        patch.object(agent_recorder, "start_span", side_effect=fake_start),
+        patch.object(agent_recorder, "end_span", side_effect=fake_end),
     ):
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
@@ -2416,8 +2416,8 @@ def test_trace_recorder_tool_start_end_idempotent():
     recorder._chat_span_id = "chat-span-0"
 
     with (
-        patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
+        patch.object(agent_recorder, "start_span", side_effect=fake_start),
+        patch.object(agent_recorder, "end_span", side_effect=fake_end),
     ):
         span_id = recorder.start_tool(tc, sequence=0)
         assert span_id is not None
@@ -2458,11 +2458,9 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
     recorder._chat_span_id = "span-llm_chat-0"
 
     with (
-        patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
-        patch.object(
-            agent_recorder, "trace_record_budget_message", side_effect=fake_budget
-        ),
+        patch.object(agent_recorder, "start_span", side_effect=fake_start),
+        patch.object(agent_recorder, "end_span", side_effect=fake_end),
+        patch.object(agent_recorder, "record_budget_message", side_effect=fake_budget),
     ):
         recorder.record_budget("[剩余轮次：2]")
         assert len(budget_targets) == 1
@@ -2500,8 +2498,8 @@ def test_chat_span_and_tool_same_iteration():
         )
 
     with (
-        patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
+        patch.object(agent_recorder, "start_span", side_effect=fake_start),
+        patch.object(agent_recorder, "end_span", side_effect=fake_end),
     ):
         # 第一轮
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
@@ -2563,8 +2561,8 @@ def test_chat_span_exception_propagates_original():
         raise ValueError("boom")
 
     with (
-        patch.object(agent_recorder, "trace_start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "trace_end_span", side_effect=fake_end),
+        patch.object(agent_recorder, "start_span", side_effect=fake_start),
+        patch.object(agent_recorder, "end_span", side_effect=fake_end),
     ):
         with pytest.raises(ValueError, match="boom"):
             _drain_chat_span(recorder, _scripted_stream(exploding_script))
@@ -2623,7 +2621,7 @@ def test_trace_recorder_start_iteration_affects_first_chat_span_iteration():
     async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(content="", stop_reason="end_turn", blocks=[], model="m")
 
-    with patch.object(agent_recorder, "trace_start_span", side_effect=fake_start):
+    with patch.object(agent_recorder, "start_span", side_effect=fake_start):
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
     chat_starts = [s for s in starts if s["name"] == "llm_chat"]
@@ -2654,7 +2652,7 @@ def test_trace_recorder_begin_replayed_round_sets_current_iteration():
     recorder.begin_replayed_round(7)
 
     tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
-    with patch.object(agent_recorder, "trace_start_span", side_effect=fake_start):
+    with patch.object(agent_recorder, "start_span", side_effect=fake_start):
         recorder.start_tool(tc, sequence=0)
 
     tool_starts = [s for s in starts if s["name"] == "tool_execute"]
@@ -4540,8 +4538,8 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
     chat = _chat_side_effect(responses)
 
     with (
-        patch.object(agent_recorder, "trace_start_span", return_value="span-x"),
-        patch.object(agent_recorder, "trace_end_span"),
+        patch.object(agent_recorder, "start_span", return_value="span-x"),
+        patch.object(agent_recorder, "end_span"),
     ):
         _drain_chat_span(recorder, _scripted_stream(chat))
         _drain_chat_span(recorder, _scripted_stream(chat))

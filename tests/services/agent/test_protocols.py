@@ -11,8 +11,9 @@
 - **执行器显式实现协议**：``StreamingToolExecutor`` 显式继承
   ``protocols.StreamingExecutor``（nominal 而非纯鸭子类型），使协议变更由类型检查与
   本守卫同时兜住，而非仅靠结构约定。
-- **chat span 单聚合契约**：``protocols.ChatSpan`` 定义四个契约点，两处实现
-  （``recorder._ChatSpan`` / ``loop.PlainChatSpan``）显式继承。
+- **chat span 单聚合契约**：``chat_span.ChatSpan`` 定义四个契约点，两处实现
+  （``chat_span.RecorderChatSpan`` / ``chat_span.PlainChatSpan``）显式继承；
+  ``ChatSpan`` 随概念归位（不留在 protocols.py）。
 """
 
 from __future__ import annotations
@@ -20,10 +21,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from app.services.agent.loop import PlainChatSpan
+from app.services.agent.chat_span import ChatSpan, PlainChatSpan
 from app.services.agent.protocols import (
     BudgetRecorder,
-    ChatSpan,
     StreamingExecutor,
     ToolSpanRecorder,
 )
@@ -78,9 +78,17 @@ def test_tools_defines_no_recorder_protocol():
 
 
 def test_recorder_protocol_defined_in_protocols_module():
-    """ToolSpanRecorder / BudgetRecorder / ChatSpan 均在 protocols.py 定义。"""
-    defined = _defined_class_names("protocols.py")
-    assert {"ToolSpanRecorder", "BudgetRecorder", "ChatSpan"} <= defined
+    """ToolSpanRecorder / BudgetRecorder 在 protocols.py；ChatSpan 随概念归位。
+
+    归位判据（见 protocols.py 头部）：跨层能力契约留中立层；消费方与实现方同概念
+    （chat span）的契约随概念走 ``chat_span.py``。
+    """
+    protocols_defined = _defined_class_names("protocols.py")
+    assert {"ToolSpanRecorder", "BudgetRecorder"} <= protocols_defined
+    assert "ChatSpan" not in protocols_defined, (
+        "ChatSpan 应随其实现归位 chat_span.py（不再留在 protocols.py）"
+    )
+    assert "ChatSpan" in _defined_class_names("chat_span.py")
 
 
 def test_budget_recorder_covers_budget_and_tool_span():
@@ -174,16 +182,17 @@ def test_chat_span_protocol_surface():
 def test_chat_span_implementations_explicitly_inherit_protocol():
     """两处 chat span 实现显式继承协议（nominal，非纯鸭子类型）。
 
-    - ``recorder`` 的 chat span（``chat_span()`` 工厂产出）：唯一 finalize + 轮末写 span；
-    - ``loop.PlainChatSpan``：无 recorder 时的纯聚合实现。
+    - ``chat_span.RecorderChatSpan``：落库实现（唯一 finalize + 轮末写 span）；
+    - ``chat_span.PlainChatSpan``：无 recorder 时的纯聚合实现。
 
     两道路径：AST 校验基类写在源码里（防动态蒙混，与执行器守卫同构）；
-    ``__mro__`` 校验运行时确实继承（含工厂产出，防止返回未继承的对象）。
-    注意：协议未加 ``@runtime_checkable``（全仓约定），故**不能**用
-    ``issubclass`` / ``isinstance`` 校验——那会抛 TypeError，不代表未继承。
+    ``__mro__`` 校验运行时确实继承（含 ``TraceRecorder.chat_span()`` 工厂产出，
+    防止返回未继承的对象）。注意：协议未加 ``@runtime_checkable``（全仓约定），
+    故**不能**用 ``issubclass`` / ``isinstance`` 校验——那会抛 TypeError，
+    不代表未继承。
     """
-    assert _class_bases("recorder.py", "_ChatSpan") == ["ChatSpan"]
-    assert _class_bases("loop.py", "PlainChatSpan") == ["ChatSpan"]
+    assert _class_bases("chat_span.py", "RecorderChatSpan") == ["ChatSpan"]
+    assert _class_bases("chat_span.py", "PlainChatSpan") == ["ChatSpan"]
 
     produced = TraceRecorder("guard-run", start_iteration=0).chat_span()
     assert ChatSpan in type(produced).__mro__

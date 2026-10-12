@@ -221,7 +221,7 @@ def test_chat_span_write_failure_does_not_mask_stream_exception(dbm, monkeypatch
     def exploding_end_span(*args, **kwargs):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(agent_recorder, "trace_end_span", exploding_end_span)
+    monkeypatch.setattr(agent_recorder, "end_span", exploding_end_span)
 
     async def stream_fn(messages, *, tools=None, tool_choice=None):
         yield StreamChunk(type="text_delta", text="partial")

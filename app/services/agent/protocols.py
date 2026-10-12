@@ -1,26 +1,27 @@
-"""Agent 层协议与类型定义（纯协议，无实现）。
+"""Agent 层**跨层能力契约**与类型别名。
 
-集中定义 agent 通用骨架与场景层 / 记录器之间的契约，消除循环依赖：
+**归位判据**（决定一个契约放本文件，还是随其概念模块走）：
 
-- ``loop.py``（通用骨架）与 ``recorder.py``（记录器）都从这里引用协议，
-  避免 ``loop ↔ recorder`` 互相 import。
-- ``scenario.py`` / ``runtime.py`` / ``registry.py`` 等场景与运行时模块统一引用。
+- 若契约的「消费方」与「实现方」**双向都不应 import 对方模块**（依赖防火墙）→ 放本
+  文件：中立契约层，任何一侧都可依赖，两侧互不成环；
+- 若消费方 import 概念模块天经地义、且概念模块不反向依赖消费方 → 契约**随概念归位**。
+  例：``chat_span.ChatSpan`` 与其两种实现同处 :mod:`app.services.agent.chat_span`。
 
-新增 agent 层 Protocol 时，优先放在此文件。
+本文件现有：:data:`StreamFn`（LLM 调用边界）、:class:`StreamingExecutor`、
+:class:`ToolSpanRecorder`、:class:`BudgetRecorder`——被 ``loop`` / ``tools`` /
+``streaming_tool_executor`` / ``runtime`` 多层消费，实现方分散在各自模块，故留中立层。
+
+历史：本文件曾集中全部 agent 协议（含 ``ChatSpan``）；``ChatSpan`` 随实现归位后，
+本文件收窄为「跨层能力契约」。
 """
 
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from types import TracebackType
 from typing import Protocol
 
-from app.services.llm.models import (
-    ChatResponse,
-    StreamChunk,
-    ToolResultBlock,
-    ToolUseBlock,
-)
+from app.services.agent.chat_span import ChatSpan
+from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
 
 # ---------------------------------------------------------------------------
 # 流式 LLM 调用
@@ -49,38 +50,6 @@ class StreamingExecutor(Protocol):
 # ---------------------------------------------------------------------------
 # 记录器协议（chat span / 工具 span / 预算）
 # ---------------------------------------------------------------------------
-
-
-class ChatSpan(Protocol):
-    """一轮 chat span 上下文：既是聚合视图，也是 ``async with`` 上下文管理器。
-
-    单聚合契约（消除「同一轮流被两处聚合」）：
-
-    - ``__aenter__``：落本轮 span 起点（iteration / 父级上下文由实现自持）并返回 self；
-    - ``feed(chunk)``：逐事件聚合（调用方**唯一**的馈入点，不再另建 aggregator）；
-    - ``__aexit__``：正常退出做**唯一**一次 ``StreamAggregator.finalize()`` 并写 span
-      终态；异常退出（流异常 / 取消）写 error span、不吞异常、不产出响应。
-
-    ``resp`` 仅在 ``__aexit__`` 正常退出后有效（异常路径为 ``None``）。
-    实现者（``recorder`` 的 chat span / ``loop.PlainChatSpan``）需保证：
-    正常退出必有响应，且每个实例的聚合恰好一次。
-    """
-
-    def feed(self, chunk: StreamChunk) -> None:
-        """馈入一个流事件（唯一聚合点）。"""
-
-    @property
-    def resp(self) -> ChatResponse | None:
-        """本轮聚合响应；仅 ``__aexit__`` 正常退出后有效。"""
-
-    async def __aenter__(self) -> ChatSpan: ...
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool | None: ...
 
 
 class ToolSpanRecorder(Protocol):

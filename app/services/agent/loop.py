@@ -40,20 +40,13 @@ import asyncio
 import logging
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from types import TracebackType
 
-from app.services.agent.protocols import (
-    BudgetRecorder,
-    ChatSpan,
-    StreamFn,
-    StreamingExecutor,
-)
+from app.services.agent.chat_span import ChatSpan, PlainChatSpan
+from app.services.agent.protocols import BudgetRecorder, StreamFn, StreamingExecutor
 from app.services.llm.models import (
     ChatResponse,
     ContentBlock,
     Message,
-    StreamAggregator,
-    StreamChunk,
     ToolResultBlock,
     ToolUseBlock,
 )
@@ -122,40 +115,6 @@ class RunResult:
 #:
 #: 零参可调用这一形状本身就是契约的一部分：调用方不得缓存 factory 的返回值。
 ExecutorFactory = Callable[[], StreamingExecutor]
-
-
-class PlainChatSpan(ChatSpan):
-    """纯聚合 chat span（不落库）：``recorder`` 缺省时的默认实现。
-
-    loop 控制流需要本轮响应与是否落库无关，故无记录器时也必须聚合；语义与
-    记录器实现一致（``feed`` 单点聚合、``__aexit__`` 唯一一次 finalize），
-    仅不做 span 写库。可被测试替身复用（``chat_span()`` 返回本类实例）。
-    """
-
-    def __init__(self) -> None:
-        self._aggregator = StreamAggregator()
-        self._resp: ChatResponse | None = None
-
-    async def __aenter__(self) -> PlainChatSpan:
-        return self
-
-    def feed(self, chunk: StreamChunk) -> None:
-        self._aggregator.feed(chunk)
-
-    @property
-    def resp(self) -> ChatResponse | None:
-        return self._resp
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
-    ) -> bool:
-        # 异常退出不 finalize（半截流不作为响应交给控制流）；原异常照常透传。
-        if exc_type is None:
-            self._resp = self._aggregator.finalize()
-        return False
 
 
 async def _consume_stream(

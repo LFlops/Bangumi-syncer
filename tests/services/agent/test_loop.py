@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import asyncio
 
-from app.services.agent.loop import PlainChatSpan, RunResult, run
+from app.services.agent.chat_span import PlainChatSpan
+from app.services.agent.loop import RunResult, run
 from app.services.agent.tools import ToolError
 from app.services.llm.models import (
     ChatResponse,
