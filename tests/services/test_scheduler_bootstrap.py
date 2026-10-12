@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 from app.core.scheduler_registry import scheduler_registry
-from app.services.agent.run import registry as registry_module
 from app.services.agent.run.registry import get_scenario
 from app.services.llm_match_scheduler import llm_match_scheduler
 from app.services.scheduler_bootstrap import register_all
@@ -69,7 +68,7 @@ class TestRegisterAllWiresScenarios:
         全局装配，故必须先清空 ``_scenarios`` 使断言具备鉴别力（否则不调用
         wire_scenarios 也会通过）。
         """
-        monkeypatch.setattr(registry_module, "_scenarios", {})
+        monkeypatch.setattr("app.services.agent.run.registry._scenarios", {})
 
         register_all()
 

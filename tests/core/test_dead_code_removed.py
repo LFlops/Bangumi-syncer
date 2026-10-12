@@ -53,6 +53,16 @@ def test_wrap_stream_fn_removed_from_trace_recorder():
     )
 
 
+def test_trace_recorder_reexport_removed_from_llm_assist():
+    """llm_assist 不再 re-export TraceRecorder（``as`` 同义别名会遮蔽导航）。
+
+    测试与其它调用方直接从定义处（``agent.observe.recorder``）导入。
+    """
+    assert not hasattr(llm_assist, "TraceRecorder"), (
+        "llm_assist.TraceRecorder 应已删除（re-export 别名；改从 observe.recorder 导入）"
+    )
+
+
 def test_llm_match_cross_call_cache_removed_from_config():
     """llm_match_cross_call_cache 已删除（enqueue_match_run 的 reused 决策无条件实现）。"""
     import inspect

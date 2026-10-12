@@ -30,8 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services import scenarios as scenarios_module
-from app.services.agent.run import registry as registry_module
+from app.services import scenarios
 from app.services.agent.run.registry import get_scenario
 from app.services.matching import llm_assist
 
@@ -41,7 +40,7 @@ class TestWireScenarios:
 
     def test_wire_scenarios_get_match_returns_runtime_bound_to_match_hooks(self):
         """wire_scenarios() 后 get_scenario("match") 返回绑定 _MATCH_HOOKS 的运行入口。"""
-        scenarios_module.wire_scenarios()
+        scenarios.wire_scenarios()
 
         runtime = get_scenario("match")
 
@@ -68,12 +67,12 @@ class TestWireScenarios:
         def _listener(line: str, level: str) -> None:
             seen.append((line, level))
 
-        scenarios_module.wire_scenarios()
+        scenarios.wire_scenarios()
         first = get_scenario("match")
 
         logger.add_listener(_listener)
         try:
-            scenarios_module.wire_scenarios()
+            scenarios.wire_scenarios()
         finally:
             logger.remove_listener(_listener)
 
@@ -98,7 +97,7 @@ class TestGetScenarioErrors:
 
     def test_get_scenario_unknown_task_raises_keyerror_with_registered_list(self):
         """未注册 task_type → KeyError，消息含未知 task_type 与已注册列表。"""
-        scenarios_module.wire_scenarios()
+        scenarios.wire_scenarios()
 
         with pytest.raises(KeyError) as exc_info:
             get_scenario("no_such_task")
@@ -111,7 +110,7 @@ class TestGetScenarioErrors:
         self, monkeypatch
     ):
         """未装配（表为空）→ KeyError，消息明确提示需先装配（monkeypatch 隔离）。"""
-        monkeypatch.setattr(registry_module, "_scenarios", {})
+        monkeypatch.setattr("app.services.agent.run.registry._scenarios", {})
 
         with pytest.raises(KeyError) as exc_info:
             get_scenario("match")

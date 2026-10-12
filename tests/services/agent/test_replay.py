@@ -386,7 +386,7 @@ class TestReplayRebuildsFullBlocks:
         """端到端一致性：真实 loop.run_loop 的逐轮上下文与 replay.messages 逐条相等。"""
         import asyncio
 
-        from app.services.agent import loop as loop_module
+        from app.services.agent import loop
         from app.services.agent.observe.recorder import TraceRecorder
 
         _ensure_run(dbm, "run-loop-eq")
@@ -435,7 +435,7 @@ class TestReplayRebuildsFullBlocks:
             return results
 
         asyncio.run(
-            loop_module.run_loop(
+            loop.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
@@ -458,7 +458,7 @@ class TestReplayRebuildsFullBlocks:
         """端到端一致性：veto 注入的 tool_result 在 replay 重建中与 live 一致。"""
         import asyncio
 
-        from app.services.agent import loop as loop_module
+        from app.services.agent import loop
         from app.services.agent.observe.recorder import TraceRecorder
 
         _ensure_run(dbm, "run-veto-eq")
@@ -494,7 +494,7 @@ class TestReplayRebuildsFullBlocks:
             return {}
 
         asyncio.run(
-            loop_module.run_loop(
+            loop.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],

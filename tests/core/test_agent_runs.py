@@ -1615,14 +1615,14 @@ def _seed_scheduler_active_runs():
     conftest 的 autouse fixture 在每条测试 setup 阶段清理；模块级 fixture 的
     setup 早于函数级 fixture，因此首条用例即可观测到 conftest 清理已生效。
     """
-    import app.services.llm_match_scheduler as sched_module
+    from app.services import llm_match_scheduler
 
-    sched_module._active_run_ids.add("s5-leftover")
+    llm_match_scheduler._active_run_ids.add("s5-leftover")
     yield
 
 
 def test_scheduler_active_runs_cleared_by_conftest_fixture():
     """预置的 active run 元素被 conftest 的 autouse fixture 清空。"""
-    import app.services.llm_match_scheduler as sched_module
+    from app.services import llm_match_scheduler
 
-    assert sched_module._active_run_ids == set()
+    assert llm_match_scheduler._active_run_ids == set()

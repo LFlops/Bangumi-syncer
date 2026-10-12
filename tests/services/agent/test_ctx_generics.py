@@ -21,7 +21,7 @@ import inspect
 import typing
 from pathlib import Path
 
-from app.services.agent.run import registry as registry_mod, scenario as scenario_mod
+from app.services.agent.run import registry, scenario
 from app.services.agent.run.registry import ScenarioRuntime
 from app.services.agent.run.scenario import CtxT, ScenarioHooks, TerminalHandler
 from app.services.matching import llm_assist
@@ -46,9 +46,9 @@ def test_run_and_continue_run_ctx_annotated_with_typevar():
 
 def test_agent_runtime_ctx_annotated_with_typevar():
     """``agent_runtime.run`` / ``continue_run`` 内部同样按 ``CtxT`` 收ctx。"""
-    from app.services.agent.run import runtime as runtime_mod
+    from app.services.agent.run import runtime
 
-    for fn in (runtime_mod.run, runtime_mod.continue_run):
+    for fn in (runtime.run, runtime.continue_run):
         hints = typing.get_type_hints(fn)
         assert hints["ctx"] is CtxT, f"{fn.__name__} 的 ctx 应标注 CtxT"
 
@@ -177,7 +177,7 @@ def test_scene_impl_matches_terminal_handler_signature():
 def test_scene_runtime_factory_declares_concrete_ctx():
     """场景工厂的返回注解绑定具体 ctx 类型（把类型信息带进通用层入口）。"""
     hints = typing.get_type_hints(llm_assist.get_scenario_runtime)
-    assert hints["return"] == registry_mod.ScenarioRuntime[llm_assist._MatchContext]
+    assert hints["return"] == registry.ScenarioRuntime[llm_assist._MatchContext]
 
 
 # ---------------------------------------------------------------------------
@@ -202,5 +202,5 @@ def test_agent_layer_never_mentions_scene_private_ctx_type():
 
 def test_ctx_typevar_defined_in_scenario_contract_module():
     """``CtxT`` 定义在场景契约模块（protocols/scenario），供hooks 与 registry 共用。"""
-    assert hasattr(scenario_mod, "CtxT")
-    assert registry_mod.CtxT is scenario_mod.CtxT, "registry 应复用同一个 CtxT"
+    assert hasattr(scenario, "CtxT")
+    assert registry.CtxT is scenario.CtxT, "registry 应复用同一个 CtxT"

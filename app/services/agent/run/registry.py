@@ -21,7 +21,7 @@ from typing import Any, Generic
 from app.core.logging import logger
 from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.protocols import StreamFn
-from app.services.agent.run import runtime as agent_runtime
+from app.services.agent.run import runtime
 from app.services.agent.run.scenario import CtxT, ScenarioHooks
 from app.services.notification_service import NotificationService
 
@@ -58,7 +58,7 @@ class ScenarioRuntime(Generic[CtxT]):
         （只经 :data:`~app.services.agent.run.scenario.CtxT` 绑定类型）。
         ``stream_fn`` 为流式 LLM 调用注入；为空时由场景默认 ``build_stream_fn`` 构造。
         """
-        return await agent_runtime.run(
+        return await runtime.run(
             run_id,
             hooks=self.hooks,
             ctx=ctx,
@@ -79,7 +79,7 @@ class ScenarioRuntime(Generic[CtxT]):
 
         ``ctx`` 为场景上下文，由调用方构造；通用层对其完全不可见（不透明边界）。
         """
-        await agent_runtime.continue_run(
+        await runtime.continue_run(
             run_id,
             hooks=self.hooks,
             ctx=ctx,
@@ -91,7 +91,7 @@ class ScenarioRuntime(Generic[CtxT]):
 _scenarios: dict[str, ScenarioRuntime] = {}
 
 
-def register_scenario(task_type: str, runtime: ScenarioRuntime) -> None:
+def register_scenario(task_type: str, scenario_runtime: ScenarioRuntime) -> None:
     """登记场景运行入口（覆盖语义，幂等）。
 
     重复登记属预期（应用启动与测试 conftest 可能各装配一次），只打
@@ -101,7 +101,7 @@ def register_scenario(task_type: str, runtime: ScenarioRuntime) -> None:
         logger.debug(f"[registry] 覆盖已登记的场景: {task_type!r}")
     else:
         logger.info(f"[registry] 登记 Agent 场景: {task_type!r}")
-    _scenarios[task_type] = runtime
+    _scenarios[task_type] = scenario_runtime
 
 
 def get_scenario(task_type: str) -> ScenarioRuntime:

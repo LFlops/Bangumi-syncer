@@ -25,8 +25,7 @@ from pathlib import Path
 import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
-from app.services.agent import loop as loop_module
-from app.services.agent.observe import recorder as agent_recorder
+from app.services.agent import loop
 from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.run import runtime
 from app.services.agent.run.scenario import ScenarioHooks
@@ -92,7 +91,7 @@ def _tool_round_stream(tool_name: str = "search_bangumi"):
 def _run_loop(*, stream_fn, recorder):
     """以脚本化流驱动 ``loop.run_loop``（loop 级测试：异常需向调用方抛出）。"""
     return asyncio.run(
-        loop_module.run_loop(
+        loop.run_loop(
             tools_schemas=[],
             max_iterations=1,
             tool_choice_terminal="submit_suggestion",
@@ -223,7 +222,9 @@ def test_chat_span_write_failure_does_not_mask_stream_exception(dbm, monkeypatch
     def exploding_end_span(*args, **kwargs):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(agent_recorder, "end_span", exploding_end_span)
+    monkeypatch.setattr(
+        "app.services.agent.observe.recorder.end_span", exploding_end_span
+    )
 
     async def stream_fn(messages, *, tools=None, tool_choice=None):
         yield StreamChunk(type="text_delta", text="partial")

@@ -58,9 +58,6 @@ from app.services.agent.execution.tools import (
     ToolRegistry,
 )
 from app.services.agent.loop import RunResult
-from app.services.agent.observe.recorder import (
-    TraceRecorder as TraceRecorder,  # re-export（测试/兼容）
-)
 from app.services.agent.run.registry import ScenarioRuntime
 from app.services.agent.run.scenario import ScenarioHooks
 from app.services.llm.client import get_llm_client

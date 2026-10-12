@@ -23,13 +23,14 @@ from app.services.agent.execution.tools import (
     ToolRegistry,
 )
 from app.services.agent.loop import RunResult
-from app.services.agent.observe import recorder as agent_recorder
+from app.services.agent.observe import recorder
+from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.observe.trace import (
     ReplayResponse,
     ReplayResult,
     ReplayToolCall,
 )
-from app.services.agent.run import runtime as agent_runtime
+from app.services.agent.run import runtime
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -1839,7 +1840,7 @@ async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
+    monkeypatch.setattr("app.services.agent.run.runtime.run_loop", _fake_loop)
 
     run_id = "run-f5"
     sr_id = 50
@@ -1879,7 +1880,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
+    monkeypatch.setattr("app.services.agent.run.runtime.run_loop", _fake_loop)
 
     run_id = "run-f5b"
     sr_id = 51
@@ -1931,7 +1932,7 @@ async def test_run_non_positive_config_override_falls_back_to_none(
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
+    monkeypatch.setattr("app.services.agent.run.runtime.run_loop", _fake_loop)
 
     run_id = f"run-g3-{tag}"
     sr_id = 70
@@ -1977,7 +1978,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
+    monkeypatch.setattr("app.services.agent.run.runtime.run_loop", _fake_loop)
 
     run_id = "run-g3-invalid"
     sr_id = 71
@@ -2137,7 +2138,7 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
         captured.update(kwargs)
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "run_loop", _fake_run_loop)
+    monkeypatch.setattr("app.services.agent.run.runtime.run_loop", _fake_run_loop)
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
@@ -2250,9 +2251,9 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         "end": [],
         "budget": [],
     }
-    original_start = agent_recorder.start_span
-    original_end = agent_recorder.end_span
-    original_budget = agent_recorder.record_budget_message
+    original_start = recorder.start_span
+    original_end = recorder.end_span
+    original_budget = recorder.record_budget_message
 
     def fake_start(run_id, name, iteration, sequence, parent_id=""):
         span_id = original_start(run_id, name, iteration, sequence, parent_id)
@@ -2276,9 +2277,11 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         )
         return original_budget(span_id, budget_message)
 
-    monkeypatch.setattr(agent_recorder, "start_span", fake_start)
-    monkeypatch.setattr(agent_recorder, "end_span", fake_end)
-    monkeypatch.setattr(agent_recorder, "record_budget_message", fake_budget)
+    monkeypatch.setattr("app.services.agent.observe.recorder.start_span", fake_start)
+    monkeypatch.setattr("app.services.agent.observe.recorder.end_span", fake_end)
+    monkeypatch.setattr(
+        "app.services.agent.observe.recorder.record_budget_message", fake_budget
+    )
 
     chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
 
@@ -2365,7 +2368,7 @@ def test_trace_recorder_chat_span_tracks_iteration():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder = TraceRecorder("run-test", start_iteration=0)
 
     async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(
@@ -2377,8 +2380,8 @@ def test_trace_recorder_chat_span_tracks_iteration():
 
     # patch llm_assist 模块上的引用（闭包通过模块全局名字查找）
     with (
-        patch.object(agent_recorder, "start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "end_span", side_effect=fake_end),
+        patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
+        patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
     ):
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
@@ -2410,15 +2413,15 @@ def test_trace_recorder_tool_start_end_idempotent():
     def fake_end(span_id, **kwargs):
         ends.append(span_id)
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder = TraceRecorder("run-test", start_iteration=0)
     tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
 
     # 模拟 chat 已发生（设置 chat_span_id）
     recorder._chat_span_id = "chat-span-0"
 
     with (
-        patch.object(agent_recorder, "start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "end_span", side_effect=fake_end),
+        patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
+        patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
     ):
         span_id = recorder.start_tool(tc, sequence=0)
         assert span_id is not None
@@ -2454,14 +2457,17 @@ def test_trace_recorder_budget_falls_back_to_chat_span():
     def fake_budget(span_id, budget_message):
         budget_targets.append(span_id)
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=1)
+    recorder = TraceRecorder("run-test", start_iteration=1)
     # 仅有 chat span，无 tool span
     recorder._chat_span_id = "span-llm_chat-0"
 
     with (
-        patch.object(agent_recorder, "start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "end_span", side_effect=fake_end),
-        patch.object(agent_recorder, "record_budget_message", side_effect=fake_budget),
+        patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
+        patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
+        patch(
+            "app.services.agent.observe.recorder.record_budget_message",
+            side_effect=fake_budget,
+        ),
     ):
         recorder.record_budget("[剩余轮次：2]")
         assert len(budget_targets) == 1
@@ -2487,7 +2493,7 @@ def test_chat_span_and_tool_same_iteration():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder = TraceRecorder("run-test", start_iteration=0)
 
     # 脚本返回含 tool_calls 的响应 → 模拟工具执行后调用 start_tool
     async def dummy_script(messages, *, tools=None, tool_choice=None):
@@ -2499,8 +2505,8 @@ def test_chat_span_and_tool_same_iteration():
         )
 
     with (
-        patch.object(agent_recorder, "start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "end_span", side_effect=fake_end),
+        patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
+        patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
     ):
         # 第一轮
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
@@ -2556,14 +2562,14 @@ def test_chat_span_exception_propagates_original():
     def fake_end(span_id, **kwargs):
         ends.append({"span_id": span_id, **kwargs})
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder = TraceRecorder("run-test", start_iteration=0)
 
     async def exploding_script(messages, *, tools=None, tool_choice=None):
         raise ValueError("boom")
 
     with (
-        patch.object(agent_recorder, "start_span", side_effect=fake_start),
-        patch.object(agent_recorder, "end_span", side_effect=fake_end),
+        patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
+        patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
     ):
         with pytest.raises(ValueError, match="boom"):
             _drain_chat_span(recorder, _scripted_stream(exploding_script))
@@ -2599,7 +2605,7 @@ def test_trace_recorder_requires_start_iteration():
     """TraceRecorder 构造函数要求必填 start_iteration（不得有默认值）。"""
     import inspect
 
-    sig = inspect.signature(llm_assist.TraceRecorder.__init__)
+    sig = inspect.signature(TraceRecorder.__init__)
     param = sig.parameters.get("start_iteration")
     assert param is not None, "TraceRecorder.__init__ 应有 start_iteration 参数"
     assert param.default is inspect.Parameter.empty, (
@@ -2617,12 +2623,14 @@ def test_trace_recorder_start_iteration_affects_first_chat_span_iteration():
         starts.append({"name": name, "iteration": iteration, "sequence": sequence})
         return f"span-{name}-{iteration}-{sequence}"
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=5)
+    recorder = TraceRecorder("run-test", start_iteration=5)
 
     async def dummy_script(messages, *, tools=None, tool_choice=None):
         return ChatResponse(content="", stop_reason="end_turn", blocks=[], model="m")
 
-    with patch.object(agent_recorder, "start_span", side_effect=fake_start):
+    with patch(
+        "app.services.agent.observe.recorder.start_span", side_effect=fake_start
+    ):
         _drain_chat_span(recorder, _scripted_stream(dummy_script))
 
     chat_starts = [s for s in starts if s["name"] == "llm_chat"]
@@ -2649,11 +2657,13 @@ def test_trace_recorder_begin_replayed_round_sets_current_iteration():
         starts.append({"name": name, "iteration": iteration, "sequence": sequence})
         return f"span-{name}-{iteration}-{sequence}"
 
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=3)
+    recorder = TraceRecorder("run-test", start_iteration=3)
     recorder.begin_replayed_round(7)
 
     tc = ToolUseBlock(id="t1", name="search_bangumi", input={"title": "x"})
-    with patch.object(agent_recorder, "start_span", side_effect=fake_start):
+    with patch(
+        "app.services.agent.observe.recorder.start_span", side_effect=fake_start
+    ):
         recorder.start_tool(tc, sequence=0)
 
     tool_starts = [s for s in starts if s["name"] == "tool_execute"]
@@ -2929,7 +2939,7 @@ async def test_handle_result_exhausted_passes_total_tokens(monkeypatch):
 
 def test_begin_replayed_round_sets_next_iteration_to_iteration_plus_one():
     """begin_replayed_round(iteration) 应设 _current_iteration=iteration 且 _next_iteration=iteration+1。"""
-    recorder = llm_assist.TraceRecorder("run-test", start_iteration=0)
+    recorder = TraceRecorder("run-test", start_iteration=0)
     recorder.begin_replayed_round(5)
     assert recorder._current_iteration == 5
     assert recorder._next_iteration == 6
@@ -3775,7 +3785,7 @@ def test_replay_missing_tool_appends_tool_result_to_messages():
 
     before = _count_tool_results(messages)
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(
                 id="t2", name="get_subject_detail", input={"subject_id": "2"}
             ),
@@ -3838,7 +3848,7 @@ def test_replay_missing_write_tool_appends_placeholder_tool_result():
     ]
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(id="w1", name="write_mapping", input={}),
             registry,
             messages,
@@ -3860,7 +3870,7 @@ def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
     messages: list = []
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(
                 id="s1", name="submit_suggestion", input={"subject_id": "1"}
             ),
@@ -3883,7 +3893,7 @@ def test_replay_missing_unregistered_tool_appends_placeholder_tool_result():
     messages: list = []
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(id="u1", name="ghost_tool", input={}),
             registry,
             messages,
@@ -3915,7 +3925,7 @@ def test_replay_missing_tool_serializes_dict_result_as_json():
     messages: list = []
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(id="t9", name="get_subject_detail", input={}),
             registry,
             messages,
@@ -3949,7 +3959,7 @@ def test_replay_missing_non_idempotent_read_tool_still_replayed():
     messages: list = []
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(id="r1", name="read_non_idem", input={}),
             registry,
             messages,
@@ -3981,7 +3991,7 @@ def test_replay_missing_idempotent_write_tool_appends_placeholder():
     messages: list = []
 
     asyncio.run(
-        agent_runtime._replay_missing_tool(
+        runtime._replay_missing_tool(
             ReplayToolCall(id="w1", name="write_idem", input={}),
             registry,
             messages,
@@ -4002,7 +4012,9 @@ def test_replay_missing_idempotent_write_tool_appends_placeholder():
 
 def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):
     """补执行缺失工具后写 tool_execute span，二次 replay 不再判缺失。"""
-    from app.services.agent.observe.trace import replay as real_replay
+    from app.services.agent.observe import trace
+
+    real_replay = trace.replay
 
     run_id = "run-continue-replay-span"
     sr_id = 401
@@ -4354,7 +4366,9 @@ def test_continue_run_iteration_strictly_greater_than_existing_max(monkeypatch):
 @pytest.mark.asyncio
 async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
     """崩溃 → 恢复完成 → 再次重置 processing → 第二次恢复不再额外调 LLM。"""
-    from app.services.agent.observe.trace import replay as real_replay
+    from app.services.agent.observe import trace
+
+    real_replay = trace.replay
 
     run_id = "run-continue-double"
     sr_id = 995
@@ -4531,7 +4545,7 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
     """chat span 逐轮累计 usage.total_tokens。"""
     from unittest.mock import patch
 
-    recorder = llm_assist.TraceRecorder("run-tok-rec", start_iteration=0)
+    recorder = TraceRecorder("run-tok-rec", start_iteration=0)
     responses = [
         ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
         ChatResponse(content="", stop_reason="end_turn", usage=Usage(total_tokens=100)),
@@ -4539,8 +4553,8 @@ def test_trace_recorder_accumulates_total_tokens_across_rounds():
     chat = _chat_side_effect(responses)
 
     with (
-        patch.object(agent_recorder, "start_span", return_value="span-x"),
-        patch.object(agent_recorder, "end_span"),
+        patch("app.services.agent.observe.recorder.start_span", return_value="span-x"),
+        patch("app.services.agent.observe.recorder.end_span"),
     ):
         _drain_chat_span(recorder, _scripted_stream(chat))
         _drain_chat_span(recorder, _scripted_stream(chat))

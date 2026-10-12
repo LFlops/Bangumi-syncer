@@ -17,7 +17,7 @@ from __future__ import annotations
 import typing
 from typing import Any
 
-from app.services.agent import loop as loop_mod
+from app.services.agent import loop
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.loop import run_loop
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
@@ -112,9 +112,9 @@ async def test_executor_factory_result_not_cached_across_rounds():
 
 def test_executor_factory_is_zero_arg_callable_alias():
     """``ExecutorFactory`` 形状必须是**零参**可调用（``Callable[[], ...]``）。"""
-    params, ret = typing.get_args(loop_mod.ExecutorFactory)
+    params, ret = typing.get_args(loop.ExecutorFactory)
     assert params == [], f"ExecutorFactory 应为零参可调用，实际参数列表 {params}"
-    assert ret is loop_mod.StreamingExecutor
+    assert ret is loop.StreamingExecutor
 
 
 def test_run_signature_takes_factory_not_instance():
@@ -122,7 +122,7 @@ def test_run_signature_takes_factory_not_instance():
     import ast
     import inspect
 
-    tree = ast.parse(inspect.getsource(loop_mod.run_loop))
+    tree = ast.parse(inspect.getsource(loop.run_loop))
     fn = next(
         node
         for node in ast.walk(tree)

@@ -12,8 +12,8 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
 
-import app.services.llm_match_scheduler as sched_module
 from app.models.agent import AgentRunRecord
+from app.services import llm_match_scheduler
 from app.services.llm_match_scheduler import LlmMatchScheduler
 
 # ---------------------------------------------------------------------------
@@ -24,9 +24,9 @@ from app.services.llm_match_scheduler import LlmMatchScheduler
 @pytest.fixture(autouse=True)
 def _clean_active_runs():
     """每测试前后清空模块级 active run 集合，避免跨测试状态污染。"""
-    sched_module._clear_active_runs()
+    llm_match_scheduler._clear_active_runs()
     yield
-    sched_module._clear_active_runs()
+    llm_match_scheduler._clear_active_runs()
 
 
 def _run_model(**overrides) -> AgentRunRecord:
@@ -431,7 +431,7 @@ def test_scheduler_source_no_scenario_private_symbols():
     """调度器不得再引用场景层私有符号/内部实现（组合模式，不嵌套场景内部）。"""
     import inspect
 
-    source = inspect.getsource(sched_module)
+    source = inspect.getsource(llm_match_scheduler)
     forbidden = (
         "_continue_replay",
         "_replay_missing_tool",
@@ -462,11 +462,11 @@ def test_scheduler_has_no_bgm_construction_path():
     """
     import inspect
 
-    source = inspect.getsource(sched_module)
+    source = inspect.getsource(llm_match_scheduler)
     # 调度器源码中不应再出现客户端构造点
     assert "BangumiApi(" not in source
     # 也不应再有 _build_bgm 方法
-    assert not hasattr(sched_module.LlmMatchScheduler, "_build_bgm"), (
+    assert not hasattr(llm_match_scheduler.LlmMatchScheduler, "_build_bgm"), (
         "调度器不应保留 _build_bgm（bgm 构造已下沉场景侧）"
     )
 
@@ -697,7 +697,7 @@ def test_recovery_scan_skips_active_run():
     repo.list_stale_processing.return_value = [
         {"run_id": "A", "task_type": "match", "sync_record_id": 42}
     ]
-    sched_module._active_run_ids.add("A")
+    llm_match_scheduler._active_run_ids.add("A")
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
         patch(
@@ -786,7 +786,7 @@ def test_concurrent_recover_same_run_only_one_acquires():
     repo.refresh_started_at.assert_called_once_with(
         "A", 1700000001, expected_started_at=0
     )
-    assert "A" not in sched_module._active_run_ids
+    assert "A" not in llm_match_scheduler._active_run_ids
 
 
 def test_recover_run_cas_loser_skips_continuation_and_releases_active():
@@ -821,7 +821,7 @@ def test_recover_run_cas_loser_skips_continuation_and_releases_active():
         "A", 1700000009, expected_started_at=111
     )
     cont.assert_not_awaited()
-    assert "A" not in sched_module._active_run_ids, "CAS 失败后必须释放执行权"
+    assert "A" not in llm_match_scheduler._active_run_ids, "CAS 失败后必须释放执行权"
 
 
 def test_recover_run_releases_after_unexpected_exception():
@@ -852,9 +852,9 @@ def test_recover_run_releases_after_unexpected_exception():
     assert any("boom" in m for m in errors), f"兜底应记 error，实际 {errors}"
     # 计数在 continue_run 内部完成，调度器兜底不得重复计数
     repo.increment_attempts.assert_not_called()
-    assert "A" not in sched_module._active_run_ids, "异常后必须释放执行权"
+    assert "A" not in llm_match_scheduler._active_run_ids, "异常后必须释放执行权"
     # 释放后可再次取得执行权（下一轮可恢复）
-    assert sched_module._try_acquire_run("A") is True
+    assert llm_match_scheduler._try_acquire_run("A") is True
 
 
 def test_process_run_skips_active_run():
@@ -862,7 +862,7 @@ def test_process_run_skips_active_run():
     sched = LlmMatchScheduler()
     cm = _make_config()
     repo = _make_repo()
-    sched_module._active_run_ids.add("A")
+    llm_match_scheduler._active_run_ids.add("A")
     run_mock = AsyncMock(return_value="succeeded")
     with (
         patch("app.services.llm_match_scheduler.config_manager", cm),
@@ -876,7 +876,7 @@ def test_process_run_skips_active_run():
         asyncio.run(sched._process_run(_run_model(run_id="A", sync_record_id=42)))
 
     run_mock.assert_not_awaited()
-    assert "A" in sched_module._active_run_ids, "跳过时不应误删他人持有的执行权"
+    assert "A" in llm_match_scheduler._active_run_ids, "跳过时不应误删他人持有的执行权"
 
 
 # ---------------------------------------------------------------------------
@@ -1184,7 +1184,7 @@ def test_recover_run_skips_run_without_sync_record_id(empty_id):
     acquire_spy.assert_not_called()
     repo.refresh_started_at.assert_not_called()
     repo.mark_failed.assert_not_called()
-    assert "A" not in sched_module._active_run_ids
+    assert "A" not in llm_match_scheduler._active_run_ids
     debugs = [str(c.args[0]) for c in log.debug.call_args_list]
     assert any("sync_record_id" in m for m in debugs), (
         f"跳过时应记 debug 说明原因，实际 {debugs}"
@@ -1293,7 +1293,7 @@ def test_scheduler_module_has_no_function_level_imports():
     import ast
     import inspect
 
-    tree = ast.parse(inspect.getsource(sched_module))
+    tree = ast.parse(inspect.getsource(llm_match_scheduler))
     offenders = []
     for fn in ast.walk(tree):
         if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1450,7 +1450,7 @@ def test_per_run_timeout_cancels_hang_releases_active_and_isolates():
 
     assert "hang" not in finished, "hang run 不应完成"
     assert "ok" in finished, "同批其他 run 应正常完成（隔离）"
-    assert "hang" not in sched_module._active_run_ids, (
+    assert "hang" not in llm_match_scheduler._active_run_ids, (
         "超时取消后 finally 必须释放执行权，否则恢复扫描永久跳过"
     )
     errors = [str(c.args[0]) for c in log.error.call_args_list]
@@ -1507,7 +1507,7 @@ def test_per_run_timeout_leaves_run_processing_then_recovery_continues():
 
     repo.mark_failed.assert_not_called()
     repo.increment_attempts.assert_not_called()
-    assert "hang" not in sched_module._active_run_ids
+    assert "hang" not in llm_match_scheduler._active_run_ids
 
     # 第二轮：run 仍为 processing → 恢复扫描捞起 → continue_run 续跑
     repo.list_pending.return_value = []
