@@ -130,10 +130,10 @@ Agent 会话数据由 `agent_runs` 与 `agent_steps` 两张表承载，采用 **
 
 ### span 记录位置与时序
 
-- **chat span**：由 `TraceRecorder.chat_span()`（loop 每轮 `async with` 的上下文）写入——`feed` 单点聚合、`__aexit__` 唯一一次 finalize 并落库（LLM 调用完成后写入）。
+- **chat span**：由 `TraceRecorder.chat_span()`（loop 每轮 `async with` 的上下文）写入。`__aenter__` 立即 `start_span`（轮首 INSERT，使流进行中提前执行的 tool span 能挂同一 parent/iteration）；`feed` 是**唯一聚合点**；`__aexit__` 做**唯一**一次 `finalize()` 并 `end_span`（轮末 UPDATE，response / model / tokens 落库）。轮粒度两段式入库是崩溃恢复的可重放锚点，**不得攒批**。
 - **tool span**：由 `execute_batch` 的单工具包裹层写入。`start` 在工具执行**之前**（保证时序真实），每工具完成后**即刻独立事务落库**——批内部分成功时可从已完成 span 恢复，不会因后续工具失败丢失前序观测。
 - **tool span 时序**：`started_at` 由 `start_span` 写入；`end_span` **不回写** `started_at`（仅当显式传入时才覆盖），避免用结束时间覆盖真实开始时间。`ended_at` 由 `end_span` 写入。
-- **loop 层**：零 trace 逻辑，仅编排迭代。
+- **loop 层**：不执行 trace 读写，只驱动 span 生命周期（`async with recorder.chat_span()`）并消费聚合响应；`recorder=None` 时为 `PlainChatSpan` 纯聚合（不落库）。
 
 ### replay_delta 加密
 

@@ -86,10 +86,47 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 > 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run`）。恢复路径预算耗尽时不再发起
 > 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_succeeded`）。
 
+## 观测：chat span 单聚合契约
+
+每轮 LLM 调用的响应**只聚合一次、只落一次 span**。`loop` 每轮经
+`recorder.chat_span()` 进入本轮 `async with` 上下文（`recorder=None` 时为
+`PlainChatSpan` 纯聚合，控制流不变）：
+
+```python
+async with recorder.chat_span() as span:
+    async for chunk in stream_fn(messages, tools=..., tool_choice=...):
+        span.feed(chunk)                  # 唯一聚合点
+        if executor is not None:
+            executor.feed(chunk)          # 工具事件并行喂执行器
+resp = span.resp                          # __aexit__ 已完成唯一一次 finalize
+```
+
+| 契约点（`protocols.ChatSpan`） | 语义 |
+| --- | --- |
+| `__aenter__` | 落本轮 span 起点：iteration 进位、`_current_iteration` 就位（流进行中提前执行的 tool span 靠它同轮 + 同 parent） |
+| `feed(chunk)` | **唯一**聚合点（调用方不再另建 `StreamAggregator`） |
+| `__aexit__` | 正常退出：做**唯一**一次 `StreamAggregator.finalize()` 并写 span 终态；异常退出：写 error span、**不** finalize、原异常透传（落库自身失败只记 warning，不遮蔽主流程） |
+| `resp` | 在 `async with` **块外**读取；loop 控制流与 `replay_delta` 落库内容同源 |
+
+两条硬约束（放宽会破坏恢复语义）：
+
+- **CM 粒度是「每轮」而非「每 run」**：loop 必须在流结束、下一轮开始前消费 resp
+  做控制流决策；且 chat span 的 INSERT（轮首）/ UPDATE（轮末）是 `trace.replay`
+  的可重放锚点，攒到 run 末统一入库会让恢复看不到已发生轮次（全量重跑，工具副作用
+  重复执行）。
+- **轮次编号由 recorder 自持**：`chat_span()` 不接收调用方下标——续跑从
+  `executed_iterations` 起算、补执行轮经 `begin_replayed_round` 再偏移，loop 本地
+  轮次与持久化历史编号不同源；撞号会让 replay 按 `iteration` 分组时静默丢响应。
+
+守卫：`tests/services/agent/test_chat_span.py`（每轮 finalize 恰好一次、控制流与落库
+同源、流异常 error span、收尾轮 iteration 顺延、无 recorder 纯聚合）、
+`tests/services/agent/test_protocols.py`（协议面 + 实现显式继承）、
+`tests/core/test_dead_code_removed.py`（`wrap_stream_fn` 不回归）。
+
 ## 新增一个 Agent 场景
 
-1. 实现 `ScenarioHooks` 的 8 个钩子（工具 / seed / chat / 预算 / 终局 等）与
-   `make_ctx`；
+1. 实现 `ScenarioHooks` 各钩子（工具注册 / 默认 `stream_fn` / 预算 / 终局，可选
+   `veto_terminal` 软护栏）与 `ScenarioRuntime.new_ctx`（run 输入 → 场景 ctx）；
 2. 提供工厂 `get_scenario_runtime() -> ScenarioRuntime`（`agent/registry.py`
    中的类型）；
 3. 在**应用装配层** `app/services/scenarios.py::wire_scenarios()` 中**静态
@@ -128,6 +165,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | 主题 | 位置 |
 | --- | --- |
 | 运行时 / 场景协议 / 注册表 | `app/services/agent/runtime.py`、`scenario.py`、`registry.py` |
+| 观测（chat span 契约 / tool span / seed / budget） | `app/services/agent/recorder.py`、`protocols.py`、`tests/services/agent/test_chat_span.py` |
 | 匹配场景实现 | `app/services/matching/llm_assist.py` |
 | 场景测试 | `tests/services/matching/test_llm_assist.py` |
 | 调度器与守卫 | `app/services/llm_match_scheduler.py`、`tests/services/test_llm_match_scheduler.py` |
