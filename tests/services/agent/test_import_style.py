@@ -1,7 +1,8 @@
-"""导入风格守卫：agent 相关导入禁止 ``as`` 别名（保证 go-to-definition 可穿越）。
+"""导入风格守卫：agent 相关导入禁止 ``as`` 别名（保证名字可一跳追溯）。
 
-背景：``from X import Y as Z`` 会让使用处的名字与定义处脱钩，ty / LSP 的跳转与
-重命名无法可靠穿越别名（模块级 ``import X as Y`` 同理）。约定：
+背景：ty 的 go-to-definition / go-to-declaration 会**跳过 ``as`` 绑定点**、直奔原定义
+（astral-sh/ty#1592，maintainer 提交且未修；实测 ty 0.0.84：references / rename 对别名
+处理正常）。多级别名下「这个名字从哪来」无法一跳看到，故约定：
 
 - **agent 相关导入禁止任何 ``as`` 别名**（符号或模块）；需要避让时改**本地名字**
   （参数 / 变量），patch 目标用字符串路径（``patch("a.b.c.fn", ...)``）；

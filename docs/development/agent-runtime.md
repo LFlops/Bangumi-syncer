@@ -173,12 +173,14 @@ resp = span.resp                          # __aexit__ 已完成唯一一次 fina
   可重试失败 → 累计 attempts；其它异常 → 日志 + attempts。
 - 运行时日志前缀由 `hooks.task_type` 派生（如 `[match]`）。
 - 事务 / 落库 / 通知属场景职责；runtime 只透传 `ctx` 与 `notification_service`。
-- **导入风格（agent 生态）**：禁止 `as` 别名（`from X import Y as Z` / `import X as Y`）——
-  别名让使用处与定义处脱钩，ty / LSP 的跳转与重命名无法穿越。需要避让时改**本地名字**
-  （参数 / 变量）；patch 目标用字符串路径（`patch("a.b.c.fn", ...)`）；需要「留真身」
-  （patch 后仍调原函数）时用**本地赋值** `real = module.func`。有 AST 守卫
-  `tests/services/agent/test_import_style.py`（覆盖 `app/`、`eval/`、`tests/` 中所有
-  agent 相关导入）。
+- **导入风格（agent 生态）**：禁止 `as` 别名（`from X import Y as Z` / `import X as Y`）。
+  依据：ty 的 go-to-definition / go-to-declaration 会**跳过 `as` 绑定点**直奔原定义
+  （[astral-sh/ty#1592](https://github.com/astral-sh/ty/issues/1592)，maintainer 提交、未修；
+  实测 ty 0.0.84：references / rename 对别名处理正常）——多级别名下「这个名字从哪来」
+  无法一跳看到，评审与排障都要多跳一层。需要避让时改**本地名字**（参数 / 变量）；
+  patch 目标用字符串路径（`patch("a.b.c.fn", ...)`）；需要「留真身」（patch 后仍调原函数）
+  时用**本地赋值** `real = module.func`。有 AST 守卫 `tests/services/agent/test_import_style.py`
+  （覆盖 `app/`、`eval/`、`tests/` 中所有 agent 相关导入）。
 
 ## 相关文件与测试
 
