@@ -425,7 +425,7 @@ def replay(run_id: str) -> ReplayResult:
     种子消息从 ``name="seed"`` 行的 ``replay_delta.seed_messages`` 还原
     （seed 行由写入方在 run 启动时写入），无需调用方提供额外入参。
 
-    重建规则（与原执行 ``loop.run`` 完全一致）：
+    重建规则（与原执行 ``loop.run_loop`` 完全一致）：
     - 每轮从 ``llm_chat.replay_delta`` 重建**一条** assistant 消息：
       ``Message(role="assistant", content=[ToolUseBlock(...) for tc in tool_calls])``
       （content 为 ``list[ToolUseBlock]``，与原执行对齐）。

@@ -94,7 +94,7 @@ def test_runtime_reads_seed_from_ctx_not_from_hooks():
     """通用层从 ``ctx.seed`` 取 seed，不再回调场景派生（AST 级断言）。"""
     runtime_src = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
     assert "hooks.build_seed" not in runtime_src, "通用层不应再驱动场景派生 seed"
-    assert "ctx.seed" in runtime_src, "run() 应直接取 ctx.seed"
+    assert "ctx.seed" in runtime_src, "run_loop() 应直接取 ctx.seed"
 
 
 def test_scene_ctx_carries_seed():

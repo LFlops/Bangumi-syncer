@@ -383,7 +383,7 @@ class TestReplayRebuildsFullBlocks:
         assert assistant == Message(role="assistant", content=list(resp.blocks))
 
     def test_replay_matches_live_loop_messages_with_thinking(self, dbm):
-        """端到端一致性：真实 loop.run 的逐轮上下文与 replay.messages 逐条相等。"""
+        """端到端一致性：真实 loop.run_loop 的逐轮上下文与 replay.messages 逐条相等。"""
         import asyncio
 
         from app.services.agent import loop as loop_module
@@ -435,7 +435,7 @@ class TestReplayRebuildsFullBlocks:
             return results
 
         asyncio.run(
-            loop_module.run(
+            loop_module.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],
@@ -494,7 +494,7 @@ class TestReplayRebuildsFullBlocks:
             return {}
 
         asyncio.run(
-            loop_module.run(
+            loop_module.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
                 tools_schemas=[],

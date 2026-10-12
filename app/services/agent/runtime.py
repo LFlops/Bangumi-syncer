@@ -28,7 +28,7 @@ from app.services.agent.loop import (
     RunResult,
     StreamFn,
     normalize_stop_reason,
-    run as loop_run,
+    run_loop,
 )
 from app.services.agent.protocols import ToolSpanRecorder
 from app.services.agent.recorder import TraceRecorder
@@ -180,7 +180,7 @@ async def _invoke_loop(
     ``stream_fn`` 保持**原始**流式入口：聚合与落库在 loop 内经
     ``span_recorder.chat_span()`` 单点完成（不再另有包装层聚合）。
     """
-    return await loop_run(
+    return await run_loop(
         stream_fn=stream_fn,
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
@@ -212,7 +212,7 @@ async def continue_run(
          原始 stop_reason 归一化，与 ``_final_recovery`` 的二分判据对齐
        - 匹配的 ``terminal_tool`` 调用 → 走场景终局处理
        - ``stop_reason == terminal_tool`` 但无匹配调用 → 防御降级 exhausted
-       - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run`` 共用判据）：
+       - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run_loop`` 共用判据）：
          ``end_turn`` → mark_succeeded；``max_tokens`` / 空壳 ``llm_error``
          → 交场景终态处理（llm_assist 落 failed）；``None``（含非终止工具调用）
          → 补执行缺失只读工具 + 回填结果后续跑 loop
@@ -319,7 +319,7 @@ async def continue_run(
                 last_response=None,
             )
             # 恢复路径不重放 veto（软护栏）——**有意**与 live 路径不同：
-            # live 会话在 loop.run 命中终止工具时经 veto_terminal 软护栏（remaining>1
+            # live 会话在 loop.run_loop 命中终止工具时经 veto_terminal 软护栏（remaining>1
             # 且本 run 未拦过才拦一次），防止模型未核对即提交；但 crash 恢复 replay 到
             # 已记录的 submit 终局时直接落库，不重放该护栏。原因：
             # (a) veto 依赖「已拦一次 / 剩余轮次」会话内状态，该状态在崩溃中不可靠，
@@ -356,7 +356,7 @@ async def continue_run(
             )
             return
 
-        # 终局归一化（与 loop.run 共用判据）：max_tokens 超限、空壳 llm_error、
+        # 终局归一化（与 loop.run_loop 共用判据）：max_tokens 超限、空壳 llm_error、
         # 未知 stop_reason 有内容 → end_turn。置于 submit/终止工具分派之后，
         # 保证真实工具语义优先；返回 None 表示含非终止工具调用，需续跑。
         terminal_reason = normalize_stop_reason(
@@ -367,7 +367,7 @@ async def continue_run(
         )
 
         if terminal_reason in ("llm_error", "max_tokens"):
-            # 与 loop.run 一致：显式失败/超限终态，不再当作「待补执行工具轮」反复
+            # 与 loop.run_loop 一致：显式失败/超限终态，不再当作「待补执行工具轮」反复
             # 续跑。交场景终态处理（llm_assist 按 stop_reason 落 failed）。
             result = RunResult(stop_reason=terminal_reason, last_response=None)
             await hooks.handle_terminal(

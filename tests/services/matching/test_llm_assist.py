@@ -1838,7 +1838,7 @@ async def test_run_passes_config_override_to_get_max_iterations(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
 
     run_id = "run-f5"
     sr_id = 50
@@ -1878,7 +1878,7 @@ async def test_run_empty_config_override_passes_none(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
 
     run_id = "run-f5b"
     sr_id = 51
@@ -1930,7 +1930,7 @@ async def test_run_non_positive_config_override_falls_back_to_none(
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
 
     run_id = f"run-g3-{tag}"
     sr_id = 70
@@ -1976,7 +1976,7 @@ async def test_run_invalid_config_override_logs_warning(monkeypatch):
     async def _fake_loop(**kwargs):
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop)
+    monkeypatch.setattr(agent_runtime, "run_loop", _fake_loop)
 
     run_id = "run-g3-invalid"
     sr_id = 71
@@ -2096,7 +2096,7 @@ async def test_run_default_stream_fn_passes_thinking_level_medium(monkeypatch):
     _wire_stream_client(mock_client, response_fn)
 
     # get_llm_client 由 llm_assist 模块头部导入，patch 其模块命名空间
-    # 不 mock loop_run：让真实循环执行，验证默认 stream_fn 确实调用 client
+    # 不 mock run_loop：让真实循环执行，验证默认 stream_fn 确实调用 client
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
     ):
@@ -2119,7 +2119,7 @@ async def test_run_default_stream_fn_passes_thinking_level_medium(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
-    """场景2：run(thinking_level="high") → loop_run 收到 max_iterations=10。"""
+    """场景2：run(thinking_level="high") → run_loop 收到 max_iterations=10。"""
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from app.services.agent.loop import RunResult
@@ -2129,14 +2129,14 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
         return_value=ChatResponse(content="", stop_reason="end_turn")
     )
 
-    # 捕获 loop_run 收到的实参
+    # 捕获 run_loop 收到的实参
     captured = {}
 
-    async def _fake_loop_run(**kwargs):
+    async def _fake_run_loop(**kwargs):
         captured.update(kwargs)
         return RunResult(stop_reason="end_turn")
 
-    monkeypatch.setattr(agent_runtime, "loop_run", _fake_loop_run)
+    monkeypatch.setattr(agent_runtime, "run_loop", _fake_run_loop)
 
     with patch(
         "app.services.matching.llm_assist.get_llm_client", return_value=mock_client
@@ -2150,9 +2150,9 @@ async def test_run_thinking_level_high_controls_max_iterations(monkeypatch):
             thinking_level="high",
         )
 
-    # 验证 max_iterations 直接传入 loop_run：high → 10
+    # 验证 max_iterations 直接传入 run_loop：high → 10
     assert captured.get("max_iterations") == 10, (
-        f"loop_run 应收到 max_iterations=10，实际 captured={captured}"
+        f"run_loop 应收到 max_iterations=10，实际 captured={captured}"
     )
 
 
@@ -3050,7 +3050,7 @@ def _medium_cfg(raw_max: str = "") -> dict:
 
 
 def test_continue_run_end_turn_marks_succeeded_without_llm():
-    """last_response=end_turn → 直接 mark_succeeded，不调 LLM（loop_run）。"""
+    """last_response=end_turn → 直接 mark_succeeded，不调 LLM（run_loop）。"""
     repo = _make_continuation_repo()
     rr = _make_replay_result(
         executed=1,
@@ -3065,7 +3065,7 @@ def test_continue_run_end_turn_marks_succeeded_without_llm():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
@@ -3110,7 +3110,7 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3162,7 +3162,7 @@ def test_continue_run_submit_uses_replayed_total_tokens():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3184,7 +3184,7 @@ def test_continue_run_submit_uses_replayed_total_tokens():
 
 
 def test_continue_run_tool_use_backfills_and_continues_loop():
-    """last_response 含 tool_use（缺失工具）→ 补执行缺失工具 + 回填后继续 loop_run。"""
+    """last_response 含 tool_use（缺失工具）→ 补执行缺失工具 + 回填后继续 run_loop。"""
     repo = _make_continuation_repo()
     missing = {"id": "t1", "name": "search_bangumi", "input": {"title": "foo"}}
     rr = _make_replay_result(
@@ -3205,7 +3205,7 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.agent.runtime._replay_missing_tool", backfill),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3222,7 +3222,7 @@ def test_continue_run_tool_use_backfills_and_continues_loop():
     assert backfill_call.args[0] == ReplayToolCall.model_validate(missing)
     assert backfill_call.kwargs.get("sequence") == 0
     assert backfill_call.kwargs.get("span_recorder") is not None
-    # 回填后进入下一轮 loop_run 续跑（1 次 LLM 调用）
+    # 回填后进入下一轮 run_loop 续跑（1 次 LLM 调用）
     loop.assert_awaited_once()
 
 
@@ -3243,7 +3243,7 @@ def test_continue_run_last_response_none_runs_loop_and_lands_result():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3287,7 +3287,7 @@ def test_continue_run_continuation_sums_replay_and_new_round_tokens():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.agent.runtime.TraceRecorder", trace_recorder_cls),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
@@ -3386,7 +3386,7 @@ def test_continue_run_tool_use_no_remaining_marks_succeeded():
             return_value=_make_continuation_dbm(repo),
         ),
         patch("app.services.agent.runtime._replay_missing_tool", backfill),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
@@ -3420,7 +3420,7 @@ def test_continue_run_no_remaining_before_replay_marks_succeeded():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
@@ -3501,7 +3501,7 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch("app.services.matching.llm_assist._handle_result", handle),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -3546,7 +3546,7 @@ def test_continue_run_zero_remaining_recovery_end_turn_lands_exhausted():
             "app.services.matching.llm_assist.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
@@ -3589,7 +3589,7 @@ def test_continue_run_replay_exhausted_after_backfill_logs_warning():
         ),
         patch("app.services.agent.runtime.logger", log),
         patch("app.services.agent.runtime._replay_missing_tool", new=AsyncMock()),
-        patch("app.services.agent.runtime.loop_run", new=AsyncMock()),
+        patch("app.services.agent.runtime.run_loop", new=AsyncMock()),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
         asyncio.run(
@@ -3709,7 +3709,7 @@ def test_continue_run_outer_exception_logs_current_run_status():
             "app.services.matching.llm_assist._build_default_stream_fn",
             return_value=_stream_fn,
         ),
-        patch("app.services.agent.runtime.loop_run", boom_loop),
+        patch("app.services.agent.runtime.run_loop", boom_loop),
         patch("app.services.agent.runtime.logger", log),
     ):
         cm.get_sync_llm_match_config.return_value = _medium_cfg()
@@ -4061,7 +4061,7 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
         await llm_assist.get_scenario_runtime().run(
             run_id, ctx=_ctx(sr, bgm), thinking_level="medium"
         )
-        # 恢复续跑：真实 trace.replay + 真实 loop_run
+        # 恢复续跑：真实 trace.replay + 真实 run_loop
         await llm_assist.get_scenario_runtime().continue_run(run_id, ctx=_ctx(sr, bgm))
 
     asyncio.run(_go())
@@ -4981,7 +4981,7 @@ def test_continue_run_submit_tail_runs_off_event_loop_thread():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch(
             "app.services.matching.llm_assist._handle_result",
             side_effect=_capture,
@@ -5018,7 +5018,7 @@ def test_continue_run_continuation_tail_runs_off_event_loop_thread():
             "app.services.agent.runtime.get_database_manager",
             return_value=_make_continuation_dbm(repo),
         ),
-        patch("app.services.agent.runtime.loop_run", loop),
+        patch("app.services.agent.runtime.run_loop", loop),
         patch(
             "app.services.matching.llm_assist._handle_result",
             side_effect=_capture,

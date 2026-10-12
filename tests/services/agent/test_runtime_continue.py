@@ -240,7 +240,7 @@ def test_continue_run_submit_terminal_does_not_replay_veto(
 
 
 # ---------------------------------------------------------------------------
-# stop_reason 终局归一化：与 loop.run 判据对齐（空壳/max_tokens/未知有内容）
+# stop_reason 终局归一化：与 loop.run_loop 判据对齐（空壳/max_tokens/未知有内容）
 # ---------------------------------------------------------------------------
 
 
@@ -256,7 +256,7 @@ def test_continue_run_empty_shell_response_marks_failed_llm_error(
 ):
     """空壳响应（stop_reason=\"\" 且无 blocks/content）→ 不再空转调 LLM，落 llm_error。
 
-    与 loop.run 归一化一致：空壳不是 end_turn，也不应被当作「待补执行工具轮」
+    与 loop.run_loop 归一化一致：空壳不是 end_turn，也不应被当作「待补执行工具轮」
     反复续跑，而是按 llm_error 失败终态处理。
     """
     run_id = "run-empty-shell"
@@ -292,7 +292,7 @@ def test_continue_run_max_tokens_response_marks_failed_max_tokens(
 def test_continue_run_unknown_stop_reason_with_content_is_end_turn(
     dbm: DatabaseManager,
 ):
-    """未知 stop_reason 但有内容（无工具调用）→ 按 loop.run 兼容判据落 end_turn。"""
+    """未知 stop_reason 但有内容（无工具调用）→ 按 loop.run_loop 兼容判据落 end_turn。"""
     run_id = "run-unknown-content"
     _write_seed(dbm, run_id)
     _write_llm_chat(

@@ -12,7 +12,7 @@
 收尾轮同样按 chat span 落库、无记录器纯聚合。
 
 「单聚合」守卫经 :func:`runtime.run`（生产接线）驱动——包装动作归属通用层，
-直接调 ``loop.run`` 会绕开被守卫的接线路径。
+直接调 ``loop.run_loop`` 会绕开被守卫的接线路径。
 """
 
 from __future__ import annotations
@@ -88,9 +88,9 @@ def _tool_round_stream(tool_name: str = "search_bangumi"):
 
 
 def _run_loop(*, stream_fn, recorder):
-    """以脚本化流驱动 ``loop.run``（loop 级测试：异常需向调用方抛出）。"""
+    """以脚本化流驱动 ``loop.run_loop``（loop 级测试：异常需向调用方抛出）。"""
     return asyncio.run(
-        loop_module.run(
+        loop_module.run_loop(
             tools_schemas=[],
             max_iterations=1,
             tool_choice_terminal="submit_suggestion",

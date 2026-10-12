@@ -83,7 +83,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 > 顺序说明：末轮可能已产出 `submit` 但 run 中断，若先判预算耗尽会误判 `exhausted` 丢失提交，
 > 故终局语义必须先消费。
 >
-> 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run`）。恢复路径预算耗尽时不再发起
+> 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run_loop`）。恢复路径预算耗尽时不再发起
 > 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_succeeded`）。
 
 ## 观测：chat span 单聚合契约

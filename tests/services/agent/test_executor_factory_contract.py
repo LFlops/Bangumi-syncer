@@ -18,7 +18,7 @@ import typing
 from typing import Any
 
 from app.services.agent import loop as loop_mod
-from app.services.agent.loop import run as loop_run
+from app.services.agent.loop import run_loop
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
 
@@ -71,7 +71,7 @@ async def test_executor_factory_invoked_once_per_round():
         built.append(inst)
         return inst
 
-    result = await loop_run(
+    result = await run_loop(
         stream_fn=_scripted_stream_for_tool_rounds,
         tools_schemas=[],
         max_iterations=rounds,
@@ -97,7 +97,7 @@ async def test_executor_factory_result_not_cached_across_rounds():
         built.append(len(built))
         return _make_executor()
 
-    await loop_run(
+    await run_loop(
         stream_fn=_scripted_stream_for_tool_rounds,
         tools_schemas=[],
         max_iterations=3,
@@ -118,22 +118,22 @@ def test_executor_factory_is_zero_arg_callable_alias():
 
 
 def test_run_signature_takes_factory_not_instance():
-    """``loop.run`` 收工厂而非单个执行器（AST 级断言，防参数改名/改语义）。"""
+    """``loop.run_loop`` 收工厂而非单个执行器（AST 级断言，防参数改名/改语义）。"""
     import ast
     import inspect
 
-    tree = ast.parse(inspect.getsource(loop_mod.run))
+    tree = ast.parse(inspect.getsource(loop_mod.run_loop))
     fn = next(
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_loop"
     )
     kwonly = [a.arg for a in fn.args.kwonlyargs]
     assert "executor_factory" in kwonly, (
-        f"run() 应保留 executor_factory 关键字参数，实际 kwonly={kwonly}"
+        f"run_loop() 应保留 executor_factory 关键字参数，实际 kwonly={kwonly}"
     )
     assert "executor" not in kwonly, (
-        "run() 不应直接接收单个 executor（会跨轮串状态），应传 executor_factory"
+        "run_loop() 不应直接接收单个 executor（会跨轮串状态），应传 executor_factory"
     )
 
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 
 from app.services.agent.chat_span import PlainChatSpan
-from app.services.agent.loop import RunResult, run
+from app.services.agent.loop import RunResult, run_loop
 from app.services.agent.tools import ToolError
 from app.services.llm.models import (
     ChatResponse,
@@ -105,7 +105,7 @@ async def test_run_end_turn_returns_end_turn_with_text():
     end_turn.content = "已分析完毕，无建议"
     stream = scripted_stream([end_turn])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         tools_schemas=[{"name": "search_bangumi"}],
         max_iterations=3,
@@ -129,7 +129,7 @@ async def test_run_no_tool_calls_falls_back_to_end_turn():
     # stop_reason=tool_use 但 blocks 里没有任何 ToolUseBlock
     stream = scripted_stream([_resp("tool_use", [])])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         tools_schemas=[],
         max_iterations=3,
@@ -161,7 +161,7 @@ async def test_assistant_aggregate_message_precedes_tool_results():
         ]
     )
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -215,7 +215,7 @@ async def test_submit_suggestion_breaks_and_captures_without_executing_others():
     stream = scripted_stream([_resp("tool_use", [read, submit])])
     executed: list[str] = []
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -244,7 +244,7 @@ async def test_segmented_parallel_passes_full_batch_in_order():
     stream = scripted_stream([_resp("tool_use", [a, b, c]), _resp("end_turn", None)])
     executed: list[str] = []
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -270,7 +270,7 @@ async def test_segmented_parallel_preserves_mixed_read_write_order():
     stream = scripted_stream([_resp("tool_use", [r, w, r2]), _resp("end_turn", None)])
     executed: list[str] = []
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -299,7 +299,7 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
         ]
     )
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -333,7 +333,7 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
         # 未知工具：handler 抛 ToolError，执行器包装为 is_error 的 ToolResultBlock
         raise ToolError("工具执行失败: ToolError")
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(_raise),
         tools_schemas=[],
@@ -367,7 +367,7 @@ async def test_max_iterations_exhausted_returns_last_response():
     # 2 轮循环 + 1 次兜底收尾调用
     stream = scripted_stream([always_tool, always_tool, always_tool])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -427,7 +427,7 @@ async def test_budget_record_budget_called_per_non_final_round_with_remaining():
     # 3 轮循环 + 1 次兜底收尾调用
     stream = scripted_stream([always_tool, always_tool, always_tool, always_tool])
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -456,7 +456,7 @@ async def test_budget_recorder_none_runs_exhausted_path_without_error():
     # 2 轮循环 + 1 次兜底收尾调用
     stream = scripted_stream([always_tool, always_tool, always_tool])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -475,7 +475,7 @@ async def test_budget_appended_to_messages_even_without_recorder():
     always_tool = _resp("tool_use", [_tool_use("t", "search_bangumi")])
     stream = scripted_stream([always_tool, always_tool, always_tool])
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -511,7 +511,7 @@ async def test_budget_no_phantom_message_on_final_round():
         async for chunk in base(messages, tools=tools, tool_choice=tool_choice):
             yield chunk
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -557,7 +557,7 @@ async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
             return [None]
 
     with caplog.at_level(logging.WARNING):
-        await run(
+        await run_loop(
             stream_fn=stream,
             executor_factory=_NonToolResultExecutor,
             tools_schemas=[],
@@ -581,7 +581,7 @@ async def test_run_empty_shell_response_returns_llm_error():
     # 模拟 LLMCallError 后被包装成的空壳（client 不再返回此物，但 loop 仍需防御）
     stream = scripted_stream([ChatResponse(content="", blocks=[], stop_reason="")])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         tools_schemas=[],
         max_iterations=3,
@@ -598,7 +598,7 @@ async def test_run_max_tokens_response_returns_max_tokens():
         [ChatResponse(content="truncated...", blocks=[], stop_reason="max_tokens")]
     )
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         tools_schemas=[],
         max_iterations=3,
@@ -615,7 +615,7 @@ async def test_run_end_turn_unchanged():
     end_turn.content = "已分析完毕"
     stream = scripted_stream([end_turn])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         tools_schemas=[{"name": "search_bangumi"}],
         max_iterations=3,
@@ -636,7 +636,7 @@ async def test_run_tool_calls_path_unchanged():
         ]
     )
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -700,7 +700,7 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
         ]
     )
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -729,7 +729,7 @@ async def test_final_round_budget_message_is_strengthened():
     # max_iterations=2 → 2 轮循环 + 1 次兜底收尾调用
     stream = scripted_stream([always_tool, always_tool, always_tool])
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -753,7 +753,7 @@ async def test_non_final_round_budget_message_not_strengthened():
     # max_iterations=3 → 3 轮循环 + 1 次兜底收尾调用
     stream = scripted_stream([always_tool, always_tool, always_tool, always_tool])
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -790,7 +790,7 @@ async def test_exhausted_final_recovery_submits_suggestion():
     )
     stream = _exhausting_stream(2, [_resp("tool_use", [submit])])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -816,7 +816,7 @@ async def test_exhausted_final_recovery_still_no_submit_returns_exhausted():
         2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -849,7 +849,7 @@ async def test_exhausted_final_recovery_exception_returns_exhausted_not_crash():
         else:
             raise RuntimeError("收尾调用失败")
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -879,7 +879,7 @@ async def test_exhausted_final_recovery_tools_only_terminal_schema():
         {"name": "submit_suggestion"},
     ]
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -903,7 +903,7 @@ async def test_exhausted_final_recovery_called_exactly_once():
         2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -922,7 +922,7 @@ async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
         2, [_resp("tool_use", [_tool_use("t", "search_bangumi")])]
     )
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -991,7 +991,7 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
         veto_inputs.append(args)
         return None if args.get("subject_id") == "2" else "请再核对"
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -1029,7 +1029,7 @@ async def test_veto_happens_at_most_once_per_run():
         veto_calls.append(args)
         return "暂缓"
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -1058,7 +1058,7 @@ async def test_veto_not_applied_on_final_round():
         veto_calls.append(args)
         return "暂缓"
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -1082,7 +1082,7 @@ async def test_veto_none_behaves_like_current_behavior():
     )
     stream = scripted_stream([_resp("tool_use", [submit])])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -1104,7 +1104,7 @@ async def test_veto_records_injected_tool_result_span_for_replay():
     stream = scripted_stream([_resp("tool_use", [first]), _resp("tool_use", [second])])
     recorder = _FakeToolRecorder()
 
-    await run(
+    await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],
@@ -1143,7 +1143,7 @@ async def test_veto_multi_tool_round_injects_paired_results_for_all_tool_uses():
     )
     executed: list[str] = []
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
@@ -1187,7 +1187,7 @@ def _last_assistant_tool_use_and_results(
 
 
 # ---------------------------------------------------------------------------
-# 16b. stop_reason 终局归一化（loop.run 与 runtime.continue_run 共用判据）
+# 16b. stop_reason 终局归一化（loop.run_loop 与 runtime.continue_run 共用判据）
 # ---------------------------------------------------------------------------
 
 
@@ -1280,7 +1280,7 @@ async def test_scripted_executor_passes_through_tool_result_block():
     stream = scripted_stream([_resp("tool_use", [a]), _resp("end_turn", None)])
     exact = ToolResultBlock(tool_use_id="a", content="exact", is_error=False)
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: exact),
         tools_schemas=[],
@@ -1326,7 +1326,7 @@ async def test_stream_path_starts_idempotent_tool_before_stream_ends():
     def factory():
         return _streaming_executor(events)
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
         tools_schemas=[],
@@ -1363,7 +1363,7 @@ async def test_stream_path_backfills_ordered_tool_results_and_blocks():
     def factory():
         return _streaming_executor([])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
         tools_schemas=[],
@@ -1404,7 +1404,7 @@ async def test_stream_path_terminal_captured_and_other_tools_not_executed():
     def factory():
         return _streaming_executor(events)
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
         tools_schemas=[],
@@ -1435,7 +1435,7 @@ async def test_stream_path_malformed_json_error_and_loop_continues():
     def factory():
         return _streaming_executor([])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
         tools_schemas=[],
@@ -1482,7 +1482,7 @@ async def test_stream_path_pads_missing_slots_to_close_protocol(caplog):
             # 少一个槽位 + 顺序破坏：只给 b 的结果（a 的槽位缺失）
             return [ToolResultBlock(tool_use_id="b", content="res-b", is_error=False)]
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=_ShortFinalizeExecutor,
         tools_schemas=[],
@@ -1529,7 +1529,7 @@ async def test_stream_path_budget_and_recovery_use_stream():
     def factory():
         return _streaming_executor([])
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
         tools_schemas=[],
@@ -1547,7 +1547,7 @@ async def test_run_requires_stream_fn():
     import pytest
 
     with pytest.raises(ValueError, match="stream_fn"):
-        await run(
+        await run_loop(
             tools_schemas=[],
             max_iterations=1,
             tool_choice_terminal="submit_suggestion",
@@ -1596,7 +1596,7 @@ async def test_stream_exception_converges_early_tasks_and_propagates():
         raise RuntimeError("stream boom")
 
     with pytest.raises(RuntimeError, match="stream boom"):
-        await run(
+        await run_loop(
             stream_fn=stream_fn,
             executor_factory=factory,
             tools_schemas=[],
@@ -1640,7 +1640,7 @@ async def test_stream_exception_not_masked_when_finalize_raises_base_exception()
         raise RuntimeError("stream boom")
 
     with pytest.raises(RuntimeError, match="stream boom"):
-        await run(
+        await run_loop(
             stream_fn=stream_fn,
             executor_factory=_FatalFinalizeExecutor,
             tools_schemas=[],
@@ -1685,7 +1685,7 @@ async def test_cancel_during_convergence_keeps_finalize_running_in_background(
         raise RuntimeError("stream boom")
 
     task = asyncio.create_task(
-        run(
+        run_loop(
             stream_fn=stream_fn,
             executor_factory=_SlowFinalizeExecutor,
             tools_schemas=[],
@@ -1734,7 +1734,7 @@ async def test_run_accepts_tuple_seed_messages():
     async def stream_fn(messages, *, tools=None, tool_choice=None):
         yield _stream_end_turn()
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream_fn,
         tools_schemas=[],
         max_iterations=3,
@@ -1762,7 +1762,7 @@ async def test_run_does_not_mutate_caller_seed_list():
         ]
     )
 
-    result = await run(
+    result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
         tools_schemas=[],

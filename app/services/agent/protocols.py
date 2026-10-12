@@ -83,7 +83,7 @@ class ToolSpanRecorder(Protocol):
 class BudgetRecorder(ToolSpanRecorder, Protocol):
     """通用循环要求的记录器协议：chat span + 预算消息 + 工具 span（继承 ``ToolSpanRecorder``）。
 
-    仅 ``loop.run`` 需要 ``record_budget``；``start_tool`` / ``end_tool`` 的签名
+    仅 ``loop.run_loop`` 需要 ``record_budget``；``start_tool`` / ``end_tool`` 的签名
     **不在此重复声明**，统一由基类 :class:`ToolSpanRecorder` 提供（避免此前
     ``tools.ToolSpanRecorder`` 与本协议逐字重复的两份定义）。
     """

@@ -280,7 +280,7 @@ def normalize_stop_reason(
     blocks: Sequence[ContentBlock] | None,
     content: str,
 ) -> str | None:
-    """按 loop 终局判据归一化响应 ``stop_reason``（``run`` 与恢复续跑共用）。
+    """按 loop 终局判据归一化响应 ``stop_reason``（``run_loop`` 与恢复续跑共用）。
 
     返回 ``None`` 表示**非终局**（存在工具调用，应进入工具执行/续跑流程）；否则返回
     归一化后的终局原因：
@@ -290,7 +290,7 @@ def normalize_stop_reason(
     - ``llm_error``：空壳响应（``stop_reason == ""`` 且无内容块、无内容）——LLM 调用
       失败被错误传递，或 provider 异常；不得伪装 end_turn，也不得反复重调 LLM
 
-    判据顺序与 ``run`` 内联逻辑一致：显式 end_turn 优先（即便同轮带工具也视为终态），
+    判据顺序与 ``run_loop`` 内联逻辑一致：显式 end_turn 优先（即便同轮带工具也视为终态），
     其次存在工具调用则非终局，最后按 stop_reason 细分。
     """
     if stop_reason == "end_turn":
@@ -304,7 +304,7 @@ def normalize_stop_reason(
     return "end_turn"
 
 
-async def run(
+async def run_loop(
     *,
     tools_schemas: list[dict],
     max_iterations: int,
