@@ -54,7 +54,7 @@ def serialize_tool_result(result: Any) -> str:
         return json.dumps(result, ensure_ascii=False)
     except (TypeError, ValueError):
         # 非 JSON 可序列化对象：降级 str，记录 debug 以便定位降级来源（非静默）
-        logger.debug(
+        logger.warning(
             "serialize_tool_result 无法 JSON 编码 %s，降级为 str",
             type(result).__name__,
         )

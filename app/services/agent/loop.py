@@ -260,7 +260,7 @@ def _record_veto_tool(
     span_id = recorder.start_tool(terminal_tc, sequence=sequence)
     if span_id is None:
         # 记录器选择不落 span（如可空实现）：仍需可观测，避免静默
-        logger.debug(
+        logger.warning(
             "veto terminal 工具 %s 未获得 span_id，跳过 replay 落 span",
             terminal_tc.name,
         )

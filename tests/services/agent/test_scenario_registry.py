@@ -55,10 +55,10 @@ class TestWireScenarios:
         - 行为面：``get_scenario_runtime()`` 每次调用新建 ``ScenarioRuntime``，
           故第二次装配后 ``get_scenario("match")`` 必为新实例（``is not`` 首次），
           直接证明「覆盖确实发生」，而非「第二次装配未执行」。
-        - 日志面：覆盖分支走 ``logger.debug``（消息含「覆盖」）；项目 Logger 的
+        - 日志面：覆盖分支走 ``logger.info``（消息含「覆盖」）；项目 Logger 的
           监听器**不受级别阈值限制**（见 ``app/core/logging.py`` 中
-          ``log_level_enabled``/``log`` 的注释），DEBUG 行可达监听器，故断言
-          收到覆盖 DEBUG 行，证明走的是覆盖分支。
+          ``log_level_enabled``/``log`` 的注释），故断言收到覆盖 INFO 行，
+          证明走的是覆盖分支。
         """
         from app.core.logging import logger
 
@@ -83,9 +83,9 @@ class TestWireScenarios:
         assert runtime is not first, (
             "第二次 wire_scenarios() 应覆盖为新的 ScenarioRuntime 实例"
         )
-        # 正向证据 2：覆盖分支的 DEBUG 日志被监听器捕获
-        assert any(level == "DEBUG" and "覆盖" in line for line, level in seen), (
-            f"应捕获覆盖分支 DEBUG 日志，实际 {seen}"
+        # 正向证据 2：覆盖分支的 INFO 日志被监听器捕获
+        assert any(level == "INFO" and "覆盖" in line for line, level in seen), (
+            f"应捕获覆盖分支 INFO 日志，实际 {seen}"
         )
 
         warnings = [(line, level) for line, level in seen if level == "WARNING"]

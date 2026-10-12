@@ -3836,8 +3836,8 @@ def _registry_with(
     return registry
 
 
-def test_replay_missing_write_tool_appends_placeholder_tool_result():
-    """write 缺失工具不重放副作用，但回填占位 tool_result 闭合协议。"""
+def test_replay_missing_write_tool_appends_placeholder_tool_result(log_records):
+    """write 缺失工具不重放副作用，但回填占位 tool_result 闭合协议；记 info。"""
     called: list = []
     registry = _registry_with("write_mapping", "write", called)
     messages = [
@@ -3861,6 +3861,11 @@ def test_replay_missing_write_tool_appends_placeholder_tool_result():
     assert blk.tool_use_id == "w1"
     assert blk.is_error is False
     assert blk.content == _SKIP_PLACEHOLDER
+    # 分支流转：不重放副作用这一关键决策必须默认可见（≥ info，不能停在 debug）
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("非只读/未注册" in line for line in infos), (
+        f"占位回填（不重放副作用）应记 info，实际 {infos}"
+    )
 
 
 def test_replay_missing_terminal_tool_appends_placeholder_tool_result():
@@ -4008,6 +4013,66 @@ def test_replay_missing_idempotent_write_tool_appends_placeholder():
 
 
 # 补执行落 tool_execute span（二次 replay 不再判缺失） -------------------
+
+
+def test_replay_missing_unnamed_tool_logs_info(log_records):
+    """缺失工具无 name（防御分支）：跳过并记 info（不静默）。"""
+    called: list = []
+    registry = _registry_with("x", "read", called)
+    messages: list = []
+
+    asyncio.run(
+        runtime._replay_missing_tool(
+            ReplayToolCall(id="n1", name="", input={}),
+            registry,
+            messages,
+        )
+    )
+
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("无 name" in line for line in infos), (
+        f"无 name 防御分支应记 info，实际 {infos}"
+    )
+    assert messages == []
+
+
+def test_replay_missing_read_tool_failure_logs_warning(log_records):
+    """只读工具补执行失败（异常被吞并回填错误块）：记 warning。"""
+
+    def _boom(args):
+        raise RuntimeError("tool down")
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read_boom",
+            description="d",
+            parameters={"type": "object", "properties": {}},
+            handler=_boom,
+            access="read",
+        )
+    )
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="r1", name="read_boom", input={})],
+        )
+    ]
+
+    asyncio.run(
+        runtime._replay_missing_tool(
+            ReplayToolCall(id="r1", name="read_boom", input={}),
+            registry,
+            messages,
+        )
+    )
+
+    blk = _last_tool_result(messages)
+    assert blk is not None and blk.is_error is True
+    warns = [line for level, line in log_records if level == "WARNING"]
+    assert any("补执行工具 read_boom 失败" in line for line in warns), (
+        f"补执行失败应记 warning，实际 {warns}"
+    )
 
 
 def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypatch):

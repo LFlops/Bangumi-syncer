@@ -242,6 +242,7 @@ class StreamingToolExecutor(StreamingExecutor):
         （保持「终止工具优先，同轮其他工具不执行」的既有语义）。
         """
         deferred: list[_ToolState] = []
+        degraded: list[str] = []
         for tid in self._order:
             st = self._states[tid]
             if st.result is not None or st.task is not None:
@@ -255,9 +256,8 @@ class StreamingToolExecutor(StreamingExecutor):
                 continue
             if not st.stop_seen:
                 # 无停点协议的轮级降级：仍按原 execute_batch 语义执行
-                logger.debug(
-                    "StreamingToolExecutor 无停点工具 %s 走轮级降级执行", st.name
-                )
+                # （聚合到本轮一条 info，避免逐工具刷屏）
+                degraded.append(st.name)
             if not st.parse_ok and not self._parse_args(st):
                 # 未收到停点且累积 JSON 非法：error result 已就位，不执行
                 logger.debug(
@@ -265,6 +265,11 @@ class StreamingToolExecutor(StreamingExecutor):
                 )
                 continue
             deferred.append(st)
+        if degraded:
+            logger.info(
+                "StreamingToolExecutor 本轮无停点（协议降级为轮级执行）: %s",
+                ", ".join(degraded),
+            )
         return deferred
 
     async def _execute_deferred(self, states: list[_ToolState]) -> None:
@@ -330,7 +335,18 @@ class StreamingToolExecutor(StreamingExecutor):
         if st.result is not None:
             return st.result
         # 防御兜底：无结果（terminal 轮被抑制 / 异常路径）→ 协议闭合占位块
-        logger.debug("StreamingToolExecutor 工具 %s 无执行结果，回填占位块", st.name)
+        if self._terminal_seen:
+            # 终止工具优先：同轮其他工具**按设计**不执行 → 正常路径
+            logger.debug(
+                "StreamingToolExecutor terminal 轮抑制未执行工具 %s，回填占位块",
+                st.name,
+            )
+        else:
+            # 非 terminal 轮却无结果 = 异常路径兜底，必须默认可见
+            logger.warning(
+                "StreamingToolExecutor 工具 %s 无执行结果（异常路径），回填占位块",
+                st.name,
+            )
         return self._not_executed(st)
 
     @staticmethod

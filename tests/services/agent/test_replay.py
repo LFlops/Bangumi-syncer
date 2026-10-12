@@ -975,8 +975,8 @@ class TestReplayAbnormalBranchLogging:
         infos = [line for level, line in log_records if level == "INFO"]
         assert any("replay_delta" in line for line in infos)
 
-    def test_replay_skips_non_tool_execute_rows_logs_debug(self, dbm, log_records):
-        """重建轮内非 tool_execute 行：跳过并记 debug。"""
+    def test_replay_skips_non_tool_execute_rows_logs_warning(self, dbm, log_records):
+        """重建轮内非 tool_execute 行：跳过并记 warning（replay 数据异常，默认可见）。"""
         _write_seed(dbm, "run-skip-row", [])
         _write_llm_chat(
             dbm, "run-skip-row", 0, [{"id": "t1", "name": "x", "input": {}}]
@@ -986,9 +986,9 @@ class TestReplayAbnormalBranchLogging:
         result = trace.replay("run-skip-row")
 
         assert result.executed_iterations == 1
-        debugs = [line for level, line in log_records if level == "DEBUG"]
-        # 同轮 llm_chat 行在重建循环中被跳过，应留 debug
-        assert any("llm_chat" in line for line in debugs)
+        warns = [line for level, line in log_records if level == "WARNING"]
+        # 同轮 llm_chat 行在重建循环中被跳过（数据异常），应留 warning
+        assert any("llm_chat" in line for line in warns)
 
     def test_replay_tool_result_parse_failure_logs_warning(self, dbm, log_records):
         """tool_execute 无有效 tool_result：跳过并记 warning，工具计入缺失。"""

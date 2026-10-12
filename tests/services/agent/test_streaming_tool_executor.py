@@ -15,9 +15,26 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.execution.tools import ToolError
 from app.services.llm.models import StreamChunk, ToolResultBlock
+
+
+@pytest.fixture
+def log_records():
+    """捕获项目 Logger 的 ``(level, line)``（监听器不受级别阈值限制）。"""
+    from app.core.logging import logger as app_logger
+
+    records: list[tuple[str, str]] = []
+
+    def _listener(line: str, level: str) -> None:
+        records.append((level, line))
+
+    app_logger.add_listener(_listener)
+    yield records
+    app_logger.remove_listener(_listener)
 
 
 def _start(tid: str, name: str) -> StreamChunk:
@@ -285,8 +302,8 @@ async def test_early_started_tool_before_terminal_completes_and_is_kept():
 # ---------------------------------------------------------------------------
 
 
-async def test_no_stop_signal_degrades_to_round_level_batch_execution():
-    """无 tool_use_stop：幂等工具也不提前执行，finalize 经 batch 路径执行。"""
+async def test_no_stop_signal_degrades_to_round_level_batch_execution(log_records):
+    """无 tool_use_stop：幂等工具也不提前执行，finalize 经 batch 路径执行；记 info。"""
     batch_calls: list[list[str]] = []
 
     async def batch_execute_fn(tool_calls):
@@ -313,6 +330,39 @@ async def test_no_stop_signal_degrades_to_round_level_batch_execution():
 
     assert batch_calls == [["a", "b"]]
     assert [r.content for r in results] == ["batch:a", "batch:b"]
+    # 协议降级（停点机制不可用）是关键分支：聚合为本轮一条 info，默认级别可见
+    infos = [line for level, line in log_records if level == "INFO"]
+    assert any("本轮无停点" in line and "read_a" in line for line in infos), (
+        f"轮级降级应记 info，实际 {infos}"
+    )
+
+
+async def test_result_for_placeholder_warns_only_on_exception_path(log_records):
+    """无结果回填占位块：异常路径 → warning；terminal 抑制（按设计）→ debug。"""
+    # ① 异常路径：非 terminal 轮且无结果 → 兜底回填，必须默认可见
+    ex = _make_executor()
+    ex.feed(_start("a", "read_a"))
+    ex.feed(_delta("a", "{}"))
+    ex._result_for("a")
+    warns = [line for level, line in log_records if level == "WARNING"]
+    assert any("无执行结果" in line and "read_a" in line for line in warns), warns
+
+    # ② terminal 抑制：同轮其他工具按设计不执行 → 占位回填走 debug，不新增 warning
+    before = len(warns)
+    ex2 = _make_executor()
+    ex2.feed(_start("s", "submit_suggestion"))
+    ex2.feed(_delta("s", "{}"))
+    ex2.feed(_stop("s"))
+    ex2.feed(_start("b", "read_b"))
+    ex2.feed(_delta("b", "{}"))
+    await ex2.finalize()
+
+    after = [line for level, line in log_records if level == "WARNING"]
+    assert len(after) == before, (
+        f"terminal 抑制属正常路径，不应新增 warning：{after[before:]}"
+    )
+    debugs = [line for level, line in log_records if level == "DEBUG"]
+    assert any("terminal 轮抑制未执行工具 read_b" in line for line in debugs), debugs
 
 
 async def test_batch_path_used_for_deferred_non_idempotent_only():

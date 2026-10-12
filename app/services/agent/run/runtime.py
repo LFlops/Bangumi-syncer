@@ -552,7 +552,7 @@ async def _replay_missing_tool(
     name = tool_call.name
     if not name:
         # 防御分支：缺失工具无 name 无法执行/登记，跳过并留日志（不静默）
-        logger.debug("🤖 恢复补执行：缺失工具无 name，跳过")
+        logger.info("🤖 恢复补执行：缺失工具无 name，跳过")
         return
     args = tool_call.input or {}
     tool_use_id = tool_call.id
@@ -565,7 +565,7 @@ async def _replay_missing_tool(
         span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
 
     if defn is None or defn.access != "read":
-        logger.debug(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
+        logger.info(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
         _append_tool_result(
             messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
         )
@@ -586,7 +586,7 @@ async def _replay_missing_tool(
         content = serialize_tool_result(result)
         is_error = False
     except Exception as e:
-        logger.debug(f"🤖 恢复补执行工具 {name} 失败: {e}")
+        logger.warning(f"🤖 恢复补执行工具 {name} 失败: {e}")
         content = f"工具执行失败: {type(e).__name__}"
         is_error = True
     _append_tool_result(messages, tool_use_id, content, is_error=is_error)

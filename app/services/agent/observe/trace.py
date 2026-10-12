@@ -522,7 +522,7 @@ def replay(run_id: str) -> ReplayResult:
             budget_message: str | None = None
             for t in sorted(isteps, key=lambda x: (x["sequence"], x["id"])):
                 if t["name"] != "tool_execute":
-                    logger.debug(
+                    logger.warning(
                         f"[trace] replay iteration={it} 跳过非 tool_execute 行:"
                         f" name={t['name']}"
                     )

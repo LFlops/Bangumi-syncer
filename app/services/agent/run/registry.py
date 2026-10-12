@@ -98,7 +98,7 @@ def register_scenario(task_type: str, scenario_runtime: ScenarioRuntime) -> None
     debug/info，**不打 warning**。
     """
     if task_type in _scenarios:
-        logger.debug(f"[registry] 覆盖已登记的场景: {task_type!r}")
+        logger.info(f"[registry] 覆盖已登记的场景: {task_type!r}")
     else:
         logger.info(f"[registry] 登记 Agent 场景: {task_type!r}")
     _scenarios[task_type] = scenario_runtime

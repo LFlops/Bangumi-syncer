@@ -344,12 +344,20 @@ def test_serialize_tool_result_string_is_json_quoted():
     assert serialize_tool_result("ran") == '"ran"'
 
 
-def test_serialize_tool_result_unserializable_falls_back_to_str():
-    """不可 JSON 序列化对象 fallback str(result)，不抛异常。"""
+def test_serialize_tool_result_unserializable_falls_back_to_str(caplog):
+    """不可 JSON 序列化对象 fallback str(result)，不抛异常；降级记 warning。
+
+    ``tools.py`` 用 stdlib logging（非项目自定义 Logger），故用 ``caplog`` 捕获。
+    """
     obj = {1, 2}  # set 无法 JSON 序列化
     with pytest.raises(TypeError):
         json.dumps(obj, ensure_ascii=False)
-    assert serialize_tool_result(obj) == str(obj)
+    with caplog.at_level(logging.WARNING, logger="app.services.agent.execution.tools"):
+        assert serialize_tool_result(obj) == str(obj)
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("降级为 str" in m and "set" in m for m in messages), (
+        f"降级应记 warning（默认级别可见），实际 {messages}"
+    )
 
 
 # ---------------------------------------------------------------------------
