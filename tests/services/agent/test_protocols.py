@@ -20,12 +20,14 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from app.services.agent.loop import PlainChatSpan
 from app.services.agent.protocols import (
     BudgetRecorder,
     ChatSpan,
     StreamingExecutor,
     ToolSpanRecorder,
 )
+from app.services.agent.recorder import TraceRecorder
 from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 
 _AGENT_DIR = Path("app/services/agent")
@@ -172,10 +174,17 @@ def test_chat_span_protocol_surface():
 def test_chat_span_implementations_explicitly_inherit_protocol():
     """两处 chat span 实现显式继承协议（nominal，非纯鸭子类型）。
 
-    - ``recorder._ChatSpan``：落库实现（唯一 finalize + 轮末写 span）；
+    - ``recorder`` 的 chat span（``chat_span()`` 工厂产出）：唯一 finalize + 轮末写 span；
     - ``loop.PlainChatSpan``：无 recorder 时的纯聚合实现。
 
-    显式继承使协议变更（如新增契约点）由类型检查与本源码守卫同时兜住。
+    两道路径：AST 校验基类写在源码里（防动态蒙混，与执行器守卫同构）；
+    ``__mro__`` 校验运行时确实继承（含工厂产出，防止返回未继承的对象）。
+    注意：协议未加 ``@runtime_checkable``（全仓约定），故**不能**用
+    ``issubclass`` / ``isinstance`` 校验——那会抛 TypeError，不代表未继承。
     """
     assert _class_bases("recorder.py", "_ChatSpan") == ["ChatSpan"]
     assert _class_bases("loop.py", "PlainChatSpan") == ["ChatSpan"]
+
+    produced = TraceRecorder("guard-run", start_iteration=0).chat_span()
+    assert ChatSpan in type(produced).__mro__
+    assert ChatSpan in PlainChatSpan.__mro__
