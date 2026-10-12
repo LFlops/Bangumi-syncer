@@ -13,7 +13,7 @@ import logging
 
 import pytest
 
-from app.services.agent.tools import (
+from app.services.agent.execution.tools import (
     TerminalCapture,
     ToolDefinition,
     ToolError,
@@ -619,7 +619,7 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
 
 
 def test_batch_results_construct_keeps_first_result():
-    from app.services.agent.tools import BatchResults
+    from app.services.agent.execution.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="dup", content="real", is_error=False)
     r2 = ToolResultBlock(tool_use_id="dup", content="dup", is_error=True)
@@ -628,7 +628,7 @@ def test_batch_results_construct_keeps_first_result():
 
 
 def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
-    from app.services.agent.tools import BatchResults
+    from app.services.agent.execution.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
     r2 = ToolResultBlock(tool_use_id="a", content="second", is_error=False)
@@ -647,7 +647,7 @@ def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
 
 
 def test_batch_results_setitem_allows_new_key():
-    from app.services.agent.tools import BatchResults
+    from app.services.agent.execution.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
     r2 = ToolResultBlock(tool_use_id="b", content="new", is_error=False)
@@ -1344,7 +1344,7 @@ async def test_execute_batch_idempotent_write_tool_runs_in_parallel():
 @pytest.mark.asyncio
 async def test_execute_batch_idempotent_segment_caps_parallelism():
     """超过上限的幂等工具并发数不超过 _MAX_PARALLEL_TOOLS。"""
-    from app.services.agent.tools import _MAX_PARALLEL_TOOLS
+    from app.services.agent.execution.tools import _MAX_PARALLEL_TOOLS
 
     reg = ToolRegistry()
     active = 0

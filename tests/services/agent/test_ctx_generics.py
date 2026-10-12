@@ -21,9 +21,9 @@ import inspect
 import typing
 from pathlib import Path
 
-from app.services.agent import registry as registry_mod, scenario as scenario_mod
-from app.services.agent.registry import ScenarioRuntime
-from app.services.agent.scenario import CtxT, ScenarioHooks, TerminalHandler
+from app.services.agent.run import registry as registry_mod, scenario as scenario_mod
+from app.services.agent.run.registry import ScenarioRuntime
+from app.services.agent.run.scenario import CtxT, ScenarioHooks, TerminalHandler
 from app.services.matching import llm_assist
 
 _AGENT_DIR = Path("app/services/agent")
@@ -46,7 +46,7 @@ def test_run_and_continue_run_ctx_annotated_with_typevar():
 
 def test_agent_runtime_ctx_annotated_with_typevar():
     """``agent_runtime.run`` / ``continue_run`` 内部同样按 ``CtxT`` 收ctx。"""
-    from app.services.agent import runtime as runtime_mod
+    from app.services.agent.run import runtime as runtime_mod
 
     for fn in (runtime_mod.run, runtime_mod.continue_run):
         hints = typing.get_type_hints(fn)
@@ -69,7 +69,7 @@ def test_scenario_hooks_ctx_hooks_are_typed():
 
 def test_ctx_typevar_bounded_to_run_inputs():
     """``CtxT`` 受 ``RunInputs`` 约束：通用层对 ctx 的**唯一**要求是 seed。"""
-    from app.services.agent.scenario import RunInputs
+    from app.services.agent.run.scenario import RunInputs
 
     assert CtxT.__bound__ is RunInputs, (
         f"CtxT 应受 RunInputs 约束（否则通用层读 ctx.seed 无类型保障），"
@@ -92,7 +92,7 @@ def test_scenario_hooks_no_longer_exposes_build_seed():
 
 def test_runtime_reads_seed_from_ctx_not_from_hooks():
     """通用层从 ``ctx.seed`` 取 seed，不再回调场景派生（AST 级断言）。"""
-    runtime_src = (_AGENT_DIR / "runtime.py").read_text(encoding="utf-8")
+    runtime_src = (_AGENT_DIR / "run" / "runtime.py").read_text(encoding="utf-8")
     assert "hooks.build_seed" not in runtime_src, "通用层不应再驱动场景派生 seed"
     assert "ctx.seed" in runtime_src, "run_loop() 应直接取 ctx.seed"
 
@@ -188,7 +188,7 @@ def test_scene_runtime_factory_declares_concrete_ctx():
 def test_agent_layer_never_mentions_scene_private_ctx_type():
     """``app/services/agent/**`` 源码不得出现 ``_MatchContext`` 等场景私有类型。"""
     offenders: dict[str, list[str]] = {}
-    for path in sorted(_AGENT_DIR.glob("*.py")):
+    for path in sorted(_AGENT_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         hits = [
             node.id

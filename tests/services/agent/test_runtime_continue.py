@@ -21,8 +21,9 @@ from app.core.database import (
     get_database_manager,
     set_database_manager,
 )
-from app.services.agent import runtime, trace
-from app.services.agent.scenario import ScenarioHooks
+from app.services.agent.observe import trace
+from app.services.agent.run import runtime
+from app.services.agent.run.scenario import ScenarioHooks
 
 
 @pytest.fixture

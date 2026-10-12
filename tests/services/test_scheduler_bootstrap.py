@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 from app.core.scheduler_registry import scheduler_registry
-from app.services.agent import registry as registry_module
-from app.services.agent.registry import get_scenario
+from app.services.agent.run import registry as registry_module
+from app.services.agent.run.registry import get_scenario
 from app.services.llm_match_scheduler import llm_match_scheduler
 from app.services.scheduler_bootstrap import register_all
 

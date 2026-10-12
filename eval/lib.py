@@ -21,7 +21,7 @@ from unittest.mock import patch
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.core.logging import logger
-from app.services.agent.tools import ToolRegistry
+from app.services.agent.execution.tools import ToolRegistry
 from app.services.llm.models import (
     ChatResponse,
     RedactedThinkingBlock,

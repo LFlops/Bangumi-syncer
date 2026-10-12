@@ -17,8 +17,8 @@ from unittest.mock import patch
 import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
-from app.services.agent import trace
-from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+from app.services.agent.execution.streaming import StreamingToolExecutor
+from app.services.agent.observe import trace
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -387,7 +387,7 @@ class TestReplayRebuildsFullBlocks:
         import asyncio
 
         from app.services.agent import loop as loop_module
-        from app.services.agent.recorder import TraceRecorder
+        from app.services.agent.observe.recorder import TraceRecorder
 
         _ensure_run(dbm, "run-loop-eq")
         seed = [
@@ -459,7 +459,7 @@ class TestReplayRebuildsFullBlocks:
         import asyncio
 
         from app.services.agent import loop as loop_module
-        from app.services.agent.recorder import TraceRecorder
+        from app.services.agent.observe.recorder import TraceRecorder
 
         _ensure_run(dbm, "run-veto-eq")
         seed = [

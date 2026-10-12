@@ -189,7 +189,7 @@ CREATE INDEX idx_agent_steps_run_id ON agent_steps(run_id);
 
 ### 断点续跑
 
-`replay(run_id)`（位于 `app/services/agent/trace.py`）从 `agent_steps` 重建可续跑 `list[Message]`：
+`replay(run_id)`（位于 `app/services/agent/observe/trace.py`）从 `agent_steps` 重建可续跑 `list[Message]`：
 
 - 从 `seed` 行提取种子前缀消息，无需调用方提供 `seed_builder` / `max_iterations` 等入参。
 - 按 `(iteration, sequence)` 排序逐轮重建：`llm_chat` → assistant 消息，`tool_execute` → 独立 user 消息（每条工具结果不合并）。

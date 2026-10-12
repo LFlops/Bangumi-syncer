@@ -25,9 +25,11 @@ from pathlib import Path
 import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
-from app.services.agent import loop as loop_module, recorder as agent_recorder, runtime
-from app.services.agent.recorder import TraceRecorder
-from app.services.agent.scenario import ScenarioHooks
+from app.services.agent import loop as loop_module
+from app.services.agent.observe import recorder as agent_recorder
+from app.services.agent.observe.recorder import TraceRecorder
+from app.services.agent.run import runtime
+from app.services.agent.run.scenario import ScenarioHooks
 from app.services.llm import models as llm_models
 from app.services.llm.models import Message, StreamChunk, TextBlock
 

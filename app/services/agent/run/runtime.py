@@ -1,6 +1,6 @@
 """通用 Agent 运行时：run 编排与恢复续跑状态机。
 
-与业务无关：全部场景差异通过 :class:`~app.services.agent.scenario.ScenarioHooks`
+与业务无关：全部场景差异通过 :class:`~app.services.agent.run.scenario.ScenarioHooks`
 注入，运行时只透传 ``ctx``（场景上下文）给场景钩子，不感知其内部结构。
 
 对外入口：
@@ -23,21 +23,21 @@ from collections.abc import Callable, Sequence
 
 from app.core.database import get_database_manager
 from app.core.logging import logger
-from app.services.agent import trace
+from app.services.agent.execution.streaming import StreamingToolExecutor
+from app.services.agent.execution.tools import (
+    ToolRegistry,
+    serialize_tool_result,
+)
 from app.services.agent.loop import (
     RunResult,
     StreamFn,
     normalize_stop_reason,
     run_loop,
 )
+from app.services.agent.observe import trace
+from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.protocols import ToolSpanRecorder
-from app.services.agent.recorder import TraceRecorder
-from app.services.agent.scenario import CtxT, ScenarioHooks
-from app.services.agent.streaming_tool_executor import StreamingToolExecutor
-from app.services.agent.tools import (
-    ToolRegistry,
-    serialize_tool_result,
-)
+from app.services.agent.run.scenario import CtxT, ScenarioHooks
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 from app.services.notification_service import NotificationService

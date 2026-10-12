@@ -19,10 +19,10 @@ from dataclasses import dataclass
 from typing import Any, Generic
 
 from app.core.logging import logger
-from app.services.agent import runtime as agent_runtime
+from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.protocols import StreamFn
-from app.services.agent.recorder import TraceRecorder
-from app.services.agent.scenario import CtxT, ScenarioHooks
+from app.services.agent.run import runtime as agent_runtime
+from app.services.agent.run.scenario import CtxT, ScenarioHooks
 from app.services.notification_service import NotificationService
 
 
@@ -55,7 +55,7 @@ class ScenarioRuntime(Generic[CtxT]):
         """执行一次场景任务（转发通用运行时）。
 
         ``ctx`` 为场景上下文，由 :meth:`new_ctx` 构造；通用层对其内部结构不可见
-        （只经 :data:`~app.services.agent.scenario.CtxT` 绑定类型）。
+        （只经 :data:`~app.services.agent.run.scenario.CtxT` 绑定类型）。
         ``stream_fn`` 为流式 LLM 调用注入；为空时由场景默认 ``build_stream_fn`` 构造。
         """
         return await agent_runtime.run(

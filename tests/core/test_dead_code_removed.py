@@ -46,7 +46,7 @@ def test_wrap_stream_fn_removed_from_trace_recorder():
     聚合与落库统一由 ``recorder.chat_span()`` 的 ``async with`` 承担：
     ``feed`` 单点聚合、``__aexit__`` 唯一一次 finalize。
     """
-    from app.services.agent.recorder import TraceRecorder
+    from app.services.agent.observe.recorder import TraceRecorder
 
     assert not hasattr(TraceRecorder, "wrap_stream_fn"), (
         "TraceRecorder.wrap_stream_fn 应已删除（改由 chat_span() 单点聚合）"

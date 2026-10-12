@@ -15,7 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from app.services.agent.tools import ToolRegistry
+from app.services.agent.execution.tools import ToolRegistry
 from app.services.llm.models import Message
 from app.services.llm.providers.anthropic import AnthropicProvider
 from app.services.llm.providers.openai_compat import OpenAICompatProvider

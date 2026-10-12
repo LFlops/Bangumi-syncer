@@ -23,8 +23,8 @@ from unittest.mock import patch
 import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
-from app.services.agent import trace
-from app.services.agent.recorder import TraceRecorder
+from app.services.agent.observe import trace
+from app.services.agent.observe.recorder import TraceRecorder
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -504,7 +504,7 @@ class TestRecordBudgetMessageEncryptFailure:
         assert raw_before.startswith("BGS1:")
 
         with patch(
-            "app.services.agent.trace.encrypt",
+            "app.services.agent.observe.trace.encrypt",
             side_effect=RuntimeError("key unavailable"),
         ):
             trace.record_budget_message(sid, "[剩余轮次：2]")

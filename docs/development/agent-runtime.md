@@ -14,16 +14,30 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 
 | 层 | 模块 | 职责 |
 | --- | --- | --- |
-| 循环 | `agent/loop.py` | 通用 LLM 循环（工具调用、终止工具、预算注入） |
-| 观测 | `agent/trace.py`、`agent/recorder.py` | span 读写与 `TraceRecorder`（chat span 上下文、tool span、seed 行、budget 钩子、全轮 tokens 累计） |
+| 契约 | `agent/protocols.py`、`agent/chat_span.py` | 跨层能力契约（StreamFn / 执行器 / 记录器）与 chat span 契约 + 两实现（纯聚合 / 落库） |
+| 循环 | `agent/loop.py` | 通用 LLM 循环 `run_loop`（工具调用、终止工具、预算注入、兜底收尾） |
 | 预算 | `agent/budget.py` | 轮次预算策略（`task_type` + `thinking_level` → `max_iterations`） |
-| 运行时 | `agent/runtime.py` | `run` 编排与 `continue_run` 恢复状态机（原子抢占 / 异常分流 / replay 分派 / 补执行 / 终局分派） |
-| 场景协议 | `agent/scenario.py` | `ScenarioHooks`：场景差异点契约 |
-| 注册表 | `agent/registry.py` | `get_scenario(task_type)`：调度器等通用组件按 task_type 取得场景运行入口（纯机制，由装配层登记） |
+| 工具执行 | `agent/execution/tools.py`、`agent/execution/streaming.py` | 工具注册与执行（分区并行 / 停点提前执行） |
+| 观测 | `agent/observe/trace.py`、`agent/observe/recorder.py` | span 读写与 `TraceRecorder`（chat/tool span、seed 行、budget 钩子、全轮 tokens 累计） |
+| 运行编排 | `agent/run/runtime.py` | `run` 编排与 `continue_run` 恢复状态机（原子抢占 / 异常分流 / replay 分派 / 补执行 / 终局分派） |
+| 场景协议 | `agent/run/scenario.py` | `ScenarioHooks`：场景差异点契约 |
+| 注册表 | `agent/run/registry.py` | `get_scenario(task_type)`：调度器等通用组件按 task_type 取得场景运行入口（纯机制，由装配层登记） |
 | 装配层 | `services/scenarios.py` | Composition Root：静态 import 场景工厂并 `wire_scenarios()` 登记进注册表 |
 | 场景实现 | `matching/llm_assist.py` | 匹配场景：工具注册 / seed 构建 / 条目校验 / 候选落库 / 通知 / 业务键 |
 
-## ScenarioHooks 协议（`agent/scenario.py`）
+## 代码地图（按执行顺序读）
+
+1. `agent/run/registry.py` —— 调度器如何取到场景入口（`ScenarioRuntime` 门面 + 注册表）；
+2. `agent/run/runtime.py` —— `run()`：原子抢占 → 场景 ctx/seed → 调 `run_loop` → 终局分派；
+3. `agent/loop.py` —— `run_loop()`：每轮 `_consume_stream` → 终局归一化 → 工具执行 / 预算注入 → 兜底收尾；
+4. `agent/chat_span.py` —— 每轮的聚合与落库契约（`async with` 单 finalize，`resp` 与落库同源）；
+5. `agent/observe/recorder.py` + `agent/observe/trace.py` —— span 落库与 `replay()` 重建；
+6. `agent/execution/tools.py` + `agent/execution/streaming.py` —— 工具注册与执行（分区并行 / 停点提前执行）；
+7. `agent/run/scenario.py` —— 场景契约（hooks / ctx 泛型 / terminal handler）。
+
+`agent/__init__.py` 的 docstring 里也放了同一份包地图。
+
+## ScenarioHooks 协议（`agent/run/scenario.py`）
 
 | 字段 | 说明 |
 | --- | --- |
@@ -127,7 +141,7 @@ resp = span.resp                          # __aexit__ 已完成唯一一次 fina
 
 1. 实现 `ScenarioHooks` 各钩子（工具注册 / 默认 `stream_fn` / 预算 / 终局，可选
    `veto_terminal` 软护栏）与 `ScenarioRuntime.new_ctx`（run 输入 → 场景 ctx）；
-2. 提供工厂 `get_scenario_runtime() -> ScenarioRuntime`（`agent/registry.py`
+2. 提供工厂 `get_scenario_runtime() -> ScenarioRuntime`（`agent/run/registry.py`
    中的类型）；
 3. 在**应用装配层** `app/services/scenarios.py::wire_scenarios()` 中**静态
    import** 该工厂并 `register_scenario(task_type, factory())`；
@@ -164,13 +178,16 @@ resp = span.resp                          # __aexit__ 已完成唯一一次 fina
 
 | 主题 | 位置 |
 | --- | --- |
-| 运行时 / 场景协议 / 注册表 | `app/services/agent/runtime.py`、`scenario.py`、`registry.py` |
-| 观测（chat span 契约 / tool span / seed / budget） | `app/services/agent/recorder.py`、`protocols.py`、`tests/services/agent/test_chat_span.py` |
+| 运行编排 / 场景协议 / 注册表 | `app/services/agent/run/runtime.py`、`run/scenario.py`、`run/registry.py` |
+| 观测（chat span 契约 / tool span / seed / budget） | `app/services/agent/observe/recorder.py`、`observe/trace.py`、`chat_span.py`、`protocols.py`、`tests/services/agent/test_chat_span.py` |
 | 匹配场景实现 | `app/services/matching/llm_assist.py` |
 | 场景测试 | `tests/services/matching/test_llm_assist.py` |
+| 工具执行 | `app/services/agent/execution/tools.py`、`execution/streaming.py` |
 | 调度器与守卫 | `app/services/llm_match_scheduler.py`、`tests/services/test_llm_match_scheduler.py` |
 | 待办（终局策略拆分等） | `remain/agent_phase3_deferred_design.md`（本地归档，不入库） |
 
 > 历史：`llm_assist.py` 曾混居通用状态机与匹配业务（1583 行）；commit `2cda3bb`
 > 将 `TraceRecorder` 迁入 `agent/recorder.py`，`5110e46` 抽取 `agent/runtime.py`
 > 与 `ScenarioHooks` 协议，场景层收缩为「匹配业务 + 运行入口工厂」。
+> （后续重组：`recorder.py`/`trace.py` 迁入 `agent/observe/`，`runtime.py`/`scenario.py`/
+> `registry.py` 迁入 `agent/run/`，`tools.py`/`streaming_tool_executor.py` 迁入 `agent/execution/`。）

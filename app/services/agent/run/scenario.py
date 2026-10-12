@@ -1,7 +1,7 @@
 """Agent 场景协议：通用运行时（runtime）与业务场景之间的契约。
 
 具体的 Agent 场景（如 LLM 匹配增强）通过 :class:`ScenarioHooks` 提供全部
-业务差异点；通用运行时（:mod:`app.services.agent.runtime`）只负责 run 编排
+业务差异点；通用运行时（:mod:`app.services.agent.run.runtime`）只负责 run 编排
 与恢复续跑状态机，并原样透传 ``ctx``（场景上下文，结构由场景自定义）。
 
 设计约束：
@@ -32,9 +32,9 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, Protocol, TypeVar
 
+from app.services.agent.execution.tools import ToolDefinition, ToolRegistry
 from app.services.agent.loop import RunResult
 from app.services.agent.protocols import StreamFn
-from app.services.agent.tools import ToolDefinition, ToolRegistry
 from app.services.llm.models import Message
 from app.services.notification_service import NotificationService
 

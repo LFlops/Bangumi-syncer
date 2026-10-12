@@ -33,7 +33,7 @@ from app.services.llm.models import (
 )
 
 if TYPE_CHECKING:  # 仅类型引用，避免 recorder ↔ chat_span 运行时环
-    from app.services.agent.recorder import TraceRecorder
+    from app.services.agent.observe.recorder import TraceRecorder
 
 
 class ChatSpan(Protocol):

@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from app.services.agent.registry import register_scenario
+from app.services.agent.run.registry import register_scenario
 from app.services.matching.llm_assist import get_scenario_runtime
 
 

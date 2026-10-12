@@ -19,8 +19,8 @@ from __future__ import annotations
 import asyncio
 
 from app.services.agent.chat_span import PlainChatSpan
+from app.services.agent.execution.tools import ToolError
 from app.services.agent.loop import RunResult, run_loop
-from app.services.agent.tools import ToolError
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -1564,7 +1564,7 @@ async def test_stream_exception_converges_early_tasks_and_propagates():
     """stream_fn 在幂等停点后抛异常 → 异常传播；提前任务被 finalize 收敛、无泄漏。"""
     import pytest
 
-    from app.services.agent.streaming_tool_executor import StreamingToolExecutor
+    from app.services.agent.execution.streaming import StreamingToolExecutor
 
     events: list = []
     created: list[StreamingToolExecutor] = []

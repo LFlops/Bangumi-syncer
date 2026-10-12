@@ -42,11 +42,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core.logging import logger
-from app.services.agent.protocols import StreamingExecutor, ToolSpanRecorder
-from app.services.agent.tools import (
+from app.services.agent.execution.tools import (
     _MAX_PARALLEL_TOOLS,
     serialize_tool_result,
 )
+from app.services.agent.protocols import StreamingExecutor, ToolSpanRecorder
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
 
 # 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。

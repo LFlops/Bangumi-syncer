@@ -23,8 +23,8 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.services.agent.streaming_tool_executor import StreamingToolExecutor
-from app.services.agent.tools import serialize_tool_result
+from app.services.agent.execution.streaming import StreamingToolExecutor
+from app.services.agent.execution.tools import serialize_tool_result
 from app.services.llm.models import (
     ChatResponse,
     Message,

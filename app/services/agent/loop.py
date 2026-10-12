@@ -11,7 +11,7 @@
   chat span（``recorder.chat_span()``，其 ``__aexit__`` 做**唯一**一次
   ``StreamAggregator.finalize()``；``recorder=None`` 时为 :class:`PlainChatSpan`
   纯聚合），同时喂
-  :class:`~app.services.agent.streaming_tool_executor.StreamingToolExecutor`。
+  :class:`~app.services.agent.execution.streaming.StreamingToolExecutor`。
   停点时序因协议而异：anthropic/responses **逐工具停点** → 幂等工具在参数停点
   （``tool_use_stop``）到达时**提前启动并与生成重叠**；openai_compat 在
   ``finish_reason`` **流末集中补发**停点 → 仍提前执行但**无重叠收益**；eval replay

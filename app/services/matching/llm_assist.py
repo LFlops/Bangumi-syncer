@@ -1,7 +1,7 @@
 """匹配场景服务：LLM 匹配增强（场景适配层）。
 
 职责（仅做场景接入；通用 Agent 运行时与恢复状态机见
-``app/services/agent/runtime.py``，场景契约见 ``app/services/agent/scenario.py``）：
+``app/services/agent/run/runtime.py``，场景契约见 ``app/services/agent/run/scenario.py``）：
 
 - ``register_match_tools``：注册匹配场景工具（4 个 read + 1 个 terminal）
 - ``build_seed_messages``：从 sync_records 还原请求上下文 + 候选摘要，注入
@@ -53,16 +53,16 @@ from app.services.agent.budget import (
     get_max_iterations,
     resolve_match_iterations_override,
 )
-from app.services.agent.loop import RunResult
-from app.services.agent.recorder import (
-    TraceRecorder as TraceRecorder,  # re-export（测试/兼容）
-)
-from app.services.agent.registry import ScenarioRuntime
-from app.services.agent.scenario import ScenarioHooks
-from app.services.agent.tools import (
+from app.services.agent.execution.tools import (
     ToolDefinition,
     ToolRegistry,
 )
+from app.services.agent.loop import RunResult
+from app.services.agent.observe.recorder import (
+    TraceRecorder as TraceRecorder,  # re-export（测试/兼容）
+)
+from app.services.agent.run.registry import ScenarioRuntime
+from app.services.agent.run.scenario import ScenarioHooks
 from app.services.llm.client import get_llm_client
 from app.services.llm.models import (
     Message,
@@ -589,7 +589,7 @@ def _build_default_stream_fn(thinking_level: str):
 
 # ---------------------------------------------------------------------------
 # 场景适配：匹配场景 ScenarioHooks + 运行入口工厂
-# （通用编排与恢复状态机见 app/services/agent/runtime.py）
+# （通用编排与恢复状态机见 app/services/agent/run/runtime.py）
 # ---------------------------------------------------------------------------
 
 
@@ -757,7 +757,7 @@ def make_match_ctx(sync_record: dict) -> _MatchContext:
 
 
 def get_scenario_runtime() -> ScenarioRuntime[_MatchContext]:
-    """场景运行入口工厂（供 ``app.services.agent.registry`` 惰性加载）。
+    """场景运行入口工厂（供 ``app.services.agent.run.registry`` 惰性加载）。
 
     通用层（调度器等）不直接依赖本模块；反向由本模块提供工厂，
     注册表按 ``task_type`` 惰性导入并调用本函数。

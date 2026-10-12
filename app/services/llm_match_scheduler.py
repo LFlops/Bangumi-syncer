@@ -49,7 +49,7 @@ from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.models.agent import AgentRunRecord
 from app.services.agent.budget import compute_match_run_timeout
-from app.services.agent.registry import get_scenario
+from app.services.agent.run.registry import get_scenario
 from app.services.base.scheduler import BaseScheduler
 from app.services.notification_service import get_notification_service
 

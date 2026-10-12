@@ -31,8 +31,8 @@ from pathlib import Path
 import pytest
 
 from app.services import scenarios as scenarios_module
-from app.services.agent import registry as registry_module
-from app.services.agent.registry import get_scenario
+from app.services.agent.run import registry as registry_module
+from app.services.agent.run.registry import get_scenario
 from app.services.matching import llm_assist
 
 
@@ -154,7 +154,7 @@ class TestStaticWiringGuard:
 
     def test_registry_module_has_no_importlib_or_provider_table(self):
         """注册表纯机制化：不得残留 importlib 与字符串提供者表。"""
-        tree = self._parse("app/services/agent/registry.py")
+        tree = self._parse("app/services/agent/run/registry.py")
 
         importlib_hits: list[str] = []
         provider_names: list[str] = []
@@ -194,19 +194,19 @@ class TestImportOrderGuard:
         # A: 装配层优先（触发其静态 import 链）
         "composition_root_first": (
             "import app.services.scenarios",
-            "import app.services.agent.registry",
+            "import app.services.agent.run.registry",
             "import app.services.matching.llm_assist",
         ),
         # B: 注册表优先
         "registry_first": (
-            "import app.services.agent.registry",
+            "import app.services.agent.run.registry",
             "import app.services.matching.llm_assist",
             "import app.services.scenarios",
         ),
         # C: 场景模块优先
         "scenario_first": (
             "import app.services.matching.llm_assist",
-            "import app.services.agent.registry",
+            "import app.services.agent.run.registry",
         ),
     }
 

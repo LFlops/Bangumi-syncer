@@ -14,7 +14,7 @@
 - **budget 钩子**：``record_budget`` 定位本轮最后 tool span（无则回退 chat span）。
 
 由场景层（如 ``app/services/matching/llm_assist``）在 run 编排中实例化；
-span 的读写细节由 :mod:`app.services.agent.trace` 承担。
+span 的读写细节由 :mod:`app.services.agent.observe.trace` 承担。
 """
 
 from __future__ import annotations
@@ -25,8 +25,8 @@ from datetime import datetime
 
 from app.core.logging import logger
 from app.services.agent.chat_span import ChatSpan, ChatSpanStart, RecorderChatSpan
+from app.services.agent.observe.trace import end_span, record_budget_message, start_span
 from app.services.agent.protocols import BudgetRecorder
-from app.services.agent.trace import end_span, record_budget_message, start_span
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 
 

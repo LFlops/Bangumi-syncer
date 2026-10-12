@@ -18,8 +18,8 @@ import typing
 from typing import Any
 
 from app.services.agent import loop as loop_mod
+from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.loop import run_loop
-from app.services.agent.streaming_tool_executor import StreamingToolExecutor
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
 
 _TERMINAL = "submit_suggestion"

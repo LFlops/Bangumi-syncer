@@ -105,7 +105,7 @@ def test_agent_history_assistant_messages_always_carry_tool_calls():
         ]
 
     # trace.py：append assistant 显式位于 ``if tool_calls:`` 守卫内。
-    trace_src = Path("app/services/agent/trace.py").read_text(encoding="utf-8")
+    trace_src = Path("app/services/agent/observe/trace.py").read_text(encoding="utf-8")
     trace_tree = ast.parse(trace_src)
     guarded_lines: set[int] = set()
     for node in ast.walk(trace_tree):
