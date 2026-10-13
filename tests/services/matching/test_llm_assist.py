@@ -4036,7 +4036,7 @@ def test_replay_missing_unnamed_tool_logs_info(log_records):
     assert messages == []
 
 
-def test_replay_missing_read_tool_failure_logs_warning(log_records):
+def test_replay_missing_read_tool_failure_logs_warning(caplog):
     """只读工具补执行失败（异常被吞并回填错误块）：记 warning。"""
 
     def _boom(args):
@@ -4069,9 +4069,10 @@ def test_replay_missing_read_tool_failure_logs_warning(log_records):
 
     blk = _last_tool_result(messages)
     assert blk is not None and blk.is_error is True
-    warns = [line for level, line in log_records if level == "WARNING"]
-    assert any("补执行工具 read_boom 失败" in line for line in warns), (
-        f"补执行失败应记 warning，实际 {warns}"
+    # 失败 warning 由唯一执行入口（run_tool）统一产出；tools.py 用 stdlib logging
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("read_boom" in m and "执行失败" in m for m in messages), (
+        f"补执行失败应记 warning，实际 {messages}"
     )
 
 
@@ -5411,3 +5412,52 @@ class TestSubjectIdCoercionDefense:
         result = self._handler("get_subject_detail")({"subject_id": "123"})
         assert result["name"] == "subject-123"
         assert result["name_cn"] == "条目-123"
+
+
+def test_replay_missing_read_tool_capture_falls_back_to_placeholder(
+    log_records, monkeypatch
+):
+    """补执行遇 capture（read 门控失效）：warning + 占位，不重放副作用。"""
+    from app.services.agent.protocols import TerminalCapture
+
+    def _boom(args):
+        raise AssertionError("capture 路径不得执行 handler")
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="read_cap",
+            description="d",
+            parameters={},
+            handler=_boom,
+            access="read",
+        )
+    )
+
+    async def _fake_run_tool(tool_use, *, recorder=None, sequence=0):
+        return TerminalCapture(name=tool_use.name, args=tool_use.input)
+
+    monkeypatch.setattr(registry, "run_tool", _fake_run_tool)
+    messages = [
+        Message(
+            role="assistant",
+            content=[ToolUseBlock(id="c1", name="read_cap", input={})],
+        )
+    ]
+
+    asyncio.run(
+        runtime._replay_missing_tool(
+            ReplayToolCall(id="c1", name="read_cap", input={}),
+            registry,
+            messages,
+        )
+    )
+
+    blk = _last_tool_result(messages)
+    assert blk is not None
+    assert blk.content == _SKIP_PLACEHOLDER, (
+        f"capture 应回填占位（不重放副作用），实际 {blk.content!r}"
+    )
+    assert blk.is_error is False
+    warns = [line for level, line in log_records if level == "WARNING"]
+    assert any("终止工具" in line and "read_cap" in line for line in warns), warns

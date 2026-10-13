@@ -25,6 +25,7 @@ from typing import Any
 
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.execution.tools import serialize_tool_result
+from app.services.agent.protocols import TerminalCapture
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -154,43 +155,38 @@ def scripted_stream(responses: list[ChatResponse]) -> ScriptedStream:
     return ScriptedStream(responses=list(responses))
 
 
-class _ScriptedExecutor(StreamingToolExecutor):
-    """``scripted_executor`` 使用的执行器：支持 handler 返回 ``ToolResultBlock``。
+def raw_handler_runner(handler: Callable[[ToolUseBlock], Any]):
+    """把「原始值 handler」适配为 ``run_tool`` 契约（**仅测试**）。
 
-    生产 ``execute_fn`` 契约只返回**原始值**（由执行器 ``serialize_tool_result`` 包装）；
-    测试脚本常需精确控制结果内容与 ``is_error``，故这里对 ``ToolResultBlock`` 返回值
-    直接采用；其余返回值与异常包装语义与生产执行器完全一致。
+    生产归一化在 ``ToolRegistry.run_tool``（唯一执行入口）；本适配器供测试脚本
+    注入任意 handler（同步或 awaitable），语义与生产一致：
+
+    - 原始值 → ``serialize_tool_result`` 包装为成功块
+    - ``ToolResultBlock`` / ``TerminalCapture`` → 直传（精确控制内容/is_error/捕获）
+    - 异常 → ``is_error`` 块（文案与 ``run_tool`` 相同）
     """
 
-    async def _exec_single(self, st: Any, *, record_span: bool) -> ToolResultBlock:
-        tool_use = ToolUseBlock(id=st.tool_use_id, name=st.name, input=st.args or {})
-        recorder = self._on_recorder
-        span_id: str | None = None
-        if record_span and recorder is not None:
-            span_id = recorder.start_tool(tool_use, sequence=st.seq)
-        result: ToolResultBlock
-        error_name = ""
-        try:
-            raw = await self._execute_fn(tool_use)
-            if isinstance(raw, ToolResultBlock):
-                result = raw
-            else:
-                result = ToolResultBlock(
-                    tool_use_id=st.tool_use_id,
-                    content=serialize_tool_result(raw),
-                    is_error=False,
+    class _RawHandlerRunner:
+        async def run_tool(self, tool_use, *, recorder=None, sequence=0):
+            try:
+                result = handler(tool_use)
+                if inspect.isawaitable(result):
+                    result = await result
+            except Exception as exc:  # 与 run_tool 同文案
+                return ToolResultBlock(
+                    tool_use_id=tool_use.id,
+                    content=f"工具执行失败: {type(exc).__name__}",
+                    is_error=True,
                 )
-        except Exception as e:  # 与生产执行器一致：handler 异常统一转错误块
-            error_name = type(e).__name__
-            result = ToolResultBlock(
-                tool_use_id=st.tool_use_id,
-                content=f"工具执行失败: {error_name}",
-                is_error=True,
+            if isinstance(result, (ToolResultBlock, TerminalCapture)):
+                return result
+            return ToolResultBlock(
+                tool_use_id=tool_use.id,
+                content=serialize_tool_result(result),
+                is_error=False,
             )
-        finally:
-            if recorder is not None and span_id is not None:
-                recorder.end_tool(span_id, result=result, error=error_name)
-        return result
+
+    return _RawHandlerRunner()
 
 
 def scripted_executor(
@@ -210,15 +206,9 @@ def scripted_executor(
     idempotent = is_idempotent or (lambda name: name.startswith("read"))
     terminal = is_terminal or (lambda name: name == "submit_suggestion")
 
-    async def execute_fn(tool_use: ToolUseBlock) -> Any:
-        result = handler(tool_use)
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
     def factory() -> StreamingToolExecutor:
-        return _ScriptedExecutor(
-            execute_fn=execute_fn,
+        return StreamingToolExecutor(
+            run_tool=raw_handler_runner(handler),
             is_idempotent=idempotent,
             is_terminal=terminal,
         )

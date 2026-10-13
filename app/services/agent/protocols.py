@@ -8,7 +8,8 @@
   例：``chat_span.ChatSpan`` 与其两种实现同处 :mod:`app.services.agent.chat_span`。
 
 本文件现有：:data:`StreamFn`（LLM 调用边界）、:class:`ToolSchema` / :data:`ToolAccess`
-（工具 schema 内部形态 + wire 出口）、:class:`StreamingExecutor`、:class:`ToolSpanRecorder`、
+（工具 schema 内部形态 + wire 出口）、:class:`TerminalCapture`、
+:class:`StreamingExecutor`、:class:`ToolSpanRecorder`、:class:`ToolRunner`、
 :class:`BudgetRecorder`——被 ``loop`` / ``execution`` / ``streaming_tool_executor`` /
 ``runtime`` 多层消费，实现方分散在各自模块，故留中立层。
 
@@ -68,6 +69,22 @@ class ToolSchema:
 
 
 # ---------------------------------------------------------------------------
+# 工具执行结果类型（agent 内部契约）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class TerminalCapture:
+    """终止性工具（access=terminal）的捕获结果：**正常结束**语义。
+
+    仅记录参数、不执行 handler（无副作用）；由循环收到即终止（终止工具优先）。
+    """
+
+    name: str
+    args: dict
+
+
+# ---------------------------------------------------------------------------
 # 流式工具执行器
 # ---------------------------------------------------------------------------
 
@@ -77,11 +94,14 @@ class StreamingExecutor(Protocol):
 
     本地声明（不 import 具体 ``StreamingToolExecutor``），保持通用骨架对执行器实现的
     运行时解耦；返回值需实现 ``feed`` / ``finalize``。
+
+    ``finalize`` 的槽位元素为 ``ToolResultBlock | TerminalCapture``（后者为终止工具的
+    **正常捕获**，由终止层消费）。
     """
 
     def feed(self, chunk: StreamChunk) -> None: ...
 
-    async def finalize(self) -> list[ToolResultBlock]: ...
+    async def finalize(self) -> list[ToolResultBlock | TerminalCapture]: ...
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +135,25 @@ class ToolSpanRecorder(Protocol):
         - ``result=ToolResultBlock``：正常结果（含 is_error 的占位块）
         - ``result=None 且 error=""``：terminal 捕获等非结果路径
         """
+
+
+class ToolRunner(Protocol):
+    """工具执行入口协议（**唯一**）：调用方不得绕过它直调 ``execute``。
+
+    三分类结果（包装 / span / 错误文本单点收口）：
+
+    - 成功 → ``ToolResultBlock``（内容为 JSON 序列化结果）
+    - 异常（ToolError / handler 异常 / 超时）→ ``ToolResultBlock(is_error=True)``，**不上抛**
+    - terminal → :class:`TerminalCapture`（**正常结束**：捕获参数、不执行 handler、无副作用）
+    """
+
+    async def run_tool(
+        self,
+        tool_use: ToolUseBlock,
+        *,
+        recorder: ToolSpanRecorder | None = None,
+        sequence: int = 0,
+    ) -> ToolResultBlock | TerminalCapture: ...
 
 
 class BudgetRecorder(ToolSpanRecorder, Protocol):

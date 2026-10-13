@@ -200,3 +200,50 @@ def test_chat_span_implementations_explicitly_inherit_protocol():
     produced = TraceRecorder("guard-run", start_iteration=0).chat_span()
     assert ChatSpan in type(produced).__mro__
     assert ChatSpan in PlainChatSpan.__mro__
+
+
+# ---------------------------------------------------------------------------
+# 6. 工具执行入口唯一化（ToolRunner.run_tool）
+# ---------------------------------------------------------------------------
+
+
+def test_tool_runner_protocol_defined_in_protocols_module():
+    """ToolRunner 协议在 protocols.py 定义（loop / executor / registry 共用契约）。"""
+    assert "ToolRunner" in _defined_class_names("protocols.py")
+
+
+def test_tool_registry_explicitly_implements_runner_protocol():
+    """ToolRegistry 显式继承 ToolRunner（nominal；唯一执行入口由类型兜住）。"""
+    assert _class_bases("execution/tools.py", "ToolRegistry") == ["ToolRunner"]
+
+    from app.services.agent.execution.tools import ToolRegistry
+    from app.services.agent.protocols import ToolRunner
+
+    assert ToolRunner in ToolRegistry.__mro__
+
+
+def test_production_calls_execute_only_inside_run_tool():
+    """生产代码不得绕过唯一执行入口：agent 层仅 run_tool 内部可直调 ``execute()``。"""
+    offenders: list[str] = []
+    for path in sorted(_AGENT_DIR.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for func in ast.walk(tree):
+            if not isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for sub in ast.walk(func):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "execute"
+                ):
+                    in_run_tool = (
+                        path.name == "tools.py"
+                        and path.parent.name == "execution"
+                        and func.name == "run_tool"
+                    )
+                    if not in_run_tool:
+                        offenders.append(f"{path}:{sub.lineno} in {func.name}()")
+    assert offenders == [], (
+        "仅 run_tool 内部可直调 execute()（其余应经 ToolRunner.run_tool）：\n"
+        + "\n".join(offenders)
+    )

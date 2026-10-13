@@ -28,6 +28,7 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
+from tests.services.agent.stream_script import raw_handler_runner
 
 
 def _blocks(message: Message) -> list:
@@ -215,7 +216,7 @@ def _executor_factory(recorder, tools_fn):
 
     def factory():
         return StreamingToolExecutor(
-            execute_fn=lambda tool_use: tools_fn([tool_use]),
+            run_tool=raw_handler_runner(lambda tool_use: tools_fn([tool_use])),
             is_idempotent=lambda name: False,
             is_terminal=lambda name: name == "submit_suggestion",
             on_recorder=recorder,

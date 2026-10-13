@@ -20,6 +20,7 @@ import pytest
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.execution.tools import ToolError
 from app.services.llm.models import StreamChunk, ToolResultBlock
+from tests.services.agent.stream_script import raw_handler_runner
 
 
 @pytest.fixture
@@ -72,8 +73,9 @@ def _make_executor(**overrides):
     async def default_execute(tool_use):
         return {"echo": tool_use.name, "input": tool_use.input}
 
+    execute_fn = overrides.pop("execute_fn", default_execute)
     kwargs: dict[str, Any] = {
-        "execute_fn": default_execute,
+        "run_tool": raw_handler_runner(execute_fn),
         "is_idempotent": lambda name: name.startswith("read"),
         "is_terminal": lambda name: name == "submit_suggestion",
     }
@@ -549,3 +551,50 @@ async def test_batch_results_ordered_contract_preferred_over_get():
     results = await ex.finalize()
 
     assert [r.content for r in results] == ["ordered"]
+
+
+# ---------------------------------------------------------------------------
+# 8. capture 的显式处理（Option ②：执行层正常返回 capture，绝不序列化成字符串）
+# ---------------------------------------------------------------------------
+
+
+async def test_capture_is_preserved_not_serialized():
+    """提前执行返回 capture：原样保留（不得 str 化塞进 tool_result 内容）。"""
+    from app.services.agent.protocols import TerminalCapture
+
+    async def capture_fn(tool_use):
+        return TerminalCapture(name=tool_use.name, args=tool_use.input)
+
+    ex = _make_executor(execute_fn=capture_fn)
+    ex.feed(_start("a", "read_a"))
+    ex.feed(_delta("a", '{"x": 1}'))
+    ex.feed(_stop("a"))
+
+    results = await ex.finalize()
+
+    assert len(results) == 1
+    assert isinstance(results[0], TerminalCapture), (
+        f"capture 应原样保留，实际 {type(results[0]).__name__}: {results[0]!r}"
+    )
+    assert results[0].args == {"x": 1}
+
+
+async def test_batch_capture_not_dropped_to_placeholder():
+    """batch 结果含 capture：不得被 isinstance(ToolResultBlock) 过滤成占位块。"""
+    from app.services.agent.protocols import TerminalCapture
+
+    async def batch_execute_fn(tool_calls):
+        return _BatchResults(
+            [(tc.id, TerminalCapture(name=tc.name, args=tc.input)) for tc in tool_calls]
+        )
+
+    ex = _make_executor(batch_execute_fn=batch_execute_fn)
+    ex.feed(_start("b", "write_b"))  # 非幂等 → 延迟执行（batch 路径）
+    ex.feed(_delta("b", "{}"))
+
+    results = await ex.finalize()
+
+    assert len(results) == 1
+    assert isinstance(results[0], TerminalCapture), (
+        f"batch 的 capture 不应被丢弃成占位块，实际 {results[0]!r}"
+    )

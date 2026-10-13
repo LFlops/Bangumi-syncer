@@ -21,7 +21,8 @@
 
 依赖注入（不耦合具体 ``ToolRegistry`` 内部）：
 
-- ``execute_fn``：``tool_use: ToolUseBlock -> Awaitable[Any]``，单工具执行（返回原始结果），
+- ``run_tool``：唯一执行入口（``ToolRunner`` 协议），单工具执行返回
+  ``ToolResultBlock | TerminalCapture``（包装/span/错误文本由入口收口），
   异常自行抛出，由本组件统一包装为 ``ToolResultBlock(is_error=True)``。
 - ``is_idempotent`` / ``is_terminal``：``name -> bool``，用于调度决策。
 - ``on_recorder``：可选 :class:`~app.services.agent.protocols.ToolSpanRecorder`，
@@ -44,9 +45,13 @@ from typing import Any
 from app.core.logging import logger
 from app.services.agent.execution.tools import (
     _MAX_PARALLEL_TOOLS,
-    serialize_tool_result,
 )
-from app.services.agent.protocols import StreamingExecutor, ToolSpanRecorder
+from app.services.agent.protocols import (
+    StreamingExecutor,
+    TerminalCapture,
+    ToolRunner,
+    ToolSpanRecorder,
+)
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
 
 # 未执行工具的占位错误块（terminal 轮的非终止工具、或异常缺失结果）。
@@ -66,7 +71,7 @@ class _ToolState:
     parse_ok: bool = False
     stop_seen: bool = False
     task: asyncio.Task | None = None
-    result: ToolResultBlock | None = None
+    result: ToolResultBlock | TerminalCapture | None = None
 
 
 class StreamingToolExecutor(StreamingExecutor):
@@ -75,14 +80,14 @@ class StreamingToolExecutor(StreamingExecutor):
     def __init__(
         self,
         *,
-        execute_fn: Callable[[ToolUseBlock], Awaitable[Any]],
+        run_tool: ToolRunner,
         is_idempotent: Callable[[str], bool],
         is_terminal: Callable[[str], bool],
         on_recorder: ToolSpanRecorder | None = None,
         batch_execute_fn: Callable[[list[ToolUseBlock]], Awaitable[Any]] | None = None,
         max_parallel: int = _MAX_PARALLEL_TOOLS,
     ) -> None:
-        self._execute_fn = execute_fn
+        self._run_tool = run_tool
         self._is_idempotent = is_idempotent
         self._is_terminal = is_terminal
         self._on_recorder = on_recorder
@@ -191,40 +196,27 @@ class StreamingToolExecutor(StreamingExecutor):
         同一上限），避免停点密集时无界并发打爆下游。
         """
         async with self._sem:
-            st.result = await self._exec_single(st, record_span=True)
+            st.result = await self._exec_single(st)
 
-    async def _exec_single(
-        self, st: _ToolState, *, record_span: bool
-    ) -> ToolResultBlock:
+    async def _exec_single(self, st: _ToolState) -> ToolResultBlock | TerminalCapture:
+        """单条执行（薄委托）：包装 / span / 错误文本统一由 ``run_tool`` 收口。
+
+        显式处理 capture（Option ②）：终止工具被**正常捕获**时，置位终止语义并
+        原样保留结果（绝不序列化成字符串塞进 tool_result）。
+        """
         tool_use = ToolUseBlock(id=st.tool_use_id, name=st.name, input=st.args or {})
-        recorder = self._on_recorder
-        span_id: str | None = None
-        if record_span and recorder is not None:
-            span_id = recorder.start_tool(tool_use, sequence=st.seq)
-        result: ToolResultBlock | None = None
-        error_name = ""
-        try:
-            raw = await self._execute_fn(tool_use)
-            result = ToolResultBlock(
-                tool_use_id=st.tool_use_id,
-                content=serialize_tool_result(raw),
-                is_error=False,
-            )
-        except Exception as e:  # ToolError / handler 异常 / 超时 统一转为错误块
-            error_name = type(e).__name__
-            result = ToolResultBlock(
-                tool_use_id=st.tool_use_id,
-                content=f"工具执行失败: {error_name}",
-                is_error=True,
-            )
-        finally:
-            if recorder is not None and span_id is not None:
-                recorder.end_tool(span_id, result=result, error=error_name)
-        return result
+        outcome = await self._run_tool.run_tool(
+            tool_use,
+            recorder=self._on_recorder,
+            sequence=st.seq,
+        )
+        if isinstance(outcome, TerminalCapture):
+            self._terminal_seen = True
+        return outcome
 
     # -- 收尾：await 提前任务 + 延迟执行 + 保序对齐 --------------------------
 
-    async def finalize(self) -> list[ToolResultBlock]:
+    async def finalize(self) -> list[ToolResultBlock | TerminalCapture]:
         """流结束后收尾，返回按 tool_use 首次出现顺序对齐的完整结果列表。"""
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -285,12 +277,12 @@ class StreamingToolExecutor(StreamingExecutor):
             return
         # 无批量执行器注入：串行兜底（保序）
         for st in states:
-            st.result = await self._exec_single(st, record_span=True)
+            st.result = await self._exec_single(st)
 
     @staticmethod
     def _index_batch_results(
         results: Any, states: list[_ToolState]
-    ) -> dict[str, ToolResultBlock]:
+    ) -> dict[str, ToolResultBlock | TerminalCapture]:
         """把 ``execute_batch`` 返回值按 tool_use_id 建索引。
 
         参数刻意用 ``Any``：这是**非契约注入的鸭子边界**（注入方可能传 ``BatchResults``、
@@ -303,11 +295,11 @@ class StreamingToolExecutor(StreamingExecutor):
         逐槽拉取（``isinstance`` 校验）——避免静默丢失全部 deferred 结果。
         两者都不可用时返回已索引结果并告警（可观测，不静默）。
         """
-        out: dict[str, ToolResultBlock] = {}
+        out: dict[str, ToolResultBlock | TerminalCapture] = {}
         ordered = getattr(results, "ordered", None)
         if isinstance(ordered, list):
             for oid, item in ordered:
-                if isinstance(item, ToolResultBlock):
+                if isinstance(item, (ToolResultBlock, TerminalCapture)):
                     out.setdefault(oid, item)
             if out:
                 return out
@@ -326,11 +318,11 @@ class StreamingToolExecutor(StreamingExecutor):
             )
         for st in states:
             item = getter(st.tool_use_id)
-            if isinstance(item, ToolResultBlock):
+            if isinstance(item, (ToolResultBlock, TerminalCapture)):
                 out.setdefault(st.tool_use_id, item)
         return out
 
-    def _result_for(self, tid: str) -> ToolResultBlock:
+    def _result_for(self, tid: str) -> ToolResultBlock | TerminalCapture:
         st = self._states[tid]
         if st.result is not None:
             return st.result

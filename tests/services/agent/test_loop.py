@@ -30,7 +30,11 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from tests.services.agent.stream_script import scripted_executor, scripted_stream
+from tests.services.agent.stream_script import (
+    raw_handler_runner,
+    scripted_executor,
+    scripted_stream,
+)
 
 # ---------------------------------------------------------------------------
 # 测试辅助
@@ -1590,7 +1594,7 @@ async def test_stream_exception_converges_early_tasks_and_propagates():
 
     def factory():
         ex = _SpyExecutor(
-            execute_fn=execute_fn,
+            run_tool=raw_handler_runner(execute_fn),
             is_idempotent=lambda name: name.startswith("read"),
             is_terminal=lambda name: name == "submit_suggestion",
         )
@@ -1783,3 +1787,36 @@ async def test_run_does_not_mutate_caller_seed_list():
     assert result.stop_reason == "end_turn"
     # 调用方 list 长度不变（内部快照隔离）
     assert len(seed) == original_len
+
+
+async def test_terminal_branch_prefers_executor_capture_args():
+    """终止分支：执行器产出的 capture 优先作为 RunResult 载荷（无 capture 时才回退参数）。"""
+    from app.services.agent.protocols import TerminalCapture
+
+    class _CaptureExecutor:
+        def feed(self, chunk):  # noqa: ANN001 - 测试替身
+            pass
+
+        async def finalize(self):
+            return [
+                TerminalCapture(name="submit_suggestion", args={"subject_id": "42"})
+            ]
+
+    terminal = _resp(
+        "tool_use", [_tool_use("s", "submit_suggestion", {"subject_id": "1"})]
+    )
+    stream = scripted_stream([terminal])
+
+    result = await run_loop(
+        stream_fn=stream,
+        executor_factory=lambda: _CaptureExecutor(),
+        tools_schemas=[_schema("submit_suggestion", access="terminal")],
+        max_iterations=2,
+        tool_choice_terminal="submit_suggestion",
+        seed_messages=_seed(),
+    )
+
+    assert result.stop_reason == "submit_suggestion"
+    assert result.suggestion == {"subject_id": "42"}, (
+        "存在 capture 时应以 capture.args 为准（消除「产而不用」）"
+    )

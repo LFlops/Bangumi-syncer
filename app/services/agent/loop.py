@@ -46,6 +46,7 @@ from app.services.agent.protocols import (
     BudgetRecorder,
     StreamFn,
     StreamingExecutor,
+    TerminalCapture,
     ToolSchema,
 )
 from app.services.llm.models import (
@@ -190,7 +191,8 @@ def _extract_tool_calls(resp: ChatResponse) -> list[ToolUseBlock]:
 
 
 def _pad_aligned(
-    tool_calls: list[ToolUseBlock], aligned: Sequence[ToolResultBlock | None]
+    tool_calls: list[ToolUseBlock],
+    aligned: Sequence[ToolResultBlock | TerminalCapture | None],
 ) -> list[ToolResultBlock | None]:
     """把执行器结果槽位补齐到与 ``tool_calls`` 等长，闭合会话协议。
 
@@ -416,18 +418,25 @@ async def run_loop(
                 break
         if terminal_tc is not None:
             # 收尾以 await 提前任务（terminal 抑制已保证不再启动新任务、且本轮
-            # 非终止工具不执行）；结果在终止分支被忽略。
+            # 非终止工具不执行）；执行层**正常捕获**的 capture 在此消费（Option ②：
+            # capture 的唯一消费者 = 终止层），无 capture 时回退 tool_call 参数。
+            captures: list[TerminalCapture] = []
             if executor is not None:
-                await executor.finalize()
+                captures = [
+                    r
+                    for r in await executor.finalize()
+                    if isinstance(r, TerminalCapture)
+                ]
+            suggestion = captures[0].args if captures else (terminal_tc.input or {})
             # 软护栏（veto）：非末轮 + 本 run 尚未拦过时，先询问一次场景回调。
             # 末轮强收尾优先（remaining==1 不拦）；只拦一次避免无限暂缓。
             hint = ""
             if veto_terminal is not None and remaining > 1 and not vetoed:
-                hint = veto_terminal(terminal_tc.input or {}) or ""
+                hint = veto_terminal(suggestion) or ""
             if not hint:
                 return RunResult(
                     stop_reason="submit_suggestion",
-                    suggestion=terminal_tc.input,
+                    suggestion=suggestion,
                     last_response=resp,
                 )
             # 暂缓：不终止、不执行其他工具；为同轮**全部** tool_use 注入配对
@@ -441,9 +450,15 @@ async def run_loop(
         # ⑤ 执行本轮工具：finalize 保序返回与 tool_calls 对齐的 ToolResultBlock 列表。
         # aligned 元素类型含 None（_pad_aligned 补齐结果的联合类型），故用联合元素类型；
         # 用 Sequence 承接不同分支的具体列表（list 不变性下无法统一到同一 list 注解）。
-        aligned: Sequence[ToolResultBlock | None]
+        aligned: Sequence[ToolResultBlock | TerminalCapture | None]
         if executor is not None:
-            aligned = await executor.finalize()
+            finalized = await executor.finalize()
+            if any(isinstance(r, TerminalCapture) for r in finalized):
+                # 防御：终止判定在前，非终止轮不应出现 capture
+                logger.warning(
+                    "loop 非终止轮收到终止捕获（capture），已忽略（终止判定应先于工具执行）"
+                )
+            aligned = list(finalized)
             if len(aligned) != len(tool_calls):
                 # 防御：执行器结果槽位数与 tool_calls 不一致（协议破坏）→ 补齐，
                 # 保证每条 tool_use 都有配对 tool_result（否则 zip 截断留下悬垂 tool_use）

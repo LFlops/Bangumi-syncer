@@ -21,6 +21,7 @@ from app.services.agent import loop
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.loop import run_loop
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
+from tests.services.agent.stream_script import raw_handler_runner
 
 _TERMINAL = "submit_suggestion"
 _LOOKUP = "lookup_subject"
@@ -42,7 +43,7 @@ def _make_executor() -> StreamingToolExecutor:
         return {"echo": tool_use.input}
 
     return StreamingToolExecutor(
-        execute_fn=_execute,
+        run_tool=raw_handler_runner(_execute),
         is_idempotent=lambda _name: True,
         is_terminal=lambda name: name == _TERMINAL,
     )

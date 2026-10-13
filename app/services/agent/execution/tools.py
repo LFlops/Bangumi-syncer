@@ -17,7 +17,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from app.services.agent.protocols import ToolAccess, ToolSchema, ToolSpanRecorder
+from app.services.agent.protocols import (
+    TerminalCapture,
+    ToolAccess,
+    ToolRunner,
+    ToolSchema,
+    ToolSpanRecorder,
+)
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
 logger = logging.getLogger(__name__)
@@ -57,17 +63,6 @@ def serialize_tool_result(result: Any) -> str:
             type(result).__name__,
         )
         return str(result)
-
-
-@dataclass
-class TerminalCapture:
-    """终止性工具（access=terminal）的捕获结果：仅记录参数，不执行 handler。
-
-    由循环收到即 break（终止工具优先）。
-    """
-
-    name: str
-    args: dict
 
 
 @dataclass
@@ -136,7 +131,7 @@ class BatchResults(UserDict[str, ToolResultBlock]):
         super().__setitem__(key, item)
 
 
-class ToolRegistry:
+class ToolRegistry(ToolRunner):
     """工具注册表与执行器。"""
 
     def __init__(self) -> None:
@@ -227,7 +222,10 @@ class ToolRegistry:
         - 未注册 → 抛 ToolError
         - JSON Schema 校验失败 → 抛 ToolError（不调 handler）
         - write 级：执行前记录审计日志
-        - terminal 级：不执行 handler，返回 ``TerminalCapture``
+        - terminal 级：不执行 handler，返回 ``TerminalCapture``（**正常结束**语义）
+
+        注意：生产调用方应经 :meth:`run_tool`（唯一执行入口）——它负责结果包装、
+        span 与错误文本收口；本方法是底层实现（测试可直接调用）。
         - read 级：以 ``asyncio.wait_for`` 包裹 handler（默认 30s 超时，超时抛 ToolError）
         """
         defn = self._tools.get(name)
@@ -260,6 +258,53 @@ class ToolRegistry:
 
     # -- 批量分段并行执行 ---------------------------------------------------
 
+    async def run_tool(
+        self,
+        tool_use: ToolUseBlock,
+        *,
+        recorder: ToolSpanRecorder | None = None,
+        sequence: int = 0,
+    ) -> ToolResultBlock | TerminalCapture:
+        """统一工具执行入口（**唯一**；三分类结果 + span + 错误文本单点收口）。
+
+        - 成功 → ``ToolResultBlock``（内容为 ``serialize_tool_result`` 结果）
+        - 异常（ToolError / handler 异常 / 超时）→ ``ToolResultBlock(is_error=True)``，
+          **不上抛**，并记 warning（工具名 + 异常信息）
+        - terminal → ``TerminalCapture``（正常结束：捕获参数、不执行 handler）
+
+        span：注入 ``recorder`` 时在调用前 ``start_tool``、完成后 ``end_tool``（必达）；
+        terminal 捕获不作为 tool_result 落 span（``result=None, error=""``）。
+        """
+        span_id: str | None = None
+        if recorder is not None:
+            span_id = recorder.start_tool(tool_use, sequence=sequence)
+        outcome: ToolResultBlock | TerminalCapture
+        error_name = ""
+        result_for_span: ToolResultBlock | None = None
+        try:
+            raw = await self.execute(tool_use.name, tool_use.input)
+            if isinstance(raw, TerminalCapture):
+                outcome = raw
+            else:
+                outcome = ToolResultBlock(
+                    tool_use_id=tool_use.id,
+                    content=serialize_tool_result(raw),
+                    is_error=False,
+                )
+                result_for_span = outcome
+        except Exception as exc:  # ToolError / handler 异常 / 超时 统一转为错误块
+            error_name = type(exc).__name__
+            logger.warning("工具 %s 执行失败: %s", tool_use.name, exc)
+            outcome = ToolResultBlock(
+                tool_use_id=tool_use.id,
+                content=f"工具执行失败: {error_name}",
+                is_error=True,
+            )
+        finally:
+            if recorder is not None and span_id is not None:
+                recorder.end_tool(span_id, result=result_for_span, error=error_name)
+        return outcome
+
     async def execute_batch(
         self,
         tool_calls: list[ToolUseBlock],
@@ -274,7 +319,7 @@ class ToolRegistry:
           同时兼容 ``{tool_use_id: result}`` 的 dict 视图（按 id 取首个结果）：
            - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
            - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
-           - terminal → ``TerminalCapture``（不执行 handler，供循环 break）
+           - terminal → ``TerminalCapture``（正常结束：不执行 handler，供终止层消费）
            - 重复 ``tool_use_id``：仅执行第一个，**首个槽位保留真实结果**，第二及以后的
              槽位为 ``ToolResultBlock(is_error=True, content="duplicate tool_use_id")``
              （独立槽位避免 dup 错误块覆盖首个真实结果）
@@ -372,39 +417,6 @@ class ToolRegistry:
         *,
         recorder: ToolSpanRecorder | None = None,
         sequence: int = 0,
-    ) -> Any:
-        """执行单条并统一包装为 ToolResultBlock / TerminalCapture。
-
-        包裹层职责：在 await 执行前 ``start_tool``、完成后 ``finally`` 中 ``end_tool``
-        （必达）。保持现有异常语义不变：异常被吞掉转为错误块（不上抛）；
-        ``end_tool`` 的 ``error`` 参数携带异常类型名，``result`` 置 None。
-        """
-        span_id: str | None = None
-        if recorder is not None:
-            span_id = recorder.start_tool(tc, sequence=sequence)
-        result_for_recorder: ToolResultBlock | None = None
-        error_for_recorder: str = ""
-        try:
-            result = await self.execute(tc.name, tc.input)
-            if isinstance(result, TerminalCapture):
-                return result
-            result_for_recorder = ToolResultBlock(
-                tool_use_id=tc.id,
-                content=serialize_tool_result(result),
-                is_error=False,
-            )
-            return result_for_recorder
-        except Exception as exc:  # ToolError / handler 异常 / 超时 统一转为错误块
-            error_for_recorder = type(exc).__name__
-            return ToolResultBlock(
-                tool_use_id=tc.id,
-                content=f"工具执行失败: {type(exc).__name__}",
-                is_error=True,
-            )
-        finally:
-            if recorder is not None and span_id is not None:
-                recorder.end_tool(
-                    span_id,
-                    result=result_for_recorder,
-                    error=error_for_recorder,
-                )
+    ) -> ToolResultBlock | TerminalCapture:
+        """执行单条（薄委托：包装/span/错误文本统一由 :meth:`run_tool` 收口）。"""
+        return await self.run_tool(tc, recorder=recorder, sequence=sequence)

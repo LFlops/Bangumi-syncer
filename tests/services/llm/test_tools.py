@@ -14,12 +14,12 @@ import logging
 import pytest
 
 from app.services.agent.execution.tools import (
-    TerminalCapture,
     ToolDefinition,
     ToolError,
     ToolRegistry,
     serialize_tool_result,
 )
+from app.services.agent.protocols import TerminalCapture
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
 
@@ -1418,3 +1418,121 @@ async def test_execute_batch_under_cap_still_parallel():
 
     assert max_active == 5
     assert all(not results[c.id].is_error for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# run_tool：唯一执行入口（成功 / 异常 / terminal 捕获 三分类）
+# BDD：包装（序列化/错误块）、span、warning 单点收口
+# ---------------------------------------------------------------------------
+
+
+class TestRunTool:
+    """run_tool：唯一执行入口的三分类结果（异常不上抛；terminal 为正常捕获）。"""
+
+    @pytest.mark.asyncio
+    async def test_success_returns_serialized_block_and_records_span(self):
+        """成功：返回序列化结果块（is_error=False），span 记 ok。"""
+        called: list = []
+
+        def handler(args):
+            called.append(args)
+            return {"ok": True, "n": 3}
+
+        reg = ToolRegistry()
+        reg.register(
+            ToolDefinition(
+                name="read_x",
+                description="d",
+                parameters={},
+                handler=handler,
+                access="read",
+            )
+        )
+        recorder = FakeRecorder()
+
+        outcome = await reg.run_tool(
+            ToolUseBlock(id="t1", name="read_x", input={"a": 1}),
+            recorder=recorder,
+            sequence=0,
+        )
+
+        assert called == [{"a": 1}]
+        assert isinstance(outcome, ToolResultBlock)
+        assert outcome.tool_use_id == "t1"
+        assert outcome.is_error is False
+        assert json.loads(outcome.content) == {"ok": True, "n": 3}
+        spans = _spans_by_sequence(recorder)
+        assert spans[0]["end"]["error"] == ""
+        assert spans[0]["end"]["result"] is outcome
+
+    @pytest.mark.asyncio
+    async def test_error_returns_error_block_without_raising(self, caplog):
+        """异常：不上抛，返回 is_error 块（含类型名）；warning + span error 字段。"""
+
+        def boom(args):
+            raise RuntimeError("tool down")
+
+        reg = ToolRegistry()
+        reg.register(
+            ToolDefinition(
+                name="read_boom",
+                description="d",
+                parameters={},
+                handler=boom,
+                access="read",
+            )
+        )
+        recorder = FakeRecorder()
+
+        with caplog.at_level(
+            logging.WARNING, logger="app.services.agent.execution.tools"
+        ):
+            outcome = await reg.run_tool(
+                ToolUseBlock(id="t9", name="read_boom", input={}),
+                recorder=recorder,
+                sequence=1,
+            )
+
+        assert isinstance(outcome, ToolResultBlock)
+        assert outcome.is_error is True
+        assert "RuntimeError" in outcome.content
+        spans = _spans_by_sequence(recorder)
+        assert spans[1]["end"]["error"] == "RuntimeError"
+        assert spans[1]["end"]["result"] is None
+        assert any("read_boom" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_terminal_returns_capture_without_executing_handler(self):
+        """terminal：返回 capture（正常结束）、handler 绝不执行、不序列化。"""
+        called: list = []
+
+        def handler(args):
+            called.append(args)
+            return "should-not-run"
+
+        reg = ToolRegistry()
+        reg.register(
+            ToolDefinition(
+                name="submit_x",
+                description="d",
+                parameters={},
+                handler=handler,
+                access="terminal",
+            )
+        )
+        recorder = FakeRecorder()
+
+        outcome = await reg.run_tool(
+            ToolUseBlock(id="s1", name="submit_x", input={"a": 1}),
+            recorder=recorder,
+            sequence=0,
+        )
+
+        assert called == []
+        assert isinstance(outcome, TerminalCapture)
+        assert outcome.name == "submit_x"
+        assert outcome.args == {"a": 1}
+        spans = _spans_by_sequence(recorder)
+        # capture 不作为 tool_result 落 span（正常结束、无副作用）
+        assert spans[0]["end"]["result"] is None
+        assert spans[0]["end"]["error"] == ""

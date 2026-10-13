@@ -26,7 +26,6 @@ from app.core.logging import logger
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.execution.tools import (
     ToolRegistry,
-    serialize_tool_result,
 )
 from app.services.agent.loop import (
     RunResult,
@@ -36,7 +35,7 @@ from app.services.agent.loop import (
 )
 from app.services.agent.observe import trace
 from app.services.agent.observe.recorder import TraceRecorder
-from app.services.agent.protocols import ToolSchema, ToolSpanRecorder
+from app.services.agent.protocols import TerminalCapture, ToolSchema, ToolSpanRecorder
 from app.services.agent.run.scenario import CtxT, ScenarioHooks
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
@@ -141,7 +140,8 @@ def _make_executor_factory(
 ) -> Callable[[], StreamingToolExecutor]:
     """构造按轮新建 ``StreamingToolExecutor`` 的工厂（流式主路径）。
 
-    - ``execute_fn``：单工具执行（``registry.execute``，异常由执行器包装为错误块）
+    - ``run_tool``：统一执行入口（``registry`` 实现 ``ToolRunner``；包装/span/错误
+      文本由入口收口）
     - ``batch_execute_fn``：延迟执行复用 ``execute_batch``（分段并行/保序 + span 包裹）
     - ``is_idempotent``：停点是否提前启动的判据
     - ``is_terminal``：access=terminal 判定（terminal 不执行、且抑制后续停点启动）
@@ -149,11 +149,8 @@ def _make_executor_factory(
     """
 
     def factory() -> StreamingToolExecutor:
-        async def execute_fn(tool_use: ToolUseBlock):
-            return await registry.execute(tool_use.name, tool_use.input)
-
         return StreamingToolExecutor(
-            execute_fn=execute_fn,
+            run_tool=registry,
             is_idempotent=registry.is_idempotent,
             is_terminal=registry.is_terminal,
             on_recorder=span_recorder,
@@ -557,46 +554,43 @@ async def _replay_missing_tool(
     args = tool_call.input or {}
     tool_use_id = tool_call.id
     defn = registry.get(name)
-
-    # 落 tool_execute span（如果提供了 recorder）
-    span_id = None
-    if span_recorder is not None:
-        tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
-        span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
+    tool_use_block = ToolUseBlock(id=tool_use_id, name=name, input=args or {})
 
     if defn is None or defn.access != "read":
         logger.info(f"🤖 恢复补执行：工具 {name} 非只读/未注册，回填占位结果")
         _append_tool_result(
             messages, tool_use_id, _SKIP_PLACEHOLDER_CONTENT, is_error=False
         )
-        if span_recorder is not None and span_id is not None:
-            span_recorder.end_tool(
-                span_id,
-                result=ToolResultBlock(
-                    tool_use_id=tool_use_id,
-                    content=_SKIP_PLACEHOLDER_CONTENT,
-                    is_error=False,
-                ),
-            )
+        if span_recorder is not None:
+            span_id = span_recorder.start_tool(tool_use_block, sequence=sequence)
+            if span_id is not None:
+                span_recorder.end_tool(
+                    span_id,
+                    result=ToolResultBlock(
+                        tool_use_id=tool_use_id,
+                        content=_SKIP_PLACEHOLDER_CONTENT,
+                        is_error=False,
+                    ),
+                )
         return
 
-    try:
-        result = await registry.execute(name, args)
-        # 与 execute_batch 统一协议契约：工具结果 JSON 序列化
-        content = serialize_tool_result(result)
-        is_error = False
-    except Exception as e:
-        logger.warning(f"🤖 恢复补执行工具 {name} 失败: {e}")
-        content = f"工具执行失败: {type(e).__name__}"
-        is_error = True
-    _append_tool_result(messages, tool_use_id, content, is_error=is_error)
-    if span_recorder is not None and span_id is not None:
-        span_recorder.end_tool(
-            span_id,
-            result=ToolResultBlock(
-                tool_use_id=tool_use_id, content=content, is_error=is_error
-            ),
+    # 统一执行入口（包装 / span / 错误文本单点收口；异常不上抛）
+    outcome = await registry.run_tool(
+        tool_use_block, recorder=span_recorder, sequence=sequence
+    )
+    if isinstance(outcome, TerminalCapture):
+        # 防御：read 门控保证不会到达；一旦到达说明门控失效——按占位处理，不重放副作用
+        logger.warning(
+            f"🤖 恢复补执行遇到终止工具 {name}（read 门控失效），回填占位结果"
         )
+        outcome = ToolResultBlock(
+            tool_use_id=tool_use_id,
+            content=_SKIP_PLACEHOLDER_CONTENT,
+            is_error=False,
+        )
+    _append_tool_result(
+        messages, tool_use_id, outcome.content, is_error=outcome.is_error
+    )
 
 
 def _append_tool_result(
