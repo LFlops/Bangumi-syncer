@@ -7,9 +7,10 @@
 - 若消费方 import 概念模块天经地义、且概念模块不反向依赖消费方 → 契约**随概念归位**。
   例：``chat_span.ChatSpan`` 与其两种实现同处 :mod:`app.services.agent.chat_span`。
 
-本文件现有：:data:`StreamFn`（LLM 调用边界）、:class:`StreamingExecutor`、
-:class:`ToolSpanRecorder`、:class:`BudgetRecorder`——被 ``loop`` / ``tools`` /
-``streaming_tool_executor`` / ``runtime`` 多层消费，实现方分散在各自模块，故留中立层。
+本文件现有：:data:`StreamFn`（LLM 调用边界）、:class:`ToolSchema` / :data:`ToolAccess`
+（工具 schema 内部形态 + wire 出口）、:class:`StreamingExecutor`、:class:`ToolSpanRecorder`、
+:class:`BudgetRecorder`——被 ``loop`` / ``execution`` / ``streaming_tool_executor`` /
+``runtime`` 多层消费，实现方分散在各自模块，故留中立层。
 
 历史：本文件曾集中全部 agent 协议（含 ``ChatSpan``）；``ChatSpan`` 随实现归位后，
 本文件收窄为「跨层能力契约」。
@@ -18,7 +19,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
-from typing import Protocol
+from dataclasses import dataclass
+from typing import Literal, Protocol
 
 from app.services.agent.chat_span import ChatSpan
 from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
@@ -29,6 +31,41 @@ from app.services.llm.models import StreamChunk, ToolResultBlock, ToolUseBlock
 
 #: 流式 LLM 调用：``(messages, tools=, tool_choice=) -> AsyncIterator[StreamChunk]``。
 StreamFn = Callable[..., AsyncIterator[StreamChunk]]
+
+# ---------------------------------------------------------------------------
+# 工具 schema（agent 内部形态 → provider wire 形态）
+# ---------------------------------------------------------------------------
+
+#: 工具副作用语义：read（只读）/ write（写，执行前审计）/ terminal（终止性，仅捕获参数）。
+ToolAccess = Literal["read", "write", "terminal"]
+
+
+@dataclass(frozen=True)
+class ToolSchema:
+    """工具的内部 schema：wire 三字段 + 执行语义 ``access``。
+
+    - ``name`` / ``description`` / ``parameters``：provider ``tools`` 参数所需字段；
+    - ``access``：**执行语义**（终止工具派生等），仅供 agent 内部使用，
+      ``to_wire()`` **绝不输出**（LLM 不可见，天然防诱导）。
+
+    wire 形态是跨层契约（三家 provider 的 ``_normalize_*`` 与 eval cassette 指纹都
+    依赖它）——调用 provider 前必须经 :meth:`to_wire` 转换，且输出键序与历史 flat
+    形态逐字一致。
+    """
+
+    name: str
+    description: str
+    parameters: dict
+    access: ToolAccess
+
+    def to_wire(self) -> dict:
+        """转换为 provider ``tools`` 参数条目（仅三字段，键序固定）。"""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
+
 
 # ---------------------------------------------------------------------------
 # 流式工具执行器

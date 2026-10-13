@@ -42,7 +42,12 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from app.services.agent.chat_span import ChatSpan, PlainChatSpan
-from app.services.agent.protocols import BudgetRecorder, StreamFn, StreamingExecutor
+from app.services.agent.protocols import (
+    BudgetRecorder,
+    StreamFn,
+    StreamingExecutor,
+    ToolSchema,
+)
 from app.services.llm.models import (
     ChatResponse,
     ContentBlock,
@@ -306,7 +311,7 @@ def normalize_stop_reason(
 
 async def run_loop(
     *,
-    tools_schemas: list[dict],
+    tools_schemas: list[ToolSchema],
     max_iterations: int,
     tool_choice_terminal: str,
     seed_messages: Sequence[Message],
@@ -327,7 +332,8 @@ async def run_loop(
       传单个实例会跨轮串状态（seq 不归零 → span 排序错乱；finalize 重复返回历史结果
       → 重复注入 tool_result 破坏协议）。详见 ``ExecutorFactory`` 注释。
       为 ``None`` 时退化为纯聚合（不执行工具，供不使用工具的调用方）。
-    - ``tools_schemas``：传给 provider 的 tools 参数（schema 列表）
+    - ``tools_schemas``：工具内部 schema 列表（``ToolSchema``）；调用 provider 前由
+      本模块经 ``to_wire()`` 转 wire 形态（``access`` 不外泄）
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
     - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）。入口立即 ``list()``
@@ -347,6 +353,10 @@ async def run_loop(
         # 显式契约：stream_fn 为唯一 LLM 调用入口，必须提供
         raise ValueError("run 需要 stream_fn")
 
+    # provider wire 形态在边界一次性转换（ToolSchema.access 仅供 agent 内部使用，
+    # 绝不进入请求体；键序与历史 flat 形态逐字一致）
+    tools_wire = [s.to_wire() for s in tools_schemas]
+
     # 物化快照：后续每轮原地 append（assistant/tool_result/预算消息），需可追加容器；
     # list() 浅拷贝保证不改写调用方的 seed 对象（Message 视为不可变，只追加新对象）。
     messages: list[Message] = list(seed_messages)
@@ -361,7 +371,7 @@ async def run_loop(
         resp, executor = await _consume_stream(
             stream_fn,
             messages,
-            tools=tools_schemas,
+            tools=tools_wire,
             tool_choice=tool_choice,
             executor_factory=executor_factory,
             recorder=recorder,
@@ -500,7 +510,7 @@ async def run_loop(
 async def _final_recovery(
     *,
     stream_fn: StreamFn,
-    tools_schemas: list[dict],
+    tools_schemas: list[ToolSchema],
     tool_choice_terminal: str,
     messages: list[Message],
     recorder: BudgetRecorder | None,
@@ -519,16 +529,12 @@ async def _final_recovery(
     if recorder is not None:
         recorder.record_budget(recovery_msg)
 
-    terminal_schemas = [
-        s
-        for s in tools_schemas
-        if isinstance(s, dict) and s.get("name") == tool_choice_terminal
-    ]
+    terminal_schemas = [s for s in tools_schemas if s.name == tool_choice_terminal]
     try:
         recovery_resp, _ = await _consume_stream(
             stream_fn,
             messages,
-            tools=terminal_schemas,
+            tools=[s.to_wire() for s in terminal_schemas],
             tool_choice=tool_choice_terminal,
             executor_factory=None,
             recorder=recorder,

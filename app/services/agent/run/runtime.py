@@ -36,7 +36,7 @@ from app.services.agent.loop import (
 )
 from app.services.agent.observe import trace
 from app.services.agent.observe.recorder import TraceRecorder
-from app.services.agent.protocols import ToolSpanRecorder
+from app.services.agent.protocols import ToolSchema, ToolSpanRecorder
 from app.services.agent.run.scenario import CtxT, ScenarioHooks
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
@@ -170,7 +170,7 @@ async def _invoke_loop(
     stream_fn: StreamFn,
     registry: ToolRegistry,
     span_recorder: TraceRecorder,
-    tools_schemas: list[dict],
+    tools_schemas: list[ToolSchema],
     max_iterations: int,
     hooks: ScenarioHooks[CtxT],
     seed_messages: Sequence[Message],

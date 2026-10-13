@@ -32,10 +32,10 @@ def _make_stub_bgm() -> MagicMock:
 
 
 def _real_tool_schemas() -> list[dict]:
-    """通过 register_match_tools 得到真实 defns，取 to_schema() 的 flat 形态。"""
+    """通过 register_match_tools 得到真实 defns，取 to_schema().to_wire() 的 flat 形态。"""
     registry = ToolRegistry()
     defns = llm_assist.register_match_tools(registry, _make_stub_bgm())
-    return [d.to_schema() for d in defns]
+    return [d.to_schema().to_wire() for d in defns]
 
 
 class TestCrossLayerAnthropicWire:

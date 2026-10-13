@@ -15,14 +15,12 @@ import re
 from collections import UserDict
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any
 
-from app.services.agent.protocols import ToolSpanRecorder
+from app.services.agent.protocols import ToolAccess, ToolSchema, ToolSpanRecorder
 from app.services.llm.models import ToolResultBlock, ToolUseBlock
 
 logger = logging.getLogger(__name__)
-
-ToolAccess = Literal["read", "write", "terminal"]
 
 # 幂等段并行执行的并发上限：避免一次性发起过多工具调用压垮下游。
 _MAX_PARALLEL_TOOLS = 10
@@ -96,16 +94,18 @@ class ToolDefinition:
         if self.idempotent is None:
             self.idempotent = self.access == "read"
 
-    def to_schema(self) -> dict:
-        """供 provider ``tools`` 参数的 schema：仅 name/description/parameters。
+    def to_schema(self) -> ToolSchema:
+        """转换为内部 :class:`~app.services.agent.protocols.ToolSchema`。
 
-        idempotent / access 不序列化（LLM 不可见，天然防诱导）。
+        ``access`` 供 agent 内部派生终止工具等语义；**调用 provider 前**须经
+        ``ToolSchema.to_wire()`` 转换（access 不序列化，LLM 不可见，天然防诱导）。
         """
-        return {
-            "name": self.name,
-            "description": self.description,
-            "parameters": self.parameters,
-        }
+        return ToolSchema(
+            name=self.name,
+            description=self.description,
+            parameters=self.parameters,
+            access=self.access,
+        )
 
 
 class BatchResults(UserDict[str, ToolResultBlock]):

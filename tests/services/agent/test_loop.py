@@ -67,6 +67,13 @@ _FINAL_RECOVERY_KEYWORDS = (
 )
 
 
+def _schema(name: str, *, access: str = "read"):
+    """构造测试用 ToolSchema（wire 三字段留空，仅名字/access 有意义）。"""
+    from app.services.agent.protocols import ToolSchema
+
+    return ToolSchema(name=name, description="", parameters={}, access=access)
+
+
 def _assert_final_round_message(content: str) -> None:
     """断言末轮强化提示语义（强制提交结论 + 禁止再检索）。"""
     assert all(kw in content for kw in _FINAL_ROUND_KEYWORDS), (
@@ -107,7 +114,7 @@ async def test_run_end_turn_returns_end_turn_with_text():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[{"name": "search_bangumi"}],
+        tools_schemas=[_schema("search_bangumi")],
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -617,7 +624,7 @@ async def test_run_end_turn_unchanged():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[{"name": "search_bangumi"}],
+        tools_schemas=[_schema("search_bangumi")],
         max_iterations=3,
         tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
@@ -875,8 +882,8 @@ async def test_exhausted_final_recovery_tools_only_terminal_schema():
     stream = _exhausting_stream(2, [recovery])
     executed: list[str] = []
     schemas = [
-        {"name": "search_bangumi"},
-        {"name": "submit_suggestion"},
+        _schema("search_bangumi"),
+        _schema("submit_suggestion", access="terminal"),
     ]
 
     await run_loop(
@@ -890,8 +897,10 @@ async def test_exhausted_final_recovery_tools_only_terminal_schema():
         seed_messages=_seed(),
     )
 
-    # stream.calls[2] 为收尾调用
-    assert stream.calls[2][1]["tools"] == [{"name": "submit_suggestion"}]
+    # stream.calls[2] 为收尾调用（wire 形态：仅三字段）
+    assert stream.calls[2][1]["tools"] == [
+        {"name": "submit_suggestion", "description": "", "parameters": {}}
+    ]
     assert stream.calls[2][1]["tool_choice"] == "submit_suggestion"
     # 收尾不执行任何非终止工具：handler 只被循环内两轮调用
     assert len(executed) == 2

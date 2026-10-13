@@ -49,12 +49,17 @@ def test_tool_definition_to_schema_excludes_access_and_idempotent():
         access="read",
     )
     schema = d.to_schema()
-    assert set(schema.keys()) == {"name", "description", "parameters"}
-    assert schema["name"] == "search"
-    assert schema["description"] == "search bangumi"
-    assert schema["parameters"]["properties"]["title"]["maxLength"] == 200
-    assert "access" not in schema
-    assert "idempotent" not in schema
+    # 内部形态：带 access 的 ToolSchema（属性访问）
+    assert schema.name == "search"
+    assert schema.description == "search bangumi"
+    assert schema.access == "read"
+    assert schema.parameters["properties"]["title"]["maxLength"] == 200
+    # wire 形态：仅三字段，access 绝不外泄
+    wire = schema.to_wire()
+    assert set(wire.keys()) == {"name", "description", "parameters"}
+    assert wire["name"] == "search"
+    # access / idempotent 均不外泄到 wire（LLM 不可见，天然防诱导）
+    assert "access" not in wire and "idempotent" not in wire
 
 
 # ---------------------------------------------------------------------------
