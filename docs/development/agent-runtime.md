@@ -42,7 +42,6 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | 字段 | 说明 |
 | --- | --- |
 | `task_type` | 任务类型（观测/日志前缀用，如 `"match"`） |
-| `terminal_tool` | 终止工具名（循环末轮强制指向它；恢复分派据此识别终局） |
 | `register_tools(registry, ctx)` | 注册场景工具，返回 `ToolDefinition` 列表 |
 | `build_seed(ctx)` | 构建种子消息（system + user） |
 | `build_stream_fn(thinking_level)` | 构建默认流式 LLM 函数（场景决定 job 归属与思考强度透传） |
@@ -88,7 +87,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 2. `trace.replay` 从 `agent_steps` 重建消息与终局响应；
 3. **终局优先**（先于预算耗尽判定）按 `last_response` 分派：
    - `end_turn` → `mark_succeeded`（stop_reason=`end_turn`）；
-   - `terminal_tool`（或 tool_calls 含终止工具）→ 场景 `handle_terminal`（tokens 取 replay 累计）；
+   - 含终止工具调用（注册表 `access="terminal"` 派生）→ 场景 `handle_terminal`（tokens 取 replay 累计）；
    - `None`（轮次已完整记录）→ 预算耗尽则 `succeeded(stop_reason=exhausted)`，否则续跑 loop；
    - 含 tool_use → 补执行缺失只读工具（写 tool span 自包含）→ 预算够则续跑 loop；
 4. 非终局且 `remaining <= 0` → `succeeded(stop_reason=exhausted)`（避免 run 永久滞留 `processing`）；
@@ -171,6 +170,10 @@ resp = span.resp                          # __aexit__ 已完成唯一一次 fina
   mock / patch / 替换（既有测试依赖该约定）。
 - **失败语义**（run / continue 一致）：确定性 LLM 失败 → 立即 `failed`；
   可重试失败 → 累计 attempts；其它异常 → 日志 + attempts。
+- **终止工具单一来源**：由注册表 `access="terminal"` 派生（**至多一个**，多则
+  runtime 入口 fail-fast；`ScenarioHooks` 不承载工具名，`loop` 从 `ToolSchema` 自行
+  派生）。末轮强制 `tool_choice`、终止判定、收尾轮 tools 过滤均只依赖它；
+  `RunResult.stop_reason` 为**实际终止工具名**（骨架不硬编码场景名）。
 - 运行时日志前缀由 `hooks.task_type` 派生（如 `[match]`）。
 - 事务 / 落库 / 通知属场景职责；runtime 只透传 `ctx` 与 `notification_service`。
 - **导入风格（agent 生态）**：禁止 `as` 别名（`from X import Y as Z` / `import X as Y`）。

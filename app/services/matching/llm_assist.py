@@ -271,7 +271,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
             idempotent=True,  # 幂等：纯查询，重复执行无副作用
         ),
         ToolDefinition(
-            name="submit_suggestion",
+            name=_TERMINAL_TOOL,
             description=(
                 "提交最终推荐；若确实无法确定，可用 give_up=true 明确放弃。调用即终止。"
             ),
@@ -689,9 +689,11 @@ async def _match_handle_terminal(
     )
 
 
+#: 终止工具名（场景侧单一常量：注册与终局分派共用；由注册表 access="terminal" 派生）
+_TERMINAL_TOOL = "submit_suggestion"
+
 _MATCH_HOOKS: ScenarioHooks[_MatchContext] = ScenarioHooks(
     task_type="match",
-    terminal_tool="submit_suggestion",
     register_tools=_match_register_tools,
     build_stream_fn=_match_build_stream_fn,
     resolve_thinking_level=_match_resolve_thinking_level,
@@ -840,7 +842,7 @@ def _handle_result(
     """
     stop = result.stop_reason
 
-    if stop == "submit_suggestion":
+    if stop == _TERMINAL_TOOL:
         suggestion = result.suggestion or {}
         if suggestion.get("give_up"):
             # 放弃协议：模型明确放弃 → 不落库、不通知，直接记 succeeded(stop_reason='give_up')。
@@ -865,7 +867,7 @@ def _handle_result(
                 bgm=bgm,
                 subject_id=sid,
                 reason=reason,
-                stop_reason="submit_suggestion",
+                stop_reason=_TERMINAL_TOOL,
                 total_tokens=total_tokens,
                 notification_service=notification_service,
             )
@@ -874,7 +876,7 @@ def _handle_result(
         # 校验失败：不落库，标记 succeeded + last_error（诊断信息）
         dbm.agent_runs.mark_succeeded(
             run_id,
-            stop_reason="submit_suggestion",
+            stop_reason=_TERMINAL_TOOL,
             last_error=err,
             total_tokens=total_tokens,
         )

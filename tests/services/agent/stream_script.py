@@ -155,6 +155,13 @@ def scripted_stream(responses: list[ChatResponse]) -> ScriptedStream:
     return ScriptedStream(responses=list(responses))
 
 
+def terminal_schema(name: str = "submit_suggestion"):
+    """测试用终止工具 schema（``access="terminal"``，供 loop 派生终止集合）。"""
+    from app.services.agent.protocols import ToolSchema
+
+    return ToolSchema(name=name, description="", parameters={}, access="terminal")
+
+
 def raw_handler_runner(handler: Callable[[ToolUseBlock], Any]):
     """把「原始值 handler」适配为 ``run_tool`` 契约（**仅测试**）。
 

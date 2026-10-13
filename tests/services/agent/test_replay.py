@@ -28,7 +28,10 @@ from app.services.llm.models import (
     ToolResultBlock,
     ToolUseBlock,
 )
-from tests.services.agent.stream_script import raw_handler_runner
+from tests.services.agent.stream_script import (
+    raw_handler_runner,
+    terminal_schema,
+)
 
 
 def _blocks(message: Message) -> list:
@@ -439,9 +442,8 @@ class TestReplayRebuildsFullBlocks:
             loop.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
-                tools_schemas=[],
+                tools_schemas=[terminal_schema()],
                 max_iterations=2,
-                tool_choice_terminal="submit_suggestion",
                 seed_messages=seed,
                 recorder=recorder,
             )
@@ -498,9 +500,8 @@ class TestReplayRebuildsFullBlocks:
             loop.run_loop(
                 stream_fn=_scripted_stream(chat),
                 executor_factory=_executor_factory(recorder, tools_fn),
-                tools_schemas=[],
+                tools_schemas=[terminal_schema()],
                 max_iterations=3,
-                tool_choice_terminal="submit_suggestion",
                 seed_messages=seed,
                 recorder=recorder,
                 veto_terminal=lambda args: "请再核对",

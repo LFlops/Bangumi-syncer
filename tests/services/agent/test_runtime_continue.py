@@ -106,13 +106,27 @@ def _write_tool_exec(
 
 class _FakeHooks:
     task_type = "match"
-    terminal_tool = "submit_suggestion"
 
     def __init__(self, *, max_iterations: int = 10) -> None:
         self.terminal_calls: list[tuple[tuple, dict]] = []
         # 恢复路径不应触发 veto 软护栏（见 runtime.continue_run submit 分支注释）
         self.veto_calls: list[dict] = []
         self._max_iterations = max_iterations
+
+    @staticmethod
+    def register_tools(registry, ctx):
+        """注册终止工具：continue_run 入口据此派生终止集合（单一来源）。"""
+        from app.services.agent.execution.tools import ToolDefinition
+
+        defn = ToolDefinition(
+            name="submit_suggestion",
+            description="",
+            parameters={},
+            handler=lambda args: {},
+            access="terminal",
+        )
+        registry.register(defn, quiet=True)
+        return [defn]
 
     def resolve_thinking_level(self) -> str:
         return "medium"

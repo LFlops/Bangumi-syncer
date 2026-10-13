@@ -21,7 +21,10 @@ from app.services.agent import loop
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.loop import run_loop
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
-from tests.services.agent.stream_script import raw_handler_runner
+from tests.services.agent.stream_script import (
+    raw_handler_runner,
+    terminal_schema,
+)
 
 _TERMINAL = "submit_suggestion"
 _LOOKUP = "lookup_subject"
@@ -74,9 +77,8 @@ async def test_executor_factory_invoked_once_per_round():
 
     result = await run_loop(
         stream_fn=_scripted_stream_for_tool_rounds,
-        tools_schemas=[],
+        tools_schemas=[terminal_schema()],
         max_iterations=rounds,
-        tool_choice_terminal=_TERMINAL,
         seed_messages=[Message(role="user", content="hi")],
         executor_factory=_factory,
     )
@@ -100,9 +102,8 @@ async def test_executor_factory_result_not_cached_across_rounds():
 
     await run_loop(
         stream_fn=_scripted_stream_for_tool_rounds,
-        tools_schemas=[],
+        tools_schemas=[terminal_schema()],
         max_iterations=3,
-        tool_choice_terminal=_TERMINAL,
         seed_messages=[Message(role="user", content="hi")],
         executor_factory=_factory,
     )

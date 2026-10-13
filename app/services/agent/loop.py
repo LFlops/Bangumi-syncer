@@ -17,7 +17,7 @@
   ``finish_reason`` **流末集中补发**停点 → 仍提前执行但**无重叠收益**；eval replay
   **无停点** → 纯轮级降级。非幂等工具在流结束后按 ``execute_batch`` 语义（连续幂等段
   并行、非幂等串行、保序）执行。执行器由 ``executor_factory`` 按轮构造。
-- **终止工具优先**：本轮含 ``tool_choice_terminal`` 工具 → 捕获参数即 break，同轮其他工具不执行。
+- **终止工具优先**：本轮含终止工具（``ToolSchema.access == "terminal"``）→ 捕获参数即 break，同轮其他工具不执行。
   流式路径下同轮已提前启动的幂等工具可能已执行完成，其结果保留但走终止分支时被忽略
   （无害；terminal 抑制保证后续停点不再启动新任务）。
 - **透明预算**：每轮递减后仅当仍有后续轮次（remaining>0）才追加预算消息；
@@ -60,27 +60,27 @@ from app.services.llm.models import (
 logger = logging.getLogger(__name__)
 
 
-def final_round_budget_message(tool_choice_terminal: str) -> str:
+def final_round_budget_message(terminal_name: str) -> str:
     """末轮（remaining==1）强化提示。
 
     思考模型在强制 ``tool_choice=terminal`` 被供应商降级为 auto 时容易不提交，
     明确要求给出结论（含放弃）并禁止再检索。
     """
     return (
-        f"[剩余轮次：1（最后一轮）] 必须调用 {tool_choice_terminal} 给出结论："
+        f"[剩余轮次：1（最后一轮）] 必须调用 {terminal_name} 给出结论："
         "若已确定推荐条目则提交 subject_id 与理由；若确实无法确定，也要调用并说明放弃理由。"
         "不得再调用其他检索工具。"
     )
 
 
-def final_recovery_message(tool_choice_terminal: str) -> str:
+def final_recovery_message(terminal_name: str) -> str:
     """兜底收尾提示。
 
     for 循环自然结束（即将 exhausted）时追加一次收尾调用，best-effort 争取一个明确结论；
     该消息须经 recorder 预算通道记录，保证恢复重放一致性。
     """
     return (
-        f"[最终收尾] 轮次预算已耗尽。请立即调用 {tool_choice_terminal} 给出结论："
+        f"[最终收尾] 轮次预算已耗尽。请立即调用 {terminal_name} 给出结论："
         "若已确定则提交 subject_id 与理由；若确实无法确定也请调用并说明放弃理由。"
     )
 
@@ -315,7 +315,6 @@ async def run_loop(
     *,
     tools_schemas: list[ToolSchema],
     max_iterations: int,
-    tool_choice_terminal: str,
     seed_messages: Sequence[Message],
     stream_fn: StreamFn | None = None,
     executor_factory: ExecutorFactory | None = None,
@@ -337,7 +336,6 @@ async def run_loop(
     - ``tools_schemas``：工具内部 schema 列表（``ToolSchema``）；调用 provider 前由
       本模块经 ``to_wire()`` 转 wire 形态（``access`` 不外泄）
     - ``max_iterations``：轮次上限（由 budget 策略计算后传入，循环无感知映射来源）
-    - ``tool_choice_terminal``：终止性工具名（submit_suggestion）
     - ``seed_messages``：调用方构建的种子消息（system + user）。入口立即 ``list()``
       做快照：不改写调用方对象、调用方仍可复用；用 ``Sequence`` 而非 ``Iterable``
       ——seed 会被 runtime 的 ``write_seed_row`` 与 loop **多次消费**，生成器必须被
@@ -359,6 +357,18 @@ async def run_loop(
     # 绝不进入请求体；键序与历史 flat 形态逐字一致）
     tools_wire = [s.to_wire() for s in tools_schemas]
 
+    # 终止工具由注册表语义（access="terminal"）**单点派生**：末轮强制定向、终止判定、
+    # 收尾 tools 过滤都只用它；>1 个由 runtime 入口 fail-fast（loop 防御式取首个）。
+    terminals = [s for s in tools_schemas if s.access == "terminal"]
+    terminal_name = terminals[0].name if terminals else None
+    if len(terminals) > 1:
+        logger.warning(
+            "收到 %d 个终止工具（%s），仅首个 %r 生效（入口应已 fail-fast）",
+            len(terminals),
+            ", ".join(s.name for s in terminals),
+            terminal_name,
+        )
+
     # 物化快照：后续每轮原地 append（assistant/tool_result/预算消息），需可追加容器；
     # list() 浅拷贝保证不改写调用方的 seed 对象（Message 视为不可变，只追加新对象）。
     messages: list[Message] = list(seed_messages)
@@ -368,7 +378,7 @@ async def run_loop(
 
     for _iteration in range(max_iterations):
         # 末轮（remaining==1 起手）强制 terminal 收尾；其余轮不指定 tool_choice
-        tool_choice = tool_choice_terminal if remaining == 1 else None
+        tool_choice = terminal_name if remaining == 1 else None
 
         resp, executor = await _consume_stream(
             stream_fn,
@@ -408,11 +418,11 @@ async def run_loop(
         assistant_blocks: list[ContentBlock] = list(resp.blocks)
         messages.append(Message(role="assistant", content=assistant_blocks))
 
-        # ③ 终止工具优先：含 tool_choice_terminal → 捕获即 break（其他工具不执行）
+        # ③ 终止工具优先：含终止工具（access="terminal"）→ 捕获即 break（其他工具不执行）
         terminal_tc: ToolUseBlock | None = None
         terminal_idx = -1
         for idx, tc in enumerate(tool_calls):
-            if tc.name == tool_choice_terminal:
+            if terminal_name is not None and tc.name == terminal_name:
                 terminal_tc = tc
                 terminal_idx = idx
                 break
@@ -434,8 +444,9 @@ async def run_loop(
             if veto_terminal is not None and remaining > 1 and not vetoed:
                 hint = veto_terminal(suggestion) or ""
             if not hint:
+                assert terminal_name is not None  # terminal_tc 非空即派生名存在
                 return RunResult(
-                    stop_reason="submit_suggestion",
+                    stop_reason=terminal_name,
                     suggestion=suggestion,
                     last_response=resp,
                 )
@@ -502,8 +513,8 @@ async def run_loop(
         remaining -= 1
         if remaining > 0:
             budget_message = (
-                final_round_budget_message(tool_choice_terminal)
-                if remaining == 1
+                final_round_budget_message(terminal_name)
+                if (remaining == 1 and terminal_name)
                 else f"[剩余轮次：{remaining}]"
             )
             messages.append(Message(role="user", content=budget_message))
@@ -515,7 +526,7 @@ async def run_loop(
     return await _final_recovery(
         stream_fn=stream_fn,
         tools_schemas=tools_schemas,
-        tool_choice_terminal=tool_choice_terminal,
+        terminal_name=terminal_name,
         messages=messages,
         recorder=recorder,
         last_response=resp,
@@ -526,7 +537,7 @@ async def _final_recovery(
     *,
     stream_fn: StreamFn,
     tools_schemas: list[ToolSchema],
-    tool_choice_terminal: str,
+    terminal_name: str | None,
     messages: list[Message],
     recorder: BudgetRecorder | None,
     last_response: ChatResponse | None,
@@ -535,22 +546,25 @@ async def _final_recovery(
 
     - 追加 ``FINAL_RECOVERY_MESSAGE`` 并经 recorder 预算通道记录（重放一致性）
     - tools 过滤为**仅** terminal schema，``tool_choice=terminal``
-    - 含 terminal tool_call → submit_suggestion；否则 exhausted（last_response=收尾响应）
+    - 含 terminal tool_call → 以终止工具名作为 stop_reason；否则 exhausted（last_response=收尾响应）
     - LLM 调用抛异常 → best-effort 捕获返回 exhausted（保留循环内最后一次响应），不重试
     - 收尾不执行任何工具（``executor_factory=None``：纯聚合流，不构造执行器）
+    - **无终止工具**（``terminal_name is None``）→ 直接 exhausted，不发起收尾调用
     """
-    recovery_msg = final_recovery_message(tool_choice_terminal)
+    if terminal_name is None:
+        return RunResult(stop_reason="exhausted", last_response=last_response)
+    recovery_msg = final_recovery_message(terminal_name)
     messages.append(Message(role="user", content=recovery_msg))
     if recorder is not None:
         recorder.record_budget(recovery_msg)
 
-    terminal_schemas = [s for s in tools_schemas if s.name == tool_choice_terminal]
+    terminal_schemas = [s for s in tools_schemas if s.name == terminal_name]
     try:
         recovery_resp, _ = await _consume_stream(
             stream_fn,
             messages,
             tools=[s.to_wire() for s in terminal_schemas],
-            tool_choice=tool_choice_terminal,
+            tool_choice=terminal_name,
             executor_factory=None,
             recorder=recorder,
         )
@@ -560,17 +574,13 @@ async def _final_recovery(
         return RunResult(stop_reason="exhausted", last_response=last_response)
 
     terminal_tc = next(
-        (
-            tc
-            for tc in _extract_tool_calls(recovery_resp)
-            if tc.name == tool_choice_terminal
-        ),
+        (tc for tc in _extract_tool_calls(recovery_resp) if tc.name == terminal_name),
         None,
     )
     if terminal_tc is not None:
         return RunResult(
-            stop_reason="submit_suggestion",
-            suggestion=terminal_tc.input,
+            stop_reason=terminal_name,
+            suggestion=terminal_tc.input or {},
             last_response=recovery_resp,
         )
     return RunResult(stop_reason="exhausted", last_response=recovery_resp)

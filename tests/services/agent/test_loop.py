@@ -78,6 +78,9 @@ def _schema(name: str, *, access: str = "read"):
     return ToolSchema(name=name, description="", parameters={}, access=access)
 
 
+_TERMINAL_SCHEMA = _schema("submit_suggestion", access="terminal")
+
+
 def _assert_final_round_message(content: str) -> None:
     """断言末轮强化提示语义（强制提交结论 + 禁止再检索）。"""
     assert all(kw in content for kw in _FINAL_ROUND_KEYWORDS), (
@@ -118,9 +121,8 @@ async def test_run_end_turn_returns_end_turn_with_text():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[_schema("search_bangumi")],
+        tools_schemas=[_schema("search_bangumi"), _TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -142,9 +144,8 @@ async def test_run_no_tool_calls_falls_back_to_end_turn():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -175,9 +176,8 @@ async def test_assistant_aggregate_message_precedes_tool_results():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -231,9 +231,8 @@ async def test_submit_suggestion_breaks_and_captures_without_executing_others():
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
         ),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -260,9 +259,8 @@ async def test_segmented_parallel_passes_full_batch_in_order():
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
         ),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -274,7 +272,7 @@ async def test_segmented_parallel_passes_full_batch_in_order():
 
 async def test_segmented_parallel_preserves_mixed_read_write_order():
     # 循环对 read/write 无感知（分段是执行器内部职责），这里仅验证整批顺序透传。
-    # 注意：中间工具绝不能是 tool_choice_terminal（否则触发终止优先 break）。
+    # 注意：中间工具绝不能是终止工具（否则触发终止优先 break）。
     r = _tool_use("r", "search_bangumi")
     w = _tool_use("w", "check_subject")  # 代表非终止的写/读工具，仅用于验证顺序
     r2 = _tool_use("r2", "get_subject_detail")
@@ -286,9 +284,8 @@ async def test_segmented_parallel_preserves_mixed_read_write_order():
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
         ),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -313,9 +310,8 @@ async def test_transparent_budget_appends_remaining_and_forces_terminal_on_last_
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -347,9 +343,8 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(_raise),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -381,9 +376,8 @@ async def test_max_iterations_exhausted_returns_last_response():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -441,9 +435,8 @@ async def test_budget_record_budget_called_per_non_final_round_with_remaining():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=recorder,
     )
@@ -470,9 +463,8 @@ async def test_budget_recorder_none_runs_exhausted_path_without_error():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=None,
     )
@@ -489,9 +481,8 @@ async def test_budget_appended_to_messages_even_without_recorder():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=None,
     )
@@ -525,9 +516,8 @@ async def test_budget_no_phantom_message_on_final_round():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=1,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=recorder,
     )
@@ -571,9 +561,8 @@ async def test_defense_branch_logs_warning_on_non_tool_result(caplog):
         await run_loop(
             stream_fn=stream,
             executor_factory=_NonToolResultExecutor,
-            tools_schemas=[],
+            tools_schemas=[_TERMINAL_SCHEMA],
             max_iterations=1,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
 
@@ -594,9 +583,8 @@ async def test_run_empty_shell_response_returns_llm_error():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -611,9 +599,8 @@ async def test_run_max_tokens_response_returns_max_tokens():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -628,9 +615,8 @@ async def test_run_end_turn_unchanged():
 
     result = await run_loop(
         stream_fn=stream,
-        tools_schemas=[_schema("search_bangumi")],
+        tools_schemas=[_schema("search_bangumi"), _TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -650,9 +636,8 @@ async def test_run_tool_calls_path_unchanged():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -714,9 +699,8 @@ async def test_assistant_message_preserves_text_and_thinking_blocks():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -743,9 +727,8 @@ async def test_final_round_budget_message_is_strengthened():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -767,9 +750,8 @@ async def test_non_final_round_budget_message_not_strengthened():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -804,9 +786,8 @@ async def test_exhausted_final_recovery_submits_suggestion():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -830,9 +811,8 @@ async def test_exhausted_final_recovery_still_no_submit_returns_exhausted():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -863,9 +843,8 @@ async def test_exhausted_final_recovery_exception_returns_exhausted_not_crash():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -897,7 +876,6 @@ async def test_exhausted_final_recovery_tools_only_terminal_schema():
         ),
         tools_schemas=schemas,
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -919,9 +897,8 @@ async def test_exhausted_final_recovery_called_exactly_once():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -938,9 +915,8 @@ async def test_exhausted_final_recovery_message_recorded_via_budget_channel():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=recorder,
     )
@@ -1009,9 +985,8 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
         ),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         veto_terminal=_veto,
     )
@@ -1045,9 +1020,8 @@ async def test_veto_happens_at_most_once_per_run():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         veto_terminal=_veto,
     )
@@ -1074,9 +1048,8 @@ async def test_veto_not_applied_on_final_round():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=1,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         veto_terminal=_veto,
     )
@@ -1098,9 +1071,8 @@ async def test_veto_none_behaves_like_current_behavior():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         veto_terminal=None,
     )
@@ -1120,9 +1092,8 @@ async def test_veto_records_injected_tool_result_span_for_replay():
     await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         recorder=recorder,
         veto_terminal=lambda args: "请再核对",
@@ -1161,9 +1132,8 @@ async def test_veto_multi_tool_round_injects_paired_results_for_all_tool_uses():
         executor_factory=scripted_executor(
             lambda tc: executed.append(tc.id) or {"ok": tc.id}
         ),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
         veto_terminal=lambda args: "请再核对",
     )
@@ -1296,9 +1266,8 @@ async def test_scripted_executor_passes_through_tool_result_block():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: exact),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1342,9 +1311,8 @@ async def test_stream_path_starts_idempotent_tool_before_stream_ends():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1379,9 +1347,8 @@ async def test_stream_path_backfills_ordered_tool_results_and_blocks():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1420,9 +1387,8 @@ async def test_stream_path_terminal_captured_and_other_tools_not_executed():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1451,9 +1417,8 @@ async def test_stream_path_malformed_json_error_and_loop_continues():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1498,9 +1463,8 @@ async def test_stream_path_pads_missing_slots_to_close_protocol(caplog):
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=_ShortFinalizeExecutor,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1545,9 +1509,8 @@ async def test_stream_path_budget_and_recovery_use_stream():
     result = await run_loop(
         stream_fn=stream_fn,
         executor_factory=factory,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 
@@ -1561,9 +1524,8 @@ async def test_run_requires_stream_fn():
 
     with pytest.raises(ValueError, match="stream_fn"):
         await run_loop(
-            tools_schemas=[],
+            tools_schemas=[_TERMINAL_SCHEMA],
             max_iterations=1,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
 
@@ -1612,9 +1574,8 @@ async def test_stream_exception_converges_early_tasks_and_propagates():
         await run_loop(
             stream_fn=stream_fn,
             executor_factory=factory,
-            tools_schemas=[],
+            tools_schemas=[_TERMINAL_SCHEMA],
             max_iterations=2,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
 
@@ -1656,9 +1617,8 @@ async def test_stream_exception_not_masked_when_finalize_raises_base_exception()
         await run_loop(
             stream_fn=stream_fn,
             executor_factory=_FatalFinalizeExecutor,
-            tools_schemas=[],
+            tools_schemas=[_TERMINAL_SCHEMA],
             max_iterations=2,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
 
@@ -1701,9 +1661,8 @@ async def test_cancel_during_convergence_keeps_finalize_running_in_background(
         run_loop(
             stream_fn=stream_fn,
             executor_factory=_SlowFinalizeExecutor,
-            tools_schemas=[],
+            tools_schemas=[_TERMINAL_SCHEMA],
             max_iterations=2,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_seed(),
         )
     )
@@ -1749,9 +1708,8 @@ async def test_run_accepts_tuple_seed_messages():
 
     result = await run_loop(
         stream_fn=stream_fn,
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=seed,
     )
 
@@ -1778,9 +1736,8 @@ async def test_run_does_not_mutate_caller_seed_list():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
-        tools_schemas=[],
+        tools_schemas=[_TERMINAL_SCHEMA],
         max_iterations=3,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=seed,
     )
 
@@ -1810,9 +1767,11 @@ async def test_terminal_branch_prefers_executor_capture_args():
     result = await run_loop(
         stream_fn=stream,
         executor_factory=lambda: _CaptureExecutor(),
-        tools_schemas=[_schema("submit_suggestion", access="terminal")],
+        tools_schemas=[
+            _schema("submit_suggestion", access="terminal"),
+            _TERMINAL_SCHEMA,
+        ],
         max_iterations=2,
-        tool_choice_terminal="submit_suggestion",
         seed_messages=_seed(),
     )
 

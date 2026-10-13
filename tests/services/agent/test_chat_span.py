@@ -31,6 +31,7 @@ from app.services.agent.run import runtime
 from app.services.agent.run.scenario import ScenarioHooks
 from app.services.llm import models as llm_models
 from app.services.llm.models import Message, StreamChunk, TextBlock
+from tests.services.agent.stream_script import terminal_schema
 
 _SEED = [Message(role="user", content="hello")]
 
@@ -92,9 +93,8 @@ def _run_loop(*, stream_fn, recorder):
     """以脚本化流驱动 ``loop.run_loop``（loop 级测试：异常需向调用方抛出）。"""
     return asyncio.run(
         loop.run_loop(
-            tools_schemas=[],
+            tools_schemas=[terminal_schema()],
             max_iterations=1,
-            tool_choice_terminal="submit_suggestion",
             seed_messages=_SEED,
             stream_fn=stream_fn,
             recorder=recorder,
@@ -122,10 +122,23 @@ def _run_runtime(
         captured["result"] = result
         return "succeeded"
 
+    def _register_tools(registry, ctx):
+        """注册终止工具（收尾轮/终止判定由注册表派生）。"""
+        from app.services.agent.execution.tools import ToolDefinition
+
+        defn = ToolDefinition(
+            name="submit_suggestion",
+            description="",
+            parameters={},
+            handler=lambda args: {},
+            access="terminal",
+        )
+        registry.register(defn, quiet=True)
+        return [defn]
+
     hooks: ScenarioHooks = ScenarioHooks(
         task_type="match",
-        terminal_tool="submit_suggestion",
-        register_tools=lambda registry, ctx: [],
+        register_tools=_register_tools,
         build_stream_fn=lambda thinking_level: stream_fn,
         resolve_thinking_level=lambda: "off",
         resolve_max_iterations=lambda level: max_iterations,

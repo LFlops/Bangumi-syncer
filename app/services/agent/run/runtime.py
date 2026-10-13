@@ -75,6 +75,7 @@ async def run(
     registry = ToolRegistry()
     defns = hooks.register_tools(registry, ctx)
     tools_schemas = [d.to_schema() for d in defns]
+    _assert_terminals_unique(tools_schemas)
 
     # seed 是本次 run 的**数据**（由场景在 new_ctx 初始化时备好），非行为钩子：
     # 通用层只读取，不在执行期回调场景派生。
@@ -135,6 +136,20 @@ async def run(
     )
 
 
+def _assert_terminals_unique(tools_schemas: Sequence[ToolSchema]) -> None:
+    """终止工具（``access="terminal"``）唯一性 fail-fast（0 个允许：自然收尾）。
+
+    >1 个时末轮"强制定向"无法表达（provider 只支持单一具名），属场景配置错误，
+    入口立即报错，避免静默走错分支。
+    """
+    terminals = [s.name for s in tools_schemas if s.access == "terminal"]
+    if len(terminals) > 1:
+        raise ValueError(
+            f"场景注册了 {len(terminals)} 个终止工具（{', '.join(terminals)}）；"
+            '框架要求至多一个（access="terminal"）'
+        )
+
+
 def _make_executor_factory(
     registry: ToolRegistry, span_recorder: ToolSpanRecorder
 ) -> Callable[[], StreamingToolExecutor]:
@@ -181,7 +196,6 @@ async def _invoke_loop(
         stream_fn=stream_fn,
         tools_schemas=tools_schemas,
         max_iterations=max_iterations,
-        tool_choice_terminal=hooks.terminal_tool,
         seed_messages=seed_messages,
         recorder=span_recorder,
         # 场景可选软护栏（旧 hooks 无该字段时兼容 None）
@@ -207,8 +221,8 @@ async def continue_run(
          响应）：含终止工具调用 → 走场景终局处理；否则一律 ``exhausted``
          （响应文本交场景 ``parse_suggestion`` 兜底解析）——**不**按 provider
          原始 stop_reason 归一化，与 ``_final_recovery`` 的二分判据对齐
-       - 匹配的 ``terminal_tool`` 调用 → 走场景终局处理
-       - ``stop_reason == terminal_tool`` 但无匹配调用 → 防御降级 exhausted
+       - 匹配的终止工具调用（注册表 ``access="terminal"`` 派生）→ 走场景终局处理
+       - ``stop_reason`` 为终止工具名但无匹配调用 → 防御降级 exhausted
        - 其余按 ``normalize_stop_reason`` 归一化（与 ``loop.run_loop`` 共用判据）：
          ``end_turn`` → mark_succeeded；``max_tokens`` / 空壳 ``llm_error``
          → 交场景终态处理（llm_assist 落 failed）；``None``（含非终止工具调用）
@@ -236,6 +250,14 @@ async def continue_run(
         thinking_level = hooks.resolve_thinking_level()
         max_iterations = hooks.resolve_max_iterations(thinking_level)
 
+        # per-run ToolRegistry 在入口构建一次（注册无副作用）：终止集合的唯一来源
+        # （replay 分派与续跑共用），并复用给 _execute_continuation。
+        registry = ToolRegistry()
+        defns = hooks.register_tools(registry, ctx)
+        tools_schemas = [d.to_schema() for d in defns]
+        _assert_terminals_unique(tools_schemas)
+        terminal_names = {s.name for s in tools_schemas if s.access == "terminal"}
+
         # seed 由 replay 从 agent_steps 的 seed 行提取，无需此处重建
         replay_result = trace.replay(run_id)
         remaining = max_iterations - replay_result.executed_iterations
@@ -261,6 +283,8 @@ async def continue_run(
                 ctx=ctx,
                 notification_service=notification_service,
                 anchor_replayed_round=bool(replay_result.missing_tool_calls),
+                registry=registry,
+                tools_schemas=tools_schemas,
             )
             return
 
@@ -268,7 +292,7 @@ async def continue_run(
         # 末轮已 submit 却被误判 exhausted 丢失提交。
         stop: str = last_response.stop_reason or ""
         tcs = last_response.tool_calls
-        submit_tc = next((tc for tc in tcs if tc.name == hooks.terminal_tool), None)
+        submit_tc = next((tc for tc in tcs if tc.name in terminal_names), None)
 
         # 收尾轮判据：``remaining <= 0`` 表示 max_iterations 个预算轮已全部执行完
         # （见上），此后的响应只能来自 ``loop._final_recovery`` 收尾轮。
@@ -311,7 +335,7 @@ async def continue_run(
         if submit_tc is not None:
             sug = submit_tc.input or {}
             result = RunResult(
-                stop_reason=hooks.terminal_tool,
+                stop_reason=submit_tc.name,
                 suggestion=sug,
                 last_response=None,
             )
@@ -335,7 +359,7 @@ async def continue_run(
             )
             return
 
-        if stop == hooks.terminal_tool:
+        if stop in terminal_names:
             # 防御：stop_reason 声称终局，但 tool_calls 中无匹配的终止工具调用，
             # 无真实提交可消费。不得把空 dict 当作有效建议落库（假阳性），
             # 降级为与预算耗尽一致的 exhausted 终态。
@@ -343,7 +367,7 @@ async def continue_run(
             # stop_reason=终止工具名的场景误判为 end_turn。
             logger.warning(
                 f"🤖 恢复续跑 {run_id} stop_reason={stop} 但 tool_calls 无 "
-                f"{hooks.terminal_tool} 调用，无有效终局，降级 exhausted"
+                f"{stop} 调用，无有效终局，降级 exhausted"
             )
             _mark_exhausted(
                 repo,
@@ -409,6 +433,8 @@ async def continue_run(
             ctx=ctx,
             notification_service=notification_service,
             anchor_replayed_round=True,
+            registry=registry,
+            tools_schemas=tools_schemas,
         )
     except LLMCallError as e:
         # LLM 调用失败：按可重试性分流
@@ -469,18 +495,15 @@ async def _execute_continuation(
     ctx: CtxT,
     notification_service: NotificationService | None,
     anchor_replayed_round: bool,
+    registry: ToolRegistry,
+    tools_schemas: list[ToolSchema],
 ) -> None:
-    """注册工具 → 建 recorder → 补执行缺失工具 → 续跑 loop → 终局处理。
+    """建 recorder → 补执行缺失工具 → 续跑 loop → 终局处理（registry/schemas 由入口复用）。
 
     ``anchor_replayed_round=True`` 用于 last_response 非 None 的补执行场景：
     recorder 需锚定到已发生的轮次（补执行 tool span 与既有 chat span 同轮），
     并让续跑 chat 从 ``executed_iterations + 1`` 开始。
     """
-    # per-run ToolRegistry：续跑同样使用独立实例
-    registry = ToolRegistry()
-    defns = hooks.register_tools(registry, ctx)
-    tools_schemas = [d.to_schema() for d in defns]
-
     span_recorder = TraceRecorder(
         run_id, start_iteration=replay_result.executed_iterations
     )

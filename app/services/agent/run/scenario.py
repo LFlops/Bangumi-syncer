@@ -91,8 +91,6 @@ class ScenarioHooks(Generic[CtxT]):
 
     #: 任务类型（观测/日志用，如 "match"）
     task_type: str
-    #: 终止工具名（loop 的 ``tool_choice_terminal``；恢复分派据此识别终局）
-    terminal_tool: str
     #: 注册场景工具（``registry`` + ``ctx`` → 工具定义列表）
     register_tools: Callable[[ToolRegistry, CtxT], list[ToolDefinition]]
     #: 构建默认**流式** LLM 函数（``thinking_level`` → ``StreamFn``；场景决定 job 归属
