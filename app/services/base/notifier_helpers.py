@@ -6,6 +6,8 @@
   时触发 `scheduler_job_failed`
 - `notify_batch_sync_summary(driver, total, succeeded, failed, skipped=0, **ctx)`：批量同步
   完成时触发 `batch_sync_summary`
+- `notify_agent_run_failed(run_id, *, task_type, stop_reason, last_error, attempts)`：
+  Agent 会话（run）终态失败时触发 `agent_run_failed`
 
 调用方只需提供 driver 名与统计字段，其他细节（冷却、路由、站内信）由 NotificationService 处理。
 """
@@ -152,3 +154,39 @@ def notify_airing_today(
         )
     except Exception as e:
         logger.debug(f"发送 airing_today 通知失败（可忽略）: {e}")
+
+
+def notify_agent_run_failed(
+    run_id: str,
+    *,
+    task_type: str,
+    stop_reason: str,
+    last_error: str = "",
+    attempts: int = 0,
+    source: str | None = None,
+) -> None:
+    """Agent 会话（run）终态失败通知（``agent_run_failed``）。
+
+    调用方：run 进入 ``failed`` 终态的判定点（确定性 LLM 失败 / 可重试达上限 /
+    恢复续跑失败 / 恢复扫描关联缺失）。冷却、路由与站内信由 NotificationService
+    按通知规则统一处理；本函数 best-effort，失败仅记 warning。
+    """
+    try:
+        error_text = str(last_error or "")
+        notification_service.notify(
+            "agent_run_failed",
+            source=source,
+            in_app_title=f"Agent 运行失败：{task_type or 'unknown'}",
+            in_app_body=(
+                f"run_id={run_id}\n原因={stop_reason}"
+                + (f"\n错误={error_text[:200]}" if error_text else "")
+            ),
+            in_app_type="agent_run_failed",
+            run_id=run_id,
+            task_type=task_type,
+            stop_reason=stop_reason,
+            last_error=error_text[:200],
+            attempts=attempts,
+        )
+    except Exception as e:
+        logger.warning(f"发送 agent_run_failed 通知失败（已忽略）: {e}")

@@ -5638,3 +5638,102 @@ def test_replay_missing_read_tool_capture_falls_back_to_placeholder(
     assert blk.is_error is False
     warns = [line for level, line in log_records if level == "WARNING"]
     assert any("终止工具" in line and "read_cap" in line for line in warns), warns
+
+
+# ---------------------------------------------------------------------------
+# agent_run_failed 通知（run 进入 failed 终态的判定点）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_run_terminal_llm_failure_notifies_agent_run_failed():
+    """确定性 LLM 失败 → 发送 agent_run_failed（携带 run_id / stop_reason）。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-e-notify"
+    sr_id = 510
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("401 Unauthorized", retryable=False)
+
+    with patch("app.services.base.notifier_helpers.notification_service") as notify:
+        status = await llm_assist.get_scenario_runtime().run(
+            run_id,
+            ctx=_ctx(sr, _make_bgm()),
+            thinking_level="medium",
+            stream_fn=_scripted_stream(_boom),
+            span_recorder=None,
+        )
+
+    assert status == "failed"
+    notify.notify.assert_called_once()
+    assert notify.notify.call_args.args[0] == "agent_run_failed"
+    kwargs = notify.notify.call_args.kwargs
+    assert kwargs.get("run_id") == run_id
+    assert kwargs.get("task_type") == "match"
+    assert kwargs.get("stop_reason") == "llm_error"
+
+
+@pytest.mark.asyncio
+async def test_run_retryable_failure_below_limit_does_not_notify():
+    """可重试失败且未达上限（attempts<3）→ 不发失败通知（避免噪声）。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-e-notify-retry"
+    sr_id = 511
+    database_manager.agent_runs.create_pending(run_id, "match", sr_id)
+    sr = _make_sync_record(sync_record_id=sr_id)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("429 rate limited", retryable=True)
+
+    with patch("app.services.base.notifier_helpers.notification_service") as notify:
+        status = await llm_assist.get_scenario_runtime().run(
+            run_id,
+            ctx=_ctx(sr, _make_bgm()),
+            thinking_level="medium",
+            stream_fn=_scripted_stream(_boom),
+            span_recorder=None,
+        )
+
+    assert status == "processing"
+    notify.notify.assert_not_called()
+
+
+def test_continue_run_terminal_failure_notifies_agent_run_failed():
+    """恢复续跑确定性失败 → 发送 agent_run_failed。"""
+    from app.services.llm.client import LLMCallError
+
+    repo = _make_continuation_repo()
+    rr = _make_replay_result(executed=0, missing=[], last_response=None)
+
+    async def _boom(messages, *, tools=None, tool_choice=None):
+        raise LLMCallError("401 Unauthorized", retryable=False)
+        yield  # pragma: no cover - 使其成为 async generator，供流式消费
+
+    with (
+        patch("app.services.agent.observe.trace.replay", return_value=rr),
+        patch("app.services.matching.llm_assist.config_manager") as cm,
+        patch(
+            "app.services.agent.run.runtime.get_database_manager",
+            return_value=_make_continuation_dbm(repo),
+        ),
+        patch(
+            "app.services.matching.llm_assist._build_default_stream_fn",
+            return_value=_boom,
+        ),
+        patch("app.services.base.notifier_helpers.notification_service") as notify,
+    ):
+        cm.get_sync_llm_match_config.return_value = _medium_cfg()
+        asyncio.run(
+            llm_assist.get_scenario_runtime().continue_run(
+                "r-err-notify", ctx=_ctx({"id": 1}, MagicMock())
+            )
+        )
+
+    repo.mark_failed.assert_called_once()
+    notify.notify.assert_called_once()
+    assert notify.notify.call_args.args[0] == "agent_run_failed"
+    assert notify.notify.call_args.kwargs.get("run_id") == "r-err-notify"

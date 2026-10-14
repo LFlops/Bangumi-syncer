@@ -50,6 +50,7 @@ from app.core.logging import logger
 from app.models.agent import AgentRunRecord
 from app.services.agent.budget import compute_match_run_timeout
 from app.services.agent.run.registry import get_scenario
+from app.services.base.notifier_helpers import notify_agent_run_failed
 from app.services.base.scheduler import BaseScheduler
 from app.services.notification_service import get_notification_service
 
@@ -360,6 +361,12 @@ class LlmMatchScheduler(BaseScheduler):
                 repo.mark_failed(
                     run_id, stop_reason="error", last_error="sync_record missing"
                 )
+                notify_agent_run_failed(
+                    run_id,
+                    task_type=run.task_type,
+                    stop_reason="error",
+                    last_error="sync_record missing",
+                )
                 return
 
             ctx = get_scenario(run.task_type).new_ctx(sync_record)
@@ -406,6 +413,12 @@ class LlmMatchScheduler(BaseScheduler):
                 logger.warning(f"🤖 run {run_id} 关联 sync_record 缺失，标记失败")
                 repo.mark_failed(
                     run_id, stop_reason="error", last_error="sync_record missing"
+                )
+                notify_agent_run_failed(
+                    run_id,
+                    task_type=run.task_type,
+                    stop_reason="error",
+                    last_error="sync_record missing",
                 )
                 return
 

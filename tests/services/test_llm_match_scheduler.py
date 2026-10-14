@@ -1603,3 +1603,30 @@ def test_tick_timeout_cancels_hanging_round_and_returns():
     )
     errors = [str(c.args[0]) for c in log.error.call_args_list]
     assert any("整体超时" in m for m in errors), f"tick 超时应记 error，实际 {errors}"
+
+
+def test_recovery_missing_sync_record_notifies_agent_run_failed():
+    """恢复扫描：sync_record 缺失 → mark_failed 并发送 agent_run_failed。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.list_stale_processing.return_value = [
+        {"run_id": "r1", "task_type": "match", "sync_record_id": 42}
+    ]
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch.object(sched, "_get_sync_record", return_value=None),
+        patch("app.services.base.notifier_helpers.notification_service") as notify,
+    ):
+        import asyncio
+
+        asyncio.run(sched._run_sync_job())
+
+    repo.mark_failed.assert_called_once()
+    notify.notify.assert_called_once()
+    assert notify.notify.call_args.args[0] == "agent_run_failed"
+    assert notify.notify.call_args.kwargs.get("run_id") == "r1"

@@ -60,6 +60,7 @@ from app.services.agent.execution.tools import (
 from app.services.agent.loop import RunResult
 from app.services.agent.run.registry import ScenarioRuntime
 from app.services.agent.run.scenario import ScenarioHooks
+from app.services.base.notifier_helpers import notify_agent_run_failed
 from app.services.llm.client import get_llm_client
 from app.services.llm.models import (
     Message,
@@ -920,6 +921,12 @@ def _handle_result(
             stop_reason=stop,
             last_error=f"循环终止原因: {stop}",
             total_tokens=total_tokens,
+        )
+        notify_agent_run_failed(
+            run_id,
+            task_type="match",
+            stop_reason=stop,
+            last_error=f"循环终止原因: {stop}",
         )
         return "failed"
 

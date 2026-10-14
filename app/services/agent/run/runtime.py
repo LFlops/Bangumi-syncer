@@ -37,6 +37,7 @@ from app.services.agent.observe import trace
 from app.services.agent.observe.recorder import TraceRecorder
 from app.services.agent.protocols import TerminalCapture, ToolSchema, ToolSpanRecorder
 from app.services.agent.run.scenario import CtxT, ScenarioHooks
+from app.services.base.notifier_helpers import notify_agent_run_failed
 from app.services.llm.client import LLMCallError
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 from app.services.notification_service import NotificationService
@@ -116,11 +117,25 @@ async def run(
                 last_error=str(e),
                 total_tokens=span_recorder.total_tokens,
             )
+            notify_agent_run_failed(
+                run_id,
+                task_type=hooks.task_type,
+                stop_reason="llm_error",
+                last_error=str(e),
+            )
             return "failed"
         # 可重试（429/5xx/超时）→ 累加 attempts；达上限时由仓储在**同一次调用事务内**
         # 单点置终态（status='failed' + last_error），此处不得再 mark_failed（避免双写）。
         logger.error(f"[{hooks.task_type}] run {run_id} 可重试 LLM 失败: {e}")
         attempts = dbm.agent_runs.increment_attempts(run_id, last_error=str(e))
+        if attempts >= 3:
+            notify_agent_run_failed(
+                run_id,
+                task_type=hooks.task_type,
+                stop_reason="llm_error",
+                last_error=str(e),
+                attempts=attempts,
+            )
         return "failed" if attempts >= 3 else "processing"
     except Exception as e:
         logger.error(f"[{hooks.task_type}] run {run_id} LLM 调用异常: {e}")
@@ -441,9 +456,23 @@ async def continue_run(
         if not e.retryable:
             logger.error(f"🤖 恢复续跑 {run_id} 确定性 LLM 失败: {e}")
             repo.mark_failed(run_id, stop_reason="llm_error", last_error=str(e))
+            notify_agent_run_failed(
+                run_id,
+                task_type=hooks.task_type,
+                stop_reason="llm_error",
+                last_error=str(e),
+            )
         else:
             logger.error(f"🤖 恢复续跑 {run_id} 可重试 LLM 失败: {e}")
-            repo.increment_attempts(run_id, last_error=str(e))
+            attempts = repo.increment_attempts(run_id, last_error=str(e))
+            if attempts >= 3:
+                notify_agent_run_failed(
+                    run_id,
+                    task_type=hooks.task_type,
+                    stop_reason="llm_error",
+                    last_error=str(e),
+                    attempts=attempts,
+                )
     except Exception as e:
         # 附带当前 run 状态，便于区分「处理中异常」与「已终态后的异常」
         logger.error(
