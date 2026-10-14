@@ -119,6 +119,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"启动时清理旧同步记录失败（不影响主流程）: {e}")
 
+    # 标记残留的未闭合 span（上次进程中断遗留的 running → error），best-effort
+    try:
+        marked = database_manager.agent_runs.mark_residual_running_spans()
+        if marked:
+            logger.info(
+                f"启动清理：{marked} 条未闭合 span 已标记为 error（进程中断遗留）"
+            )
+    except Exception as e:
+        logger.warning(f"启动清理未闭合 span 失败（不影响主流程）: {e}")
+
     try:
         register_schedulers()
         scheduler_config = config_manager.get_scheduler_config()

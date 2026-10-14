@@ -67,6 +67,7 @@ def _make_repo() -> MagicMock:
     repo.list_pending.return_value = []
     repo.increment_attempts.return_value = 1
     repo.refresh_started_at.return_value = True
+    repo.mark_residual_running_spans.return_value = 0
     return repo
 
 
@@ -322,6 +323,55 @@ def test_cleanup_no_log_when_nothing_expired():
     # 删除数为 0 时不打清理日志
     for call in log.info.call_args_list:
         assert "清理终态过期 agent_run" not in call.args[0]
+
+
+# ---------------------------------------------------------------------------
+# 残留 span 清理（观测：进程中断遗留的 running → error）
+# ---------------------------------------------------------------------------
+
+
+def test_run_round_marks_residual_running_spans_and_logs():
+    """调度轮清理未闭合 span；受影响 >0 时记 info。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.mark_residual_running_spans.return_value = 2
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        import asyncio
+
+        asyncio.run(sched._run_sync_job())
+    repo.mark_residual_running_spans.assert_called_once()
+    log.info.assert_any_call("🤖 清理未闭合 span 2 条（进程中断遗留）")
+
+
+def test_run_round_residual_span_failure_is_ignored():
+    """清理异常仅记 warning，本轮调度继续（恢复扫描照常执行）。"""
+    sched = LlmMatchScheduler()
+    cm = _make_config()
+    repo = _make_repo()
+    repo.mark_residual_running_spans.side_effect = RuntimeError("db boom")
+    log = MagicMock()
+    with (
+        patch("app.services.llm_match_scheduler.config_manager", cm),
+        patch(
+            "app.services.llm_match_scheduler.get_database_manager",
+            return_value=_make_dbm(repo),
+        ),
+        patch("app.services.llm_match_scheduler.logger", log),
+    ):
+        import asyncio
+
+        asyncio.run(sched._run_sync_job())
+    repo.list_stale_processing.assert_called_once()
+    assert any("清理未闭合 span 失败" in c.args[0] for c in log.warning.call_args_list)
 
 
 # ---------------------------------------------------------------------------

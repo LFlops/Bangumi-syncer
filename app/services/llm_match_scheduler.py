@@ -231,7 +231,7 @@ class LlmMatchScheduler(BaseScheduler):
         return value
 
     async def _run_round(self, match_cfg: dict, run_timeout: float) -> None:
-        """单轮调度主体：清理 → 恢复扫描 → pending 共享信号量并发消费。
+        """单轮调度主体：清理 → 残留 span → 恢复扫描 → pending 共享信号量并发消费。
 
         ``run_timeout`` 为单 run 动态超时（``compute_match_run_timeout`` 推算）。
         ``_consume`` 内 ``asyncio.wait_for`` 超时会 cancel ``fn`` 协程，进而触发
@@ -251,7 +251,16 @@ class LlmMatchScheduler(BaseScheduler):
         if deleted and deleted > 0:
             logger.info(f"🤖 清理过期 agent_run {deleted} 条")
 
-        # 2. 恢复扫描（本进程已在处理（活着但慢）的 run 不得被重复捞起）
+        # 2. 残留 span 清理（观测）：所属 run 已终结但自身未闭合的 running →
+        #    error（进程中断遗留），best-effort，失败仅日志、不影响本轮调度
+        try:
+            marked = repo.mark_residual_running_spans()
+            if marked:
+                logger.info(f"🤖 清理未闭合 span {marked} 条（进程中断遗留）")
+        except Exception as e:
+            logger.warning(f"🤖 清理未闭合 span 失败（已忽略）: {e}")
+
+        # 3. 恢复扫描（本进程已在处理（活着但慢）的 run 不得被重复捞起）
         recovery_timeout = match_cfg["llm_match_recovery_timeout_s"]
         try:
             stale_raw = repo.list_stale_processing(timeout_seconds=recovery_timeout)
@@ -264,7 +273,7 @@ class LlmMatchScheduler(BaseScheduler):
             if run.run_id not in _active_run_ids
         ]
 
-        # 3. 正常处理（limit 防堆积；切片双保险，避免上层 mock 返回超量）
+        # 4. 正常处理（limit 防堆积；切片双保险，避免上层 mock 返回超量）
         try:
             pending_raw = repo.list_pending(limit=self.BATCH_SIZE)[: self.BATCH_SIZE]
         except Exception as e:
@@ -272,7 +281,7 @@ class LlmMatchScheduler(BaseScheduler):
             pending_raw = []
         pending = _parse_run_rows(pending_raw, source="pending")
 
-        # 4. 并发消费：recover 先入列，与 pending 共享并发限额（信号量结构化并发）
+        # 5. 并发消费：recover 先入列，与 pending 共享并发限额（信号量结构化并发）
         # getter 已做非法值回退，此处仅兜底非正数下限。
         limit = max(1, match_cfg["llm_match_concurrency"])
         sem = asyncio.Semaphore(limit)
