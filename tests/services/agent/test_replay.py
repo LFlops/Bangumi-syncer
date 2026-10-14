@@ -20,6 +20,7 @@ from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.execution.tools import BatchResults
 from app.services.agent.observe import trace
+from app.services.agent.observe.delta import BudgetMessageDelta, encode_replay_delta
 from app.services.llm.models import (
     ChatResponse,
     Message,
@@ -167,6 +168,16 @@ def _write_tool_exec(dbm, run_id, iteration, sequence, tool_use_id, content):
     trace.end_span(span_id, replay_delta=_tool_rd(tool_use_id, content))
 
 
+def _write_budget(dbm, run_id, iteration, sequence, content):
+    """写入一条独立 budget 行（与生产 recorder.record_budget 同构）。"""
+    _ensure_run(dbm, run_id)
+    span_id = trace.start_span(run_id, "budget", iteration, sequence)
+    trace.end_span(
+        span_id,
+        replay_delta=encode_replay_delta(BudgetMessageDelta(budget_message=content)),
+    )
+
+
 def _scripted_stream(script):
     """把 chat 风格脚本函数适配为流式 ``StreamFn``（含工具停点与 usage/stop 事件）。
 
@@ -274,9 +285,7 @@ class TestReplayReconstructsFullRun:
         )
         _write_tool_exec(dbm, "run-eq", 0, 1, "t1", "res1")
         _write_tool_exec(dbm, "run-eq", 0, 2, "t2", "res2")
-        trace.record_budget_message(
-            dbm.agent_runs.get_steps("run-eq")[-1]["span_id"], "[剩余轮次：1]"
-        )
+        _write_budget(dbm, "run-eq", 0, 3, "[剩余轮次：1]")
         # 轮 1：终局
         _write_llm_chat(dbm, "run-eq", 1, [], stop_reason="end_turn", content="done")
 

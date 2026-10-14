@@ -47,6 +47,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 from app.core.config_secret_crypto import decrypt, encrypt
 from app.core.database import get_database_manager
 from app.core.logging import logger
+from app.services.agent.observe.delta import BudgetMessageDelta, decode_replay_delta
 from app.services.llm.models import (
     ContentBlock,
     Message,
@@ -434,7 +435,7 @@ def replay(run_id: str) -> ReplayResult:
       （content 为 ``list[ToolUseBlock]``，与原执行对齐）。
     - 逐条追加各 ``tool_execute.replay_delta.tool_result`` 重建的
       ``Message(role="user", content=[ToolResultBlock(...)])``（每条工具结果独立成消息，不合并）。
-    - 预算消息：优先用存储的 ``budget_message``（同轮最后 tool_execute 已并入）；
+    - 预算消息：读同轮独立 ``budget`` 行（``name="budget"``，一行一形态）；
        缺失时不追加预算消息。
     - 缺失工具识别（S(tool_calls) - R(已记录 tool_execute)）逻辑不变；命中缺失的该轮
        不追加预算消息、不计入 executed_iterations，交回调用方补执行。
@@ -524,6 +525,12 @@ def replay(run_id: str) -> ReplayResult:
             recorded_ids: set = set()
             budget_message: str | None = None
             for t in sorted(isteps, key=lambda x: (x["sequence"], x["id"])):
+                if t["name"] == "budget":
+                    # 独立预算行（一行一形态）：按序收集，完整轮末尾统一追加
+                    delta = decode_replay_delta(_parse_json(t.get("replay_delta"), {}))
+                    if isinstance(delta, BudgetMessageDelta):
+                        budget_message = delta.budget_message
+                    continue
                 if t["name"] != "tool_execute":
                     logger.warning(
                         f"[trace] replay iteration={it} 跳过非 tool_execute 行:"
@@ -552,9 +559,6 @@ def replay(run_id: str) -> ReplayResult:
                     )
                 )
                 recorded_ids.add(tr.get("tool_use_id"))
-                bm = _extract_budget_message(t)
-                if bm is not None:
-                    budget_message = bm
 
             missing = [tc for tc in tool_calls if tc.id not in recorded_ids]
             if missing:

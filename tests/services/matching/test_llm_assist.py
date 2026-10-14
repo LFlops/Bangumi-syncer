@@ -2371,11 +2371,9 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
     captured = {
         "start": [],
         "end": [],
-        "budget": [],
     }
     original_start = recorder.start_span
     original_end = recorder.end_span
-    original_budget = recorder.record_budget_message
 
     def fake_start(run_id, name, iteration, sequence, parent_id=""):
         span_id = original_start(run_id, name, iteration, sequence, parent_id)
@@ -2393,17 +2391,8 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
         captured["end"].append({"span_id": span_id, **kwargs})
         return original_end(span_id, **kwargs)
 
-    def fake_budget(span_id, budget_message):
-        captured["budget"].append(
-            {"span_id": span_id, "budget_message": budget_message}
-        )
-        return original_budget(span_id, budget_message)
-
     monkeypatch.setattr("app.services.agent.observe.recorder.start_span", fake_start)
     monkeypatch.setattr("app.services.agent.observe.recorder.end_span", fake_end)
-    monkeypatch.setattr(
-        "app.services.agent.observe.recorder.record_budget_message", fake_budget
-    )
 
     chat = _chat_side_effect([_search_response(), _submit_response("789", "搜索补充")])
 
@@ -2445,8 +2434,18 @@ async def test_run_full_link_trace_recorder_seed_chat_tool_budget(monkeypatch):
     tool_starts = [s for s in captured["start"] if s["name"] == "tool_execute"]
     assert len(tool_starts) >= 1, "应存在 tool_execute span"
 
-    # budget 钩子被调用（每轮一次）
-    assert len(captured["budget"]) >= 1, "budget 应被记录"
+    # budget 行：独立 span（name="budget"），delta 为 budget_message 形态
+    budget_starts = [s for s in captured["start"] if s["name"] == "budget"]
+    assert len(budget_starts) >= 1, "预算应写独立 budget 行"
+    budget_ends = [
+        e
+        for e in captured["end"]
+        if e["span_id"] in [s["span_id"] for s in budget_starts]
+    ]
+    assert budget_ends, "独立 budget 行应 end_span 落库"
+    assert all(e["replay_delta"]["kind"] == "budget_message" for e in budget_ends), (
+        budget_ends
+    )
 
 
 @pytest.mark.asyncio
@@ -2564,36 +2563,41 @@ def test_trace_recorder_tool_start_end_idempotent():
         assert len(ends) == 1, "幂等：第二次 end_tool 不应产生新 span 记录"
 
 
-def test_trace_recorder_budget_falls_back_to_chat_span():
-    """budget 钩子定位本轮最后 tool span，无则回退 chat span。"""
+def test_trace_recorder_budget_writes_independent_row():
+    """budget 钩子写独立 budget 行（一行一形态）；sequence = 本轮 max+1。"""
     from unittest.mock import patch
 
-    budget_targets = []
+    starts: list[dict] = []
+    ends: list[dict] = []
 
     def fake_start(run_id, name, iteration, sequence, parent_id=""):
-        return f"span-{name}-{iteration}"
+        starts.append({"name": name, "iteration": iteration, "sequence": sequence})
+        return f"span-{name}-{iteration}-{sequence}"
 
     def fake_end(span_id, **kwargs):
-        pass
+        ends.append({"span_id": span_id, **kwargs})
 
-    def fake_budget(span_id, budget_message):
-        budget_targets.append(span_id)
-
-    recorder = TraceRecorder("run-test", start_iteration=1)
-    # 仅有 chat span，无 tool span
-    recorder._chat_span_id = "span-llm_chat-0"
+    recorder = TraceRecorder("run-test", start_iteration=0)
 
     with (
         patch("app.services.agent.observe.recorder.start_span", side_effect=fake_start),
         patch("app.services.agent.observe.recorder.end_span", side_effect=fake_end),
-        patch(
-            "app.services.agent.observe.recorder.record_budget_message",
-            side_effect=fake_budget,
-        ),
     ):
+        # 同轮已有工具行：max sequence = 2
+        recorder.start_tool(
+            ToolUseBlock(id="t1", name="search_bangumi", input={}), sequence=2
+        )
         recorder.record_budget("[剩余轮次：2]")
-        assert len(budget_targets) == 1
-        assert budget_targets[0] == "span-llm_chat-0", "无 tool span 时应回退 chat span"
+
+    budget_starts = [s for s in starts if s["name"] == "budget"]
+    assert len(budget_starts) == 1, "预算应写独立 budget 行"
+    assert budget_starts[0]["iteration"] == 0
+    # 排序保证：预算行位于本轮全部工具行之后（max+1）
+    assert budget_starts[0]["sequence"] == 3, budget_starts
+    # delta 形态为 budget_message
+    assert len(ends) == 1
+    assert ends[0]["replay_delta"]["kind"] == "budget_message"
+    assert ends[0]["replay_delta"]["budget_message"] == "[剩余轮次：2]"
 
 
 # ---------------------------------------------------------------------------

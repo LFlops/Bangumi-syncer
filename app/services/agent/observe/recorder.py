@@ -11,7 +11,8 @@
 - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
   包裹层调用；幂等安全。
 - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
-- **budget 钩子**：``record_budget`` 定位本轮最后 tool span（无则回退 chat span）。
+- **budget 钩子**：``record_budget`` 写独立 ``budget`` 行（一行一形态；
+  sequence 取本轮 max+1，排序恒在全部工具行之后）。
 
 由场景层（如 ``app/services/matching/llm_assist``）在 run 编排中实例化；
 span 的读写细节由 :mod:`app.services.agent.observe.trace` 承担。
@@ -25,7 +26,14 @@ from datetime import datetime
 
 from app.core.logging import logger
 from app.services.agent.chat_span import ChatSpan, ChatSpanStart, RecorderChatSpan
-from app.services.agent.observe.trace import end_span, record_budget_message, start_span
+from app.services.agent.observe.delta import (
+    BudgetMessageDelta,
+    ResponseDelta,
+    SeedDelta,
+    ToolResultDelta,
+    encode_replay_delta,
+)
+from app.services.agent.observe.trace import end_span, start_span
 from app.services.agent.protocols import BudgetRecorder
 from app.services.llm.models import ChatResponse, Message, ToolResultBlock, ToolUseBlock
 
@@ -43,15 +51,16 @@ def _input_summary(inp: dict) -> str:
 class TraceRecorder(BudgetRecorder):
     """统一 trace 记录器（chat span / tool span / seed 行 / budget 钩子）。
 
-    职责：
-    - **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文
-      （:class:`~app.services.agent.chat_span.RecorderChatSpan`）：进入时 start_span、
-      ``feed`` 单点聚合、退出时**唯一**一次 finalize + end_span
-      （model/tokens 写专用列，不再塞 payload_json）。
-    - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
-      包裹层调用；幂等安全。
-    - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
-    - **budget 钩子**：``record_budget`` 定位本轮最后 tool span（无则回退 chat span）。
+      职责：
+      - **chat span 上下文**：``chat_span()`` 产出一轮的 ``async with`` 上下文
+        （:class:`~app.services.agent.chat_span.RecorderChatSpan`）：进入时 start_span、
+        ``feed`` 单点聚合、退出时**唯一**一次 finalize + end_span
+        （model/tokens 写专用列，不再塞 payload_json）。
+      - **ToolSpanRecorder 实现**：``start_tool`` / ``end_tool`` 供 execute_batch
+        包裹层调用；幂等安全。
+      - **seed 行**：run 启动时写一条 ``name="seed"`` span，供 replay 显式提取。
+      - **budget 钩子**：``record_budget`` 写独立 ``budget`` 行（一行一形态；
+    sequence 取本轮 max+1，排序恒在全部工具行之后）。
     """
 
     def __init__(
@@ -67,7 +76,7 @@ class TraceRecorder(BudgetRecorder):
         # 当前轮的 iteration（chat span 进入时设定，start_tool / record_budget 读取）
         self._current_iteration: int = 0
         self._chat_span_id: str | None = None
-        self._last_tool_span_id: str | None = None
+        self._round_max_sequence: int = 0
         # 全轮累计 token 用量（每轮 chat 响应 usage 累加，供终态落库使用）
         self.total_tokens: int = 0
         # span_id → (tool_use, t0)，供 end_tool 检索后清除（幂等）
@@ -99,7 +108,7 @@ class TraceRecorder(BudgetRecorder):
             self.run_id, name="llm_chat", iteration=self._current_iteration, sequence=0
         )
         self._chat_span_id = span_id
-        self._last_tool_span_id = None  # 新轮重置
+        self._round_max_sequence = 0  # 新轮重置
         return ChatSpanStart(
             span_id=span_id, iteration=self._current_iteration, t0=self._clock()
         )
@@ -138,14 +147,16 @@ class TraceRecorder(BudgetRecorder):
                 model=resp.model,
                 tokens=tokens,
                 latency_ms=latency_ms,
-                replay_delta={
-                    "response": {
-                        "stop_reason": resp.stop_reason,
-                        "content": resp.content,
-                        "tool_calls": tool_calls,
-                        "blocks": blocks,
-                    }
-                },
+                replay_delta=encode_replay_delta(
+                    ResponseDelta(
+                        response={
+                            "stop_reason": resp.stop_reason,
+                            "content": resp.content,
+                            "tool_calls": tool_calls,
+                            "blocks": blocks,
+                        }
+                    )
+                ),
             )
         else:
             # LLM 调用异常 / 流中断：写 error span 但不遮掩原始异常
@@ -174,7 +185,7 @@ class TraceRecorder(BudgetRecorder):
             parent_id=self._chat_span_id or "",
         )
         self._tool_state[span_id] = (tool_use, self._clock())
-        self._last_tool_span_id = span_id
+        self._round_max_sequence = max(self._round_max_sequence, sequence)
         return span_id
 
     def end_tool(
@@ -199,13 +210,15 @@ class TraceRecorder(BudgetRecorder):
 
         replay_delta: dict | None = None
         if result is not None:
-            replay_delta = {
-                "tool_result": {
-                    "tool_use_id": result.tool_use_id,
-                    "content": result.content,
-                    "is_error": result.is_error,
-                }
-            }
+            replay_delta = encode_replay_delta(
+                ToolResultDelta(
+                    tool_result={
+                        "tool_use_id": result.tool_use_id,
+                        "content": result.content,
+                        "is_error": result.is_error,
+                    }
+                )
+            )
 
         end_span(
             span_id,
@@ -226,7 +239,7 @@ class TraceRecorder(BudgetRecorder):
         end_span(
             span_id,
             status="ok",
-            replay_delta={"seed_messages": seed_delta},
+            replay_delta=encode_replay_delta(SeedDelta(seed_messages=seed_delta)),
         )
 
     # -- 恢复续跑锚定 ------------------------------------------------------
@@ -240,12 +253,28 @@ class TraceRecorder(BudgetRecorder):
         """
         self._current_iteration = iteration
         self._next_iteration = iteration + 1
-        self._last_tool_span_id = None
+        self._round_max_sequence = 0
 
     # -- budget 钩子 -------------------------------------------------------
 
     def record_budget(self, budget_message: str) -> None:
-        """预算钩子：并入本轮最后 tool span，无则回退 chat span。"""
-        target = self._last_tool_span_id or self._chat_span_id
-        if target:
-            record_budget_message(target, budget_message)
+        """预算钩子：写**独立** ``budget`` 行（一行一形态，不并入工具行）。
+
+        排序保证：sequence 取本轮已用最大 sequence + 1，故在
+        ``(iteration, sequence, id)`` 排序下恒位于该轮全部工具行之后、
+        下一轮之前——replay 重建顺序与 live 一致，不依赖"最后一条工具 span"。
+        """
+        sequence = self._round_max_sequence + 1
+        self._round_max_sequence = sequence
+        span_id = start_span(
+            self.run_id,
+            name="budget",
+            iteration=self._current_iteration,
+            sequence=sequence,
+        )
+        end_span(
+            span_id,
+            replay_delta=encode_replay_delta(
+                BudgetMessageDelta(budget_message=budget_message)
+            ),
+        )
