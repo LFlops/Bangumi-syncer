@@ -19,9 +19,10 @@ Agent 追踪查询 API
 """
 
 import json
+import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 
 from ..api.deps import get_current_user_flexible
 from ..core.database import database_manager
@@ -37,6 +38,11 @@ from ..services.agent.observe.delta import (
 from ..utils.truncate import MAX_PAYLOAD_JSON_BYTES, truncate_text_with_marker
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+# 列表端点的分页与窗口常量
+_LIST_DEFAULT_PAGE_SIZE = 20
+_LIST_MAX_PAGE_SIZE = 100
+_LIST_DEFAULT_DAYS = 30
 
 # run 端点对外暴露的字段（不含 payload_json / replay_delta 等内部重放字段）
 _RUN_PUBLIC_FIELDS = (
@@ -247,6 +253,58 @@ def _project_steps(steps: list) -> list:
         projected.append(record)
     projected.sort(key=lambda r: (r.get("iteration") or 0, r.get("sequence") or 0))
     return projected
+
+
+@router.get("/runs")
+async def list_agent_runs(
+    run_status: str = Query("", alias="status"),
+    task_type: str = "",
+    days: int = _LIST_DEFAULT_DAYS,
+    page: int = 1,
+    page_size: int = _LIST_DEFAULT_PAGE_SIZE,
+    current_user: dict = Depends(get_current_user_flexible),
+):
+    """列出 agent 会话（观测用；非 admin 仅见自己的 run）。
+
+    - 分页：``page`` / ``page_size``（上限 100）；创建时间倒序（id DESC）；
+    - 过滤：``status``（pending/processing/succeeded/failed/cancelled）、
+      ``task_type``、``days``（窗口天数，非正数回退 30）；
+    - 授权：非 admin 经 ``sync_records.user_name`` 归属过滤；无用户名时返回空
+      （不查库、不泄漏全量）；admin 看全部；
+    - 字段：与单 run 端点同口径（不含 replay_delta 原文）；时间 ISO 化。
+    """
+    page = max(1, page)
+    page_size = min(max(1, page_size), _LIST_MAX_PAGE_SIZE)
+    window_days = days if days > 0 else _LIST_DEFAULT_DAYS
+    since = int(time.time()) - window_days * 86400
+
+    owner: str | None
+    if _is_admin_user(current_user):
+        owner = None
+    else:
+        owner = current_user.get("username") or ""
+        if not owner:
+            # 异常态（非 admin 且无用户名）：不查库、不泄漏全量
+            return {"items": [], "total": 0, "page": page, "page_size": page_size}
+
+    filters = {
+        "status": run_status or None,
+        "task_type": task_type or None,
+        "since": since,
+        "user_name": owner,
+    }
+    rows = database_manager.agent_runs.list_runs(
+        limit=page_size, offset=(page - 1) * page_size, **filters
+    )
+    total = database_manager.agent_runs.count_runs(**filters)
+
+    items: list[dict] = []
+    for run in rows:
+        record = {field: run.get(field) for field in _RUN_PUBLIC_FIELDS}
+        record["run_id"] = run.get("run_id", "")
+        _apply_time_fields(record)
+        items.append(record)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 @router.get("/runs/{run_id}")

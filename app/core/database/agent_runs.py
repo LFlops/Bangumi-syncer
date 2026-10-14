@@ -757,6 +757,91 @@ class AgentRunsRepository(BaseRepository):
 
         return self._run_read(_read, error_msg="查询最新 agent_run 失败", default=None)
 
+    # ------------------------------------------------------------------
+    # 观测列表（分页 / 过滤）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _runs_filter_sql(
+        *,
+        status: str | None,
+        task_type: str | None,
+        since: int | None,
+        user_name: str | None,
+    ) -> tuple[str, str, list]:
+        """构造观测列表的 JOIN / WHERE / 参数（list_runs 与 count_runs 共用口径）。
+
+        - ``user_name``：经 ``sync_records`` 归属过滤（agent_runs 无用户列，
+          归属在同步记录上；run↔sync_record 一对一，JOIN 不放大行）；
+        - ``since``：epoch 秒下界（``created_at >= since``）。
+        """
+        joins = ""
+        where: list[str] = []
+        params: list = []
+        if user_name is not None:
+            joins += " JOIN sync_records s ON s.id = r.sync_record_id"
+            where.append("s.user_name = ?")
+            params.append(user_name)
+        if status:
+            where.append("r.status = ?")
+            params.append(status)
+        if task_type:
+            where.append("r.task_type = ?")
+            params.append(task_type)
+        if since is not None:
+            where.append("r.created_at >= ?")
+            params.append(int(since))
+        where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+        return joins, where_sql, params
+
+    def list_runs(
+        self,
+        *,
+        status: str | None = None,
+        task_type: str | None = None,
+        since: int | None = None,
+        user_name: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list:
+        """列出会话（观测用）：可选过滤 + id 倒序（最新在最前）+ 分页。"""
+
+        def _read(conn):
+            joins, where_sql, params = self._runs_filter_sql(
+                status=status, task_type=task_type, since=since, user_name=user_name
+            )
+            cursor = conn.execute(
+                f"SELECT r.* FROM agent_runs r{joins}{where_sql} "
+                "ORDER BY r.id DESC LIMIT ? OFFSET ?",
+                [*params, int(limit), int(offset)],
+            )
+            cols = [d[0] for d in cursor.description]
+            return [dict(zip(cols, r, strict=True)) for r in cursor.fetchall()]
+
+        return self._run_read(_read, error_msg="列出 agent_run 失败", default=[])
+
+    def count_runs(
+        self,
+        *,
+        status: str | None = None,
+        task_type: str | None = None,
+        since: int | None = None,
+        user_name: str | None = None,
+    ) -> int:
+        """按与 :meth:`list_runs` 相同过滤口径统计总数。"""
+
+        def _read(conn):
+            joins, where_sql, params = self._runs_filter_sql(
+                status=status, task_type=task_type, since=since, user_name=user_name
+            )
+            cursor = conn.execute(
+                f"SELECT COUNT(*) FROM agent_runs r{joins}{where_sql}", params
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+
+        return self._run_read(_read, error_msg="统计 agent_run 失败", default=0)
+
     def list_pending(self, limit: int = 50) -> list:
         """列出 pending 会话（供调度器拾取），按 id 升序"""
 

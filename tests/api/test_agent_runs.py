@@ -660,3 +660,112 @@ async def test_display_json_budget_message_preview(app, mock_db):
     steps = await _get_steps(app, mock_db, [_make_step("s1", "budget", delta)])
 
     assert steps[0]["display_json"] == {"budget_message": "[剩余轮次：2]"}
+
+
+# ---------------------------------------------------------------------------
+# runs 列表端点（观测）
+# ---------------------------------------------------------------------------
+
+
+def _list_run_row(run_id="run-1", **overrides):
+    row = {
+        "run_id": run_id,
+        "task_type": "match",
+        "status": "succeeded",
+        "stop_reason": "submit_suggestion",
+        "sync_record_id": 42,
+        "attempts": 0,
+        "total_attempts": 1,
+        "total_tokens": 123,
+        "started_at": 1704067200,
+        "ended_at": 1704067202,
+        "created_at": 1704067200,
+        "last_error": "",
+        "replay_delta": "should-not-leak",
+    }
+    row.update(overrides)
+    return row
+
+
+async def test_list_agent_runs_structure_fields_and_time_iso(app, mock_db):
+    """列表：{items,total,page,page_size}；公共字段 + ISO 时间；不泄漏 replay_delta。"""
+    mock_db.agent_runs.list_runs.return_value = [
+        _list_run_row("run-2"),
+        _list_run_row("run-1"),
+    ]
+    mock_db.agent_runs.count_runs.return_value = 42
+
+    await _override_user(app, {"username": "alice"})
+
+    async with _client(app) as client:
+        resp = await client.get("/api/agent/runs?page=2&page_size=10")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total"] == 42
+    assert data["page"] == 2
+    assert data["page_size"] == 10
+    assert [i["run_id"] for i in data["items"]] == ["run-2", "run-1"]
+    item = data["items"][0]
+    assert item["status"] == "succeeded"
+    assert item["created_at"] == "2024-01-01T00:00:00+00:00"
+    assert "replay_delta" not in item
+    # 分页透传：offset=(2-1)*10
+    kwargs = mock_db.agent_runs.list_runs.call_args.kwargs
+    assert kwargs["limit"] == 10
+    assert kwargs["offset"] == 10
+
+
+async def test_list_agent_runs_owner_filter_and_admin(app, mock_db):
+    """非 admin 传 user_name 过滤；admin 不过滤（None）。"""
+    mock_db.agent_runs.list_runs.return_value = []
+    mock_db.agent_runs.count_runs.return_value = 0
+
+    await _override_user(app, {"username": "alice"})
+    async with _client(app) as client:
+        resp = await client.get("/api/agent/runs")
+    assert resp.status_code == 200
+    assert mock_db.agent_runs.list_runs.call_args.kwargs["user_name"] == "alice"
+
+    mock_db.agent_runs.list_runs.reset_mock()
+    await _override_user(app, {"username": "admin", "is_admin": True})
+    async with _client(app) as client:
+        resp = await client.get("/api/agent/runs")
+    assert resp.status_code == 200
+    assert mock_db.agent_runs.list_runs.call_args.kwargs["user_name"] is None
+
+
+async def test_list_agent_runs_page_size_capped_and_page_floored(app, mock_db):
+    """page_size 上限 100；page<1 归正为 1；days 非正数回退默认 30。"""
+    import time as _time
+
+    mock_db.agent_runs.list_runs.return_value = []
+    mock_db.agent_runs.count_runs.return_value = 0
+    await _override_user(app, {"username": "alice"})
+
+    async with _client(app) as client:
+        resp = await client.get("/api/agent/runs?page=0&page_size=500&days=0")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["page"] == 1
+    assert data["page_size"] == 100
+    kwargs = mock_db.agent_runs.list_runs.call_args.kwargs
+    assert kwargs["limit"] == 100
+    assert kwargs["offset"] == 0
+    # days=0 → 默认 30 天窗口（since 在未来之前、且约为 now-30d 以内）
+    now = int(_time.time())
+    assert now - 31 * 86400 <= kwargs["since"] <= now - 29 * 86400
+
+
+async def test_list_agent_runs_non_admin_without_username_returns_empty(app, mock_db):
+    """非 admin 但无 username（异常态）：返回空列表且不查库（不泄漏全量）。"""
+    await _override_user(app, {"username": ""})
+
+    async with _client(app) as client:
+        resp = await client.get("/api/agent/runs")
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": [], "total": 0, "page": 1, "page_size": 20}
+    mock_db.agent_runs.list_runs.assert_not_called()
+    mock_db.agent_runs.count_runs.assert_not_called()

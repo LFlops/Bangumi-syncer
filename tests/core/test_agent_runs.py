@@ -1626,3 +1626,96 @@ def test_scheduler_active_runs_cleared_by_conftest_fixture():
     from app.services import llm_match_scheduler
 
     assert llm_match_scheduler._active_run_ids == set()
+
+
+class TestListRuns:
+    """list_runs / count_runs：观测列表查询（过滤 / 排序 / 分页 / 归属 join）。
+
+    BDD：
+
+    - 全量列表按 id 倒序（最新在前）且含基础字段；
+    - status / task_type / since 过滤生效（组合语义 = AND）；
+    - user_name 经 sync_records 归属 join 过滤（alice 看不到 bob 的 run）；
+    - 分页 limit/offset 稳定切片；count_runs 与列表过滤口径一致。
+    """
+
+    @staticmethod
+    def _seed(tmp_path: Path) -> DatabaseManager:
+        dbm = _make_db(tmp_path)
+        conn = _db_conn(dbm)
+        conn.execute(
+            "INSERT INTO sync_records (user_name, title, season, episode, status, source) "
+            "VALUES ('alice', 'A', 1, 1, 'success', 'plex')"
+        )
+        sr_alice = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO sync_records (user_name, title, season, episode, status, source) "
+            "VALUES ('bob', 'B', 1, 1, 'success', 'plex')"
+        )
+        sr_bob = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+
+        repo = dbm.agent_runs
+        repo.create_pending("run-a1", "match", sr_alice)
+        repo.create_pending("run-a2", "match", sr_alice)
+        repo.create_pending("run-b1", "summary", sr_bob)
+        repo.mark_succeeded("run-a1", stop_reason="submit_suggestion")
+        return dbm
+
+    def test_list_runs_returns_all_desc_with_basic_fields(self, tmp_path):
+        dbm = self._seed(tmp_path)
+
+        rows = dbm.agent_runs.list_runs()
+
+        # id 倒序：最新创建的 run-b1 在最前
+        assert [r["run_id"] for r in rows] == ["run-b1", "run-a2", "run-a1"]
+        top = rows[0]
+        for field in (
+            "run_id",
+            "task_type",
+            "status",
+            "sync_record_id",
+            "created_at",
+        ):
+            assert field in top
+
+    def test_list_runs_filters_by_status_and_task_type(self, tmp_path):
+        dbm = self._seed(tmp_path)
+
+        assert [r["run_id"] for r in dbm.agent_runs.list_runs(status="succeeded")] == [
+            "run-a1"
+        ]
+        assert [r["run_id"] for r in dbm.agent_runs.list_runs(task_type="summary")] == [
+            "run-b1"
+        ]
+        assert dbm.agent_runs.list_runs(status="failed") == []
+
+    def test_list_runs_filters_by_user_name_join(self, tmp_path):
+        dbm = self._seed(tmp_path)
+
+        alice = dbm.agent_runs.list_runs(user_name="alice")
+        bob = dbm.agent_runs.list_runs(user_name="bob")
+
+        assert [r["run_id"] for r in alice] == ["run-a2", "run-a1"]
+        assert [r["run_id"] for r in bob] == ["run-b1"]
+
+    def test_list_runs_filters_by_since(self, tmp_path):
+        import time as _time
+
+        dbm = self._seed(tmp_path)
+        now = int(_time.time())
+
+        assert dbm.agent_runs.list_runs(since=now + 3600) == []
+        assert len(dbm.agent_runs.list_runs(since=now - 3600)) == 3
+
+    def test_list_runs_pagination_stable_and_count_consistent(self, tmp_path):
+        dbm = self._seed(tmp_path)
+
+        page1 = dbm.agent_runs.list_runs(limit=2, offset=0)
+        page2 = dbm.agent_runs.list_runs(limit=2, offset=2)
+        assert [r["run_id"] for r in page1] == ["run-b1", "run-a2"]
+        assert [r["run_id"] for r in page2] == ["run-a1"]
+
+        assert dbm.agent_runs.count_runs() == 3
+        assert dbm.agent_runs.count_runs(status="succeeded") == 1
+        assert dbm.agent_runs.count_runs(user_name="alice") == 2
