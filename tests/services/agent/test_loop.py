@@ -237,7 +237,7 @@ async def test_submit_suggestion_breaks_and_captures_without_executing_others():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "49892", "reason": "标题语义相近"}
+    assert result.terminal_args == {"subject_id": "49892", "reason": "标题语义相近"}
     # 同轮其他工具不执行：执行器 handler 不应被调用
     assert executed == []
 
@@ -792,7 +792,7 @@ async def test_exhausted_final_recovery_submits_suggestion():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "49892", "reason": "收尾确定"}
+    assert result.terminal_args == {"subject_id": "49892", "reason": "收尾确定"}
     assert result.last_response is not None
     # last_response 为收尾响应（含 submit tool_use）
     assert [
@@ -992,7 +992,7 @@ async def test_veto_defers_first_terminal_and_injects_hint_tool_result():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "2", "reason": "确定"}
+    assert result.terminal_args == {"subject_id": "2", "reason": "确定"}
     # 首次 submit 被暂缓：其他工具不执行
     assert executed == []
     # 第二轮请求携带注入的 veto tool_result（配对 terminal tool_use）
@@ -1027,7 +1027,7 @@ async def test_veto_happens_at_most_once_per_run():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    assert result.terminal_args == {"subject_id": "1", "reason": "暂推荐"}
     # veto 仅调用一次（第二次 terminal 因「已 veto 过」直接放行，不再询问）
     assert len(veto_calls) == 1
     assert stream.count == 2
@@ -1055,7 +1055,7 @@ async def test_veto_not_applied_on_final_round():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    assert result.terminal_args == {"subject_id": "1", "reason": "暂推荐"}
     # 末轮不 veto：回调根本不被调用
     assert veto_calls == []
     assert stream.count == 1
@@ -1078,7 +1078,7 @@ async def test_veto_none_behaves_like_current_behavior():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "1", "reason": "暂推荐"}
+    assert result.terminal_args == {"subject_id": "1", "reason": "暂推荐"}
     assert stream.count == 1
 
 
@@ -1393,7 +1393,7 @@ async def test_stream_path_terminal_captured_and_other_tools_not_executed():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "1", "reason": "ok"}
+    assert result.terminal_args == {"subject_id": "1", "reason": "ok"}
     assert events == [], "terminal 轮不得执行任何工具（含后续 read）"
 
 
@@ -1515,7 +1515,7 @@ async def test_stream_path_budget_and_recovery_use_stream():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "9", "reason": "收尾"}
+    assert result.terminal_args == {"subject_id": "9", "reason": "收尾"}
 
 
 async def test_run_requires_stream_fn():
@@ -1776,6 +1776,6 @@ async def test_terminal_branch_prefers_executor_capture_args():
     )
 
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == {"subject_id": "42"}, (
+    assert result.terminal_args == {"subject_id": "42"}, (
         "存在 capture 时应以 capture.args 为准（消除「产而不用」）"
     )

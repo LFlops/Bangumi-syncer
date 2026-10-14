@@ -72,7 +72,7 @@ def test_stop_reason_is_actual_terminal_tool_name():
     assert result.stop_reason == "finish_x", (
         f"stop_reason 应为实际终止工具名，实际 {result.stop_reason!r}"
     )
-    assert result.suggestion == {"ok": True}
+    assert result.terminal_args == {"ok": True}
 
 
 def test_zero_terminal_tools_natural_exhaustion_without_recovery_call():
@@ -161,3 +161,38 @@ def test_scenario_hooks_has_no_terminal_tool_field():
     assert "terminal_tool" not in ScenarioHooks.__dataclass_fields__, (
         "terminal_tool 字段应已删除（终止集合由注册表派生）"
     )
+
+
+def test_run_result_fields_are_skeleton_only():
+    """RunResult 字段清单：终止载荷名为 terminal_args（骨架不含场景词 suggestion）。"""
+    from dataclasses import fields
+
+    from app.services.agent.loop import RunResult
+
+    assert {f.name for f in fields(RunResult)} == {
+        "stop_reason",
+        "text",
+        "terminal_args",
+        "last_response",
+    }
+
+
+def test_end_turn_run_result_keeps_terminal_args_none():
+    """非终止终态（end_turn）：terminal_args 为 None（场景层 or {} 兼容）。"""
+
+    async def stream_fn(messages, *, tools=None, tool_choice=None):
+        yield StreamChunk(type="text_delta", text="done")
+        yield StreamChunk(type="stop", stop_reason="end_turn", model="m")
+
+    async def run():
+        return await loop.run_loop(
+            stream_fn=stream_fn,
+            tools_schemas=[terminal_schema()],
+            max_iterations=2,
+            seed_messages=_SEED,
+        )
+
+    result = asyncio.run(run())
+
+    assert result.stop_reason == "end_turn"
+    assert result.terminal_args is None

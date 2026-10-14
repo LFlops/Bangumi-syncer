@@ -843,7 +843,7 @@ def _handle_result(
     stop = result.stop_reason
 
     if stop == _TERMINAL_TOOL:
-        suggestion = result.suggestion or {}
+        suggestion = result.terminal_args or {}
         if suggestion.get("give_up"):
             # 放弃协议：模型明确放弃 → 不落库、不通知，直接记 succeeded(stop_reason='give_up')。
             # 这是被鼓励的正确终态（好于提交不确定的推荐），reason 仅作观测。

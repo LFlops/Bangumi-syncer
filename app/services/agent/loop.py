@@ -96,13 +96,13 @@ class RunResult:
 
     - ``stop_reason``：end_turn / submit_suggestion / exhausted（统一结束原因）
     - ``text``：end_turn 时 LLM 的纯文本输出
-    - ``suggestion``：submit_suggestion 捕获的参数 dict（subject_id/reason）
+    - ``terminal_args``：终止工具捕获的参数 dict（骨架只记录，语义由场景层解释）
     - ``last_response``：末轮 ChatResponse（exhausted 兜底供 output_parser 解析）
     """
 
     stop_reason: str
     text: str = ""
-    suggestion: dict | None = None
+    terminal_args: dict | None = None
     last_response: ChatResponse | None = None
 
 
@@ -437,17 +437,17 @@ async def run_loop(
                     for r in await executor.finalize()
                     if isinstance(r, TerminalCapture)
                 ]
-            suggestion = captures[0].args if captures else (terminal_tc.input or {})
+            terminal_args = captures[0].args if captures else (terminal_tc.input or {})
             # 软护栏（veto）：非末轮 + 本 run 尚未拦过时，先询问一次场景回调。
             # 末轮强收尾优先（remaining==1 不拦）；只拦一次避免无限暂缓。
             hint = ""
             if veto_terminal is not None and remaining > 1 and not vetoed:
-                hint = veto_terminal(suggestion) or ""
+                hint = veto_terminal(terminal_args) or ""
             if not hint:
                 assert terminal_name is not None  # terminal_tc 非空即派生名存在
                 return RunResult(
                     stop_reason=terminal_name,
-                    suggestion=suggestion,
+                    terminal_args=terminal_args,
                     last_response=resp,
                 )
             # 暂缓：不终止、不执行其他工具；为同轮**全部** tool_use 注入配对
@@ -580,7 +580,7 @@ async def _final_recovery(
     if terminal_tc is not None:
         return RunResult(
             stop_reason=terminal_name,
-            suggestion=terminal_tc.input or {},
+            terminal_args=terminal_tc.input or {},
             last_response=recovery_resp,
         )
     return RunResult(stop_reason="exhausted", last_response=recovery_resp)

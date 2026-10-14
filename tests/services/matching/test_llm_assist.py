@@ -2879,7 +2879,7 @@ async def test_handle_result_invalid_subject_id_passes_total_tokens(monkeypatch)
     dbm = MagicMock()
     result = RunResult(
         stop_reason="submit_suggestion",
-        suggestion={"subject_id": "999999", "reason": "非法"},
+        terminal_args={"subject_id": "999999", "reason": "非法"},
     )
     monkeypatch.setattr(
         llm_assist, "_validate_subject_id", lambda sid: (False, "subject_id 非法")
@@ -3137,7 +3137,7 @@ def test_continue_run_submit_suggestion_dispatches_to_handle_result():
     handle.assert_called_once()
     result_arg = handle.call_args[0][2]  # _handle_result(dbm, run_id, result, ...)
     assert result_arg.stop_reason == "submit_suggestion"
-    assert result_arg.suggestion == {"subject_id": "123", "reason": "跨季匹配"}
+    assert result_arg.terminal_args == {"subject_id": "123", "reason": "跨季匹配"}
     # 接线断言：notification_service 必须透传（生产链路真正发送站内信）
     assert handle.call_args[1].get("notification_service") is fake_svc
     loop.assert_not_awaited()
@@ -3526,7 +3526,7 @@ def test_continue_run_zero_remaining_with_submit_uses_terminal():
     handle.assert_called_once()
     result_arg = handle.call_args[0][2]
     assert result_arg.stop_reason == "submit_suggestion"
-    assert result_arg.suggestion == {"subject_id": "123", "reason": "末轮已提交"}
+    assert result_arg.terminal_args == {"subject_id": "123", "reason": "末轮已提交"}
     repo.mark_succeeded.assert_not_called()
     loop.assert_not_awaited()
 
@@ -5220,7 +5220,7 @@ def test_handle_result_give_up_marks_succeeded_without_persist_or_notify(
 
     result = RunResult(
         stop_reason="submit_suggestion",
-        suggestion={"give_up": True, "reason": "确实无法确定，放弃"},
+        terminal_args={"give_up": True, "reason": "确实无法确定，放弃"},
     )
 
     status = llm_assist._handle_result(
@@ -5256,7 +5256,7 @@ def test_handle_result_give_up_false_takes_normal_submit_path(monkeypatch):
 
     result = RunResult(
         stop_reason="submit_suggestion",
-        suggestion={"subject_id": "123", "reason": "确定", "give_up": False},
+        terminal_args={"subject_id": "123", "reason": "确定", "give_up": False},
     )
 
     status = llm_assist._handle_result(

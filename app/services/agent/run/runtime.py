@@ -336,7 +336,7 @@ async def continue_run(
             sug = submit_tc.input or {}
             result = RunResult(
                 stop_reason=submit_tc.name,
-                suggestion=sug,
+                terminal_args=sug,
                 last_response=None,
             )
             # 恢复路径不重放 veto（软护栏）——**有意**与 live 路径不同：

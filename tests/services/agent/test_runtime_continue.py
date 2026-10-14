@@ -222,7 +222,7 @@ def test_continue_run_with_matching_terminal_tool_call_dispatches_normally(
     assert len(hooks.terminal_calls) == 1
     args, _kwargs = hooks.terminal_calls[0]
     result = args[1]
-    assert result.suggestion == submit_input
+    assert result.terminal_args == submit_input
     assert result.stop_reason == "submit_suggestion"
 
 
@@ -470,7 +470,7 @@ def test_continue_run_final_recovery_terminal_call_dispatches_submit(
     assert len(hooks.terminal_calls) == 1
     result = hooks.terminal_calls[0][0][1]
     assert result.stop_reason == "submit_suggestion"
-    assert result.suggestion == submit_input
+    assert result.terminal_args == submit_input
 
 
 def test_continue_run_final_recovery_stray_tool_call_ignored_lands_exhausted(
