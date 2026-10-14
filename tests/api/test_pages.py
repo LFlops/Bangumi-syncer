@@ -302,3 +302,21 @@ def test_agent_runs_page():
     assert 'id="agentRunDetailModal"' in body
     assert "agent_runs.js" in body
     assert "agent-run-steps.js" in body
+
+
+def test_dashboard_llm_trend_canvases():
+    """仪表板含 LLM 用量趋势容器（tokens 与质量双图；已登录）"""
+    app = FastAPI()
+    app.include_router(pages.router)
+
+    client = TestClient(app)
+    with patch.object(
+        pages, "get_current_user_from_cookie", return_value={"username": "u"}
+    ):
+        response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="llm-trend-row"' in body
+    assert 'id="llmTokensChart"' in body
+    assert 'id="llmQualityChart"' in body
