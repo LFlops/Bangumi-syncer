@@ -27,6 +27,13 @@ from ..api.deps import get_current_user_flexible
 from ..core.database import database_manager
 from ..core.logging import logger
 from ..core.security import security_manager
+from ..services.agent.observe.delta import (
+    BudgetMessageDelta,
+    ResponseDelta,
+    SeedDelta,
+    ToolResultDelta,
+    decode_replay_delta,
+)
 from ..utils.truncate import MAX_PAYLOAD_JSON_BYTES, truncate_text_with_marker
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
@@ -188,41 +195,35 @@ def _fit_preview_within_limit(preview: dict) -> dict:
     return {}
 
 
-def _build_display_json(name: str, replay_delta: str) -> dict:
-    """从 replay_delta 现场生成展示摘要（直接返回嵌套对象，超限截断）。
+def _build_display_json(replay_delta: str) -> dict:
+    """从 replay_delta 现场生成展示摘要（decode 分派；超限截断）。
 
-    - llm_chat → {"stop_reason", "content"}
-    - tool_execute → {"tool_use_id", "content", "is_error"}
+    - response → {"stop_reason", "content"}
+    - tool_result → {"tool_use_id", "content", "is_error"}
     - seed → {"seed_messages_count": N}
-    - 解析失败/空 delta/未知 name → {}
+    - budget_message → {"budget_message": ...}
+    - 空 delta / 形态非法（decode 降级）→ {}
     """
-    if not replay_delta:
+    delta = decode_replay_delta(replay_delta)
+    if delta is None:
         return {}
-    try:
-        data = (
-            json.loads(replay_delta) if isinstance(replay_delta, str) else replay_delta
-        )
-    except (ValueError, TypeError):
-        return {}
-    if not isinstance(data, dict):
-        return {}
-
-    if name == "llm_chat":
-        response = data.get("response") or {}
+    if isinstance(delta, ResponseDelta):
+        response = delta.response or {}
         preview = {
             "stop_reason": response.get("stop_reason", ""),
             "content": response.get("content", ""),
         }
-    elif name == "tool_execute":
-        tool_result = data.get("tool_result") or {}
+    elif isinstance(delta, ToolResultDelta):
+        tool_result = delta.tool_result or {}
         preview = {
             "tool_use_id": tool_result.get("tool_use_id", ""),
             "content": tool_result.get("content", ""),
             "is_error": tool_result.get("is_error", False),
         }
-    elif name == "seed":
-        seed_messages = data.get("seed_messages") or []
-        preview = {"seed_messages_count": len(seed_messages)}
+    elif isinstance(delta, SeedDelta):
+        preview = {"seed_messages_count": len(delta.seed_messages)}
+    elif isinstance(delta, BudgetMessageDelta):
+        preview = {"budget_message": delta.budget_message}
     else:
         return {}
 
@@ -241,9 +242,7 @@ def _project_steps(steps: list) -> list:
     projected = []
     for s in steps:
         record = {f: s.get(f) for f in _STEP_PUBLIC_FIELDS}
-        record["display_json"] = _build_display_json(
-            s.get("name", ""), s.get("replay_delta", "")
-        )
+        record["display_json"] = _build_display_json(s.get("replay_delta", ""))
         _apply_time_fields(record)
         projected.append(record)
     projected.sort(key=lambda r: (r.get("iteration") or 0, r.get("sequence") or 0))

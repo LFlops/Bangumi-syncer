@@ -276,7 +276,7 @@ async def test_get_agent_run_steps_sorted_and_no_replay_delta(app, mock_db):
             "error": "",
             "iteration": 1,
             "sequence": 1,
-            "replay_delta": '{"tool_result":{"tool_use_id":"tu-3","content":"detail ok","is_error":false}}',
+            "replay_delta": '{"kind": "tool_result", "delta_version": 1, "tool_result":{"tool_use_id":"tu-3","content":"detail ok","is_error":false}}',
             "started_at": 1704067200,
             "ended_at": 1704067201,
         },
@@ -292,7 +292,7 @@ async def test_get_agent_run_steps_sorted_and_no_replay_delta(app, mock_db):
             "error": "",
             "iteration": 0,
             "sequence": 0,
-            "replay_delta": '{"response":{"stop_reason":"end_turn","content":"你好","tool_calls":[]}}',
+            "replay_delta": '{"kind": "response", "delta_version": 1, "response":{"stop_reason":"end_turn","content":"你好","tool_calls":[]}}',
             "started_at": 1704067200,
             "ended_at": 1704067202,
         },
@@ -308,7 +308,7 @@ async def test_get_agent_run_steps_sorted_and_no_replay_delta(app, mock_db):
             "error": "",
             "iteration": 0,
             "sequence": 1,
-            "replay_delta": '{"tool_result":{"tool_use_id":"tu-2","content":"搜索结果","is_error":false}}',
+            "replay_delta": '{"kind": "tool_result", "delta_version": 1, "tool_result":{"tool_use_id":"tu-2","content":"搜索结果","is_error":false}}',
             "started_at": 1704067200,
             "ended_at": 1704067201,
         },
@@ -378,7 +378,11 @@ async def test_display_json_llm_chat_small_content_not_truncated(app, mock_db):
     """llm_chat 小 content → display_json 含 stop_reason + content，无 shrinked 标记"""
     big = "x" * 50
     delta = json.dumps(
-        {"response": {"stop_reason": "end_turn", "content": big, "tool_calls": []}}
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": "end_turn", "content": big, "tool_calls": []},
+        }
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
@@ -394,7 +398,11 @@ async def test_display_json_llm_chat_oversized_content_truncated_with_marker(
     """llm_chat 超长 content → display_json 截断且含 shrinked 标记，仍是嵌套对象"""
     huge = "A" * 5000  # 远超 2KB
     delta = json.dumps(
-        {"response": {"stop_reason": "end_turn", "content": huge, "tool_calls": []}}
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": "end_turn", "content": huge, "tool_calls": []},
+        }
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
@@ -411,7 +419,15 @@ async def test_display_json_llm_chat_oversized_content_truncated_with_marker(
 async def test_display_json_tool_execute_preview_fields(app, mock_db):
     """tool_execute → display_json 含 tool_use_id / content / is_error"""
     delta = json.dumps(
-        {"tool_result": {"tool_use_id": "tu-1", "content": "ok结果", "is_error": False}}
+        {
+            "kind": "tool_result",
+            "delta_version": 1,
+            "tool_result": {
+                "tool_use_id": "tu-1",
+                "content": "ok结果",
+                "is_error": False,
+            },
+        }
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "tool_execute", delta)])
 
@@ -427,7 +443,7 @@ async def test_display_json_seed_only_count(app, mock_db):
         {"role": "user", "content": "msg1"},
         {"role": "assistant", "content": "msg2"},
     ]
-    delta = json.dumps({"seed_messages": messages})
+    delta = json.dumps({"kind": "seed", "delta_version": 1, "seed_messages": messages})
     steps = await _get_steps(app, mock_db, [_make_step("s1", "seed", delta)])
 
     display = steps[0]["display_json"]
@@ -456,7 +472,15 @@ async def test_display_json_llm_chat_content_list_returns_nested_original(app, m
     """content 为 list → display_json 原样返回嵌套列表（不 500、不字符串化）。"""
     segments = [{"type": "text", "text": "分段文本"}]
     delta = json.dumps(
-        {"response": {"stop_reason": "end_turn", "content": segments, "tool_calls": []}}
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {
+                "stop_reason": "end_turn",
+                "content": segments,
+                "tool_calls": [],
+            },
+        }
     )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
@@ -470,7 +494,13 @@ async def test_display_json_llm_chat_content_object_returns_nested_original(
 ):
     """content 为对象（dict）→ display_json 原样返回嵌套对象。"""
     content = {"blocks": ["a", "b"], "n": 2}
-    delta = json.dumps({"response": {"stop_reason": "end_turn", "content": content}})
+    delta = json.dumps(
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": "end_turn", "content": content},
+        }
+    )
     steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
 
     assert steps[0]["display_json"]["content"] == content
@@ -482,7 +512,11 @@ async def test_display_json_no_truncatable_str_field_returns_empty_and_warns(
     """超限预览中字段全为非 str（无可截断字符串）→ 返回 {} 且记 warning。"""
     # stop_reason 非 str（int）+ content 为超大 dict：两个字段都不可按字符串截断
     delta = json.dumps(
-        {"response": {"stop_reason": 123, "content": {"blob": "y" * 5000}}}
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": 123, "content": {"blob": "y" * 5000}},
+        }
     )
     with patch.object(agent_runs_module, "logger") as mock_logger:
         steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
@@ -497,7 +531,11 @@ async def test_display_json_truncation_not_converging_returns_empty_and_warns(
 ):
     """仅有的 str 字段截断至空后仍超限（巨大非 str 负载）→ 收敛失败返回 {} 且记 warning。"""
     delta = json.dumps(
-        {"response": {"stop_reason": "x" * 100, "content": {"blob": "y" * 5000}}}
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": "x" * 100, "content": {"blob": "y" * 5000}},
+        }
     )
     with patch.object(agent_runs_module, "logger") as mock_logger:
         steps = await _get_steps(app, mock_db, [_make_step("s1", "llm_chat", delta)])
@@ -586,7 +624,13 @@ async def test_run_timestamps_zero_or_none_returns_none(app, mock_db):
 
 async def test_steps_timestamps_epoch_to_iso(app, mock_db):
     """agent_steps 时间字段 epoch → ISO 8601"""
-    delta = json.dumps({"response": {"stop_reason": "end_turn", "content": "hi"}})
+    delta = json.dumps(
+        {
+            "kind": "response",
+            "delta_version": 1,
+            "response": {"stop_reason": "end_turn", "content": "hi"},
+        }
+    )
     steps = await _get_steps(
         app, mock_db, [_make_step("s1", "llm_chat", delta, iteration=0, sequence=0)]
     )
@@ -602,3 +646,17 @@ async def test_steps_timestamps_epoch_to_iso(app, mock_db):
     assert datetime.fromisoformat(s["ended_at"]) == datetime.fromtimestamp(
         1704067201, tz=timezone.utc
     )
+
+
+async def test_display_json_budget_message_preview(app, mock_db):
+    """budget 行 → display_json 展示预算消息文本"""
+    delta = json.dumps(
+        {
+            "kind": "budget_message",
+            "delta_version": 1,
+            "budget_message": "[剩余轮次：2]",
+        }
+    )
+    steps = await _get_steps(app, mock_db, [_make_step("s1", "budget", delta)])
+
+    assert steps[0]["display_json"] == {"budget_message": "[剩余轮次：2]"}

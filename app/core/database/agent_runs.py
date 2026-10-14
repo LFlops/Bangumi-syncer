@@ -28,7 +28,6 @@
 import json
 import sqlite3
 import time
-from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 
@@ -855,7 +854,7 @@ class AgentRunsRepository(BaseRepository):
         return self._run_write(_write, error_msg="写入 agent_step 失败", default=0)
 
     def update_step(self, span_id: str, **fields: Any) -> bool:
-        """更新一条 span（agent_steps），供 trace.end_span / record_budget_message 调用。
+        """更新一条 span（agent_steps），供 trace.end_span 调用。
 
         支持的字段：status, model, tokens, latency_ms, tool_name, input_summary,
         error, replay_delta, started_at, ended_at。
@@ -891,46 +890,6 @@ class AgentRunsRepository(BaseRepository):
             return cursor.rowcount > 0
 
         return self._run_write(_write, error_msg="更新 agent_step 失败", default=False)
-
-    def record_budget_message(
-        self,
-        span_id: str,
-        transform: Callable[[str], str | None],
-    ) -> None:
-        """将预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
-
-        **读改写事务在仓储内**：SELECT 当前 ``replay_delta`` → 调 ``transform``
-        得到写回值 → UPDATE（``_run_write`` 取锁 + commit；异常 rollback + 日志）。
-        SELECT 无行时不调用 ``transform``、不写入。
-
-        ``transform`` 接收当前 raw ``replay_delta``，返回应写回的新 raw；
-        返回 ``None`` 表示**跳过写入**（解密/解析/加密失败等由 transform 内部判定
-        并留痕，保持「失败保留原 raw」契约）。加密/解密逻辑保留在 trace 侧
-        （``config_secret_crypto.decrypt/encrypt``）：仓储既有
-        ``_encrypt_replay_delta`` 在加密失败时降级存明文，与 replay_delta
-        的「失败不落明文」契约不等价，故不在此复用。
-
-        独立 best-effort 事务：失败仅日志（由 ``_run_write`` 的 ``error_msg`` 承载），
-        不向调用方抛出。
-        """
-
-        def _write(conn):
-            row = conn.execute(
-                "SELECT replay_delta FROM agent_steps WHERE span_id=?", (span_id,)
-            ).fetchone()
-            if not row:
-                return
-            new_delta = transform(row[0] or "")
-            if new_delta is None:
-                return
-            conn.execute(
-                "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
-                (new_delta, span_id),
-            )
-
-        self._run_write(
-            _write, error_msg="[trace] record_budget_message 失败（已忽略）"
-        )
 
     def mark_residual_running_spans(self) -> int:
         """把「所属 run 已终结但自身仍未闭合」的 running span 标记为 error。

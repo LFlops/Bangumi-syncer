@@ -5,7 +5,9 @@
 - **类型化列**（status / model / tokens / latency_ms / tool_name / input_summary /
   error / iteration / sequence）：payload 摘要，供观测与索引。
 - **replay_delta**：重放所需全部增量（seed / response / tool_result / budget_message），
-  完整、Fernet 加密（BGS1: 前缀）、永不截断、无大小上限、无 error 标记机制。
+  以 ``kind`` 判别式 + ``delta_version`` 的**联合形态**存储（见
+  :mod:`app.services.agent.observe.delta`），完整、Fernet 加密（BGS1: 前缀）、
+  永不截断、无大小上限、无 error 标记机制。
 
 存储边界（与 ``llm_usage_logs`` 的分工，避免重复/误删）：
 - ``llm_usage_logs``：**用量/成本聚合**，跨任务（job）维度，由 LLM client 层在每次
@@ -18,7 +20,6 @@
 提供：
 - ``start_span`` / ``end_span``：写入 ``agent_steps``（独立 best-effort 事务，失败仅日志），
   承载可重放会话日志。时间列统一 epoch 秒整数。
-- ``record_budget_message``：将透明预算消息并入最后一条 ``tool_execute`` 的 ``replay_delta``。
 - ``replay``：从 ``agent_steps`` 按 ``(iteration, sequence)`` 重放会话增量，
   重建可续跑的 ``messages``（断点恢复重建规则）。
 
@@ -27,8 +28,9 @@ replay_delta 写入语义：
   blocks}}``（``blocks`` 为本轮完整内容块，含 thinking/text/tool_use，是重建 assistant
   消息的首选来源；``tool_calls`` 为工具调用聚合，仅在 ``blocks`` 缺失/非法时回退使用）。
 - ``tool_execute.end_span``: ``replay_delta = {tool_result: {...}}``（仅 tool_result）。
-- 预算消息：由 ``record_budget_message`` 并入同轮最后一个 ``tool_execute`` 的
-  ``replay_delta``（``budget_message`` 字段）。
+- 预算消息：写**独立** ``budget`` 行（``name="budget"``，
+  ``replay_delta = {budget_message: ...}``；一行一形态，排序恒在同轮全部工具行
+  之后——由 recorder 的 sequence 分配保证）。
 
 读取/展示侧的截断（含 ``...[shrinked]`` 标记）由 ``app.utils.truncate`` 承担；
 写入路径零截断。
@@ -44,7 +46,6 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
-from app.core.config_secret_crypto import decrypt, encrypt
 from app.core.database import get_database_manager
 from app.core.logging import logger
 from app.services.agent.observe.delta import BudgetMessageDelta, decode_replay_delta
@@ -163,52 +164,6 @@ def end_span(
         dbm.agent_runs.update_step(span_id, **fields)
     except Exception as e:  # best-effort：失败不影响主流程
         logger.error(f"[trace] end_span 失败（已忽略）: {e}")
-
-
-def record_budget_message(span_id: str, budget_message: str) -> None:
-    """将透明预算消息并入指定 span（通常是同轮最后一个 ``tool_execute``）的 replay_delta。
-
-    在现有 replay_delta 上追加 ``budget_message`` 字段。独立 best-effort 事务。
-    读改写路径（SELECT → 解密 → 改 → 加密写回）的**事务与 SQL 已下沉仓储**
-    （``AgentRunsRepository.record_budget_message``），本函数仅提供纯数据整形
-    transform（解密/解析/合并/加密），由仓储在锁内 SELECT 后调用。
-
-    安全约束：任何解密/解析失败路径都**保留原 raw 不变**（不写库），仅记 warning 日志。
-    仅当成功解析为 dict 时才合并 budget_message 并写回。加密失败绝不明文回写
-    （违反 replay_delta 完整加密契约），同样保留原 raw——transform 返回 ``None``
-    表示跳过写入。
-    """
-
-    def _merge_budget(raw: str) -> str | None:
-        # 解密（容错无前缀明文）；解析失败保留原 raw，不写库
-        try:
-            obj = json.loads(decrypt(raw))
-        except Exception:
-            logger.warning(
-                "[trace] record_budget_message 解密/解析失败，保留原 raw 不写库"
-            )
-            return None
-        if not isinstance(obj, dict):
-            logger.warning(
-                "[trace] record_budget_message 解析结果非 dict，保留原 raw 不写库"
-            )
-            return None
-        obj["budget_message"] = budget_message
-        try:
-            return encrypt(json.dumps(obj, ensure_ascii=False))
-        except Exception as e:
-            # 加密失败绝不明文回写（违反 replay_delta 完整加密契约），保留原 raw
-            logger.warning(
-                "[trace] record_budget_message 加密失败，保留原 raw 不写库"
-                f"（{type(e).__name__}: {e}）"
-            )
-            return None
-
-    try:
-        dbm = get_database_manager()
-        dbm.agent_runs.record_budget_message(span_id, _merge_budget)
-    except Exception as e:  # best-effort
-        logger.error(f"[trace] record_budget_message 失败（已忽略）: {e}")
 
 
 # ----------------------------------------------------------------------
@@ -343,14 +298,6 @@ def _parse_tool_result(step: dict) -> dict | None:
         return None
     tr = obj.get("tool_result")
     return tr if isinstance(tr, dict) else None
-
-
-def _extract_budget_message(step: dict) -> str | None:
-    obj = _parse_json(step.get("replay_delta"), {})
-    if not isinstance(obj, dict):
-        return None
-    bm = obj.get("budget_message")
-    return bm if isinstance(bm, str) else None
 
 
 _CONTENT_BLOCK_ADAPTER: TypeAdapter[ContentBlock] = TypeAdapter(ContentBlock)

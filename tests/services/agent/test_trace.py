@@ -6,7 +6,7 @@
 - 三处 replay_delta 写路径落库均为 BGS1: 密文（加密开启时）
 - get_steps 解密后还原明文
 - 无前缀明文容错（decrypt 对明文原样返回）
-- record_budget_message 读改写后仍密文
+- budget 独立行职责分离（agent_steps 新增行，llm_usage 不变）
 - chat span（``recorder.chat_span()``）落库契约：全量 blocks / 空 blocks / 大载荷 / 异常 error span
 - 无 32KB / error 标记机制
 """
@@ -415,9 +415,11 @@ class TestEndSpanDoesNotOverwriteStartedAt:
 
 
 class TestAgentStepsVsLlmUsageSplit:
-    def test_record_budget_message_lands_in_agent_steps_not_llm_usage(self, dbm):
-        """职责分离行为契约：预算消息并入 agent_steps.replay_delta，
+    def test_budget_row_lands_in_agent_steps_not_llm_usage(self, dbm):
+        """职责分离行为契约：预算写**独立 budget 行**（agent_steps 新增行），
         llm_usage_logs 行数不变（用量聚合与重放载荷互不写入）。"""
+        from app.services.agent.observe.recorder import TraceRecorder
+
         _ensure_run(dbm, "run-split")
         sid = trace.start_span("run-split", "tool_execute", 0, 1)
         trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "r"))
@@ -428,102 +430,21 @@ class TestAgentStepsVsLlmUsageSplit:
         usage_before = conn.execute("SELECT COUNT(*) FROM llm_usage_logs").fetchone()[0]
         assert usage_before == 1
 
-        trace.record_budget_message(sid, "[剩余轮次：2]")
+        recorder = TraceRecorder("run-split", start_iteration=0)
+        recorder.record_budget("[剩余轮次：2]")
 
         steps_after = conn.execute("SELECT COUNT(*) FROM agent_steps").fetchone()[0]
         usage_after = conn.execute("SELECT COUNT(*) FROM llm_usage_logs").fetchone()[0]
-        # 预算消息并入既有 step（UPDATE，不新增行），且绝不写 llm_usage_logs
-        assert steps_after == steps_before
+        # 预算为独立新增行（agent_steps +1），且绝不写 llm_usage_logs
+        assert steps_after == steps_before + 1
         assert usage_after == usage_before == 1
-        raw = conn.execute(
-            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
-        ).fetchone()[0]
-        # 兼顾加密开启/关闭：decrypt 对 BGS1: 密文解密，对明文原样返回
-        from app.core.config_secret_crypto import decrypt
-
-        obj = json.loads(decrypt(raw))
+        budget_rows = [
+            st for st in dbm.agent_runs.get_steps("run-split") if st["name"] == "budget"
+        ]
+        assert len(budget_rows) == 1
+        obj = json.loads(budget_rows[0]["replay_delta"])
+        assert obj["kind"] == "budget_message"
         assert obj["budget_message"] == "[剩余轮次：2]"
-        # 原 tool_result 载荷必须保留（并入而非覆盖）
-        assert obj["tool_result"]["tool_use_id"] == "t1"
-
-
-class TestRecordBudgetMessage:
-    def test_record_budget_message_encrypted_at_rest(self, dbm, crypto_on):
-        """record_budget_message 读改写后落库仍为密文。"""
-        _ensure_run(dbm, "run-bud")
-        sid = trace.start_span("run-bud", "tool_execute", 0, 1)
-        trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "r"))
-        trace.record_budget_message(sid, "[剩余轮次：2]")
-        conn = dbm._connection._get_connection()
-        raw = conn.execute(
-            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
-        ).fetchone()[0]
-        assert raw.startswith("BGS1:")
-        from app.core.config_secret_crypto import decrypt
-
-        obj = json.loads(decrypt(raw))
-        assert obj["budget_message"] == "[剩余轮次：2]"
-        assert obj["tool_result"]["tool_use_id"] == "t1"
-
-    def test_record_budget_message_preserves_raw_on_parse_error(self, dbm, crypto_on):
-        """record_budget_message 解密/解析失败时保留原 raw，不覆盖。"""
-        _ensure_run(dbm, "run-bud-err")
-        sid = trace.start_span("run-bud-err", "tool_execute", 0, 1)
-        trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "original-result"))
-        # 直接写一条损坏内容（非 BGS1: 前缀、非 JSON）模拟密钥轮换后无法解密
-        conn = dbm._connection._get_connection()
-        conn.execute(
-            "UPDATE agent_steps SET replay_delta=? WHERE span_id=?",
-            ("this-is-not-valid-json-or-ciphertext", sid),
-        )
-        conn.commit()
-        # 调用 record_budget_message：应保留原 raw 不变
-        trace.record_budget_message(sid, "[剩余轮次：2]")
-        raw_after = conn.execute(
-            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
-        ).fetchone()[0]
-        # 原值未被覆盖
-        assert raw_after == "this-is-not-valid-json-or-ciphertext"
-
-
-class TestRecordBudgetMessageEncryptFailure:
-    """加密失败契约：绝不以明文回写 replay_delta（保留原 raw）。"""
-
-    def test_encrypt_failure_keeps_raw_and_logs_warning(
-        self, dbm, crypto_on, log_records
-    ):
-        """encrypt 抛错 → DB 中 replay_delta 与修改前一致（未明文回写）+ warning。"""
-        _ensure_run(dbm, "run-bud-enc-fail")
-        sid = trace.start_span("run-bud-enc-fail", "tool_execute", 0, 1)
-        trace.end_span(sid, replay_delta=_tool_replay_delta("t1", "secret-result"))
-        conn = dbm._connection._get_connection()
-        raw_before = conn.execute(
-            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
-        ).fetchone()[0]
-        # 前置：本行确实为密文
-        assert raw_before.startswith("BGS1:")
-
-        with patch(
-            "app.services.agent.observe.trace.encrypt",
-            side_effect=RuntimeError("key unavailable"),
-        ):
-            trace.record_budget_message(sid, "[剩余轮次：2]")
-
-        raw_after = conn.execute(
-            "SELECT replay_delta FROM agent_steps WHERE span_id=?", (sid,)
-        ).fetchone()[0]
-        # 原 raw 未被覆盖（未把含完整对话的明文写库）
-        assert raw_after == raw_before
-
-        from app.core.config_secret_crypto import decrypt
-
-        decrypted = decrypt(raw_after)
-        assert "budget_message" not in decrypted
-        # 密文行仍可正常解密还原原始载荷
-        assert json.loads(decrypted)["tool_result"]["tool_use_id"] == "t1"
-
-        warns = [line for level, line in log_records if level == "WARNING"]
-        assert any("加密失败" in line for line in warns)
 
 
 class TestRecorderChatSpan:
