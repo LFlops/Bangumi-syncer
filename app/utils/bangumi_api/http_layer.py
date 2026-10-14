@@ -17,6 +17,9 @@ from ..http_base import SyncHttpClient
 from ..retry import RETRY_EXCEPTIONS, RETRY_STATUS_CODES
 from .rate_limit import get_bgm_rate_limiter
 
+#: Bangumi 请求的 User-Agent（同步 ``init`` 与异步请求层共用）
+BGM_USER_AGENT = "SanaeMio/Bangumi-syncer (https://github.com/SanaeMio/Bangumi-syncer)"
+
 
 def _parse_retry_after(res: httpx.Response) -> float | None:
     """解析响应头 ``Retry-After`` 为秒数
@@ -63,6 +66,23 @@ def _parse_retry_after(res: httpx.Response) -> float | None:
 _UPSTREAM_GATEWAY_ERROR_STATUS = 502
 
 
+def notify_limiter_from_response(res: httpx.Response) -> None:
+    """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）。
+
+    仅 ``< 400``（成功）重置 429 升级计数；5xx 等服务端错误保持计数不变
+    （既不重置也不额外冻结），避免误重置弱化自适应冷却。同步/异步请求层共用。
+    """
+    limiter = get_bgm_rate_limiter()
+    if res.status_code == 429:
+        limiter.notify_rate_limited(_parse_retry_after(res))
+    elif res.status_code < 400:
+        limiter.notify_success()
+    else:
+        logger.debug(
+            f"⏳ HTTP {res.status_code} 非成功响应：保留 429 升级计数（不重置）"
+        )
+
+
 class HttpLayerMixin:
     """HTTP 请求层相关方法（供 BangumiApi 组合）
 
@@ -82,20 +102,8 @@ class HttpLayerMixin:
         ...
 
     def _apply_rate_limit_notification(self, res: httpx.Response) -> None:
-        """按响应状态通知进程级令牌桶（429 冻结 / 成功重置升级计数）
-
-        仅 ``< 400``（成功）重置 429 升级计数；5xx 等服务端错误保持计数不变
-        （既不重置也不额外冻结），避免误重置弱化自适应冷却。
-        """
-        limiter = get_bgm_rate_limiter()
-        if res.status_code == 429:
-            limiter.notify_rate_limited(_parse_retry_after(res))
-        elif res.status_code < 400:
-            limiter.notify_success()
-        else:
-            logger.debug(
-                f"⏳ HTTP {res.status_code} 非成功响应：保留 429 升级计数（不重置）"
-            )
+        """按响应状态通知进程级令牌桶（薄委托，同步/异步同源口径）。"""
+        notify_limiter_from_response(res)
 
     def _try_direct_connection(
         self, method: str, url: str, **kwargs: Any
