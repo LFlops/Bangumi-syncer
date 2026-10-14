@@ -932,6 +932,37 @@ class AgentRunsRepository(BaseRepository):
             _write, error_msg="[trace] record_budget_message 失败（已忽略）"
         )
 
+    def mark_residual_running_spans(self) -> int:
+        """把「所属 run 已终结但自身仍未闭合」的 running span 标记为 error。
+
+        - 判定：``agent_steps.status='running'`` 且所属 ``agent_runs.status``
+          已终态（succeeded / failed / cancelled）——正常处理中的 run 的
+          running span 是合法中间态，不在清理范围内（不误伤）
+        - 动作：``status='error'``、``error`` 记中断说明（残留可读、可过滤）
+        - 返回受影响行数；**幂等**（已处理后再次调用返回 0）
+        - 供应用启动 / 调度器恢复扫描调用（best-effort：失败由 ``_run_write``
+          记日志并返回 0，不影响启动主流程）
+        """
+
+        def _write(conn):
+            cursor = conn.execute(
+                """
+                UPDATE agent_steps
+                SET status='error',
+                    error='span 未闭合（所属 run 已终结，进程可能中断）'
+                WHERE status='running' AND run_id IN (
+                    SELECT run_id FROM agent_runs
+                    WHERE status IN (?, ?, ?)
+                )
+                """,
+                _TERMINAL_STATUSES,
+            )
+            return cursor.rowcount
+
+        return self._run_write(
+            _write, error_msg="标记残留 running span 失败（已忽略）", default=0
+        )
+
     def get_steps(self, run_id: str) -> list:
         """按 run_id 查询 span 列表，按 (iteration, sequence, id) 排序。
 

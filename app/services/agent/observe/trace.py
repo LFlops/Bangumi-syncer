@@ -80,6 +80,9 @@ def start_span(
     """开始一条 span，写入 ``agent_steps`` 并返回 span_id（uuid hex）。
 
     ``started_at`` 为 epoch 秒整数（None → 当前时间）。
+    初始 ``status="running"``：**未闭合（进程中断）与正常结束可区分**；
+    ``end_span`` 以 ``ok`` / ``error`` 闭合；残留由
+    ``AgentRunsRepository.mark_residual_running_spans`` 扫描标记。
     失败（DB 异常）仅记录日志并返回生成的 span_id，不影响主流程。
     """
     span_id = uuid.uuid4().hex
@@ -92,7 +95,7 @@ def start_span(
                 "span_id": span_id,
                 "parent_id": parent_id,
                 "name": name,
-                "status": "ok",
+                "status": "running",
                 "iteration": iteration,
                 "sequence": sequence,
                 "started_at": ts,
