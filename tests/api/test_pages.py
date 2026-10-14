@@ -283,3 +283,22 @@ class TestPagesGuestAndRedirects:
         r = client.get("/trakt/auth?status=err&message=bad+callback")
         assert r.status_code == 200
         assert len(r.content) > 0
+
+
+def test_agent_runs_page():
+    """运行观测页：列表 / 详情弹窗容器与共用脚本就位（已登录）"""
+    app = FastAPI()
+    app.include_router(pages.router)
+
+    client = TestClient(app)
+    with patch.object(
+        pages, "get_current_user_from_cookie", return_value={"username": "u"}
+    ):
+        response = client.get("/agent-runs")
+
+    assert response.status_code == 200
+    body = response.text
+    assert 'id="agent-runs-table"' in body
+    assert 'id="agentRunDetailModal"' in body
+    assert "agent_runs.js" in body
+    assert "agent-run-steps.js" in body
