@@ -216,6 +216,296 @@ async def test_execute_maxlength_exceeded_does_not_call_handler():
     assert called == []
 
 
+# ---------------------------------------------------------------------------
+# JSON Schema 校验（扩展）：minLength / enum / minimum / maximum / 嵌套 / items
+# ---------------------------------------------------------------------------
+
+
+def _tool_registry(name: str, schema: dict, handler) -> ToolRegistry:
+    """构造注册了单工具（read）的 registry；供扩展校验用例复用。"""
+    reg = ToolRegistry()
+    reg.register(
+        ToolDefinition(
+            name=name,
+            description="d",
+            parameters=schema,
+            handler=handler,
+            access="read",
+        )
+    )
+    return reg
+
+
+@pytest.mark.asyncio
+async def test_execute_minlength_empty_string_rejected_not_calling_handler():
+    called = []
+
+    def handler(args):
+        called.append(1)
+        return "ran"
+
+    reg = _tool_registry(
+        "minlen",
+        {
+            "type": "object",
+            "properties": {"subject_id": {"type": "string", "minLength": 1}},
+            "required": ["subject_id"],
+        },
+        handler,
+    )
+    with pytest.raises(ToolError, match="minLength"):
+        await reg.execute("minlen", {"subject_id": ""})
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_execute_minlength_boundary_single_char_passes():
+    reg = _tool_registry(
+        "minlen2",
+        {
+            "type": "object",
+            "properties": {"subject_id": {"type": "string", "minLength": 1}},
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("minlen2", {"subject_id": "1"}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_minlength_ignored_for_non_string_value():
+    """minLength 只约束字符串；非字符串（类型由 type 关键字管）不因它报错。"""
+    reg = _tool_registry(
+        "minlen3",
+        {
+            "type": "object",
+            "properties": {"count": {"type": "integer", "minLength": 3}},
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("minlen3", {"count": 5}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_enum_miss_rejected_not_calling_handler():
+    called = []
+
+    def handler(args):
+        called.append(1)
+        return "ran"
+
+    reg = _tool_registry(
+        "enum1",
+        {
+            "type": "object",
+            "properties": {"kind": {"type": "string", "enum": ["tv", "movie"]}},
+        },
+        handler,
+    )
+    with pytest.raises(ToolError, match="枚举"):
+        await reg.execute("enum1", {"kind": "book"})
+    assert called == []
+
+
+@pytest.mark.asyncio
+async def test_execute_enum_hit_passes():
+    reg = _tool_registry(
+        "enum2",
+        {
+            "type": "object",
+            "properties": {"kind": {"type": "string", "enum": ["tv", "movie"]}},
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("enum2", {"kind": "movie"}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_enum_strict_type_rejects_bool_and_string_for_int_enum():
+    """enum 严格等值 + 类型匹配：True 不等于 1、"1" 不等于 1。"""
+    reg = _tool_registry(
+        "enum3",
+        {
+            "type": "object",
+            "properties": {"level": {"type": "integer", "enum": [1, 2]}},
+        },
+        lambda args: "ran",
+    )
+    with pytest.raises(ToolError):
+        await reg.execute("enum3", {"level": True})
+    with pytest.raises(ToolError):
+        await reg.execute("enum3", {"level": "1"})
+    assert await reg.execute("enum3", {"level": 1}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_minimum_maximum_boundaries_and_out_of_range():
+    reg = _tool_registry(
+        "range1",
+        {
+            "type": "object",
+            "properties": {"score": {"type": "number", "minimum": 0.5, "maximum": 1.0}},
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("range1", {"score": 0.5}) == "ran"
+    assert await reg.execute("range1", {"score": 1.0}) == "ran"
+    with pytest.raises(ToolError, match="minimum"):
+        await reg.execute("range1", {"score": 0.49})
+    with pytest.raises(ToolError, match="maximum"):
+        await reg.execute("range1", {"score": 1.01})
+
+
+@pytest.mark.asyncio
+async def test_execute_range_skips_bool_when_type_not_declared():
+    """未声明 type 时，数值范围也不得把 bool 当数字比较（True 不应触发 minimum）。"""
+    reg = _tool_registry(
+        "range2",
+        {"type": "object", "properties": {"flag": {"minimum": 2}}},
+        lambda args: "ran",
+    )
+    assert await reg.execute("range2", {"flag": True}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_nested_object_missing_required_reports_path():
+    reg = _tool_registry(
+        "nested1",
+        {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"kind": {"type": "string"}},
+                    "required": ["kind"],
+                }
+            },
+        },
+        lambda args: "ran",
+    )
+    with pytest.raises(ToolError, match=r"filter\.kind"):
+        await reg.execute("nested1", {"filter": {}})
+
+
+@pytest.mark.asyncio
+async def test_execute_nested_object_type_error_reports_path():
+    reg = _tool_registry(
+        "nested2",
+        {
+            "type": "object",
+            "properties": {
+                "filter": {
+                    "type": "object",
+                    "properties": {"limit": {"type": "integer"}},
+                }
+            },
+        },
+        lambda args: "ran",
+    )
+    with pytest.raises(ToolError, match=r"filter\.limit"):
+        await reg.execute("nested2", {"filter": {"limit": "x"}})
+
+
+@pytest.mark.asyncio
+async def test_execute_nested_object_three_levels_passes():
+    reg = _tool_registry(
+        "nested3",
+        {
+            "type": "object",
+            "properties": {
+                "a": {
+                    "type": "object",
+                    "properties": {
+                        "b": {
+                            "type": "object",
+                            "properties": {"id": {"type": "integer", "minimum": 1}},
+                            "required": ["id"],
+                        }
+                    },
+                    "required": ["b"],
+                }
+            },
+            "required": ["a"],
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("nested3", {"a": {"b": {"id": 7}}}) == "ran"
+    with pytest.raises(ToolError, match=r"a\.b\.id"):
+        await reg.execute("nested3", {"a": {"b": {"id": 0}}})
+
+
+@pytest.mark.asyncio
+async def test_execute_array_items_element_type_rejected_reports_index():
+    reg = _tool_registry(
+        "items1",
+        {
+            "type": "object",
+            "properties": {
+                "subject_types": {"type": "array", "items": {"type": "integer"}}
+            },
+        },
+        lambda args: "ran",
+    )
+    with pytest.raises(ToolError, match=r"subject_types\[1\]"):
+        await reg.execute("items1", {"subject_types": [1, "x"]})
+
+
+@pytest.mark.asyncio
+async def test_execute_array_items_empty_and_valid_passes():
+    reg = _tool_registry(
+        "items2",
+        {
+            "type": "object",
+            "properties": {
+                "subject_types": {"type": "array", "items": {"type": "integer"}}
+            },
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("items2", {"subject_types": []}) == "ran"
+    assert await reg.execute("items2", {"subject_types": [2, 4]}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_execute_unknown_field_and_unknown_keyword_still_lenient():
+    """宽松性保持：未声明字段跳过、schema 未知关键字忽略。"""
+    reg = _tool_registry(
+        "lenient",
+        {
+            "type": "object",
+            "properties": {"title": {"type": "string", "format": "free-text"}},
+        },
+        lambda args: "ran",
+    )
+    assert await reg.execute("lenient", {"title": "x", "extra_field": 1}) == "ran"
+
+
+@pytest.mark.asyncio
+async def test_run_tool_validation_failure_returns_error_block():
+    """校验失败经唯一执行入口 → is_error 结果块（不触 handler）。"""
+    called = []
+
+    def handler(args):
+        called.append(1)
+        return "ran"
+
+    reg = _tool_registry(
+        "via_run",
+        {
+            "type": "object",
+            "properties": {"subject_id": {"type": "string", "minLength": 1}},
+            "required": ["subject_id"],
+        },
+        handler,
+    )
+    outcome = await reg.run_tool(
+        ToolUseBlock(id="t1", name="via_run", input={"subject_id": ""})
+    )
+    assert isinstance(outcome, ToolResultBlock)
+    assert outcome.is_error is True
+    assert "ToolError" in outcome.content
+    assert called == []
+
+
 @pytest.mark.asyncio
 async def test_execute_valid_args_calls_handler_with_args():
     received = {}

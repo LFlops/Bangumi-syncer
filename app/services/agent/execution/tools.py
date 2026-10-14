@@ -176,43 +176,97 @@ class ToolRegistry(ToolRunner):
     def _validate(self, defn: ToolDefinition, args: dict) -> None:
         """轻量 JSON Schema 校验；失败抛 ToolError。
 
-        支持：required 字段必填、properties.type 类型检查、pattern 正则、
-        maxLength 长度上限。
+        支持（递归；错误消息携带完整字段路径，如 ``filter.kind`` /
+        ``subject_types[0]``）：required 字段必填、type 类型检查、enum
+        （严格等值 + 类型匹配）、pattern 正则、minLength / maxLength 长度、
+        minimum / maximum 数值范围、嵌套 object、array items 元素。
+        **宽松性保持**：properties 未声明的字段与 schema 未知关键字一律跳过
+        （不收紧，避免拒绝 LLM 输出）。
         """
         schema = defn.parameters or {}
-        props: dict = schema.get("properties", {})
-        required: list = schema.get("required", [])
+        if not isinstance(schema, dict):
+            return
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        required = schema.get("required")
+        required = required if isinstance(required, list) else []
 
         for field in required:
             if field not in args:
                 raise ToolError(f"缺少必填参数: {field}")
 
         for key, val in args.items():
-            prop = props.get(key)
+            prop = properties.get(key)
             if prop is None:
                 continue
-            ptype = prop.get("type")
-            if ptype:
-                self._check_type(key, val, ptype)
-            pattern = prop.get("pattern")
-            if pattern is not None and isinstance(val, str):
-                if not re.fullmatch(pattern, val):
-                    raise ToolError(f"参数 {key} 不匹配 pattern {pattern!r}")
+            self._check_value(key, val, prop)
+
+    def _check_object(self, path: str, value: dict, prop: dict) -> None:
+        """递归校验嵌套 object（required + properties 子字段）。"""
+        required = prop.get("required")
+        required = required if isinstance(required, list) else []
+        for field in required:
+            if field not in value:
+                raise ToolError(f"缺少必填参数: {self._join_path(path, field)}")
+        properties = prop.get("properties")
+        properties = properties if isinstance(properties, dict) else {}
+        for key, val in value.items():
+            sub = properties.get(key)
+            if sub is None:
+                continue
+            self._check_value(self._join_path(path, key), val, sub)
+
+    def _check_value(self, path: str, val: Any, prop: Any) -> None:
+        """单字段校验（顶层字段入口；嵌套 object / array 元素递归调用）。"""
+        if not isinstance(prop, dict):
+            return
+        ptype = prop.get("type")
+        if ptype:
+            self._check_type(path, val, ptype)
+        enum = prop.get("enum")
+        if enum is not None and not any(
+            type(val) is type(member) and val == member for member in enum
+        ):
+            raise ToolError(f"参数 {path} 取值不在枚举 {enum!r} 中")
+        if isinstance(val, str):
+            min_length = prop.get("minLength")
+            if min_length is not None and len(val) < min_length:
+                raise ToolError(f"参数 {path} 长度小于 minLength {min_length}")
             max_length = prop.get("maxLength")
-            if max_length is not None and isinstance(val, str):
-                if len(val) > max_length:
-                    raise ToolError(f"参数 {key} 超过 maxLength {max_length}")
+            if max_length is not None and len(val) > max_length:
+                raise ToolError(f"参数 {path} 超过 maxLength {max_length}")
+            pattern = prop.get("pattern")
+            if pattern is not None and not re.fullmatch(pattern, val):
+                raise ToolError(f"参数 {path} 不匹配 pattern {pattern!r}")
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            minimum = prop.get("minimum")
+            if minimum is not None and val < minimum:
+                raise ToolError(f"参数 {path} 小于 minimum {minimum}")
+            maximum = prop.get("maximum")
+            if maximum is not None and val > maximum:
+                raise ToolError(f"参数 {path} 大于 maximum {maximum}")
+        if isinstance(val, dict) and ("properties" in prop or "required" in prop):
+            self._check_object(path, val, prop)
+        items = prop.get("items")
+        if isinstance(val, list) and isinstance(items, dict):
+            for index, elem in enumerate(val):
+                self._check_value(f"{path}[{index}]", elem, items)
 
     @staticmethod
-    def _check_type(key: str, val: Any, ptype: str) -> None:
+    def _join_path(path: str, key: str) -> str:
+        """拼接嵌套字段路径（``filter`` + ``kind`` → ``filter.kind``）。"""
+        return f"{path}.{key}" if path else key
+
+    @staticmethod
+    def _check_type(path: str, val: Any, ptype: str) -> None:
         expected = _TYPE_MAP.get(ptype)
         if expected is None:
             return
         # bool 是 int 子类的特殊情况：integer/number 不应接受 bool
         if ptype in ("integer", "number") and isinstance(val, bool):
-            raise ToolError(f"参数 {key} 应为 {ptype}，实际为 bool")
+            raise ToolError(f"参数 {path} 应为 {ptype}，实际为 bool")
         if not isinstance(val, expected):
-            raise ToolError(f"参数 {key} 应为 {ptype}，实际为 {type(val).__name__}")
+            raise ToolError(f"参数 {path} 应为 {ptype}，实际为 {type(val).__name__}")
 
     # -- 单条执行 -----------------------------------------------------------
 
