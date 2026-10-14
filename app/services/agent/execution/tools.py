@@ -309,7 +309,8 @@ class ToolRegistry(ToolRunner):
 
         - 成功 → ``ToolResultBlock``（内容为 ``serialize_tool_result`` 结果）
         - 异常（ToolError / handler 异常 / 超时）→ ``ToolResultBlock(is_error=True)``，
-          **不上抛**，并记 warning（工具名 + 异常信息）
+          **不上抛**，并记 warning（工具名 + 异常信息）；块内容携带异常 message
+          （``工具执行失败: <类型>: <原始信息>``，限速排队超时等场景可读）
         - terminal → ``TerminalCapture``（正常结束：捕获参数、不执行 handler）
 
         span：注入 ``recorder`` 时在调用前 ``start_tool``、完成后 ``end_tool``（必达）；
@@ -337,7 +338,7 @@ class ToolRegistry(ToolRunner):
             logger.warning("工具 %s 执行失败: %s", tool_use.name, exc)
             outcome = ToolResultBlock(
                 tool_use_id=tool_use.id,
-                content=f"工具执行失败: {error_name}",
+                content=f"工具执行失败: {error_name}: {exc}",
                 is_error=True,
             )
         finally:

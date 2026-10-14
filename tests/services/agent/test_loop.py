@@ -338,7 +338,7 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
 
     def _raise(_tc: ToolUseBlock):
         # 未知工具：handler 抛 ToolError，执行器包装为 is_error 的 ToolResultBlock
-        raise ToolError("工具执行失败: ToolError")
+        raise ToolError("未注册的工具: unknown_tool")
 
     result = await run_loop(
         stream_fn=stream,
@@ -360,7 +360,9 @@ async def test_malformed_tool_use_is_error_block_continues_loop():
         if isinstance(b, ToolResultBlock) and b.is_error
     ]
     assert error_blocks, "is_error 的 ToolResultBlock 应被追加"
-    assert error_blocks[0].content == "工具执行失败: ToolError"
+    assert error_blocks[0].content == (
+        "工具执行失败: ToolError: 未注册的工具: unknown_tool"
+    )
 
 
 # ---------------------------------------------------------------------------

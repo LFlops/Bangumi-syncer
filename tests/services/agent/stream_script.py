@@ -182,7 +182,7 @@ def raw_handler_runner(handler: Callable[[ToolUseBlock], Any]):
             except Exception as exc:  # 与 run_tool 同文案
                 return ToolResultBlock(
                     tool_use_id=tool_use.id,
-                    content=f"工具执行失败: {type(exc).__name__}",
+                    content=f"工具执行失败: {type(exc).__name__}: {exc}",
                     is_error=True,
                 )
             if isinstance(result, (ToolResultBlock, TerminalCapture)):

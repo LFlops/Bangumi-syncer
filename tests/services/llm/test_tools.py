@@ -1815,3 +1815,29 @@ class TestRunTool:
         # capture 不作为 tool_result 落 span（正常结束、无副作用）
         assert spans[0]["end"]["result"] is None
         assert spans[0]["end"]["error"] == ""
+
+    @pytest.mark.asyncio
+    async def test_error_block_includes_original_message(self):
+        """错误块携带原始异常 message（限速排队超时等场景可读）。"""
+
+        def boom(args):
+            raise RuntimeError("限速排队需等待 61.2s，超过 timeout=30.0s")
+
+        reg = ToolRegistry()
+        reg.register(
+            ToolDefinition(
+                name="read_boom2",
+                description="d",
+                parameters={},
+                handler=boom,
+                access="read",
+            )
+        )
+
+        outcome = await reg.run_tool(ToolUseBlock(id="t2", name="read_boom2", input={}))
+
+        assert isinstance(outcome, ToolResultBlock)
+        assert outcome.is_error is True
+        assert outcome.content == (
+            "工具执行失败: RuntimeError: 限速排队需等待 61.2s，超过 timeout=30.0s"
+        )
