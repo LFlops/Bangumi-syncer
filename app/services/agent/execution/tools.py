@@ -12,7 +12,6 @@ import asyncio
 import json
 import logging
 import re
-from collections import UserDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -103,32 +102,19 @@ class ToolDefinition:
         )
 
 
-class BatchResults(UserDict[str, ToolResultBlock]):
-    """批量执行结果：``ordered`` 独立槽位 + 兼容的 ``dict[tool_use_id, result]`` 视图。
+@dataclass
+class BatchResults:
+    """批量执行结果：``ordered`` 有序槽位（**唯一视图**）。
 
     - ``ordered``：``[(tool_use_id, result), ...]``，与传入 ``tool_calls`` 一一对应
-      （长度与顺序一致），消费方（loop.py）按槽位回填 tool_result，保证每条 tool_use
-      都有且仅有一条对应结果
-    - dict 视图：同一 ``tool_use_id`` 重复出现时保留**首个**结果（真实执行结果不会被
-      后续 duplicate 错误块覆盖）。该 first-wins 契约在**任何赋值路径**下成立：构造、
-      ``[]`` 赋值、``update`` 均触发 ``__setitem__``；对已存在 key 的再次赋值被拒绝并打
-      warning 日志（避免覆盖契约被静默破坏的悬垂分支）。
+      （长度与顺序一致），消费方按槽位回填 tool_result，保证每条 tool_use
+      都有且仅有一条对应结果；重复 ``tool_use_id`` 保留全部槽位（首个真实结果、
+      后续为 duplicate 错误块）。
+    - 结构性收敛（迁移清单）：不再提供 ``dict[tool_use_id, result]`` 视图 /
+      first-wins 覆盖语义 / 覆盖 warning；按 id 取值由消费方按槽位自行实现。
     """
 
-    def __init__(self, ordered: list[tuple[str, Any]] | None = None) -> None:
-        self.ordered: list[tuple[str, Any]] = list(ordered or [])
-        super().__init__()
-        for tool_use_id, result in self.ordered:
-            self.setdefault(tool_use_id, result)
-
-    def __setitem__(self, key: str, item: Any) -> None:
-        # first-wins：已存在的 tool_use_id 拒绝覆盖，并打 warning 暴露该非预期路径
-        if key in self:
-            logger.warning(
-                "BatchResults 试图覆盖已存在的 tool_use_id=%r，保留首个结果", key
-            )
-            return
-        super().__setitem__(key, item)
+    ordered: list[tuple[str, ToolResultBlock | TerminalCapture]]
 
 
 class ToolRegistry(ToolRunner):
@@ -369,8 +355,8 @@ class ToolRegistry(ToolRunner):
 
         - 按原始顺序扫描：连续**幂等**（idempotent）段 ``asyncio.gather`` 并行（保序返回）
         - 非幂等（含 write / terminal / 显式标注非幂等的 read）单独串行，相对顺序保持
-        - 返回 ``BatchResults``：``ordered`` 与 ``tool_calls`` **一一对应的独立槽位**，
-          同时兼容 ``{tool_use_id: result}`` 的 dict 视图（按 id 取首个结果）：
+        - 返回 ``BatchResults``：``ordered`` 与 ``tool_calls`` **一一对应的独立槽位**
+          （唯一视图）：
            - read/write 成功 → ``ToolResultBlock(tool_use_id, content, is_error=False)``
            - 任意异常（校验/超时/handler 异常/未注册）→ ``ToolResultBlock(is_error=True)``
            - terminal → ``TerminalCapture``（正常结束：不执行 handler，供终止层消费）

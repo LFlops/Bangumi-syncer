@@ -1729,12 +1729,13 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
 
     # 4 个幂等查询并行（串行则约 3×0.05=0.15s）
     assert elapsed < 0.13
-    # 槽位一一对应：4 个查询成功 + 1 个 terminal 捕获
+    # 槽位一一对应：4 个查询成功 + 1 个 terminal 捕获（ordered 唯一视图）
+    slots = {oid: item for oid, item in results.ordered}
     for key in ("s", "g", "c", "r"):
-        block = results[key]
+        block = slots[key]
         assert isinstance(block, ToolResultBlock)
         assert block.is_error is False
-    terminal = results["sub"]
+    terminal = slots["sub"]
     assert isinstance(terminal, TerminalCapture)
     assert terminal.name == "submit_suggestion"
     assert terminal.args == {"reason": "done"}

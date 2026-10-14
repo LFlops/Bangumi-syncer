@@ -247,3 +247,17 @@ def test_production_calls_execute_only_inside_run_tool():
         "仅 run_tool 内部可直调 execute()（其余应经 ToolRunner.run_tool）：\n"
         + "\n".join(offenders)
     )
+
+
+# ---------------------------------------------------------------------------
+# 7. BatchResults：ordered 单视图（结构收敛，不得退回 Mapping 双视图）
+# ---------------------------------------------------------------------------
+
+
+def test_batch_results_is_not_mapping_subclass():
+    """BatchResults 仅为 ordered 数据载体（不继承 UserDict/Mapping）。"""
+    assert _class_bases("execution/tools.py", "BatchResults") == []
+
+    from app.services.agent.execution.tools import BatchResults
+
+    assert not issubclass(BatchResults, dict)

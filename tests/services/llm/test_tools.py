@@ -31,6 +31,14 @@ async def _async_noop(args):
     return "ok"
 
 
+def _result_of(results, tool_use_id):
+    """按 ordered 槽位取首个匹配结果（BatchResults 唯一视图；重复 id 取首槽）。"""
+    for oid, item in results.ordered:
+        if oid == tool_use_id:
+            return item
+    raise KeyError(tool_use_id)
+
+
 # ---------------------------------------------------------------------------
 # ToolDefinition：to_schema 不序列化 access / idempotent
 # ---------------------------------------------------------------------------
@@ -696,9 +704,9 @@ async def test_execute_batch_readonly_segment_runs_in_parallel():
     max_start = max(starts.values())
     assert max_start - min_start < 0.04
     # 返回结构：每条都是 ToolResultBlock，保序
-    assert list(results.keys()) == ["a", "b", "c"]
+    assert [oid for oid, _ in results.ordered] == ["a", "b", "c"]
     for k in ("a", "b", "c"):
-        blk = results[k]
+        blk = _result_of(results, k)
         assert isinstance(blk, ToolResultBlock)
         assert blk.tool_use_id == k
         assert blk.is_error is False
@@ -738,7 +746,7 @@ async def test_execute_batch_preserves_order_with_write_in_middle():
     calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("ra", "rb", "wc", "rd")]
     results = await reg.execute_batch(calls)
     # 结果 dict 顺序与输入一致
-    assert list(results.keys()) == ["ra", "rb", "wc", "rd"]
+    assert [oid for oid, _ in results.ordered] == ["ra", "rb", "wc", "rd"]
     # 执行顺序：两条 read 并行（先后不确定，但都在 wc 之前），wc 在 rd 之前
     assert order.index("wc") == 2
     assert order.index("rd") == 3
@@ -768,7 +776,7 @@ async def test_execute_batch_handler_exception_wrapped_as_error_block():
     )
     calls = [ToolUseBlock(id="x1", name="boom", input={})]
     results = await reg.execute_batch(calls)
-    blk = results["x1"]
+    blk = _result_of(results, "x1")
     assert isinstance(blk, ToolResultBlock)
     assert blk.is_error is True
     assert "ValueError" in blk.content
@@ -784,7 +792,7 @@ async def test_execute_batch_unknown_tool_wrapped_as_error_block():
     reg = ToolRegistry()
     calls = [ToolUseBlock(id="u1", name="ghost", input={})]
     results = await reg.execute_batch(calls)
-    blk = results["u1"]
+    blk = _result_of(results, "u1")
     assert isinstance(blk, ToolResultBlock)
     assert blk.is_error is True
 
@@ -834,8 +842,6 @@ async def test_execute_batch_duplicate_tool_use_id_executes_only_first():
     assert isinstance(second, ToolResultBlock)
     assert second.is_error is True
     assert second.content == "duplicate tool_use_id"
-    # 兼容的 dict 视图按 id 取值 → 首个真实结果
-    assert results["same"] is first
 
 
 @pytest.mark.asyncio
@@ -869,7 +875,7 @@ async def test_execute_batch_duplicate_write_tool_keeps_first_result():
     assert results.ordered[0][1].content == '"written"'
     assert results.ordered[1][1].is_error is True
     assert results.ordered[1][1].content == "duplicate tool_use_id"
-    assert results["w1"].content == '"written"'
+    assert _result_of(results, "w1").content == '"written"'
 
 
 @pytest.mark.asyncio
@@ -900,10 +906,10 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     # 唯一 id 各自执行一次；重复的那个不执行 → 共 3 次
     assert called == ["a", "dup", "b"]
     # 唯一 id 结果不受影响
-    assert results["a"].is_error is False
-    assert results["a"].content == '"ran"'
-    assert results["b"].is_error is False
-    assert results["b"].content == '"ran"'
+    assert _result_of(results, "a").is_error is False
+    assert _result_of(results, "a").content == '"ran"'
+    assert _result_of(results, "b").is_error is False
+    assert _result_of(results, "b").content == '"ran"'
     # 重复 id 的首个槽位保留真实结果，第二个槽位为错误块
     slots = results.ordered
     assert [i for i, _ in slots] == ["a", "dup", "dup", "b"]
@@ -912,51 +918,34 @@ async def test_execute_batch_duplicate_does_not_affect_unique_ids():
     assert isinstance(slots[2][1], ToolResultBlock)
     assert slots[2][1].is_error is True
     assert slots[2][1].content == "duplicate tool_use_id"
-    # dict 视图保留首个真实结果
-    assert results["dup"].is_error is False
+    # ordered 首槽保留真实结果（后续槽为 dup 错误块，见上）
+    assert _result_of(results, "dup").is_error is False
 
 
 # ---------------------------------------------------------------------------
-# BatchResults：first-wins 契约 + 覆盖拒绝 warning（UserDict）
+# BatchResults：ordered 单视图（结构收敛；不再是 Mapping）
 # ---------------------------------------------------------------------------
 
 
-def test_batch_results_construct_keeps_first_result():
+def test_batch_results_ordered_slots_single_view():
+    """ordered 是唯一视图：槽位读、不可下标、无 get、非 Mapping。"""
+    from collections.abc import Mapping
+
     from app.services.agent.execution.tools import BatchResults
 
     r1 = ToolResultBlock(tool_use_id="dup", content="real", is_error=False)
     r2 = ToolResultBlock(tool_use_id="dup", content="dup", is_error=True)
     results = BatchResults([("dup", r1), ("dup", r2)])
-    assert results["dup"] is r1
 
-
-def test_batch_results_setitem_rejects_overwrite_and_warns(caplog):
-    from app.services.agent.execution.tools import BatchResults
-
-    r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
-    r2 = ToolResultBlock(tool_use_id="a", content="second", is_error=False)
-    results = BatchResults([("a", r1)])
-
-    with caplog.at_level(logging.WARNING, logger="app.services.llm.tools"):
-        results["a"] = r2  # 试图覆盖已存在 key
-        results.update({"a": r2})  # update 同样触发 __setitem__
-
-    # first-wins：两次覆盖均被拒绝，仍保留首个结果
-    assert results["a"] is r1
-    # 覆盖路径被 warning 日志显式暴露（非悬垂静默分支）
-    warns = [r for r in caplog.records if r.levelno >= logging.WARNING]
-    assert len(warns) == 2
-    assert all("覆盖已存在的 tool_use_id" in w.getMessage() for w in warns)
-
-
-def test_batch_results_setitem_allows_new_key():
-    from app.services.agent.execution.tools import BatchResults
-
-    r1 = ToolResultBlock(tool_use_id="a", content="first", is_error=False)
-    r2 = ToolResultBlock(tool_use_id="b", content="new", is_error=False)
-    results = BatchResults([("a", r1)])
-    results["b"] = r2  # 新 key 正常写入
-    assert results["b"] is r2
+    # ordered 保留全部槽位（含重复 id），顺序与构造一致
+    assert [oid for oid, _ in results.ordered] == ["dup", "dup"]
+    assert results.ordered[0][1] is r1
+    assert results.ordered[1][1] is r2
+    # 结构收敛：不再是 Mapping（无 dict 视图 / first-wins / 覆盖路径）
+    assert not isinstance(results, Mapping)
+    assert not hasattr(results, "get")
+    with pytest.raises(TypeError):
+        results["dup"]  # type: ignore[index]
 
 
 # ---------------------------------------------------------------------------
@@ -984,7 +973,7 @@ async def test_execute_batch_terminal_returns_capture_without_handler():
     )
     calls = [ToolUseBlock(id="s1", name="submit", input={"subject_id": "9"})]
     results = await reg.execute_batch(calls)
-    cap = results["s1"]
+    cap = _result_of(results, "s1")
     assert isinstance(cap, TerminalCapture)
     assert cap.name == "submit"
     assert cap.args == {"subject_id": "9"}
@@ -1175,7 +1164,7 @@ async def test_recorder_逐工具即刻落库_前序工具end在异常工具之�
     assert spans[1]["end"]["time"] < spans[2]["start"]["time"]
 
     # write 工具异常被正确包装为 error block
-    assert results["c"].is_error is True
+    assert _result_of(results, "c").is_error is True
 
 
 # 场景3：并行/串行时序 —— 并行段区间重叠、串行段有序不重叠
@@ -1254,7 +1243,7 @@ async def test_recorder_异常必达_工具抛异常时end仍调用且error非�
     # result=None（执行异常不产生 ToolResultBlock）
     assert s["end"]["result"] is None
     # 异常被包装为 error block
-    assert results["x1"].is_error is True
+    assert _result_of(results, "x1").is_error is True
 
 
 # 场景5：重复 id —— 占位错误块同样有 span（is_error）
@@ -1297,8 +1286,8 @@ async def test_recorder_重复id_占位错误块同样有span且is_error():
     assert any(r.is_error is True for r in end_results)
 
     # 首个保留真实结果
-    assert results["same"].is_error is False
-    assert results["same"].content == '"ran"'
+    assert _result_of(results, "same").is_error is False
+    assert _result_of(results, "same").content == '"ran"'
 
 
 # ---------------------------------------------------------------------------
@@ -1492,9 +1481,9 @@ async def test_execute_batch_idempotent_segment_runs_in_parallel():
     # 起始时间彼此接近（并发启动）
     assert max(starts.values()) - min(starts.values()) < 0.04
     # 结果保序
-    assert list(results.keys()) == ["a", "b", "c"]
+    assert [oid for oid, _ in results.ordered] == ["a", "b", "c"]
     for k in ("a", "b", "c"):
-        assert results[k].is_error is False
+        assert _result_of(results, k).is_error is False
 
 
 @pytest.mark.asyncio
@@ -1563,7 +1552,7 @@ async def test_execute_batch_mixed_segments_preserve_order():
     calls = [ToolUseBlock(id=k, name=k, input={}) for k in ("a", "b", "c")]
     results = await reg.execute_batch(calls)
     # 结果保序
-    assert list(results.keys()) == ["a", "b", "c"]
+    assert [oid for oid, _ in results.ordered] == ["a", "b", "c"]
     # 段边界不重叠：a 段结束后 b 才启动，b 结束后 c 段才启动
     assert starts["b"] >= ends["a"] - 0.005
     assert starts["c"] >= ends["b"] - 0.005
@@ -1676,7 +1665,7 @@ async def test_execute_batch_idempotent_segment_caps_parallelism():
 
     assert max_active <= _MAX_PARALLEL_TOOLS
     assert max_active >= 2  # 仍存在并行
-    assert all(not results[c.id].is_error for c in calls)
+    assert all(not _result_of(results, c.id).is_error for c in calls)
 
 
 @pytest.mark.asyncio
@@ -1707,7 +1696,7 @@ async def test_execute_batch_under_cap_still_parallel():
     results = await reg.execute_batch(calls)
 
     assert max_active == 5
-    assert all(not results[c.id].is_error for c in calls)
+    assert all(not _result_of(results, c.id).is_error for c in calls)
 
 
 # ---------------------------------------------------------------------------

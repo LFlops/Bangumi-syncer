@@ -18,6 +18,7 @@ import pytest
 
 from app.core.database import DatabaseManager, set_database_manager
 from app.services.agent.execution.streaming import StreamingToolExecutor
+from app.services.agent.execution.tools import BatchResults
 from app.services.agent.observe import trace
 from app.services.llm.models import (
     ChatResponse,
@@ -217,9 +218,14 @@ def _executor_factory(recorder, tools_fn):
     ``submit_suggestion`` 标记为 terminal，由 loop 捕获、执行器不执行。
     """
 
+    async def single(tool_use):
+        """单工具执行：取批量结果的 ordered 首槽（等价单条路径）。"""
+        results = await tools_fn([tool_use])
+        return results.ordered[0][1]
+
     def factory():
         return StreamingToolExecutor(
-            run_tool=raw_handler_runner(lambda tool_use: tools_fn([tool_use])),
+            run_tool=raw_handler_runner(single),
             is_idempotent=lambda name: False,
             is_terminal=lambda name: name == "submit_suggestion",
             on_recorder=recorder,
@@ -429,14 +435,14 @@ class TestReplayRebuildsFullBlocks:
             return round0 if counter["n"] == 1 else round1
 
         async def tools_fn(tool_calls):
-            results = {}
+            ordered = []
             for i, tc in enumerate(tool_calls):
                 span_id = recorder.start_tool(tc, sequence=i + 1)
                 result = ToolResultBlock(tool_use_id=tc.id, content=f"res-{tc.id}")
                 if span_id is not None:
                     recorder.end_tool(span_id, result=result)
-                results[tc.id] = result
-            return results
+                ordered.append((tc.id, result))
+            return BatchResults(ordered)
 
         asyncio.run(
             loop.run_loop(
@@ -494,7 +500,7 @@ class TestReplayRebuildsFullBlocks:
             return uncertain if counter["n"] == 1 else final
 
         async def tools_fn(tool_calls):
-            return {}
+            return BatchResults([])
 
         asyncio.run(
             loop.run_loop(

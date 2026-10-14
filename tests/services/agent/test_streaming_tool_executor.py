@@ -55,16 +55,10 @@ def _full_args(tid: str, name: str, args_json: str):
 
 
 class _BatchResults:
-    """伪 BatchResults：ordered + get 双视图（对齐 execute_batch 契约）。"""
+    """伪 BatchResults：仅 ordered 单视图（对齐 execute_batch 契约）。"""
 
     def __init__(self, ordered):
         self.ordered = list(ordered)
-
-    def get(self, key, default=None):
-        for oid, item in self.ordered:
-            if oid == key:
-                return item
-        return default
 
 
 def _make_executor(**overrides):
@@ -496,8 +490,10 @@ async def test_early_execution_default_cap_limits_peak_concurrency():
 # ---------------------------------------------------------------------------
 
 
-async def test_batch_results_without_ordered_falls_back_to_get():
-    """非契约批量结果（无 ordered、仅 get 视图）→ 逐槽回退取值，不丢结果。"""
+async def test_batch_results_without_ordered_fills_placeholders_with_warning(
+    log_records,
+):
+    """非契约批量结果（无 ordered）→ warning + 全批占位块（不再回退 get 取值）。"""
 
     async def batch_execute_fn(tool_calls):
         return {
@@ -518,12 +514,15 @@ async def test_batch_results_without_ordered_falls_back_to_get():
 
     results = await ex.finalize()
 
-    assert [r.content for r in results] == ["fallback:a", "fallback:b"]
-    assert all(not r.is_error for r in results)
+    assert len(results) == 2
+    assert all(r.is_error for r in results)
+    assert all("fallback" not in r.content for r in results)
+    warns = [line for level, line in log_records if level == "WARNING"]
+    assert any("无 ordered" in line for line in warns), warns
 
 
-async def test_batch_results_ordered_contract_preferred_over_get():
-    """同时具备 ordered 与 get 时，以 ordered 槽位为准（生产契约优先）。"""
+async def test_batch_results_ordered_only_never_consults_get():
+    """ordered 是唯一契约：即便替身带 get，也绝不回退取值。"""
 
     class _Results:
         def __init__(self):

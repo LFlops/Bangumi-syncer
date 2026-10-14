@@ -283,43 +283,28 @@ class StreamingToolExecutor(StreamingExecutor):
     def _index_batch_results(
         results: Any, states: list[_ToolState]
     ) -> dict[str, ToolResultBlock | TerminalCapture]:
-        """把 ``execute_batch`` 返回值按 tool_use_id 建索引。
+        """把 ``execute_batch`` 返回值按 tool_use_id 建索引（**只认 ordered**）。
 
-        参数刻意用 ``Any``：这是**非契约注入的鸭子边界**（注入方可能传 ``BatchResults``、
-        普通 dict 或测试替身），本函数只以 ``getattr`` 探测 ``ordered`` / ``get``，
+        参数刻意用 ``Any``：这是**非契约注入的鸭子边界**（注入方可能传
+        ``BatchResults`` 或测试替身），本函数只以 ``getattr`` 探测 ``ordered``，
         不做 isinstance 收窄。
 
         生产契约：``BatchResults.ordered``（``list[tuple[tool_use_id, result]]``）。
-        优先信任 ``ordered`` 槽位；若其缺失或未产出任何有效 ``ToolResultBlock``
-        （非契约实现 / 注入的简易执行器），回退用 ``results.get(tool_use_id)``
-        逐槽拉取（``isinstance`` 校验）——避免静默丢失全部 deferred 结果。
-        两者都不可用时返回已索引结果并告警（可观测，不静默）。
+        ``ordered`` 缺失（非契约实现）→ 记 warning 并返回空索引（下游逐槽回填
+        占位块）——不再提供 ``get`` 回退取值（视图收敛，避免双通道）。
         """
         out: dict[str, ToolResultBlock | TerminalCapture] = {}
         ordered = getattr(results, "ordered", None)
-        if isinstance(ordered, list):
-            for oid, item in ordered:
-                if isinstance(item, (ToolResultBlock, TerminalCapture)):
-                    out.setdefault(oid, item)
-            if out:
-                return out
-
-        getter = getattr(results, "get", None)
-        if getter is None:
+        if not isinstance(ordered, list):
             logger.warning(
-                "StreamingToolExecutor 批量结果既无 ordered 也无 get 视图，"
+                "StreamingToolExecutor 批量结果无 ordered 槽位（非契约实现），"
                 "本批 %d 个 deferred 工具将回填占位块",
                 len(states),
             )
             return out
-        if not out:
-            logger.debug(
-                "StreamingToolExecutor 批量结果无 ordered 槽位，回退逐槽 get 取值"
-            )
-        for st in states:
-            item = getter(st.tool_use_id)
+        for oid, item in ordered:
             if isinstance(item, (ToolResultBlock, TerminalCapture)):
-                out.setdefault(st.tool_use_id, item)
+                out.setdefault(oid, item)
         return out
 
     def _result_for(self, tid: str) -> ToolResultBlock | TerminalCapture:
