@@ -242,8 +242,9 @@ def test_freeze_update_visible_during_wait():
     limiter.acquire()  # 耗尽唯一令牌
 
     total: list[float] = []
+    # 给足总等待预算（300s 冻结 + 首轮 1s）；timeout 语义 = 总等待上限
     worker = threading.Thread(
-        target=lambda: total.append(limiter.acquire()), daemon=True
+        target=lambda: total.append(limiter.acquire(timeout=400.0)), daemon=True
     )
     worker.start()
     assert entered.wait(timeout=5), "acquire 未进入等待"
@@ -1058,3 +1059,89 @@ def test_reset_bgm_rate_limiter_installs_given_instance():
 
     assert get_bgm_rate_limiter() is custom
     assert rate_limit.get_bgm_rate_limiter() is custom
+
+
+# ---------------------------------------------------------------------------
+# 场景 9（等待中冻结延长）：累计等待超过 timeout → 放弃预约并回滚
+#
+# ``_reserve`` 只校验"预约时刻"的等待；等待期间收到 429 冻结会把放行时刻
+# 推后（``_remaining_wait`` 折算债务）。若不复查上限，调用方传给 ``timeout``
+# 的"总等待预算"会被穿透。本组用例锁定：累计等待将超过 timeout → 回滚 + 抛。
+# ---------------------------------------------------------------------------
+
+
+class _FreezeOnceSleeper(FakeSleeper):
+    """首段 sleep 时注入一次 429 冻结（模拟"等待中收到 429"）。"""
+
+    def __init__(self, clock: FakeClock, retry_after: float = 0.0) -> None:
+        super().__init__(clock)
+        self._retry_after = retry_after
+        self.limiter: RateLimiter | None = None  # 延迟绑定，避免构造环
+
+    def __call__(self, seconds: float) -> None:
+        if len(self.calls) == 0 and self.limiter is not None:
+            self.limiter.notify_rate_limited(self._retry_after)
+        super().__call__(seconds)
+
+
+def test_acquire_aborts_when_wait_loop_freeze_extends_beyond_timeout():
+    """等待中冻结延长使累计等待超 timeout → 抛 RateLimitTimeoutError 并回滚。"""
+    clock = FakeClock()
+    sleeper = _FreezeOnceSleeper(clock)
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
+    sleeper.limiter = limiter
+
+    limiter.acquire()  # 耗尽唯一令牌
+
+    with pytest.raises(RateLimitTimeoutError):
+        limiter.acquire(timeout=30.0)
+
+    with limiter._lock:
+        after = limiter._tokens
+    # 回滚前：-1（预约） + 1（等待 1s 的自然补充） - 59（冻结折算） = -59；
+    # 冲销预约扣减（1 + 59）后夹紧到桶容量（不回滚则残留约 -59）
+    assert after == pytest.approx(1.0)
+
+
+def test_acquire_waits_when_freeze_extension_stays_within_timeout():
+    """冻结延长后累计等待仍在 timeout 内 → 正常等待放行（不误伤）。"""
+    clock = FakeClock()
+    sleeper = _FreezeOnceSleeper(clock)
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
+    sleeper.limiter = limiter
+
+    limiter.acquire()  # 耗尽唯一令牌
+
+    # 冻结 60s；预约约 1s + 延长约 59s ≈ 60s ≤ timeout=100
+    assert limiter.acquire(timeout=100.0) == pytest.approx(60.0)
+
+
+def test_acquire_boundary_exact_timeout_still_passes():
+    """边界：累计等待恰好等于 timeout → 放行（严格大于才放弃）。"""
+    clock = FakeClock()
+    sleeper = FakeSleeper(clock)
+    limiter = RateLimiter(rate=1.0, burst=1, clock=clock, sleep=sleeper)
+
+    limiter.acquire()  # 耗尽唯一令牌
+
+    assert limiter.acquire(timeout=1.0) == pytest.approx(1.0)
+
+
+async def test_acquire_async_aborts_when_wait_loop_freeze_extends_beyond_timeout():
+    """async 同构：等待中冻结延长超 timeout → 抛错并回滚（不留透支）。"""
+    limiter = RateLimiter(rate=100.0, burst=1)
+
+    await limiter.acquire_async()  # 耗尽唯一令牌
+
+    task = asyncio.create_task(limiter.acquire_async(timeout=30.0))
+    await asyncio.sleep(0.005)  # 首轮预约约 0.01s
+    limiter.notify_rate_limited(0.0)  # 冻结 60s → 累计等待将超 30s
+
+    # 实现前会继续睡满冻结（60s+）；用外层 wait_for 兜底避免测试挂起
+    with pytest.raises(RateLimitTimeoutError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+    with limiter._lock:
+        after = limiter._tokens
+    # 桶容量即上限；回滚不得残留透支（未回滚约 -6000）
+    assert 0.0 <= after <= limiter.burst + 1e-9

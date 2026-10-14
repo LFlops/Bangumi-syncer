@@ -10,8 +10,12 @@ Bangumi 官方公开 API 已限流（社区实测约 300 请求/分钟/IP，超�
   等待采用"锁内检查、锁外休眠"，休眠期间不持锁，不阻塞其他请求与 429 通知；
 - 采用 Go ``golang.org/x/time/rate`` 的**预扣（reserve）**语义：锁内一次性
   占用令牌（允许 ``_tokens`` 透支为负），后续请求按 ``-tokens/rate`` 排队，
-  先到先得、等待时长单调不减，保证公平；超出 ``timeout`` 的预约直接放弃并抛
-  :class:`RateLimitTimeoutError`（默认 30s）；
+  先到先得、等待时长单调不减，保证公平；``timeout``（默认 30s）是**总等待
+  预算**：预约时刻超限、或等待中被 429 冻结延长致累计超限 → 放弃预约（回滚
+  扣减）并抛 :class:`RateLimitTimeoutError`；
+- 429 冷却期内**快速失败**（既定口径）：预约时刻落在冻结窗口内且超过
+  ``timeout`` 时立即抛错，**不排队等待冷却结束**；由调用方按自身语义
+  重试/降级；
 - :meth:`RateLimiter.acquire_async` 提供 async 兼容层：复用同一预约计算，
   等待改用 ``asyncio.sleep``，与同步 :meth:`RateLimiter.acquire` 共享令牌桶状态；
 - 构造支持注入 ``clock`` / ``sleep``，便于测试不真实等待；
@@ -129,25 +133,42 @@ class RateLimiter:
         期间收到更长的 429 冻结，则继续等待到新的放行时刻（并同步增加令牌
         债务，令后来者排在其后，保持 FIFO）。
 
+        ``timeout`` 是**总等待预算**：预约时刻与等待中的冻结延长共同受约束；
+        累计需要等待超过 ``timeout`` 时放弃本次预约（回滚令牌扣减，已放行者
+        的时刻不受影响）并抛 :class:`RateLimitTimeoutError`。
+
         Args:
-            timeout: 允许预约的最大等待秒数；预约所需等待超过该值时放弃并抛
-                :class:`RateLimitTimeoutError`（不影响已排队等待者的预约）。
+            timeout: 允许累计等待的最大秒数；超过时放弃并抛
+                :class:`RateLimitTimeoutError`。
                 默认 :data:`DEFAULT_ACQUIRE_TIMEOUT`。
 
         Returns:
             本次实际等待的秒数（无需等待时为 0.0）。
 
         Raises:
-            RateLimitTimeoutError: 预约所需等待超过 ``timeout``。
+            RateLimitTimeoutError: 累计等待超过 ``timeout``。
         """
-        reserved_act, _reserved_debt = self._reserve(timeout)
+        reserved_act, reserved_debt = self._reserve(timeout)
         total_wait = 0.0
         while True:
-            remaining, reserved_act, reason, _extra_debt = self._remaining_wait(
+            remaining, reserved_act, reason, extra_debt = self._remaining_wait(
                 reserved_act
             )
+            reserved_debt += extra_debt
             if remaining <= 0:
                 return total_wait
+            if total_wait + remaining > timeout:
+                # 等待中放行时刻被 429 冻结推迟 → 累计将超预算：放弃并回滚
+                self._rollback(reserved_debt)
+                logger.warning(
+                    f"⏳ 等待中放行时刻被 429 冻结推迟，累计等待 "
+                    f"{total_wait + remaining:.2f}s 超过 timeout={timeout:.2f}s，"
+                    "放弃本次令牌获取"
+                )
+                raise RateLimitTimeoutError(
+                    f"限速排队累计需等待 {total_wait + remaining:.2f}s，"
+                    f"超过 timeout={timeout:.2f}s（等待中冻结延长）"
+                )
             total_wait += remaining
             # 锁外休眠：避免长时间持锁阻塞其他请求/通知
             self._wait(remaining, reason)
@@ -160,12 +181,15 @@ class RateLimiter:
         ``asyncio.sleep``，因此不会阻塞事件循环。与同步 :meth:`acquire`
         共享同一令牌桶状态，同一实例上混用安全。
 
+        ``timeout`` 语义与 :meth:`acquire` 一致：**总等待预算**，预约时刻与
+        等待中的冻结延长共同受约束，超限即放弃（回滚）并抛错。
+
         取消语义：预约在锁内已一次性扣减令牌（含冻结折算债务），令牌真正被
         "使用" 发生在 ``await`` 正常返回之后。若等待期间任务被
-        ``CancelledError`` 取消，必须在锁内冲销本预约的全部扣减
-        （初始 1 令牌 + ``_reserve`` 冻结债务 + 等待循环中
-        :meth:`_remaining_wait` 追加的冻结债务），否则令牌桶被永久透支；
-        冲销后夹紧到 ``burst``（等待期间 :meth:`_refill` 可能已把令牌补到
+        ``CancelledError`` 取消（或累计等待超过 ``timeout`` 而放弃），必须在
+        锁内冲销本预约的全部扣减（初始 1 令牌 + ``_reserve`` 冻结债务 +
+        等待循环中 :meth:`_remaining_wait` 追加的冻结债务），否则令牌桶被永久
+        透支；冲销后夹紧到 ``burst``（等待期间 :meth:`_refill` 可能已把令牌补到
         ``burst``，直接相加会把 ``_tokens`` 推过桶容量），最后原样 ``raise``，
         绝不吞掉取消。
 
@@ -176,7 +200,7 @@ class RateLimiter:
             本次实际等待的秒数。
 
         Raises:
-            RateLimitTimeoutError: 预约所需等待超过 ``timeout``。
+            RateLimitTimeoutError: 累计等待超过 ``timeout``。
             asyncio.CancelledError: 等待期间任务被取消（冲销预约后原样抛出）。
         """
         reserved_act, reserved_debt = self._reserve(timeout)
@@ -186,22 +210,42 @@ class RateLimiter:
                 remaining, reserved_act, reason, extra_debt = self._remaining_wait(
                     reserved_act
                 )
-                # 累计本次预约的全部扣减，供取消时精确冲销
+                # 累计本次预约的全部扣减，供取消/超时放弃时精确冲销
                 reserved_debt += extra_debt
                 if remaining <= 0:
                     return total_wait
+                if total_wait + remaining > timeout:
+                    logger.warning(
+                        f"⏳ 等待中放行时刻被 429 冻结推迟，累计等待 "
+                        f"{total_wait + remaining:.2f}s 超过 timeout={timeout:.2f}s，"
+                        "放弃本次令牌获取"
+                    )
+                    raise RateLimitTimeoutError(
+                        f"限速排队累计需等待 {total_wait + remaining:.2f}s，"
+                        f"超过 timeout={timeout:.2f}s（等待中冻结延长）"
+                    )
                 total_wait += remaining
                 self._log_wait(remaining, reason)
                 await asyncio.sleep(remaining)
         except asyncio.CancelledError:
-            with self._lock:
-                # 等待期间 _remaining_wait 的 _refill 可能已在负桶上补令牌；
-                # 桶容量即上限，回滚净债务后夹紧，避免 _tokens 超过 burst（超发）。
-                self._tokens = min(self._tokens + reserved_debt, self.burst)
+            self._rollback(reserved_debt)
             logger.info(
                 f"⏳ acquire_async 等待被取消，已回滚预约扣减 {reserved_debt:.2f} 令牌"
             )
             raise
+        except RateLimitTimeoutError:
+            self._rollback(reserved_debt)
+            raise
+
+    def _rollback(self, reserved_debt: float) -> None:
+        """锁内冲销预约扣减（含冻结折算债务），并夹紧到桶容量。
+
+        供同步/异步等待路径在"放弃预约"（累计等待超预算 / 等待被取消）时归还
+        容量；夹紧避免等待期间 :meth:`_refill` 已把令牌补到 ``burst`` 时直接相加
+        把 ``_tokens`` 推过桶容量（超发）。
+        """
+        with self._lock:
+            self._tokens = min(self._tokens + reserved_debt, self.burst)
 
     def _reserve(self, timeout: float) -> tuple[float, float]:
         """锁内完成令牌预约，返回 ``(预约放行时刻, 本预约扣减的令牌总量)``
