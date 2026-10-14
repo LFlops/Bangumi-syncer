@@ -1078,6 +1078,15 @@ async def test_run_tool_execution_failure_leads_to_succeeded(monkeypatch):
         def get_related_subjects(self, sid):
             return []
 
+        async def search_async(self, **kwargs):
+            raise RuntimeError("network down")
+
+        async def get_subject_async(self, sid):
+            return {}
+
+        async def get_related_subjects_async(self, sid):
+            return []
+
     ns = _make_notify()
     # 每轮都调 search（失败），共 max_iterations(medium=5) 轮 → exhausted
     chat = _chat_side_effect([_search_response() for _ in range(5)])
@@ -1490,6 +1499,8 @@ def _chat_side_effect(responses):
 
 def _make_bgm(search_result=None):
     class _Bgm:
+        """双协议替身：同步方法供收尾链（如 _prefetch_bgm_name），async 供工具 handler。"""
+
         def search(self, **kwargs):
             return search_result if search_result is not None else [{"id": 1}]
 
@@ -1498,6 +1509,15 @@ def _make_bgm(search_result=None):
 
         def get_related_subjects(self, sid):
             return []
+
+        async def search_async(self, **kwargs):
+            return self.search(**kwargs)
+
+        async def get_subject_async(self, sid):
+            return self.get_subject(sid)
+
+        async def get_related_subjects_async(self, sid):
+            return self.get_related_subjects(sid)
 
     return _Bgm()
 
@@ -1658,6 +1678,84 @@ def test_register_match_tools_overwrite_no_warning(caplog):
 
 
 # ---------------------------------------------------------------------------
+# 工具 handler 原生协程化（bgm 异步客户端；替代 run_in_executor 线程池）
+# ---------------------------------------------------------------------------
+
+
+def test_match_tools_query_handlers_are_coroutine_functions():
+    """3 个网络查询工具 handler 为原生协程；check_subject 保持本地同步。"""
+    from app.services.agent.execution.tools import ToolRegistry
+
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, _make_bgm())
+
+    for name in ("search_bangumi", "get_subject_detail", "get_related_subjects"):
+        defn = registry.get(name)
+        assert defn is not None
+        assert asyncio.iscoroutinefunction(defn.handler), name
+
+    check = registry.get("check_subject")
+    assert check is not None
+    assert not asyncio.iscoroutinefunction(check.handler)
+
+
+class _AsyncOnlyBgm:
+    """仅提供 async 方法的 bgm 替身：误走同步路径会 AttributeError。"""
+
+    def __init__(self, *, search_result=None) -> None:
+        self.calls: list[tuple] = []
+        self._search_result = (
+            search_result if search_result is not None else [{"id": 1}]
+        )
+
+    async def search_async(self, **kwargs):
+        self.calls.append(("search", kwargs))
+        return self._search_result
+
+    async def get_subject_async(self, sid):
+        self.calls.append(("get_subject", sid))
+        return {"name": f"subject-{sid}"}
+
+    async def get_related_subjects_async(self, sid):
+        self.calls.append(("get_related", sid))
+        return []
+
+
+@pytest.mark.asyncio
+async def test_search_tool_awaits_bgm_search_async():
+    """search_bangumi 经 search_async（awaited），不走同步客户端。"""
+    from app.services.agent.execution.tools import ToolRegistry
+
+    bgm = _AsyncOnlyBgm(search_result=[{"id": 42}])
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, bgm)
+
+    result = await registry.execute("search_bangumi", {"title": "x"})
+
+    assert result == [{"id": 42}]
+    assert bgm.calls and bgm.calls[0][0] == "search"
+    assert bgm.calls[0][1]["title"] == "x"
+
+
+@pytest.mark.asyncio
+async def test_subject_detail_and_related_tools_await_async_bgm():
+    """get_subject_detail / get_related_subjects 经对应 async 方法。"""
+    from app.services.agent.execution.tools import ToolRegistry
+
+    bgm = _AsyncOnlyBgm()
+    registry = ToolRegistry()
+    llm_assist.register_match_tools(registry, bgm)
+
+    detail = await registry.execute("get_subject_detail", {"subject_id": "7"})
+    related = await registry.execute("get_related_subjects", {"subject_id": "7"})
+
+    assert detail == {"name": "subject-7"}
+    assert related == []
+    assert ("get_subject", 7) in bgm.calls
+    assert ("get_related", 7) in bgm.calls
+
+
+# ---------------------------------------------------------------------------
 # match 场景 5 个工具显式标注幂等属性（契约语义，不再依赖缺省推导）
 
 
@@ -1713,6 +1811,18 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
             time.sleep(0.05)
             return []
 
+        async def search_async(self, **kwargs):
+            await asyncio.sleep(0.05)
+            return [{"id": 1}]
+
+        async def get_subject_async(self, sid):
+            await asyncio.sleep(0.05)
+            return {"name": f"subject-{sid}"}
+
+        async def get_related_subjects_async(self, sid):
+            await asyncio.sleep(0.05)
+            return []
+
     registry = ToolRegistry()
     llm_assist.register_match_tools(registry, _SlowBgm())
 
@@ -1747,7 +1857,8 @@ async def test_execute_batch_match_tools_idempotent_segment_and_terminal_capture
 # ---------------------------------------------------------------------------
 
 
-def test_register_match_tools_rebinds_handlers_to_latest_bgm():
+@pytest.mark.asyncio
+async def test_register_match_tools_rebinds_handlers_to_latest_bgm():
     from app.services.agent.execution.tools import ToolRegistry
 
     registry = ToolRegistry()
@@ -1757,10 +1868,10 @@ def test_register_match_tools_rebinds_handlers_to_latest_bgm():
     llm_assist.register_match_tools(registry, bgm1)
     llm_assist.register_match_tools(registry, bgm2)
 
-    # search handler 闭包应指向第二个 bgm
+    # search handler 闭包应指向第二个 bgm（协程 handler → await）
     search = registry.get("search_bangumi")
     assert search is not None
-    assert search.handler({"title": "x"}) == [{"id": 2, "name": "second"}]
+    assert await search.handler({"title": "x"}) == [{"id": 2, "name": "second"}]
 
 
 @pytest.mark.asyncio
@@ -1778,6 +1889,16 @@ async def test_two_runs_with_different_bgm_second_run_uses_second_bgm():
                 return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
 
             def get_related_subjects(self, sid):
+                return []
+
+            async def search_async(self, **kwargs):
+                used.append(tag)
+                return [{"id": 1}]
+
+            async def get_subject_async(self, sid):
+                return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+            async def get_related_subjects_async(self, sid):
                 return []
 
         return _B()
@@ -4121,6 +4242,15 @@ def test_replay_missing_tool_writes_span_and_second_replay_not_missing(monkeypat
         def get_related_subjects(self, sid):
             return []
 
+        async def search_async(self, **kwargs):
+            return self.search(**kwargs)
+
+        async def get_subject_async(self, sid):
+            return self.get_subject(sid)
+
+        async def get_related_subjects_async(self, sid):
+            return self.get_related_subjects(sid)
+
     bgm = _Bgm()
     eb_calls = {"n": 0}
 
@@ -4200,6 +4330,15 @@ def test_continue_run_recovery_no_double_llm_call(monkeypatch):
 
         def get_related_subjects(self, sid):
             return []
+
+        async def search_async(self, **kwargs):
+            return self.search(**kwargs)
+
+        async def get_subject_async(self, sid):
+            return self.get_subject(sid)
+
+        async def get_related_subjects_async(self, sid):
+            return self.get_related_subjects(sid)
 
     bgm = _Bgm()
     eb_calls = {"n": 0}
@@ -4474,6 +4613,15 @@ async def test_continue_run_double_recovery_no_extra_llm_call(monkeypatch):
 
         def get_related_subjects(self, sid):
             return []
+
+        async def search_async(self, **kwargs):
+            return self.search(**kwargs)
+
+        async def get_subject_async(self, sid):
+            return self.get_subject(sid)
+
+        async def get_related_subjects_async(self, sid):
+            return self.get_related_subjects(sid)
 
     bgm = _Bgm()
 
@@ -4877,7 +5025,7 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
     tail_active = threading.Event()
 
     class _SlowBgm:
-        """get_subject 为同步阻塞函数：模拟收尾期阻塞 HTTP。"""
+        """同步 get_subject（收尾链）与 async 协议（工具路径）均为阻塞模拟。"""
 
         def search(self, **kwargs):
             return [{"id": 1}]
@@ -4889,6 +5037,18 @@ async def test_run_tail_does_not_block_event_loop(monkeypatch):
             return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
 
         def get_related_subjects(self, sid):
+            return []
+
+        async def search_async(self, **kwargs):
+            return [{"id": 1}]
+
+        async def get_subject_async(self, sid):
+            tail_active.set()
+            await asyncio.sleep(0.2)
+            tail_active.clear()
+            return {"name": f"subject-{sid}", "name_cn": f"条目-{sid}"}
+
+        async def get_related_subjects_async(self, sid):
             return []
 
     beats_during_tail = 0
@@ -4965,6 +5125,15 @@ async def test_run_tail_concurrent_db_ops_during_slow_prefetch_no_lock_error(
 
         def get_related_subjects(self, sid):
             return []
+
+        async def search_async(self, **kwargs):
+            return self.search(**kwargs)
+
+        async def get_subject_async(self, sid):
+            return self.get_subject(sid)
+
+        async def get_related_subjects_async(self, sid):
+            return self.get_related_subjects(sid)
 
     ns = _make_notify()
     task = asyncio.create_task(
@@ -5400,17 +5569,20 @@ class TestSubjectIdCoercionDefense:
         return next(d.handler for d in defns if d.name == name)
 
     @pytest.mark.parametrize("bad", ["abc", "", "12x", "  ", None, []])
-    def test_get_subject_detail_invalid_returns_error(self, bad):
-        result = self._handler("get_subject_detail")({"subject_id": bad})
+    @pytest.mark.asyncio
+    async def test_get_subject_detail_invalid_returns_error(self, bad):
+        result = await self._handler("get_subject_detail")({"subject_id": bad})
         assert result == {"error": "invalid subject_id"}
 
     @pytest.mark.parametrize("bad", ["abc", "", "12x", None])
-    def test_get_related_subjects_invalid_returns_error(self, bad):
-        result = self._handler("get_related_subjects")({"subject_id": bad})
+    @pytest.mark.asyncio
+    async def test_get_related_subjects_invalid_returns_error(self, bad):
+        result = await self._handler("get_related_subjects")({"subject_id": bad})
         assert result == {"error": "invalid subject_id"}
 
-    def test_get_subject_detail_valid_still_calls_bgm(self):
-        result = self._handler("get_subject_detail")({"subject_id": "123"})
+    @pytest.mark.asyncio
+    async def test_get_subject_detail_valid_still_calls_bgm(self):
+        result = await self._handler("get_subject_detail")({"subject_id": "123"})
         assert result["name"] == "subject-123"
         assert result["name_cn"] == "条目-123"
 

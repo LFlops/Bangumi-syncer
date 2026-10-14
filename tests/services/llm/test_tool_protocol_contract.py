@@ -11,7 +11,7 @@ tool_choice="submit_suggestion"。stub bgm 仅提供 search/get_subject/get_rela
 空实现，使注册可执行。
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -28,6 +28,10 @@ def _make_stub_bgm() -> MagicMock:
     bgm.search.return_value = []
     bgm.get_subject.return_value = {}
     bgm.get_related_subjects.return_value = []
+    # 工具 handler 已协程化（走 *_async）；契约测试不执行 handler，仅为对齐协议
+    bgm.search_async = AsyncMock(return_value=[])
+    bgm.get_subject_async = AsyncMock(return_value={})
+    bgm.get_related_subjects_async = AsyncMock(return_value=[])
     return bgm
 
 

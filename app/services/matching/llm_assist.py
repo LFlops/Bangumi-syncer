@@ -155,16 +155,18 @@ def _parse_subject_id(raw: Any) -> int | None:
 def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinition]:
     """注册匹配场景工具到指定 registry，返回已注册定义列表。
 
-    - 4 个 read 工具包装 Bangumi API（handler 闭包捕获传入的 ``bgm``）
+    - 4 个 read 工具包装 Bangumi API（handler 闭包捕获传入的 ``bgm``）；
+      3 个网络查询 handler 为**原生协程**（``*_async`` 异步客户端，避免
+      ``run_in_executor`` 线程池与「工具超时后同步等待不可取消」问题）
     - 1 个 terminal 工具 submit_suggestion（终止性，不落库）
     """
 
-    def _search(args: dict) -> Any:
+    async def _search(args: dict) -> Any:
         title = args.get("title", "")
         subject_types = args.get("subject_types") or [2]
-        return bgm.search(title=title, subject_types=subject_types)
+        return await bgm.search_async(title=title, subject_types=subject_types)
 
-    def _get_detail(args: dict) -> Any:
+    async def _get_detail(args: dict) -> Any:
         sid = _parse_subject_id(args.get("subject_id"))
         if sid is None:
             logger.warning(
@@ -172,13 +174,13 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
                 f"{args.get('subject_id')!r}"
             )
             return {"error": "invalid subject_id"}
-        return bgm.get_subject(sid)
+        return await bgm.get_subject_async(sid)
 
     def _check(args: dict) -> Any:
         ok, reason = _validate_subject_id(str(args["subject_id"]))
         return {"valid": ok, "reason": reason}
 
-    def _related(args: dict) -> Any:
+    async def _related(args: dict) -> Any:
         sid = _parse_subject_id(args.get("subject_id"))
         if sid is None:
             logger.warning(
@@ -186,7 +188,7 @@ def register_match_tools(registry: ToolRegistry, bgm: Any) -> list[ToolDefinitio
                 f"{args.get('subject_id')!r}"
             )
             return {"error": "invalid subject_id"}
-        return bgm.get_related_subjects(sid)
+        return await bgm.get_related_subjects_async(sid)
 
     def _noop(_args: dict) -> Any:  # terminal 工具不会真正执行 handler
         return {}
