@@ -772,7 +772,10 @@ class AgentRunsRepository(BaseRepository):
         """构造观测列表的 JOIN / WHERE / 参数（list_runs 与 count_runs 共用口径）。
 
         - ``user_name``：经 ``sync_records`` 归属过滤（agent_runs 无用户列，
-          归属在同步记录上；run↔sync_record 一对一，JOIN 不放大行）；
+          归属在同步记录上；run↔sync_record 一对一，JOIN 不放大行）。**INNER JOIN
+          语义**：sync_record 缺失（如已清理）时无法判定归属，该 run 对按用户过滤
+          的调用方不可见（admin 不带该过滤、无 JOIN，仍可见）——「无法判定归属
+          不展示」的安全取舍；列表与 count 共用本构造，口径一致；
         - ``since``：epoch 秒下界（``created_at >= since``）。
         """
         joins = ""

@@ -78,7 +78,8 @@
         </div>
         <div class="card-body">
             <div id="agent-runs-table-wrap" class="records-table-wrap">
-                <table class="table table-hover" id="agent-runs-table">
+                <table class="table table-hover table-striped align-middle app-data-table"
+                       id="agent-runs-table">
                     <thead>
                         <tr>
                             <th>状态</th>
@@ -99,6 +100,12 @@
                 </ul>
                 <div class="app-pagination__summary text-muted" id="pagination-summary"></div>
             </nav>
+            <!-- 加载状态 -->
+            <div id="loading" class="app-loading-state is-hidden">
+                <div class="spinner-border" role="status">
+                    <span class="visually-hidden">加载中...</span>
+                </div>
+            </div>
         </div>
     </div>
     <!-- 运行详情弹窗 -->

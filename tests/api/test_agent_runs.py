@@ -161,6 +161,7 @@ async def test_get_agent_run_owner_allowed_200(app, mock_db):
     assert resp.status_code == 200
     data = resp.json()
     # 非时间字段精确相等
+    assert data["run_id"] == "run-1"
     assert data["status"] == "succeeded"
     assert data["stop_reason"] == "submit_suggestion"
     assert data["task_type"] == "match"

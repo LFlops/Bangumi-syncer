@@ -302,6 +302,10 @@ def test_agent_runs_page():
     assert 'id="agentRunDetailModal"' in body
     assert "agent_runs.js" in body
     assert "agent-run-steps.js" in body
+    # 加载态容器（setAppTableLoading 依赖）
+    assert 'id="loading"' in body
+    # 项目表格样式（斑马纹/移动端行为）
+    assert "app-data-table" in body
 
 
 def test_dashboard_llm_trend_canvases():

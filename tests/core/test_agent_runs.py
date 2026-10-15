@@ -1719,3 +1719,12 @@ class TestListRuns:
         assert dbm.agent_runs.count_runs() == 3
         assert dbm.agent_runs.count_runs(status="succeeded") == 1
         assert dbm.agent_runs.count_runs(user_name="alice") == 2
+
+    def test_list_runs_user_filter_excludes_run_without_sync_record(self, tmp_path):
+        """INNER JOIN 语义：sync_record 缺失时按用户过滤不可见；不过滤（admin）可见。"""
+        dbm = _make_db(tmp_path)
+        repo = dbm.agent_runs
+        repo.create_pending("run-orphan", "match", 99999)  # 无对应 sync_records 行
+
+        assert repo.list_runs(user_name="alice") == []
+        assert [r["run_id"] for r in repo.list_runs()] == ["run-orphan"]

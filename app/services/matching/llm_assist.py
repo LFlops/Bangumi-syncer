@@ -627,7 +627,9 @@ def _match_resolve_max_iterations(thinking_level: str) -> int:
     config_override = resolve_max_iterations_override(
         match_cfg.get("llm_match_max_iterations")
     )
-    return get_max_iterations("match", thinking_level, config_override=config_override)
+    return get_max_iterations(
+        _TASK_TYPE, thinking_level, config_override=config_override
+    )
 
 
 # 终止提交软护栏（veto）：模型提交的 reason 中若出现下列不确定表述，
@@ -695,8 +697,11 @@ async def _match_handle_terminal(
 #: 终止工具名（场景侧单一常量：注册与终局分派共用；由注册表 access="terminal" 派生）
 _TERMINAL_TOOL = "submit_suggestion"
 
+#: 场景任务类型（注册表 / hooks / 运行时 / 通知共用，单一来源）
+_TASK_TYPE = "match"
+
 _MATCH_HOOKS: ScenarioHooks[_MatchContext] = ScenarioHooks(
-    task_type="match",
+    task_type=_TASK_TYPE,
     register_tools=_match_register_tools,
     build_stream_fn=_match_build_stream_fn,
     resolve_thinking_level=_match_resolve_thinking_level,
@@ -765,7 +770,7 @@ def get_scenario_runtime() -> ScenarioRuntime[_MatchContext]:
     注册表按 ``task_type`` 惰性导入并调用本函数。
     """
     return ScenarioRuntime(
-        task_type="match",
+        task_type=_TASK_TYPE,
         hooks=_MATCH_HOOKS,
         new_ctx=make_match_ctx,
     )
@@ -924,7 +929,7 @@ def _handle_result(
         )
         notify_agent_run_failed(
             run_id,
-            task_type="match",
+            task_type=_TASK_TYPE,
             stop_reason=stop,
             last_error=f"循环终止原因: {stop}",
         )
@@ -1045,6 +1050,12 @@ def _mark_persist_failed(dbm, run_id: str, error: Exception) -> None:
     try:
         dbm.agent_runs.mark_failed(
             run_id,
+            stop_reason="persist_error",
+            last_error=str(error),
+        )
+        notify_agent_run_failed(
+            run_id,
+            task_type=_TASK_TYPE,
             stop_reason="persist_error",
             last_error=str(error),
         )

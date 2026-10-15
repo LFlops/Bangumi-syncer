@@ -46,6 +46,7 @@ _LIST_DEFAULT_DAYS = 30
 
 # run 端点对外暴露的字段（不含 payload_json / replay_delta 等内部重放字段）
 _RUN_PUBLIC_FIELDS = (
+    "run_id",
     "status",
     "stop_reason",
     "task_type",
@@ -298,12 +299,7 @@ async def list_agent_runs(
     )
     total = database_manager.agent_runs.count_runs(**filters)
 
-    items: list[dict] = []
-    for run in rows:
-        record = {field: run.get(field) for field in _RUN_PUBLIC_FIELDS}
-        record["run_id"] = run.get("run_id", "")
-        _apply_time_fields(record)
-        items.append(record)
+    items = [_project_run(run) for run in rows]
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 

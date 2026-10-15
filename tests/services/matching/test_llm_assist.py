@@ -5705,3 +5705,15 @@ def test_continue_run_terminal_failure_notifies_agent_run_failed():
     notify.notify.assert_called_once()
     assert notify.notify.call_args.args[0] == "agent_run_failed"
     assert notify.notify.call_args.kwargs.get("run_id") == "r-err-notify"
+
+
+def test_mark_persist_failed_notifies_agent_run_failed():
+    """落库失败终态化（persist_error）→ 发送 agent_run_failed 通知。"""
+    dbm = MagicMock()
+    with patch("app.services.base.notifier_helpers.notification_service") as notify:
+        llm_assist._mark_persist_failed(dbm, "run-persist", RuntimeError("disk full"))
+
+    dbm.agent_runs.mark_failed.assert_called_once()
+    notify.notify.assert_called_once()
+    assert notify.notify.call_args.args[0] == "agent_run_failed"
+    assert notify.notify.call_args.kwargs.get("stop_reason") == "persist_error"
