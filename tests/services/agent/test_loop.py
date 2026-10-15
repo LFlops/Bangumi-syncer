@@ -1781,3 +1781,35 @@ async def test_terminal_branch_prefers_executor_capture_args():
     assert result.terminal_args == {"subject_id": "42"}, (
         "存在 capture 时应以 capture.args 为准（消除「产而不用」）"
     )
+
+
+async def test_assistant_history_messages_always_carry_tool_use_blocks():
+    """会话历史中的 assistant 消息必含 tool_use 块（协议约束的行为化守卫）。
+
+    live loop 仅在轮次含 ToolUseBlock（terminal_reason is None）时 append
+    assistant 消息；若破坏，纯文本 assistant 会以 provider 兜底 join 改写语义
+    被回传。本测试跑真实多轮循环，检查后续轮次可见的历史 assistant 消息。
+    """
+    stream = scripted_stream(
+        [
+            _resp("tool_use", [_tool_use("t1", "search_bangumi")]),
+            _resp("end_turn", None),
+        ]
+    )
+
+    await run_loop(
+        stream_fn=stream,
+        executor_factory=scripted_executor(lambda tc: {"ok": tc.id}),
+        tools_schemas=[_schema("search_bangumi"), _TERMINAL_SCHEMA],
+        max_iterations=3,
+        seed_messages=_seed(),
+    )
+
+    second_round_messages = stream.calls[1][0]
+    assistant_messages = [m for m in second_round_messages if m.role == "assistant"]
+    assert assistant_messages, "第二轮历史应包含第一轮 assistant 消息"
+    for message in assistant_messages:
+        blocks = message.content if isinstance(message.content, list) else []
+        assert any(getattr(b, "type", "") == "tool_use" for b in blocks), (
+            f"历史 assistant 消息必须携带 tool_use 块（协议约束）: {message!r}"
+        )

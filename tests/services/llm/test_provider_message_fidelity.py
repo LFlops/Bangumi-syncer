@@ -83,60 +83,6 @@ def test_anthropic_system_blocks_merge_for_cache_stability():
     assert text == "A\n\nB"
 
 
-def test_agent_history_assistant_messages_always_carry_tool_calls():
-    """历史消息中的 assistant 必带 tool_calls（否则 provider兜底 join 会改写语义）。
-
-    今天由两处守卫保证：live loop 仅在 ``terminal_reason is None``（必然含
-    tool_calls）时 append assistant；replay 同样以 ``if tool_calls:`` 把关。
-    一旦破坏，纯文本 assistant 消息会以 ``\\n\\n`` 拼接被发回 provider。
-    """
-    import ast
-    from pathlib import Path
-
-    def _assistant_appends(tree: ast.AST) -> list[int]:
-        return [
-            n.lineno
-            for n in ast.walk(tree)
-            if isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr == "append"
-            and n.args
-            and "assistant" in ast.unparse(n.args[0])
-        ]
-
-    # trace.py：append assistant 显式位于 ``if tool_calls:`` 守卫内。
-    trace_src = Path("app/services/agent/observe/trace.py").read_text(encoding="utf-8")
-    trace_tree = ast.parse(trace_src)
-    guarded_lines: set[int] = set()
-    for node in ast.walk(trace_tree):
-        if isinstance(node, ast.If) and "tool_calls" in ast.unparse(node.test):
-            guarded_lines.update(_assistant_appends(node))
-    assert set(_assistant_appends(trace_tree)) <= guarded_lines, (
-        "trace.py: append assistant 必须在 if tool_calls: 守卫内"
-    )
-
-    # loop.py：append assistant 位于 ``if terminal_reason is not None:`` 的**之后**
-    #          （该分支全部提前 return，故其后必然处于 terminal_reason is None，
-    #           而 normalize_stop_reason 仅在 has_tool_calls 时返回 None）。
-    loop_src = Path("app/services/agent/loop.py").read_text(encoding="utf-8")
-    loop_tree = ast.parse(loop_src)
-    early_return_lines: set[int] = set()
-    for node in ast.walk(loop_tree):
-        if isinstance(node, ast.If) and "terminal_reason is not None" in ast.unparse(
-            node.test
-        ):
-            early_return_lines.update(
-                n.lineno for n in ast.walk(node) if isinstance(n, ast.Return)
-            )
-    append_lines = _assistant_appends(loop_tree)
-    assert append_lines, "loop.py 应有 append assistant 消息"
-    for lineno in append_lines:
-        assert lineno > max(early_return_lines), (
-            f"loop.py:{lineno} append assistant 位于终局提前 return 之后"
-            "（即 terminal_reason is None 分支内，必然含 tool_calls）"
-        )
-
-
 # ---------------------------------------------------------------------------
 # OpenAI Responses 侧：items 数组原生保序，但仍有一处 join 需要同口径收口
 # ---------------------------------------------------------------------------

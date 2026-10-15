@@ -160,16 +160,26 @@ def test_scene_runtime_factory_declares_concrete_ctx():
 # ---------------------------------------------------------------------------
 
 
-def test_agent_layer_never_mentions_scene_private_ctx_type():
-    """``app/services/agent/**`` 源码不得出现 ``_MatchContext`` 等场景私有类型。"""
-    offenders: dict[str, list[str]] = {}
+def test_agent_layer_has_no_domain_module_imports():
+    """``app/services/agent/**`` 不得 import 场景/领域模块（依赖级解耦守卫）。
+
+    以 import 依赖（而非源码中的类型名）表述解耦：docstring 交叉引用场景文件
+    是合法说明，不构成依赖。
+    """
+    forbidden = ("app.services.matching", "app.services.scenarios")
+    offenders: list[str] = []
     for path in sorted(_AGENT_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        hits = [
-            node.id
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Name) and node.id == "_MatchContext"
-        ]
-        if hits:
-            offenders[path.name] = hits
-    assert offenders == {}, f"agent 通用层不得引用场景私有 ctx 类型，实际 {offenders}"
+        for node in ast.walk(tree):
+            module: str | None = None
+            if isinstance(node, ast.ImportFrom):
+                module = node.module
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith(forbidden):
+                        offenders.append(
+                            f"{path.name}:{node.lineno}: import {alias.name}"
+                        )
+            if module and module.startswith(forbidden):
+                offenders.append(f"{path.name}:{node.lineno}: from {module} import ...")
+    assert offenders == [], f"agent 通用层不得 import 场景/领域模块，实际：{offenders}"
