@@ -145,6 +145,25 @@ class TestIsSensitiveField:
         assert not config_schema.is_sensitive_field("feiniu", "db_path")
         assert not config_schema.is_sensitive_field("notify-webhook-1", "url")
 
+    def test_underscore_section_names(self):
+        """get_all_config 输出的下划线段名也须正确判定敏感字段。
+
+        回归 E2E 泄露：get_all_config 将段名规范化为下划线
+        （bangumi_oauth / notify_email_1），若仅识别连字符形态则掩码失效。
+        """
+        # 下划线形态 → 敏感
+        assert config_schema.is_sensitive_field("bangumi_oauth", "client_secret")
+        assert config_schema.is_sensitive_field("notify_email_1", "smtp_password")
+        assert config_schema.is_sensitive_field("notify_wecom_1", "key")
+        assert config_schema.is_sensitive_field("notify_dingtalk_1", "access_token")
+        assert config_schema.is_sensitive_field("notify_dingtalk_1", "secret")
+        assert config_schema.is_sensitive_field("bangumi_user1", "access_token")
+        # 下划线形态 → 非敏感
+        assert not config_schema.is_sensitive_field("bangumi_oauth", "client_id")
+        assert not config_schema.is_sensitive_field("bangumi_data", "access_token")
+        assert not config_schema.is_sensitive_field("notify_email_1", "smtp_host")
+        assert not config_schema.is_sensitive_field("notify_wecom_1", "url")
+
     def test_legacy_parity(self):
         """与改造前原逻辑对比：常见场景结果一致
 
@@ -286,6 +305,15 @@ class TestFieldMeta:
             config_schema.field_default("dev", "ech_doh_url")
             == "https://dns.alidns.com/resolve"
         )
+
+    def test_dev_mcp_base_url_registered_with_empty_default(self):
+        """MCP 服务公共 URL 应在 dev 段登记且默认空串。
+
+        Web 配置页依赖 SectionMeta.fields 回填；空串约定「不覆盖」，
+        由 app/mcp/server.py 按 参数 > MCP_BASE_URL > dev.mcp_base_url > 默认值 解析。
+        """
+        assert config_schema.field_meta("dev", "mcp_base_url") is not None
+        assert config_schema.field_default("dev", "mcp_base_url") == ""
 
     def test_auth_default_session_timeout(self):
         assert config_schema.field_default("auth", "session_timeout") == 3600
@@ -749,11 +777,41 @@ class TestConfigCoverage:
         names = {f.name for f in meta.fields}
         assert {
             "arbiter_enabled",
-            "weight_custom_mapping",
-            "weight_bangumi_data",
             "weight_archive",
             "weight_api_search",
             "min_score",
             "min_margin",
             "ambiguous_margin",
         } <= names
+
+    def test_only_applicable_weights_are_exposed(self):
+        """只暴露真正能影响裁决的权重
+
+        裁决层只在 APISearchStep 内运行，候选来自本地归档与在线搜索。
+        自定义映射与 bangumi-data 命中时管线已 is_terminal 终止，候选到不了
+        裁决层 —— 给它们暴露权重旋钮会让用户「调了没反应」，属于误导。
+        """
+        from app.services.matching.arbiter import APPLICABLE_WEIGHT_SOURCES
+
+        meta = config_schema.get_section_meta("matching")
+        exposed = {f.name for f in meta.fields if f.name.startswith("weight_")}
+        assert exposed == {f"weight_{s}" for s in APPLICABLE_WEIGHT_SOURCES}
+
+    def test_applicable_weights_match_reality(self):
+        """APPLICABLE_WEIGHT_SOURCES 必须与「哪些 step 会终止管线」一致
+
+        守护：若将来把 CustomMappingStep / BangumiDataStep 改成非终止
+        （从而其候选真能进入裁决层），本用例会失败，提醒把对应权重加回来。
+        """
+        from app.services.matching.arbiter import APPLICABLE_WEIGHT_SOURCES
+        from app.services.matching.contracts import (
+            SOURCE_API_SEARCH,
+            SOURCE_ARCHIVE,
+            SOURCE_BANGUMI_DATA,
+            SOURCE_CUSTOM_MAPPING,
+        )
+
+        assert APPLICABLE_WEIGHT_SOURCES == {SOURCE_ARCHIVE, SOURCE_API_SEARCH}
+        # 这两类命中即终止，其权重不可用
+        assert SOURCE_CUSTOM_MAPPING not in APPLICABLE_WEIGHT_SOURCES
+        assert SOURCE_BANGUMI_DATA not in APPLICABLE_WEIGHT_SOURCES

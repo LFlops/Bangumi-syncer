@@ -550,6 +550,136 @@ def test_other_accounts_archive_uses_archive_total_eps():
     assert "use_archive" not in other.get_subject.call_args.kwargs
 
 
+def _anime_complete_config():
+    def get_side_effect(section, key, fallback=None):
+        if section == "sync" and key == "anime_mark_subject_completed":
+            return True
+        return fallback
+
+    return get_side_effect
+
+
+def _tv_item(episode=12):
+    return CustomItem(
+        user_name="testuser",
+        title="TV Anime X",
+        ori_title=None,
+        season=1,
+        episode=episode,
+        media_type="episode",
+        release_date="",
+    )
+
+
+def test_anime_archive_uses_collection_embedded_eps_without_extra_request():
+    """总集数取自收藏响应内嵌的 subject.eps，不额外调用 get_subject。"""
+    service = SyncService()
+    bgm = MagicMock()
+    bgm.get_subject_collection.return_value = {
+        "type": 3,
+        "ep_status": 12,
+        "subject": {"id": 123, "eps": 12},
+    }
+
+    with patch("app.services.sync_service.config_manager") as mock_cfg:
+        mock_cfg.get.side_effect = _anime_complete_config()
+        service._mark_subject_completed_if_needed(_tv_item(), bgm, "123", "TV Anime X")
+
+    bgm.get_subject.assert_not_called()
+    bgm.change_collection_state.assert_called_once_with(subject_id="123", state=2)
+
+
+def test_anime_archive_ignores_stale_subject_cache():
+    """连载中条目开播后才补全 eps：实例缓存仍为旧的 eps=0 时，以收藏响应的实时 eps 为准。"""
+    from app.utils.bangumi_api import BangumiApi
+
+    service = SyncService()
+    bgm = BangumiApi()
+    # 模拟进程早先（wiki 尚未填写话数时）缓存的条目数据
+    bgm._put_cache("get_subject", ("123", True), {"id": 123, "eps": 0})
+
+    with (
+        patch.object(
+            bgm,
+            "get_subject_collection",
+            return_value={
+                "type": 3,
+                "ep_status": 12,
+                "subject": {"id": 123, "eps": 12},
+            },
+        ),
+        patch.object(bgm, "get") as mock_get,
+        patch.object(bgm, "change_collection_state") as mock_change,
+        patch("app.services.sync_service.config_manager") as mock_cfg,
+    ):
+        mock_cfg.get.side_effect = _anime_complete_config()
+        service._mark_subject_completed_if_needed(_tv_item(), bgm, "123", "TV Anime X")
+
+    mock_get.assert_not_called()
+    mock_change.assert_called_once_with(subject_id="123", state=2)
+
+
+@pytest.mark.parametrize(
+    "coll_subject",
+    [None, {"id": 123}, {"id": 123, "eps": 0}, {"id": 123, "eps": None}],
+)
+def test_anime_archive_falls_back_to_get_subject(coll_subject):
+    """收藏响应缺少有效 subject.eps 时回退 get_subject（保留 Archive 补全）。"""
+    service = SyncService()
+    bgm = MagicMock()
+    coll = {"type": 3, "ep_status": 12}
+    if coll_subject is not None:
+        coll["subject"] = coll_subject
+    bgm.get_subject_collection.return_value = coll
+    bgm.get_subject.return_value = {"eps": 12}
+
+    with patch("app.services.sync_service.config_manager") as mock_cfg:
+        mock_cfg.get.side_effect = _anime_complete_config()
+        service._mark_subject_completed_if_needed(_tv_item(), bgm, "123", "TV Anime X")
+
+    bgm.get_subject.assert_called_once_with("123")
+    bgm.change_collection_state.assert_called_once_with(subject_id="123", state=2)
+
+
+def test_anime_archive_not_completed_when_episodes_remain():
+    """已看集数未达到收藏响应中的总集数时不归档。"""
+    service = SyncService()
+    bgm = MagicMock()
+    bgm.get_subject_collection.return_value = {
+        "type": 3,
+        "ep_status": 11,
+        "subject": {"id": 123, "eps": 12},
+    }
+
+    with patch("app.services.sync_service.config_manager") as mock_cfg:
+        mock_cfg.get.side_effect = _anime_complete_config()
+        service._mark_subject_completed_if_needed(
+            _tv_item(11), bgm, "123", "TV Anime X"
+        )
+
+    bgm.get_subject.assert_not_called()
+    bgm.change_collection_state.assert_not_called()
+
+
+@pytest.mark.parametrize("eps", [0, None])
+def test_anime_archive_skips_when_total_eps_unknown(eps):
+    """收藏响应与 get_subject 均无有效总集数时不归档，也不抛异常。"""
+    service = SyncService()
+    bgm = MagicMock()
+    bgm.get_subject_collection.return_value = {
+        "type": 3,
+        "ep_status": 12,
+        "subject": {"id": 123, "eps": eps},
+    }
+    bgm.get_subject.return_value = {"eps": eps}
+
+    with patch("app.services.sync_service.config_manager") as mock_cfg:
+        mock_cfg.get.side_effect = _anime_complete_config()
+        service._mark_subject_completed_if_needed(_tv_item(), bgm, "123", "TV Anime X")
+
+    bgm.change_collection_state.assert_not_called()
+
+
 def test_check_season_info_in_title(mock_config, mock_database):
     """测试检查标题中的季度信息"""
     service = SyncService()
@@ -583,7 +713,7 @@ def _patched_sync_service_deps():
                     "app.services.sync_service.mapping_service"
                 ) as mock_mapping_service:
                     # 默认 find_mapping 返回未命中（subject_id, match_type, reason）
-                    mock_mapping_service.find_mapping.return_value = ("", "", "")
+                    mock_mapping_service.find_mapping.return_value = ("", "", "", False)
                     yield mock_cfg
 
 
@@ -627,7 +757,7 @@ def test_find_subject_id_from_mapping(mock_config, mock_database):
     with patch.object(
         mapping_service,
         "find_mapping",
-        return_value=("12345", "exact", "自定义映射命中：Test Anime=12345"),
+        return_value=("12345", "exact", "自定义映射命中：Test Anime=12345", False),
     ):
         item = CustomItem(
             user_name="testuser",
@@ -679,7 +809,9 @@ def test_find_subject_id_movie_passes_is_movie_to_bgm_search(mock_database):
             source="custom",
         )
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_api_for_user", return_value=bgm):
                 sid, is_season, _ = service._find_subject_id(item)
 
@@ -858,7 +990,9 @@ def test_find_subject_id_find_bangumi_id_exception_falls_through_to_api():
         bgm = MagicMock()
         bgm._archive.enabled = False
         bgm.bgm_search.return_value = [{"id": 42}]
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -933,7 +1067,9 @@ def test_find_subject_id_api_top_is_movie_falls_back_to_related_mainline():
             "date": "2025-10-03",
         }
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -991,7 +1127,9 @@ def test_find_subject_id_api_top_is_movie_no_related_keeps_first():
             "name_cn": "完美世界剧场版 九劫焚天",
         }
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1080,7 +1218,9 @@ def test_find_subject_id_api_top_movie_picks_mainline_over_derivative():
             },
         ]
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1161,7 +1301,9 @@ def test_find_subject_id_api_disabled_no_bgm_instance():
 
         cfg.get.side_effect = get_side_effect
         service = SyncService()
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_api_for_user", return_value=None):
                 sid, flag, err = service._find_subject_id(
                     _branch_custom_item_for_find()
@@ -1184,7 +1326,9 @@ def test_find_subject_id_api_search_exception_returns_none():
         bgm = MagicMock()
         bgm._archive.enabled = False
         bgm.bgm_search.side_effect = OSError("net")
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_api_for_user", return_value=bgm):
                 sid, flag, err = service._find_subject_id(
                     _branch_custom_item_for_find()
@@ -1231,7 +1375,9 @@ def test_find_subject_id_archive_hit_marks_stage_as_archive():
         bgm.title_diff_ratio.return_value = 1.0
 
         trace = MatchTrace()
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1299,7 +1445,9 @@ def test_find_subject_id_api_hit_keeps_stage_as_api_search():
         ]
 
         trace = MatchTrace()
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1362,7 +1510,9 @@ def test_find_subject_id_low_confidence_sediments_to_pending():
         bgm.title_diff_ratio.return_value = 0.5
 
         trace = MatchTrace()
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1423,7 +1573,9 @@ def test_find_subject_id_above_threshold_auto_accepts():
         bgm.title_diff_ratio.return_value = 0.9
 
         trace = MatchTrace()
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1534,7 +1686,9 @@ def test_find_subject_id_api_search_season_gt1_title_matched():
             }
         ]
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_api_for_user", return_value=bgm):
                 sid, flag, err = service._find_subject_id(
                     _branch_custom_item_for_find(season=9, title="瑞克和莫蒂")
@@ -1564,7 +1718,9 @@ def test_find_subject_id_api_search_season_gt1_title_not_matched():
             {"id": 146457, "name": "Rick and Morty", "name_cn": "瑞克和莫蒂"}
         ]
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_api_for_user", return_value=bgm):
                 sid, flag, err = service._find_subject_id(
                     _branch_custom_item_for_find(season=9, title="瑞克和莫蒂")
@@ -1638,7 +1794,9 @@ def test_find_subject_id_api_season_gt1_top_movie_reselects_mainline_via_related
             "date": "2025-10-03",
         }
 
-        with patch.object(mapping_service, "find_mapping", return_value=("", "", "")):
+        with patch.object(
+            mapping_service, "find_mapping", return_value=("", "", "", False)
+        ):
             with patch.object(service, "_get_bangumi_data", return_value=mock_data):
                 with patch.object(
                     service, "_get_bangumi_api_for_user", return_value=bgm
@@ -1662,3 +1820,98 @@ def test_find_subject_id_api_season_gt1_top_movie_reselects_mainline_via_related
     bgm.get_related_subjects.assert_called_once()
     # 验证 get_subject 被调用以获取关联条目详情
     bgm.get_subject.assert_called_with(577198)
+
+
+# --------------------------------------------------------------------------
+# _resolve_season_episode 的 media_type 分派
+# --------------------------------------------------------------------------
+
+
+class TestResolveSeasonEpisodeMediaTypeDispatch:
+    """media_type → 解析路径的映射必须与整体口径一致
+
+    历史疑点：mark_watching 短路径把 movie 与 real_action **都**当剧场版
+    处理（orchestrator.py），而 _resolve_season_episode 只对 movie 走
+    「条目内首集」短路径。两者口径看似矛盾，实则有明确分工：
+
+    - **只有 movie** 适合「条目内首集」：剧场版是单集条目，媒体库推来的
+      episode 往往是 1 或片源序号，用它是危险的（会当成章节定位）；
+    - **real_action 必须走季番解析**：三次元剧集（如日剧）在
+      _normalize_custom_item_params 中被归入剧集路径（不允许 season=0、
+      episode 不能为 0），其 episode 是真实集号。
+
+    因此 real_action 绝不能进电影分支 —— 否则 episode 会被当章节定位用，
+    把剧集解析到错误的一集。本用例把该不变量固定下来。
+    """
+
+    @staticmethod
+    def _item(media_type: str):
+        return CustomItem(
+            user_name="u",
+            title="某番",
+            season=1,
+            episode=5,
+            media_type=media_type,
+            release_date="2024-01-01",
+        )
+
+    def test_movie_uses_movie_shortcut(self):
+        svc = SyncService()
+        bgm = MagicMock()
+        bgm.get_movie_main_episode_id.return_value = ("100", "200")
+
+        result = svc._resolve_season_episode(bgm, self._item("movie"), "100", False)
+
+        assert result == ("100", "200")
+        bgm.get_movie_main_episode_id.assert_called_once()
+        bgm.get_target_season_episode_id.assert_not_called()
+
+    def test_real_action_uses_season_path(self):
+        """real_action 必须走季番解析（其 episode 是真实集号）"""
+        svc = SyncService()
+        bgm = MagicMock()
+        bgm.get_target_season_episode_id.return_value = ("100", "300")
+
+        result = svc._resolve_season_episode(
+            bgm, self._item("real_action"), "100", False
+        )
+
+        assert result == ("100", "300")
+        bgm.get_target_season_episode_id.assert_called_once()
+        # 关键：绝不能走电影短路径（那会把 episode 当章节定位用）
+        bgm.get_movie_main_episode_id.assert_not_called()
+
+    def test_episode_uses_season_path(self):
+        svc = SyncService()
+        bgm = MagicMock()
+        bgm.get_target_season_episode_id.return_value = ("100", "300")
+
+        result = svc._resolve_season_episode(bgm, self._item("episode"), "100", False)
+
+        assert result == ("100", "300")
+        bgm.get_movie_main_episode_id.assert_not_called()
+
+    def test_movie_honours_target_episode_override(self):
+        """分段映射换算出的目标集号必须传给电影短路径（而非用 item.episode）"""
+        svc = SyncService()
+        bgm = MagicMock()
+        bgm.get_movie_main_episode_id.return_value = ("100", "200")
+        item = self._item("movie")
+        assert item.episode == 5
+
+        svc._resolve_season_episode(bgm, item, "100", False, target_episode=9)
+
+        # target_sort 应为换算后的 9，而不是媒体库集号 5
+        assert bgm.get_movie_main_episode_id.call_args.kwargs["target_sort"] == 9
+
+    def test_season_path_honours_target_episode_override(self):
+        """分段映射的目标集号必须优先于 item.episode（剧集路径）"""
+        svc = SyncService()
+        bgm = MagicMock()
+        bgm.get_target_season_episode_id.return_value = ("100", "300")
+
+        svc._resolve_season_episode(
+            bgm, self._item("episode"), "100", False, target_episode=9
+        )
+
+        assert bgm.get_target_season_episode_id.call_args.kwargs["target_ep"] == 9

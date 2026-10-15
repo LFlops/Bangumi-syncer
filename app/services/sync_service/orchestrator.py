@@ -149,8 +149,24 @@ class SyncOrchestrator:
                 if stage == "cross_season" and outcome.status == "miss":
                     # 集数不存在：不发 bangumi_id_found（旧实现 resolve 成功后
                     # 才通知，避免"已找到"与失败通知的矛盾序列）
+                    #
+                    # 显式映射下这一步是「按配置不回退改选」导致的失败，病因是
+                    # 映射本身（条目/集数/偏移写错），而不是「集数过多」。把
+                    # step 给出的具体原因透传给用户，否则只会看到笼统的
+                    # 「不存在或集数过多」，无从下手排查自己的映射。
+                    outputs = outcome.outputs or {}
+                    detail = (
+                        str(outputs.get("error", "") or "")
+                        if outputs.get("mapping_explicit_no_reselect")
+                        else ""
+                    )
                     return self._handle_episode_not_found(
-                        item, actual_source, trace, subject_id, status_holder
+                        item,
+                        actual_source,
+                        trace,
+                        subject_id,
+                        status_holder,
+                        detail=detail,
                     )
                 if stage == "sync_action" and outcome.status == "error":
                     status_holder[0] = "error"
@@ -351,6 +367,53 @@ class SyncOrchestrator:
     # 匹配失败处理（原 _find_matching_subject L1014-1071）
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _record_terminal_result_step(
+        trace: MatchTrace,
+        item: CustomItem,
+        *,
+        reason: str,
+        message: str,
+        subject_id: str = "",
+        only_if_missing: bool = False,
+        final_message: str | None = None,
+    ) -> None:
+        """补一个终态 result step（匹配/集数失败时 SyncPipeline 从未启动，故手工补）
+
+        为什么需要补：``result`` step 由处理成功路径的 ``ResultStep`` 产出，
+        但匹配失败（管线未启动）与集数失败（管线在 result 之前终止）时都不存在，
+        而前端详情页依赖 result 的 ``processed_payload`` 展示失败原因。
+
+        Args:
+            reason: 写入 step.reason（详情页摘要行）
+            message: 面向用户的消息（写入 processed_payload.message）
+            subject_id: 已确定的条目 ID（匹配失败时为空）
+            only_if_missing: True 时仅在 trace 末尾尚无 result step 时补
+                （匹配失败路径可能已由其他分支补过，避免重复）
+            final_message: 写入 trace.final_message；默认与 ``message`` 相同。
+                匹配失败路径历史上用较短文案（"未找到匹配的番剧"）而 payload
+                用完整文案，故保留独立参数以免改变既有行为。
+        """
+        if only_if_missing and trace.steps and trace.steps[-1].stage == "result":
+            return
+        result_step = trace.start_step("result")
+        result_step.status = "miss"
+        if subject_id:
+            result_step.subject_id = str(subject_id)
+        result_step.reason = reason
+        result_step.processed_payload = {
+            "status": "error",
+            "episode": f"S{item.season:02d}E{item.episode:02d}",
+            "subject_id": str(subject_id) if subject_id else "",
+            "episode_id": "",
+            "subject_url": f"https://bgm.tv/subject/{subject_id}" if subject_id else "",
+            "episode_url": "",
+            "bgm_title": "",
+            "message": message,
+        }
+        trace.final_status = "error"
+        trace.final_message = message if final_message is None else final_message
+
     def _handle_match_failure(
         self,
         item: CustomItem,
@@ -361,26 +424,16 @@ class SyncOrchestrator:
     ) -> SyncResponse:
         """统一处理匹配失败：补 result step → 写 DB → 发通知 → 沉淀候选"""
         # 补 result step 供前端展示（_find_subject_id 已 finish trace，但未追加 result step）
-        if not trace.steps or trace.steps[-1].stage != "result":
-            result_step = trace.start_step("result")
-            result_step.status = "miss"
-            result_step.reason = (
-                f"同步失败：未找到匹配的番剧 · {subject_find_error or '无候选'}"
-            )
-            result_step.processed_payload = {
-                "status": "error",
-                "episode": f"S{item.season:02d}E{item.episode:02d}",
-                "subject_id": "",
-                "episode_id": "",
-                "subject_url": "",
-                "episode_url": "",
-                "bgm_title": "",
-                "message": self._sync._format_subject_not_found_message(
-                    item, subject_find_error
-                ),
-            }
-            trace.final_status = "error"
-            trace.final_message = "未找到匹配的番剧"
+        self._record_terminal_result_step(
+            trace,
+            item,
+            reason=f"同步失败：未找到匹配的番剧 · {subject_find_error or '无候选'}",
+            message=self._sync._format_subject_not_found_message(
+                item, subject_find_error
+            ),
+            only_if_missing=True,
+            final_message="未找到匹配的番剧",
+        )
 
         # ===== 匹配增强接入：开关开 + LLM 可用时提交 AI 评估任务 =====
         # 顺序契约：入队决策前移到 trace 写入之前，trace 记录的 run_id 必须等于
@@ -582,6 +635,8 @@ class SyncOrchestrator:
             actual_source=actual_source,
             subject_id=subject_id,
             is_season_matched_id=is_season_matched_id,
+            mapping_is_explicit=trace.mapping_is_explicit,
+            mapping_target_episode=trace.mapping_target_episode,
         )
         pipeline = SyncPipeline(
             [
@@ -618,26 +673,20 @@ class SyncOrchestrator:
         trace: MatchTrace,
         subject_id: str,
         status_holder: list[str],
+        detail: str = "",
     ) -> SyncResponse:
-        """集数解析失败：写 error 记录 + 发 episode_not_found 通知"""
-        result_step = trace.start_step("result")
-        result_step.status = "miss"
-        result_step.subject_id = str(subject_id)
-        result_step.reason = (
-            f"同步失败：未找到对应的剧集 · https://bgm.tv/subject/{subject_id}"
+        """集数解析失败：写 error 记录 + 发 episode_not_found 通知
+
+        ``detail`` 非空时（显式映射的集数对不上）作为更具体的病因替换默认文案。
+        """
+        message = detail or "未找到对应的剧集（不存在或集数过多）"
+        self._record_terminal_result_step(
+            trace,
+            item,
+            reason=f"同步失败：{message} · https://bgm.tv/subject/{subject_id}",
+            message=message,
+            subject_id=str(subject_id),
         )
-        result_step.processed_payload = {
-            "status": "error",
-            "episode": f"S{item.season:02d}E{item.episode:02d}",
-            "subject_id": str(subject_id),
-            "episode_id": "",
-            "subject_url": f"https://bgm.tv/subject/{subject_id}",
-            "episode_url": "",
-            "bgm_title": "",
-            "message": "未找到对应的剧集（不存在或集数过多）",
-        }
-        trace.final_status = "error"
-        trace.final_message = "未找到对应的剧集（不存在或集数过多）"
         trace.finish()
 
         record_id = self._persist_sync_record(
@@ -647,7 +696,7 @@ class SyncOrchestrator:
             status="error",
             subject_id=str(subject_id),
             episode_id=None,
-            message="未找到对应的剧集（不存在或集数过多）",
+            message=message,
         )
 
         from . import notification_service
@@ -658,10 +707,10 @@ class SyncOrchestrator:
             actual_source,
             in_app_ref_id=record_id,
             subject_id=subject_id,
-            error_message="不存在或集数过多",
+            error_message=detail or "不存在或集数过多",
         )
         status_holder[0] = "error"
-        return SyncResponse(status="error", message="未找到对应的剧集")
+        return SyncResponse(status="error", message=message)
 
     # ------------------------------------------------------------------
     # 标记成功收尾（ResultStep 已结算 final_*，此处只做副作用与持久化）

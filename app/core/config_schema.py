@@ -218,6 +218,10 @@ SECTIONS: dict[str, SectionMeta] = {
                 default="bgm.tv,chii.in,next.bgm.tv,lain.bgm.tv",
             ),
             FieldMeta(name="ech_ech_config", default=""),
+            # MCP 服务公共 URL：反代 / 局域网 / 域名访问时填写对外可达地址。
+            # 留空表示不覆盖，由 app/mcp/server.py 按 参数 > MCP_BASE_URL
+            # 环境变量 > 本配置 > 默认值 http://localhost:8000 解析。
+            FieldMeta(name="mcp_base_url", default=""),
         ),
     ),
     # ── 媒体源驱动（order 100-199）──
@@ -332,10 +336,14 @@ SECTIONS: dict[str, SectionMeta] = {
         # 默认值必须与 arbiter.DEFAULT_* 保持一致：前端回填与后端
         # policy_from_config 的兜底是两条独立路径，值不同会让「界面上看到的」
         # 与「实际生效的」不一致。
+        #
+        # 只暴露**真正能影响裁决**的两个权重：裁决只在 APISearchStep 内运行，
+        # 其候选来自本地归档与在线搜索（见 api_search_main.py 的候选构造）。
+        # 自定义映射与 bangumi-data 命中时管线已 is_terminal 终止，候选根本
+        # 到不了裁决层，故它们的权重**不可能生效** —— 不再提供这两个旋钮，
+        # 避免用户调了没反应（详见 arbiter.APPLICABLE_WEIGHT_SOURCES）。
         fields=(
             FieldMeta(name="arbiter_enabled", loose_true=True),
-            FieldMeta(name="weight_custom_mapping", default=1.0),
-            FieldMeta(name="weight_bangumi_data", default=1.0),
             FieldMeta(name="weight_archive", default=1.0),
             FieldMeta(name="weight_api_search", default=1.0),
             FieldMeta(name="min_score", default=0.85),
@@ -546,6 +554,9 @@ def is_sensitive_field(section: str, option: str) -> bool:
 
     支持多实例段：webhook-1 / email-2 等通过前缀匹配父段 sensitive_fields。
     """
+    # get_all_config 输出为下划线形态（如 bangumi_oauth / notify_email_1），
+    # 而注册表与 INI 段名用连字符，故入口统一归一化；对已传连字符的调用方无操作。
+    section = section.replace("_", "-")
     # 直接命中
     meta = SECTIONS.get(section)
     if meta and option in meta.sensitive_fields:
