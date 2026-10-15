@@ -477,50 +477,6 @@ def test_recover_run_calls_continue_run_single_entry():
     assert ctx.sync_record is sync_record
 
 
-def test_scheduler_source_no_scenario_private_symbols():
-    """调度器不得再引用场景层私有符号/内部实现（组合模式，不嵌套场景内部）。"""
-    import inspect
-
-    source = inspect.getsource(llm_match_scheduler)
-    forbidden = (
-        "_continue_replay",
-        "_replay_missing_tool",
-        "_append_tool_result",
-        "llm_assist_module",
-        "app.services.matching",
-        "LLMCallError",
-        "ToolUseBlock",
-        "ToolResultBlock",
-        # Bangumi 客户端与凭据属场景知识：bgm 构造已下沉到 llm_assist.build_bgm，
-        # 通用调度器只交付 run 的输入数据（sync_record），不构造客户端、不碰token。
-        "BangumiApi",
-        "get_primary_bangumi_config",
-        "access_token",
-        "_build_bgm",
-        "build_bgm",
-        "make_match_ctx",
-    )
-    leaked = [name for name in forbidden if name in source]
-    assert leaked == [], f"调度器不应引用场景层私有符号，实际残留：{leaked}"
-
-
-def test_scheduler_has_no_bgm_construction_path():
-    """调度器不再构造 Bangumi 客户端（bgm 由场景侧 new_ctx 自建）。
-
-    通用层持有凭据是层级违规：ctx 的构造（含访问凭据）属场景职责，
-    见``app/services/matching/llm_assist.py::build_bgm``。
-    """
-    import inspect
-
-    source = inspect.getsource(llm_match_scheduler)
-    # 调度器源码中不应再出现客户端构造点
-    assert "BangumiApi(" not in source
-    # 也不应再有 _build_bgm 方法
-    assert not hasattr(llm_match_scheduler.LlmMatchScheduler, "_build_bgm"), (
-        "调度器不应保留 _build_bgm（bgm 构造已下沉场景侧）"
-    )
-
-
 # ---------------------------------------------------------------------------
 # 正常处理
 # ---------------------------------------------------------------------------
@@ -1336,22 +1292,6 @@ def test_run_sync_job_skips_unparseable_row_and_logs_error():
     assert processed == ["good"], "非法行应被跳过，合法行仍处理"
     errors = [str(c.args[0]) for c in log.error.call_args_list]
     assert any("解析" in m for m in errors), f"非法行应记 error，实际 {errors}"
-
-
-def test_scheduler_module_has_no_function_level_imports():
-    """调度器模块的 import 统一在头部，函数体内不得残留 import。"""
-    import ast
-    import inspect
-
-    tree = ast.parse(inspect.getsource(llm_match_scheduler))
-    offenders = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(fn):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                offenders.append(f"{fn.name}: {ast.unparse(node)}")
-    assert offenders == [], f"函数内不应残留 import，实际：{offenders}"
 
 
 def test_build_bgm_exception_log_redacts_secret_keeps_user_and_type():

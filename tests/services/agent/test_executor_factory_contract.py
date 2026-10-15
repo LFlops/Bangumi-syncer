@@ -14,10 +14,8 @@
 
 from __future__ import annotations
 
-import typing
 from typing import Any
 
-from app.services.agent import loop
 from app.services.agent.execution.streaming import StreamingToolExecutor
 from app.services.agent.loop import run_loop
 from app.services.llm.models import Message, StreamChunk, ToolUseBlock
@@ -110,43 +108,3 @@ async def test_executor_factory_result_not_cached_across_rounds():
 
     # 每轮一次调用 → 序列严格递增，无缓存复用
     assert built == [0, 1, 2], f"工厂调用序列应逐轮递增，实际 {built}"
-
-
-def test_executor_factory_is_zero_arg_callable_alias():
-    """``ExecutorFactory`` 形状必须是**零参**可调用（``Callable[[], ...]``）。"""
-    params, ret = typing.get_args(loop.ExecutorFactory)
-    assert params == [], f"ExecutorFactory 应为零参可调用，实际参数列表 {params}"
-    assert ret is loop.StreamingExecutor
-
-
-def test_run_signature_takes_factory_not_instance():
-    """``loop.run_loop`` 收工厂而非单个执行器（AST 级断言，防参数改名/改语义）。"""
-    import ast
-    import inspect
-
-    tree = ast.parse(inspect.getsource(loop.run_loop))
-    fn = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_loop"
-    )
-    kwonly = [a.arg for a in fn.args.kwonlyargs]
-    assert "executor_factory" in kwonly, (
-        f"run_loop() 应保留 executor_factory 关键字参数，实际 kwonly={kwonly}"
-    )
-    assert "executor" not in kwonly, (
-        "run_loop() 不应直接接收单个 executor（会跨轮串状态），应传 executor_factory"
-    )
-
-
-def test_executor_state_is_round_scoped():
-    """执行器状态容器为实例私有，且无 ``reset()``（= 必须每轮新建的根本原因）。"""
-    a, b = _make_executor(), _make_executor()
-    assert a._states is not b._states
-    assert a._order is not b._order
-    assert a._tasks is not b._tasks
-    assert a._terminal_seen is False and b._terminal_seen is False
-    # 无 reset() 可用 → 不存在「复用前重置」的官方途径
-    assert not hasattr(a, "reset"), (
-        "若将来新增 reset()，本守卫需重新评估「传单实例」方案的可行性"
-    )

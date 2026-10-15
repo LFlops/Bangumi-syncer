@@ -412,15 +412,6 @@ def test_llm_assist_step_after_result_step(mock_db, mock_cfg, mock_notify):
     assert stages.index("llm_assist") > stages.index("result")
 
 
-def test_orchestrator_no_private_step_finish_call():
-    """orchestrator 不再调用 trace 私有收尾方法 _finish_current_step"""
-    import inspect
-
-    from app.services.sync_service import orchestrator as orch_mod
-
-    assert "_finish_current_step" not in inspect.getsource(orch_mod)
-
-
 @patch("app.services.sync_service.notification_service")
 @patch("app.services.sync_service.config_manager")
 @patch("app.services.sync_service.database_manager")

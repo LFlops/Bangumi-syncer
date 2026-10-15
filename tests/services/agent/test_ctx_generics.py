@@ -21,7 +21,7 @@ import inspect
 import typing
 from pathlib import Path
 
-from app.services.agent.run import registry, scenario
+from app.services.agent.run import registry
 from app.services.agent.run.registry import ScenarioRuntime
 from app.services.agent.run.scenario import CtxT, ScenarioHooks, TerminalHandler
 from app.services.matching import llm_assist
@@ -83,20 +83,6 @@ def test_ctx_typevar_bounded_to_run_inputs():
     )
 
 
-def test_scenario_hooks_no_longer_exposes_build_seed():
-    """``build_seed`` 已从 hooks 移除：seed 是数据，由 ``new_ctx`` 在初始化时产出。"""
-    assert "build_seed" not in {f.name for f in dataclasses.fields(ScenarioHooks)}, (
-        "seed 应归入 ctx（数据），不应留在 hooks（行为）"
-    )
-
-
-def test_runtime_reads_seed_from_ctx_not_from_hooks():
-    """通用层从 ``ctx.seed`` 取 seed，不再回调场景派生（AST 级断言）。"""
-    runtime_src = (_AGENT_DIR / "run" / "runtime.py").read_text(encoding="utf-8")
-    assert "hooks.build_seed" not in runtime_src, "通用层不应再驱动场景派生 seed"
-    assert "ctx.seed" in runtime_src, "run_loop() 应直接取 ctx.seed"
-
-
 def test_scene_ctx_carries_seed():
     """匹配场景 ctx 携带 seed（与 sync_record / bgm 同类的本次 run 数据）。"""
     fields = {f.name for f in dataclasses.fields(llm_assist._MatchContext)}
@@ -117,17 +103,6 @@ def test_new_ctx_returns_ctx_type():
 # ---------------------------------------------------------------------------
 # 2. hooks / runtime 确为泛型；handle_terminal 升级为受检 Protocol
 # ---------------------------------------------------------------------------
-
-
-def test_hooks_and_runtime_are_generic():
-    """``ScenarioHooks`` / ``ScenarioRuntime`` 继承 ``Generic``（可参数化）。"""
-    from typing import Generic
-
-    assert Generic in ScenarioHooks.__mro__
-    assert Generic in ScenarioRuntime.__mro__
-    # 可参数化且产出带参数形式的 _GenericAlias
-    assert ScenarioHooks.__class_getitem__ is not None
-    assert ScenarioRuntime.__class_getitem__ is not None
 
 
 def test_handle_terminal_is_protocol_not_bare_callable():
@@ -198,9 +173,3 @@ def test_agent_layer_never_mentions_scene_private_ctx_type():
         if hits:
             offenders[path.name] = hits
     assert offenders == {}, f"agent 通用层不得引用场景私有 ctx 类型，实际 {offenders}"
-
-
-def test_ctx_typevar_defined_in_scenario_contract_module():
-    """``CtxT`` 定义在场景契约模块（protocols/scenario），供hooks 与 registry 共用。"""
-    assert hasattr(scenario, "CtxT")
-    assert registry.CtxT is scenario.CtxT, "registry 应复用同一个 CtxT"

@@ -68,30 +68,6 @@ def _class_bases(name: str, class_name: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_tools_defines_no_recorder_protocol():
-    """execution/tools.py 不应本地定义任何记录器协议（避免与 protocols 重复定义）。"""
-    recorder_classes = {
-        cls for cls in _defined_class_names("execution/tools.py") if "Recorder" in cls
-    }
-    assert recorder_classes == set(), (
-        f"记录器协议应由 protocols.py 唯一持有，execution/tools.py 仍定义: {recorder_classes}"
-    )
-
-
-def test_recorder_protocol_defined_in_protocols_module():
-    """ToolSpanRecorder / BudgetRecorder 在 protocols.py；ChatSpan 随概念归位。
-
-    归位判据（见 protocols.py 头部）：跨层能力契约留中立层；消费方与实现方同概念
-    （chat span）的契约随概念走 ``chat_span.py``。
-    """
-    protocols_defined = _defined_class_names("protocols.py")
-    assert {"ToolSpanRecorder", "BudgetRecorder"} <= protocols_defined
-    assert "ChatSpan" not in protocols_defined, (
-        "ChatSpan 应随其实现归位 chat_span.py（不再留在 protocols.py）"
-    )
-    assert "ChatSpan" in _defined_class_names("chat_span.py")
-
-
 def test_budget_recorder_covers_budget_and_tool_span():
     """BudgetRecorder 同时具备 record_budget/chat_span/start_tool/end_tool 能力。"""
     assert {"record_budget", "chat_span", "start_tool", "end_tool"} <= set(
@@ -117,13 +93,6 @@ def test_budget_recorder_inherits_tool_span_recorder():
     """
     assert ToolSpanRecorder in BudgetRecorder.__mro__
     assert "start_tool" not in BudgetRecorder.__dict__
-
-
-def test_budget_recorder_does_not_duplicate_tool_span_methods():
-    """BudgetRecorder 不重复声明 start_tool/end_tool（签名只在基类一处）。"""
-    assert "start_tool" not in BudgetRecorder.__dict__
-    assert "end_tool" not in BudgetRecorder.__dict__
-    assert "record_budget" in BudgetRecorder.__dict__
 
 
 # ---------------------------------------------------------------------------

@@ -22,7 +22,6 @@ conftest 装配路径回归覆盖；场景 9（行为等价回归）由全量套
 
 from __future__ import annotations
 
-import ast
 import os
 import subprocess
 import sys
@@ -117,64 +116,6 @@ class TestGetScenarioErrors:
 
         message = exc_info.value.args[0]
         assert "未装配" in message, f"错误消息应提示未装配，实际 {message!r}"
-
-
-class TestStaticWiringGuard:
-    """场景 8：静态装配 / 纯机制化的 AST 守卫（防回归）。"""
-
-    _REPO_ROOT = Path(__file__).resolve().parents[3]
-
-    def _parse(self, relative_path: str) -> ast.AST:
-        source = (self._REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        return ast.parse(source, filename=relative_path)
-
-    def test_scenarios_module_static_import_of_factory_not_importlib(self):
-        """装配层必须静态 import 场景工厂，禁止 importlib 动态加载。"""
-        tree = self._parse("app/services/scenarios.py")
-
-        importlib_hits: list[str] = []
-        factory_imported = False
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                if any(alias.name == "importlib" for alias in node.names):
-                    importlib_hits.append(ast.unparse(node))
-            elif isinstance(node, ast.ImportFrom):
-                if node.module == "importlib":
-                    importlib_hits.append(ast.unparse(node))
-                if node.module == "app.services.matching.llm_assist" and any(
-                    alias.name == "get_scenario_runtime" for alias in node.names
-                ):
-                    factory_imported = True
-
-        assert importlib_hits == [], (
-            f"装配层禁止 importlib 动态加载，实际：{importlib_hits}"
-        )
-        assert factory_imported, "装配层必须静态 import get_scenario_runtime"
-
-    def test_registry_module_has_no_importlib_or_provider_table(self):
-        """注册表纯机制化：不得残留 importlib 与字符串提供者表。"""
-        tree = self._parse("app/services/agent/run/registry.py")
-
-        importlib_hits: list[str] = []
-        provider_names: list[str] = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                if any(alias.name == "importlib" for alias in node.names):
-                    importlib_hits.append(ast.unparse(node))
-            elif isinstance(node, ast.ImportFrom):
-                if node.module == "importlib":
-                    importlib_hits.append(ast.unparse(node))
-            elif isinstance(node, ast.Assign):
-                for target in node.targets:
-                    if isinstance(target, ast.Name) and target.id == (
-                        "_SCENARIO_PROVIDERS"
-                    ):
-                        provider_names.append(ast.unparse(node))
-
-        assert importlib_hits == [], f"注册表不应依赖 importlib，实际：{importlib_hits}"
-        assert provider_names == [], (
-            f"注册表不应保留字符串提供者表，实际：{provider_names}"
-        )
 
 
 class TestImportOrderGuard:

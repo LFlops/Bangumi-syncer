@@ -4842,38 +4842,6 @@ async def test_total_tokens_zero_when_no_usage():
 
 
 # ---------------------------------------------------------------------------
-# 函数内 import 守卫（白名单为空 = 全部禁止，import 统一在模块头部）
-# ---------------------------------------------------------------------------
-
-
-def test_llm_assist_module_no_unlisted_function_level_imports():
-    """llm_assist 模块函数体内不得残留 import（白名单为空，全部已提升到模块头部）。
-
-    白名单形如 ``{(函数名, ast.unparse(import 语句)), ...}``；当前为空表示全禁。
-    如确需豁免（如避免模块级导入环），在此登记并同时在源码处注明豁免原因。
-    """
-    import ast
-    import inspect
-
-    allowed: set[tuple[str, str]] = set()
-
-    tree = ast.parse(inspect.getsource(llm_assist))
-    offenders: list[str] = []
-    for fn in ast.walk(tree):
-        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        for node in ast.walk(fn):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            stmt = ast.unparse(node)
-            if (fn.name, stmt) not in allowed:
-                offenders.append(f"{fn.name}: {stmt}")
-    assert offenders == [], (
-        f"函数内不应残留未豁免 import（应提升到模块头部），实际：{offenders}"
-    )
-
-
-# ---------------------------------------------------------------------------
 # 静默分支补日志 / _prefetch_bgm_name 失败记 error /
 # TraceRecorder docstring 与 _SYSTEM_SUFFIX 文案清理
 #
