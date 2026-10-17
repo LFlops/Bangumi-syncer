@@ -570,6 +570,20 @@ def _clear_llm_match_active_runs():
 
 
 @pytest.fixture(autouse=True)
+def _reset_agent_run_notified_cache():
+    """测试隔离：清空 agent_run_failed 的进程内去重缓存。
+
+    ``notifier_helpers`` 的 run_id 级 LRU 缓存是模块级进程状态；多个用例
+    复用同一 run_id 时会被去重跳过，统一在每条测试前后清空。
+    """
+    from app.services.base.notifier_helpers import _reset_run_notified_cache
+
+    _reset_run_notified_cache()
+    yield
+    _reset_run_notified_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_archive_shortcut(monkeypatch):
     """每个测试默认禁用全局 archive_shortcut，避免用户 config.ini 中
     bangumi-archive.enabled=True 通过 conftest 复制污染测试。
