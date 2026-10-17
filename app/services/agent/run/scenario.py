@@ -86,6 +86,21 @@ class TerminalHandler(Protocol[_CtxT_contra]):
 
 
 @dataclass(frozen=True)
+class RunFailure:
+    """run 终态失败事件（通用层 → 场景的唯一失败出口）。
+
+    失败判定点在 runtime 内部（不经 ``handle_terminal``）；通知等副作用
+    属场景职责（见 docs/development/agent-runtime.md），runtime 只发射事件。
+    """
+
+    run_id: str
+    task_type: str
+    stop_reason: str
+    last_error: str
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
 class ScenarioHooks(Generic[CtxT]):
     """场景钩子集合：run / continue_run 的全部业务差异点。"""
 
@@ -107,3 +122,6 @@ class ScenarioHooks(Generic[CtxT]):
     #: 返回字符串=暂缓提示文案（loop 注入配对 tool_result 后继续一轮，仅拦一次）。
     #: None 时行为与现状完全一致（零回归）。
     veto_terminal: Callable[[dict], str | None] | None = None
+    #: 终态失败回调（失败判定点由 runtime 触发，不经 handle_terminal）：
+    #: 场景在此处理通知等职责（通用层不感知通知）。None = 不处理。
+    on_run_failed: Callable[[RunFailure], None] | None = None

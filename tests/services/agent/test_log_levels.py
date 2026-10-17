@@ -22,7 +22,11 @@ _TARGET_DIRS = (
     Path("app/services/agent"),
     Path("app/services/llm"),
 )
-_TARGET_FILES = (Path("app/services/llm_match_scheduler.py"),)
+_TARGET_FILES = (
+    Path("app/services/llm_match_scheduler.py"),
+    # 通知 helper 的 except 降级日志同样纳入分级守卫
+    Path("app/services/base/notifier_helpers.py"),
+)
 
 
 def _iter_files() -> Iterator[Path]:

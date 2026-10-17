@@ -45,7 +45,7 @@ def notify_scheduler_failure(
             **ctx,
         )
     except Exception as e:
-        logger.debug(f"发送 scheduler_job_failed 通知失败（可忽略）: {e}")
+        logger.warning(f"发送 scheduler_job_failed 通知失败（可忽略）: {e}")
 
 
 def notify_batch_sync_summary(
@@ -78,7 +78,7 @@ def notify_batch_sync_summary(
             **ctx,
         )
     except Exception as e:
-        logger.debug(f"发送 batch_sync_summary 通知失败（可忽略）: {e}")
+        logger.warning(f"发送 batch_sync_summary 通知失败（可忽略）: {e}")
 
 
 def notify_queue_size_warning(pending_count: int, threshold: int) -> None:
@@ -96,7 +96,7 @@ def notify_queue_size_warning(pending_count: int, threshold: int) -> None:
             threshold=threshold,
         )
     except Exception as e:
-        logger.debug(f"发送 queue_size_warning 通知失败（可忽略）: {e}")
+        logger.warning(f"发送 queue_size_warning 通知失败（可忽略）: {e}")
 
 
 def notify_source_event(
@@ -125,7 +125,7 @@ def notify_source_event(
             **ctx,
         )
     except Exception as e:
-        logger.debug(f"发送 {notification_type} 通知失败（可忽略）: {e}")
+        logger.warning(f"发送 {notification_type} 通知失败（可忽略）: {e}")
 
 
 def notify_airing_today(
@@ -153,7 +153,7 @@ def notify_airing_today(
             only_watching=only_watching,
         )
     except Exception as e:
-        logger.debug(f"发送 airing_today 通知失败（可忽略）: {e}")
+        logger.warning(f"发送 airing_today 通知失败（可忽略）: {e}")
 
 
 def notify_agent_run_failed(
@@ -173,19 +173,20 @@ def notify_agent_run_failed(
     """
     try:
         error_text = str(last_error or "")
+        snippet = error_text[:200]
         notification_service.notify(
             "agent_run_failed",
             source=source,
             in_app_title=f"Agent 运行失败：{task_type or 'unknown'}",
             in_app_body=(
                 f"run_id={run_id}\n原因={stop_reason}"
-                + (f"\n错误={error_text[:200]}" if error_text else "")
+                + (f"\n错误={snippet}" if snippet else "")
             ),
             in_app_type="agent_run_failed",
             run_id=run_id,
             task_type=task_type,
             stop_reason=stop_reason,
-            last_error=error_text[:200],
+            last_error=snippet,
             attempts=attempts,
         )
     except Exception as e:

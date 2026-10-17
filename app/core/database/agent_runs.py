@@ -165,6 +165,11 @@ def apply_succeeded(
     return cursor.rowcount > 0
 
 
+#: run 级可重试上限：attempts 达该值时由 increment_attempts 单点置终态（
+#: runtime 的失败分流共用同一常量，避免魔法数字散落）
+MAX_RUN_ATTEMPTS: int = 3
+
+
 class AgentRunsRepository(BaseRepository):
     """agent_runs / agent_steps 的增删改查与状态机流转"""
 
@@ -574,7 +579,7 @@ class AgentRunsRepository(BaseRepository):
                 "SELECT attempts FROM agent_runs WHERE run_id=?", (run_id,)
             ).fetchone()
             attempts = row[0] if row else 0
-            if attempts >= 3:
+            if attempts >= MAX_RUN_ATTEMPTS:
                 conn.execute(
                     "UPDATE agent_runs SET status='failed', stop_reason='failed', "
                     "last_error=?, ended_at=?, "

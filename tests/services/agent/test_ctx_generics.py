@@ -166,7 +166,13 @@ def test_agent_layer_has_no_domain_module_imports():
     以 import 依赖（而非源码中的类型名）表述解耦：docstring 交叉引用场景文件
     是合法说明，不构成依赖。
     """
-    forbidden = ("app.services.matching", "app.services.scenarios")
+    forbidden = (
+        "app.services.matching",
+        "app.services.scenarios",
+        # 通知为场景职责（见 docs/development/agent-runtime.md）；
+        # notification_service 的类型透传仍允许，禁的是"直接发送通知"的 helper。
+        "app.services.base.notifier_helpers",
+    )
     offenders: list[str] = []
     for path in sorted(_AGENT_DIR.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))

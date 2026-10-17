@@ -59,7 +59,7 @@ from app.services.agent.execution.tools import (
 )
 from app.services.agent.loop import RunResult
 from app.services.agent.run.registry import ScenarioRuntime
-from app.services.agent.run.scenario import ScenarioHooks
+from app.services.agent.run.scenario import RunFailure, ScenarioHooks
 from app.services.base.notifier_helpers import notify_agent_run_failed
 from app.services.llm.client import get_llm_client
 from app.services.llm.models import (
@@ -647,6 +647,17 @@ _VETO_MARKERS = (
 )
 
 
+def _match_on_run_failed(failure: RunFailure) -> None:
+    """run 终态失败 → 统一发送 agent_run_failed 通知（通知属场景职责）。"""
+    notify_agent_run_failed(
+        failure.run_id,
+        task_type=failure.task_type,
+        stop_reason=failure.stop_reason,
+        last_error=failure.last_error,
+        attempts=failure.attempts,
+    )
+
+
 def _match_veto_terminal(args: dict) -> str | None:
     """匹配场景的终止提交软护栏回调（见 ``ScenarioHooks.veto_terminal``）。
 
@@ -708,6 +719,7 @@ _MATCH_HOOKS: ScenarioHooks[_MatchContext] = ScenarioHooks(
     resolve_max_iterations=_match_resolve_max_iterations,
     handle_terminal=_match_handle_terminal,
     veto_terminal=_match_veto_terminal,
+    on_run_failed=_match_on_run_failed,
 )
 
 

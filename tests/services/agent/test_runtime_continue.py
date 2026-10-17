@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 import pytest
 
@@ -111,6 +112,9 @@ class _FakeHooks:
         self.terminal_calls: list[tuple[tuple, dict]] = []
         # 恢复路径不应触发 veto 软护栏（见 runtime.continue_run submit 分支注释）
         self.veto_calls: list[dict] = []
+        # 失败事件出口：runtime 应在失败判定点回调 on_run_failed（通用层不直接通知）
+        self.run_failed_events: list = []
+        self.on_run_failed = self.run_failed_events.append
         self._max_iterations = max_iterations
 
     @staticmethod
@@ -517,3 +521,52 @@ def test_continue_run_last_budget_round_end_turn_is_not_recovery(
     assert run["status"] == "succeeded"
     assert run["stop_reason"] == "end_turn"
     assert hooks.terminal_calls == [], "预算内 end_turn 不走 handle_terminal"
+
+
+def test_continue_run_terminal_llm_error_emits_run_failed_event(dbm):
+    """确定性 LLM 失败 → hooks.on_run_failed 收到失败事件；终态仍由 runtime 落库。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-fail-event"
+    _write_seed(dbm, run_id)
+    hooks = _FakeHooks()
+
+    async def _boom(*args, **kwargs):
+        raise LLMCallError("deterministic boom", retryable=False)
+
+    with patch.object(runtime, "_execute_continuation", _boom):
+        asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.run_failed_events) == 1, "失败事件应恰好发出一次"
+    event = hooks.run_failed_events[0]
+    assert event.run_id == run_id
+    assert event.task_type == "match"
+    assert event.stop_reason == "llm_error"
+    assert "deterministic boom" in event.last_error
+    run = dbm.agent_runs.get_run(run_id)
+    assert run is not None and run["status"] == "failed"
+
+
+def test_continue_run_retryable_at_limit_emits_run_failed_event(dbm):
+    """可重试失败达上限（MAX_ATTEMPTS）→ 事件携带 attempts；run 单点置 failed。"""
+    from app.services.llm.client import LLMCallError
+
+    run_id = "run-fail-event-limit"
+    _write_seed(dbm, run_id)
+    repo = dbm.agent_runs
+    assert repo.atomic_claim(run_id)
+    repo.increment_attempts(run_id, last_error="warmup-1")
+    repo.increment_attempts(run_id, last_error="warmup-2")
+    hooks = _FakeHooks()
+
+    async def _boom(*args, **kwargs):
+        raise LLMCallError("429 rate limited", retryable=True)
+
+    with patch.object(runtime, "_execute_continuation", _boom):
+        asyncio.run(runtime.continue_run(run_id, hooks=_hooks_of(hooks), ctx=None))
+
+    assert len(hooks.run_failed_events) == 1
+    event = hooks.run_failed_events[0]
+    assert event.attempts == 3, "达上限事件应携带 attempts"
+    run = repo.get_run(run_id)
+    assert run is not None and run["status"] == "failed"

@@ -48,6 +48,7 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 | `resolve_thinking_level()` | 从场景集中配置读取思考强度（恢复路径使用） |
 | `resolve_max_iterations(thinking_level)` | 解析轮次预算（含显式覆盖；单一来源由场景保证） |
 | `handle_terminal(dbm, run_id, result, ctx, *, total_tokens, notification_service)` | 终局处理：校验 / 落库 / 通知，返回终态 status |
+| `on_run_failed(failure)` | 终态失败回调（失败判定点由 runtime 触发，不经 `handle_terminal`）：场景在此处理通知等职责；`None` = 不处理 |
 
 `ctx` 为场景上下文（runtime **原样透传、不感知其结构**）；匹配场景使用
 `_MatchContext(sync_record, bgm)`。
