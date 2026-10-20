@@ -143,6 +143,15 @@ resp = span.resp                          # __aexit__ 已完成唯一一次 fina
 `tests/services/agent/test_protocols.py`（协议面 + 实现显式继承）、
 `tests/core/test_dead_code_removed.py`（`wrap_stream_fn` 不回归）。
 
+### 展示层：预览与按需展开
+
+- `GET /api/agent/runs/{run_id}/steps` 是 **2KB 预览**：`display_json` 超限截断并带
+  `...[shrinked]`；每步另带 `thinking` 摘要（300B）与 `thinking_truncated` 标记。
+- `GET /api/agent/runs/{run_id}/steps/{span_id}` 是**单 span 详情**（前端「展开」按需加载）：
+  完整 `display_json` 与 `thinking`（各 32KB 上限，超限截断），鉴权复用 `_load_authorized_run`。
+- `thinking` 来源：`replay_delta.response.blocks` 中 `type='thinking'` 的文本按序拼接；
+  `redacted_thinking` 以 `[已脱敏]` 占位；旧数据无 `blocks` 时为空串（兼容）。
+
 ## 新增一个 Agent 场景
 
 1. 实现 `ScenarioHooks` 各钩子（工具注册 / 默认 `stream_fn` / 预算 / 终局，可选
