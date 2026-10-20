@@ -99,6 +99,12 @@ LLM 匹配增强（以及未来的其它 Agent 场景）基于一层**通用运�
 >
 > 边界：**兜底收尾调用仅存在于 live 路径**（`loop.run_loop`）。恢复路径预算耗尽时不再发起
 > 收尾 LLM 调用，而是直接按终局语义落终态（`handle_terminal` / `mark_succeeded`）。
+>
+> 中断轮次的观测：replay 在该轮 break 时，其 `llm_chat` span 可能仍是 `running`
+> （进程被杀/重启）。续跑前会调用 `trace.reopen_interrupted_chat_span` 复用同一行
+> （重置为初始态，后续 `end_span` 闭合同一行），避免 UI 出现同轮「未闭合 + 重跑」两条
+> 记录；已完整记录的轮次不受影响。若恢复失败或 run 已终态仍有残留，
+> `mark_residual_running_spans` 在启动与调度每轮兜底标记为 error。
 
 ## 观测：chat span 单聚合契约
 
