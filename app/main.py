@@ -12,7 +12,10 @@ from uuid import uuid4
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
+from fastmcp.utilities.lifespan import combine_lifespans
+from starlette.responses import JSONResponse
 
+from .api.agent_runs import router as agent_runs_router
 from .api.airing_calendar import router as airing_calendar_router
 from .api.app_release import router as app_release_router
 from .api.auth import router as auth_router
@@ -48,6 +51,7 @@ from .core.logging import log_request_id, logger
 from .core.public_url import get_public_base_path
 from .core.scheduler_registry import scheduler_registry
 from .core.startup_info import startup_info
+from .mcp.server import mcp_app
 from .services.feiniu.sync_service import ensure_feiniu_startup_watermark
 from .services.mapping_service import mapping_service
 from .services.scheduler_bootstrap import register_all as register_schedulers
@@ -70,6 +74,14 @@ async def lifespan(app: FastAPI):
     # ===== 启动 =====
     startup_info.print_info("🚀 应用启动中...")
     startup_info.print_separator()
+
+    # 启动期校验：未配置 [auth] secret_key 时告警（敏感值与 replay_delta 将明文存储）
+    try:
+        from app.core.config_secret_crypto import warn_if_master_missing
+
+        warn_if_master_missing()
+    except Exception as e:
+        logger.warning(f"启动期 secret_key 校验失败: {e}")
 
     # 将旧 INI 账号段一次性迁移到数据库（幂等），账号以 DB 为唯一真相源
     try:
@@ -122,6 +134,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"启动时清理旧同步记录失败（不影响主流程）: {e}")
 
+    # 标记残留的未闭合 span（上次进程中断遗留的 running → error），best-effort
+    try:
+        marked = database_manager.agent_runs.mark_residual_running_spans()
+        if marked:
+            logger.info(
+                f"启动清理：{marked} 条未闭合 span 已标记为 error（进程中断遗留）"
+            )
+    except Exception as e:
+        logger.warning(f"启动清理未闭合 span 失败（不影响主流程）: {e}")
+
     try:
         register_schedulers()
         scheduler_config = config_manager.get_scheduler_config()
@@ -165,7 +187,9 @@ async def lifespan(app: FastAPI):
         logger.error(f"关闭数据库连接失败: {e}")
 
 
-app = FastAPI(**_app_kw, lifespan=lifespan)
+# 合并 MCP lifespan（FastMCP 内部资源启停）到主应用 lifespan
+_app_kw["lifespan"] = combine_lifespans(lifespan, mcp_app.lifespan)
+app = FastAPI(**_app_kw)
 
 
 # X-Request-ID 透传/生成规则：仅接受可见 ASCII 标点类安全字符，
@@ -231,7 +255,42 @@ app.include_router(bangumi_accounts_router)
 app.include_router(bangumi_archive_router)
 app.include_router(bangumi_oauth_router)
 app.include_router(bangumi_replay_router)
+app.include_router(agent_runs_router)
 app.include_router(airing_calendar_router)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FastMCP 子应用挂载
+# 官方推荐：把 FastMCP 子应用以 Mount 方式嵌入，保持其原始根路径
+# （/.well-known/*、/authorize、/token、/consent、/mcp）。
+# 必须是 catch-all，放在所有具体路由之后。
+# - user_middleware：由 Mount 自动生效，无需手动迁移。
+# - lifespan：嵌套子应用的 lifespan 不会被外层自动运行，必须经
+#   combine_lifespans(lifespan, mcp_app.lifespan) 合并（见上方 app 构造）。
+#
+# 为何只有 MCP 需要这两处额外装配？——router 与 mount 的 ASGI 语义不同：
+# - 上方 app.include_router(...) 注册的是"同一个 app 内"的路由集合，天然共享
+#   外层 lifespan / middleware / exception handler，无需额外接线。
+# - app.mount("/", mcp_app) 挂载的 mcp_app 是 mcp.http_app() 产出的"独立
+#   ASGI 子应用"，有自己的 Router / 中间件栈 / 异常处理：外层生命周期不会
+#   代跑子应用 lifespan，子应用内抛出的异常也不会冒泡到外层 FastAPI 处理器。
+# 因此上面合并 lifespan、下面注册 404 处理器都是 ASGI 嵌套语义的必然要求，
+# 不是代码设计缺陷，改动时不要把这两步当冗余删除。
+# ─────────────────────────────────────────────────────────────────────────
+# 根级 catch-all Mount 会把未匹配请求交给 mcp_app，其 Router.not_found 在
+# "app" in scope 时 raise HTTPException(404)，由子应用自身异常中间件处理，
+# 外层 FastAPI 的 404 处理器无法拦截。此处仅在子应用上注册整数 404 处理器
+# （不泛化到 StarletteHTTPException 全类），把默认 text/plain "Not Found"
+# 统一为与 FastAPI 一致的 JSON 404；子应用内其他 HTTPException（如 /authorize
+# 的 400）不受影响。
+async def _mcp_json_404(request: Request, exc: Exception) -> JSONResponse:
+    """让挂载的 MCP 子应用对未匹配路径返回与 FastAPI 一致的 JSON 404。"""
+    return JSONResponse({"detail": "Not Found"}, status_code=404)
+
+
+mcp_app.add_exception_handler(404, _mcp_json_404)
+
+app.mount("/", mcp_app)
 
 
 # ─────────────────────────────────────────────────────────────────────────
