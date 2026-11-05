@@ -130,7 +130,7 @@ class TestIssue267EndToEnd:
         bgm.get_target_season_episode_id.return_value = (639938, 999888)
         service = MagicMock()
         service._resolve_season_episode.side_effect = (
-            lambda b, i, sid, is_season, target_episode=None, mapping_is_explicit=False: (
+            lambda b, i, sid, is_season, target_episode=None, mapping_is_explicit=False, has_movie_episode=False: (
                 bgm.get_target_season_episode_id(
                     subject_id=sid,
                     target_season=i.season,
@@ -349,6 +349,14 @@ class TestMappingFileSafetyEndToEnd:
         path = tmp_path / "bangumi_mapping.json"
         path.write_text('{"mappings": {"a": "1"}, BROKEN', encoding="utf-8")
         original = path.read_text(encoding="utf-8")
+
+        # 本用例只验证「损坏文件拒绝写入」，与 POST 的改动 ID 校验无关；该校验会
+        # 走真实网络（进程级限速器 + 并行测试下偶发 429/超时 → 400），固定为
+        # 通过以聚焦写保护断言。
+        monkeypatch.setattr(
+            "app.utils.bangumi_api.subject_validation.validate_subject_id",
+            lambda sid: (True, ""),
+        )
 
         svc = MappingService()
         set_mapping_service(svc)

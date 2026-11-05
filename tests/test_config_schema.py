@@ -62,7 +62,8 @@ class TestEnvOverrides:
         assert overrides[("web", "base_path")] == "APPLICATION_ROOT"
 
     def test_count_matches_original(self):
-        """原硬编码共 14 条映射，新增 bangumi-oauth 的 client_id/client_secret 共 2 条、log_level 共 1 条"""
+        """原硬编码共 14 条映射，新增 bangumi-oauth 的 client_id/client_secret 共 2 条、
+        log_level 共 1 条"""
         overrides = config_schema.all_env_overrides()
         assert len(overrides) == 17
 
@@ -413,11 +414,15 @@ class TestLooseTrueFields:
     def test_count_matches_legacy(self):
         """原硬编码 4 个 loose_true 字段；ECH 改造新增 dev.ech_doh_use_proxy 第 5 个；
         archive BK-tree 开关新增 bangumi_archive.use_bktree 第 6 个；
-        裁决层开关新增 matching.arbiter_enabled 第 7 个"""
-        assert len(config_schema.loose_true_fields()) == 7
+        裁决层开关新增 matching.arbiter_enabled 第 7 个；
+        集数一致性加权新增 matching.episode_count_weight 第 8 个"""
+        assert len(config_schema.loose_true_fields()) == 8
 
     def test_includes_matching_arbiter_enabled(self):
         assert "matching.arbiter_enabled" in config_schema.loose_true_fields()
+
+    def test_includes_matching_episode_count_weight(self):
+        assert "matching.episode_count_weight" in config_schema.loose_true_fields()
 
 
 class TestConfigDefaults:
@@ -516,6 +521,23 @@ class TestSerializeSchema:
     def test_loose_true_fields_consistent_with_helper(self):
         schema = config_schema.serialize_schema()
         assert schema["loose_true_fields"] == config_schema.loose_true_fields()
+
+
+class TestLlmRetentionDaysManualKey:
+    """[llm].retention_days 是活配置（DB 清理读取），登记 manual_keys 说明。"""
+
+    def test_registered_in_manual_keys_with_reason(self):
+        meta = config_schema.SECTIONS["llm"]
+        assert "retention_days" in meta.manual_keys
+        reason = meta.manual_keys["retention_days"]
+        assert reason.strip()
+        assert "365" in reason
+        assert "config.ini" in reason
+
+    def test_retention_days_is_not_ui_field(self):
+        """示例键为注释态，不做配置页表单入口，故只登记 manual_keys。"""
+        field_names = {f.name for f in config_schema.SECTIONS["llm"].fields}
+        assert "retention_days" not in field_names
 
 
 class TestConfigCoverage:

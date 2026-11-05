@@ -34,6 +34,8 @@ order: 30
 - **TV系列同步后自动将整部番标为看过**（`anime_mark_subject_completed`）：仅对 **TV 动画**生效。当你看完该番剧下的所有正片格子时，自动把整个条目标为「看过」。默认关闭。
 - **启用三次元（日剧/电影）支持**（`enable_real_action`）：默认关闭，程序只认 Bangumi 的**动画**条目。开启后，动画找不到时会继续尝试**三次元**条目（日剧、真人版、真人电影等）。默认关闭。
 - **测试同步跳过用户名校验**（`test_skip_permission_check`）：开启后，「测试同步」这类调试接口不再检查媒体服务器用户名，方便你还没配好用户名时先验证匹配效果。**只对测试接口生效**，正常同步不受影响。
+- **每秒请求数**（`api_rate_limit`）：向 Bangumi 接口发请求的速度上限，默认 `1`（每秒 1 次）。调大可加快同步，过高可能被 Bangumi 限流或封禁；最大 `10`。
+- **突发请求数**（`api_rate_burst`）：允许短时间内的突发请求数量，默认 `3`。例如设为 `3` 时，可以连续发 3 个请求再回到每秒 1 个的节奏。
 
 ::: tip 单人用还是多人用
 程序按「Bangumi 账号」卡片里的账号数量自动判断：只有一个账号就是单人模式；添加了多个账号，就会按各自填写的媒体服务器用户名把记录分给对应账号。**不需要手动切换模式**。
@@ -188,6 +190,26 @@ OAuth 授权所需的应用凭证（Client ID / Client Secret）已**内置，�
   这其实是好事：自定义映射是你亲手指定的，理应无条件优先（它连屏蔽关键词都能豁免）；本地资料库同理。真正需要用户权衡的，只有「本地归档」和「在线搜索」这两个来源。
   :::
 
+- **用媒体源的季号集数辅助判断**（`episode_count_weight`）：默认关闭。开启后，媒体库推来的**季号和集数**会一同参与挑选番剧：某个候选条目（目标那一季）的集数装得下你这次播放的集数时排得更靠前，明显装不下时更靠后；候选标题明确写了季号（`第2期`、`第二季`、`Season 2` 或标题结尾的数字/罗马数字）且与请求一致时同样加分，明确写了别的季号时减分。标题没写季号的候选不会被假设成第一季，保持原位。
+
+  这一项和上面的裁决层**互相独立**：它只微调候选的先后顺序，不改变「够不够格自动采用」的判断。
+
+  ::: tip 什么时候该开
+  适合媒体库刮削规范的情况——Plex / Emby / Jellyfin 自动刮削过、并且你手动校对过季集编号。这时集数是识别续作的有力证据，尤其是**原名里不带季号**、日期又对不上的续作（例如 Bangumi 上第二季的原名和第一季几乎一样）。
+
+  只在多个候选难分高下时起作用：集数对得上最多算一次「加小分」，不会单独把一条标题明显不像的条目推上去。
+  :::
+
+  ::: warning 这些情况别开
+  - 长篇连载在媒体库里被拆成 `S01E120` 这类连续编号，与 Bangumi 的章节编号对不上
+  - 剧场版 / OVA 在媒体库里被塞进 `season=1, episode=1` 这种编造值
+  - 文件名解析出了奇怪的集号（比如 `S50E1000`）
+
+  这些情况下「集数对得上」并不代表条目选对了，反而可能把正确的候选排到后面。默认关闭正是因为这个前提——媒体库的季集是否可信，程序无法自动判断，只能由你决定。
+
+  开启后每个候选会多查一次章节数；**本地归档开启时走本地库，几乎不增加请求**。同步记录的匹配详情里会记下每一次加减分的原因，方便排查。
+  :::
+
 ::: tip 该不该开启
 实测下来，开启后**认错的条目从 9 条降到 2 条**，但代价是**自动同步的数量减少**（一部分本来正确的匹配会变成需要你人工确认）。
 
@@ -252,13 +274,15 @@ LLM 连接是独立模块，追番总结和调试工具共用。在「配置管�
 
 - **提供商（provider）**：LLM 服务提供商。可选值：`openai_compat`（默认，兼容 OpenAI / DeepSeek / Ollama 等 OpenAI 接口格式的服务）、`anthropic_compat`（兼容 Anthropic Messages API，官方 API 或遵循 `/v1/messages` 规范的代理/网关均可）。
 - **API 地址（api_base）**：LLM 服务商的 API 端点，需兼容所选 provider 的接口格式。`openai_compat` 默认 `https://api.openai.com/v1`，OpenAI 兼容接口请以 `/v1` 结尾填写完整地址；`anthropic_compat` 默认 `https://api.anthropic.com/v1`，使用第三方兼容网关时按其文档填写。
+- **端点需支持流式（SSE）**：LLM 调用一律走流式接口（请求体带 `stream: true`，或 Responses API 的流式模式），请确认所选服务/网关支持 SSE 流式返回。**不支持流式的端点会在首次调用时直接报错并提示更换端点或升级网关**，不会退化为非流式请求；`anthropic_compat` 网关还需支持 `/v1/messages` 流式返回。
 - **API 密钥（api_key）**：服务商提供的 API Key。**加密存储**，页面回显为掩码。
 - **模型（model）**：要调用的模型名称，默认 `gpt-4o-mini`。`openai_compat` 请确认模型支持 Chat Completions 接口；`anthropic_compat` 请填写 Claude 模型（如 `claude-sonnet-4-6`、`claude-opus-4-6` 等）。
 - **最大 Token（max_tokens）**：单次请求最大输出 token 数，默认 2000。根据模型上下文窗口和总结长度调整。Anthropic Messages API 的 max_tokens 为必填字段，请保持不小于所需输出长度。开启思考强度时该值会被自动抬升到不低于 `budget_tokens + 1024`（Anthropic 约束：思考 token 计入 max_tokens 上限，`budget_tokens` 必须小于 `max_tokens`），无需手动调大。
 - **温度（temperature）**：生成随机性，0~2 之间，默认 0.7。越低越确定/保守，越高越有创意。注意开启思考后该值会被强制为 1（Anthropic 与 OpenAI o 系列均要求）。
-- **思考强度（thinking_level）**：可选 `off` / `low` / `medium` / `high`，默认 `off` 不启用思考。`anthropic_compat` 开启后映射为 Anthropic extended thinking 的 `budget_tokens`（依次为 2048 / 4096 / 8192），`low` 适合日常总结，高质量总结可试 `high`；`claude-haiku` 系列等不支持 extended thinking 的模型会自动降级为 `off`（日志有提示）。`openai_compat` 开启后映射为 OpenAI `reasoning_effort`（`low` / `medium` / `high`），仅 o 系列推理模型（o1/o3/o4-mini 等）生效，其余模型自动忽略（debug 日志有提示）。
 - **超时时间（timeout）**：请求超时秒数，默认 60。遇到超时错误可适当调大。
 - **调用记录保留（retention_days）**：LLM 调用记录（Token 用量、延迟等）在数据库中保留天数，默认 365 天。
+
+> 思考强度不再由 LLM 卡片统一设置，而是**按任务在各自配置处设置**（如「AI 追番总结」任务）。
 
 配置后可点击「测试连接」按钮验证 LLM 是否可达。
 
@@ -346,6 +370,9 @@ LLM 连接是独立模块，追番总结和调试工具共用。在「配置管�
 ```
 
 </details>
+
+- **最大记录数（max_records）**：每次发送给 LLM 的最大观影记录条数，默认 -1（不限制）。季度/年度总结保持 -1 即可，日常总结可设为 200 控制上下文长度。
+- **思考强度（thinking_level）**：可选 `off` / `low` / `medium` / `high`，默认 `off` 不启用思考。每个总结任务可独立设置，执行时该值会透传到 LLM provider：`anthropic_compat` 映射为 Anthropic extended thinking 的 `budget_tokens`（依次为 2048 / 4096 / 8192），`low` 适合日常总结，高质量总结可试 `high`，不支持 extended thinking 的模型会自动降级为 `off`（日志有提示）；`openai_compat` 映射为 OpenAI `reasoning_effort`（`low` / `medium` / `high`），仅 o 系列推理模型（o1/o3/o4-mini 等）生效，其余模型自动忽略（debug 日志有提示）。
 
 ### 记忆与同剧关联
 

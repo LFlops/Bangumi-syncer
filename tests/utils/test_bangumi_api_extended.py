@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from app.utils.bangumi_api import BangumiApi
 from app.utils.bangumi_api._archive_shortcut import ShortcutResult
+from app.utils.bangumi_constants import SUBJECT_TYPE_ANIME, SUBJECT_TYPE_REAL
 from app.utils.season_title import extract_explicit_season
 
 
@@ -1038,7 +1039,7 @@ class TestFindEpisodeAcrossSeasons:
         assert result[1] == 30002
 
     def test_archive_sequel_chain_no_target_falls_back_to_hop_by_hop(self):
-        """archive 命中但链上无 target_ep 时降级到逐跳 API（P1-5 修复）。
+        """archive 命中但链上无 target_ep 时降级到逐跳 API。
 
         场景：archive 链 [200] 但 S2 的 sort 范围不含 target_ep=1000，
         且 200 无续集。archive 链不完整时必须降级到逐跳 API 兜底，
@@ -1060,7 +1061,7 @@ class TestFindEpisodeAcrossSeasons:
 
         result = api.find_episode_across_seasons(100, 1000)
         assert result is None
-        # P1-5 修复：archive 链未命中目标时应降级到逐跳 API
+        # archive 链未命中目标时应降级到逐跳 API
         assert api.get_related_subjects.called
 
     def test_archive_prequel_chain_finds_target_sort(self):
@@ -1272,6 +1273,45 @@ class TestExtractExplicitSeason:
         assert extract_explicit_season("虫师 续章") is None
         assert extract_explicit_season("凡人修仙传") is None
         assert extract_explicit_season("") is None
+
+    def test_trailing_number_is_season(self):
+        """标题结尾紧贴的季号（Bangumi 常见写法，不写「第N季」）
+
+        回归：``笨蛋，测验，召唤兽2``（bgm 11145 = 第二季）被判成「未声明季号」
+        → is_season_matched_id=False → 沿续集链找「第 2 季」→ 链上无下一季
+        → 「不存在或集数过多」。Emby S02E12 因此同步失败。
+        """
+        assert extract_explicit_season("笨蛋，测验，召唤兽2") == 2
+        assert extract_explicit_season("辉夜大小姐想让我告白2") == 2
+
+    def test_trailing_season_requires_adjacency(self):
+        """尾部数字必须是标题**结尾**的 1-2 位（本体 + 可选空格）
+
+        误判防护靠「1-2 位 + $ 锚定 + 数字前须有本体」三约束：四位作品编号
+        （ガンダム0083）结构性不匹配；章号（第3章）以「章」结尾不落在尾部；
+        整名就是数字的标题没有「标题本体」。
+
+        注意空格分隔**允许**（``タイトル 2`` → 2）：titleTranslate 外语言
+        变体常用「空格+尾数字」声明季号，收紧到紧贴会让候选丢掉季号声明，
+        季过滤器把候选当第一季剔除 —— 实测 L1 黄金集 9 条用例整链失败
+        （2026-11-05，PR #289 review）。
+        """
+        assert extract_explicit_season("機動戦士ガンダム0083") is None
+        assert extract_explicit_season("機動戦士ガンダム0083 ジオンの残光") is None
+        assert (
+            extract_explicit_season(
+                "コードギアス 亡国のアキト 第3章「輝くもの天より堕つ」"
+            )
+            is None
+        )
+        # 整名就是数字的标题没有「标题本体」，不算季号
+        assert extract_explicit_season("86") is None
+        # 空格分隔的尾部数字算季号（titleTranslate 变体的常见写法）
+        assert extract_explicit_season("タイトル 2") == 2
+
+    def test_trailing_roman_numeral_is_season(self):
+        assert extract_explicit_season("偶像大师 II") == 2
+        assert extract_explicit_season("灰与幻想的格林姆迦尔Ⅲ") == 3
 
 
 class TestExtractSeasonNumber:
@@ -1731,6 +1771,31 @@ class TestFindEpisodeFranchiseFallback:
 
         result = api.find_episode_across_seasons(100, 120)
         assert result is None
+
+    def test_chain_traversal_default_skips_real_type_subject(self):
+        """链遍历默认口径仅动画：REAL（type=6）条目即便 sort 命中也被跳过。
+
+        守卫当前**有意**设计：sequel/prequel 链沿「同一作品连续性」定位季集归属，
+        限定 ANIME 是保守策略（避免真人同名/改编作品误配）；放行 REAL 的宽口径
+        只留给 franchise 兜底（见 _try_find_episode_in_franchise）。若未来产品
+        确认需覆盖「真人改编链」，应把此处默认 allowed_types 一并放行 REAL。
+        """
+        episodes = {900: {"data": self._make_eps(101, 60, 90001), "total": 60}}
+        api = self._make_api(episodes, {})
+
+        # 默认 allowed_types=(ANIME,) → type=6 的 900 被跳过（不命中）
+        assert api._find_episode_in_chain([900], 120, set()) is None
+
+        # 显式放行 REAL（franchise 口径）时同一链可命中，佐证差异仅来自类型过滤
+        hit = api._find_episode_in_chain(
+            [900],
+            120,
+            set(),
+            allowed_types=(SUBJECT_TYPE_ANIME, SUBJECT_TYPE_REAL),
+        )
+        assert hit is not None
+        assert hit[0] == 900
+        assert hit[1] == 90020  # sort 120 -> id 90001 + (120 - 101)
 
 
 class TestFindSeasonOneEpisodeNoHang:

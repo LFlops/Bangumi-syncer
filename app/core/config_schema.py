@@ -145,6 +145,9 @@ SECTIONS: dict[str, SectionMeta] = {
             # 模糊匹配置信度阈值（0~1）：低于该相似度的 Bangumi API 匹配
             # 不会自动采用，而是沉淀到待审队列由用户在 Web 界面人工确认。
             FieldMeta(name="match_confidence_threshold", default=0.6),
+            # Bangumi API 限速（令牌桶）：每秒补充令牌数 / 突发容量。
+            FieldMeta(name="api_rate_limit", default=1),
+            FieldMeta(name="api_rate_burst", default=3),
         ),
     ),
     "auth": SectionMeta(
@@ -285,6 +288,8 @@ SECTIONS: dict[str, SectionMeta] = {
             FieldMeta(name="ssl_verify", default_true=True),
             FieldMeta(name="update_cron", default="0 8 * * 3"),
             FieldMeta(name="data_dir", default="./data/archive"),
+            # 下载源顺序：mirror=镜像优先（默认，国内）、github=直连优先（海外）
+            FieldMeta(name="download_source", default="mirror"),
             FieldMeta(name="min_disk_space_mb", default=3000),
             # BK-tree 模糊匹配开关：默认关闭，开启后对归档标题构建 BK-tree
             # 索引以支持编辑距离模糊查询，提升形近/缺字标题的召回率。
@@ -324,6 +329,10 @@ SECTIONS: dict[str, SectionMeta] = {
             FieldMeta(name="min_score", default=0.85),
             FieldMeta(name="min_margin", default=0.10),
             FieldMeta(name="ambiguous_margin", default=0.05),
+            # 季集一致性加权（媒体源季号+集数一同参与候选排序）：
+            # 默认关闭，未设置视为关（与后端
+            # ``config_manager.get(... fallback=False)`` 的兜底一致）
+            FieldMeta(name="episode_count_weight", loose_true=True),
         ),
     ),
     # ── 通知配置（order 500-599，多实例）──
@@ -404,18 +413,27 @@ SECTIONS: dict[str, SectionMeta] = {
         visible_in_ui=False,
         hidden_reason="在配置页「AI 追番总结」卡片中管理（经 /api/summary/jobs）",
         # summary 调度器为 instance 类型，配置联动由 summary_jobs API 直调
+        fields=(FieldMeta(name="thinking_level", default="off"),),
     ),
     "llm": SectionMeta(
         name="llm",
         display_name="LLM 配置",
         order=610,
         sensitive_fields=frozenset({"api_key"}),
+        # retention_days 是活配置（DB 启动时按它清理 llm_usage 记录），但示例键为
+        # 注释态、不做配置页入口，故仅登记 manual_keys（登记进 fields 会因
+        # TestConfigCoverage.test_schema_fields_exist_in_example_ini 失败）。
+        manual_keys={
+            "retention_days": "LLM 调用记录在数据库中的保留天数（默认 365 天），"
+            "内部运维参数，一般无需修改；如需调整，编辑 config.ini 的 [llm] 段",
+        },
         fields=(
+            # provider 受控取值（与 _PROVIDER_MAP / LLMConfigUpdate.provider 一致）：
+            # openai_compat / anthropic_compat
             FieldMeta(name="provider", default="openai_compat"),
             FieldMeta(name="max_tokens", default=2000),
             FieldMeta(name="temperature", default=0.7),
             FieldMeta(name="timeout", default=60),
-            FieldMeta(name="thinking_level", default="off"),
         ),
     ),
     # ── 调度器全局（order 900）──
